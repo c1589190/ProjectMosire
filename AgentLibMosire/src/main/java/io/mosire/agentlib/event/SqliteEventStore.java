@@ -12,6 +12,7 @@ import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -38,11 +39,35 @@ public final class SqliteEventStore implements EventStore {
       )
       """;
 
+  /**
+   * R9：{@code queryLatestByCorrelation} 的分组索引——(type, correlation_id, seq) 恰好覆盖"按类型分组取 MAX(seq)"。
+   */
+  private static final String LATEST_BY_CORRELATION_INDEX =
+      "CREATE INDEX IF NOT EXISTS idx_events_type_correlation_id_seq "
+          + "ON events (type, correlation_id, seq)";
+
   private static final String WAL_INSERT =
       "INSERT INTO events (ts, type, agent, payload, correlation_id) VALUES (?, ?, ?, ?, ?)";
   private static final String SELECT_BY_SEQ =
       "SELECT seq, ts, type, agent, payload, correlation_id FROM events WHERE seq = ?";
   private static final String COUNT = "SELECT COUNT(*) FROM events";
+  private static final String LATEST_BY_CORRELATION =
+      """
+      SELECT e.seq, e.ts, e.type, e.agent, e.payload, e.correlation_id
+      FROM events e
+        JOIN (
+          SELECT correlation_id, MAX(seq) AS max_seq
+          FROM events
+          WHERE type = ?
+          GROUP BY correlation_id
+        ) latest
+          ON latest.correlation_id = e.correlation_id
+         AND latest.max_seq = e.seq
+      WHERE e.type = ?
+      ORDER BY e.seq DESC
+      LIMIT ?
+      OFFSET ?
+      """;
 
   private final Connection connection;
   private final Path dbFile;
@@ -76,6 +101,8 @@ public final class SqliteEventStore implements EventStore {
       statement.execute("PRAGMA journal_mode = WAL");
       statement.execute("PRAGMA busy_timeout = 5000");
       statement.execute(DDL);
+      // 幂等：IF NOT EXISTS——旧库打开时自动补建（新库建表后同语句即可）
+      statement.execute(LATEST_BY_CORRELATION_INDEX);
     }
   }
 
@@ -149,6 +176,34 @@ public final class SqliteEventStore implements EventStore {
         }
       } catch (SQLException e) {
         throw new IllegalStateException("查询事件失败", e);
+      }
+    }
+  }
+
+  @Override
+  public List<Event> queryLatestByCorrelation(String type, int limit, int offset) {
+    Objects.requireNonNull(type, "type");
+    if (limit <= 0) {
+      throw new IllegalArgumentException("limit 必须为正: " + limit);
+    }
+    if (offset < 0) {
+      throw new IllegalArgumentException("offset 不能为负: " + offset);
+    }
+    synchronized (lock) {
+      try (var ps = connection.prepareStatement(LATEST_BY_CORRELATION)) {
+        ps.setString(1, type);
+        ps.setString(2, type);
+        ps.setInt(3, limit);
+        ps.setInt(4, offset);
+        try (ResultSet rs = ps.executeQuery()) {
+          List<Event> events = new ArrayList<>();
+          while (rs.next()) {
+            events.add(map(rs));
+          }
+          return List.copyOf(events);
+        }
+      } catch (SQLException e) {
+        throw new IllegalStateException("查询最新分组事件失败 type=" + type, e);
       }
     }
   }

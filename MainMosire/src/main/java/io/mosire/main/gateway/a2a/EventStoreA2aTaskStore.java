@@ -5,9 +5,7 @@ import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import org.a2aproject.sdk.jsonrpc.common.json.JsonProcessingException;
@@ -19,7 +17,8 @@ import org.a2aproject.sdk.spec.Task;
  *
  * <p>每次 {@link #put} 追加一条 {@code a2a.task.snapshot} 事件（agent={@code
  * a2a}、correlationId=taskId——Event 的 vocabulary 约定即 A2A task id 走 correlationId）； {@link #get}
- * 取该任务最新一条，{@link #list} 取全量按 correlationId 去重（每条第一次出现 = 最新）。
+ * 取该任务最新一条；{@link #list} 经 {@code queryLatestByCorrelation} 取每种 correlationId 的最新快照
+ * （R9：不再全量拉取逐条反序列化）。
  *
  * <p>Task 序列化用官方 {@link JsonUtil}（Gson + Part/A2AError/OffsetDateTime 适配器，与官方客户端互认）。
  */
@@ -55,18 +54,17 @@ public final class EventStoreA2aTaskStore implements A2aTaskStore {
 
   @Override
   public List<Task> list(String contextId, int limit, int offset) {
-    // 全量倒序（最新在前），每个任务取首次出现 = 最新快照；correlationId 空的事件跳过（异常写入防御）
-    List<Event> all =
-        events.query(new EventQuery(AGENT_NAME, SNAPSHOT_TYPE, "", -1, Integer.MAX_VALUE));
-    Map<String, Task> byTask = new LinkedHashMap<>();
-    for (Event event : all) {
-      Task task = parse(event);
+    // R9：SQL 侧 GROUP BY correlation_id 取 MAX(seq)，每种 correlationId 恰好一条（= 该任务最新快照），
+    // 结果按 seq 倒序与原有"全量倒序取首次出现"语义一致；correlationId 空的行跳过（异常写入防御）
+    List<Event> snapshots = events.queryLatestByCorrelation(SNAPSHOT_TYPE, Integer.MAX_VALUE, 0);
+    List<Task> all = new ArrayList<>(snapshots.size());
+    for (Event event : snapshots) {
       if (!event.correlationId().isBlank()) {
-        byTask.putIfAbsent(event.correlationId(), task);
+        all.add(parse(event));
       }
     }
-    List<Task> filtered = new ArrayList<>(byTask.size());
-    for (Task task : byTask.values()) {
+    List<Task> filtered = new ArrayList<>(all.size());
+    for (Task task : all) {
       if (contextId != null
           && !contextId.isBlank()
           && !Objects.equals(contextId, task.contextId())) {

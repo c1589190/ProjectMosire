@@ -16,6 +16,16 @@ public interface EventStore extends AutoCloseable {
   /** 按条件查询，seq 倒序、最多 {@code limit} 条。 */
   List<Event> query(EventQuery query);
 
+  /**
+   * 按 {@code correlationId} 分组取每组最新一条（组内 {@code seq} 最大），结果按 {@code seq} 倒序返回。
+   *
+   * <p>用途："每任务最新快照"类读取（如 A2A {@code tasks/list}）——SQL 侧经 {@code (type, correlation_id, seq)}
+   * 索引直接取每组最大值行，避免全量拉取再逐条反序列化。
+   *
+   * <p>{@code limit}/{@code offset} 为分组后最新集合的分页游标（{@code offset} 为 0 起）。
+   */
+  List<Event> queryLatestByCorrelation(String type, int limit, int offset);
+
   /** 按序号精确查找。 */
   Optional<Event> bySeq(long seq);
 
