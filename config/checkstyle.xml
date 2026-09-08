@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!-- 项目最小 Checkstyle 配置（其余风格规则交由 Spotless/google-java-format 承担）。
+     随 M1 起可按需扩展：包结构校验、@Override 必填等。 -->
+<module name="Checker">
+  <module name="TreeWalker">
+    <module name="AvoidStarImport"/>
+    <module name="RedundantImport"/>
+    <module name="UnusedImports"/>
+    <module name="OneStatementPerLine"/>
+  </module>
+</module>

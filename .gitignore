@@ -1,0 +1,34 @@
+# Maven
+target/
+*.class
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+release.properties
+
+# Maven shade 生成
+dependency-reduced-pom.xml
+
+# 运行时产物
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+logs/
+.work/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# 系统
+.DS_Store
+
+# 上游克隆（a2a-java 等研究用克隆）：可随时重新克隆，不入库（工作树保留在本地）
+Research/repos/a2a-java/
+**/.git/

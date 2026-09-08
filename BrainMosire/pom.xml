@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.mosire</groupId>
+    <artifactId>mosire-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>brain-mosire</artifactId>
+  <name>BrainMosire</name>
+  <description>Agent 运行时：tool-calling 循环、上下文构造与压缩、子 Agent 编排、skills、记忆（同一实现服务主 Agent 与子 Agent，差异=配置）</description>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>agentlib-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- 事件 payload/工具参数 JSON 序列化（版本由根 pom jackson-bom 管理） -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- SpotBugs 抑制注解：registry()/config() 等“有意暴露实时对象”的访问器标记（编译期仅为注解） -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
