@@ -8,20 +8,40 @@ import java.util.Objects;
  *
  * <p>W2a 新增：{@code mcpLinks}（外部 MCP 工具源配置文件路径，{@code null} = 不接入）与 {@code mcpExpose} （主 Agent
  * 工具注册表经 stdio MCP server 对外暴露，默认启用——R7 警示下保持 GUEST 默认身份，收窄属 M3 权限接线）。
+ *
+ * <p>W2b 新增：{@code a2aHost}/{@code a2aPort}（A2A 网关绑定地址/端口——默认 127.0.0.1 + 空闲端口，网络面红线： 对外打开必须显式配置）。
  */
 public record BootConfig(
-    int port, Path dataDir, boolean demo, String demoMessage, Path mcpLinks, boolean mcpExpose) {
+    int port,
+    Path dataDir,
+    boolean demo,
+    String demoMessage,
+    Path mcpLinks,
+    boolean mcpExpose,
+    String a2aHost,
+    int a2aPort) {
 
   public static final Path DEFAULT_DATA_DIR = Path.of(".work/mosire");
 
+  /** A2A 网关默认绑定地址（红线：默认仅本机）。 */
+  public static final String DEFAULT_A2A_HOST = "127.0.0.1";
+
+  /** A2A 网关默认端口：0 = 空闲端口自动分配。 */
+  public static final int DEFAULT_A2A_PORT = 0;
+
   public BootConfig {
     Objects.requireNonNull(dataDir, "dataDir");
+    Objects.requireNonNull(a2aHost, "a2aHost");
     if (port < 0 || port > 65535) {
       throw new IllegalArgumentException("端口越界: " + port);
+    }
+    if (a2aPort < 0 || a2aPort > 65535) {
+      throw new IllegalArgumentException("A2A 端口越界: " + a2aPort);
     }
   }
 
   public static BootConfig defaults() {
-    return new BootConfig(8080, DEFAULT_DATA_DIR, false, "", null, true);
+    return new BootConfig(
+        8080, DEFAULT_DATA_DIR, false, "", null, true, DEFAULT_A2A_HOST, DEFAULT_A2A_PORT);
   }
 }

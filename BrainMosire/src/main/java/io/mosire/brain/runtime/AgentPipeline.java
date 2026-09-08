@@ -37,6 +37,10 @@ import org.slf4j.LoggerFactory;
  *
  * <p>终止条件：模型无工具调用（FINISHED）或任一硬顶（计划 D10）。反幻觉护栏（伪造 [TOOL_RESULT]/finish_action/结果溢出暂存）为 GSimulator
  * 现成件，P0 下半程（M3）接入。
+ *
+ * <p><b>并发约定（R11 未尽项落定）</b>：{@link #history} 非线程安全——调用方必须保证任意时刻只跑一个回合： 每任务一个 runtime
+ * 实例，或对外（A2A/AG-UI 等）按提交序串行化调度。选择"每任务一 runtime"= 会话隔离（各任务独立历史）； 选择"串行化"= 一个 Agent 实例的连续对话（A2A
+ * 任务续接自然延续上下文）。
  */
 public final class AgentPipeline {
 

@@ -35,7 +35,8 @@ class AppMcpLinkTest {
     Path pidFile = tempDir.resolve("echo.pid");
     Path quitMarker = tempDir.resolve("echo-quit");
     Path linksFile = writeLinksJson(pidFile, quitMarker);
-    BootConfig config = new BootConfig(0, tempDir.resolve("data"), false, "", linksFile, false);
+    BootConfig config =
+        new BootConfig(0, tempDir.resolve("data"), false, "", linksFile, false, "127.0.0.1", 0);
     App app = App.start(config);
     try {
       // W2 验收：配置拉起的 MCP server 工具出现在主 Agent registry
@@ -105,7 +106,14 @@ class AppMcpLinkTest {
       // 端口被占：链接已建立后装配失败 → 已起的 MCP 子进程也必须被回收（不留僵尸）
       BootConfig config =
           new BootConfig(
-              occupied.getLocalPort(), tempDir.resolve("data"), false, "", linksFile, true);
+              occupied.getLocalPort(),
+              tempDir.resolve("data"),
+              false,
+              "",
+              linksFile,
+              true,
+              "127.0.0.1",
+              0);
       assertThatThrownBy(() -> App.start(config)).isInstanceOf(IllegalStateException.class);
     }
     waitForExit(pidFile);
@@ -119,7 +127,8 @@ class AppMcpLinkTest {
     } catch (Exception e) {
       throw new AssertionError(e);
     }
-    BootConfig config = new BootConfig(0, tempDir.resolve("data"), false, "", bad, false);
+    BootConfig config =
+        new BootConfig(0, tempDir.resolve("data"), false, "", bad, false, "127.0.0.1", 0);
     assertThatThrownBy(() -> App.start(config))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("mcp-links");

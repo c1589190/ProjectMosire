@@ -233,8 +233,17 @@ public final class A2aHttpServer implements AutoCloseable {
     }
   }
 
+  /**
+   * 关闭（优雅）：先停止接入新连接，再给在途 exchange（SSE 写帧循环）最多 1 秒排空时间，最后关闭全部连接。
+   *
+   * <p>{@code HttpServer.stop(delay)} 的契约是"关闭监听后等待当前 exchange handler 完成（或 delay 秒超时），
+   * 然后关闭所有连接"——delay=0 会立即断连，在途 SSE 流（例如 R8 关停合成 FAILED 之后要推给订阅者的终态 {@code
+   * statusUpdate}）可能来不及写出去（A2aServerTest 与 AppA2aE2eTest 曾实测：stop(0) 下订阅者收不到 终态帧，只能看到连接切断）。1
+   * 秒窗口内事件源必然排空：{@code A2aTaskService.close()} 已先行合成终态 （App.close 的关停顺序保证），写帧循环在队列上阻塞直至 END
+   * 哨兵，无锁态挂起。
+   */
   @Override
   public void close() {
-    server.stop(0);
+    server.stop(1);
   }
 }

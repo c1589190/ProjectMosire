@@ -76,6 +76,9 @@ public final class Main {
         case "--demo-message" -> config = withDemoMessage(config, requireValue(args, ++i));
         case "--mcp-link" -> config = withMcpLinks(config, Path.of(requireValue(args, ++i)));
         case "--no-mcp-expose" -> config = withMcpExpose(config, false);
+        case "--a2a-address" -> config = withA2aAddress(config, requireValue(args, ++i));
+        case "--a2a-port" ->
+            config = withA2aPort(config, Integer.parseInt(requireValue(args, ++i)));
         default -> {
           System.err.println("未知参数: " + args[i]);
           return 2;
@@ -85,8 +88,12 @@ public final class Main {
     App app = App.start(config);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
-        "Mosire v%s 已启动: http://127.0.0.1:%d%s%n",
-        Version.VERSION, app.boundPort(), config.demo() ? "（demo 模式）" : "");
+        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d%s%n",
+        Version.VERSION,
+        app.boundPort(),
+        config.a2aHost(),
+        app.a2aPort(),
+        config.demo() ? "（demo 模式）" : "");
     app.awaitTermination();
     return 0;
   }
@@ -105,7 +112,9 @@ public final class Main {
         config.demo(),
         config.demoMessage(),
         config.mcpLinks(),
-        config.mcpExpose());
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort());
   }
 
   private static BootConfig withDataDir(BootConfig config, Path dataDir) {
@@ -115,17 +124,33 @@ public final class Main {
         config.demo(),
         config.demoMessage(),
         config.mcpLinks(),
-        config.mcpExpose());
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort());
   }
 
   private static BootConfig withDemo(BootConfig config, boolean demo) {
     return new BootConfig(
-        config.port(), config.dataDir(), demo, "", config.mcpLinks(), config.mcpExpose());
+        config.port(),
+        config.dataDir(),
+        demo,
+        "",
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort());
   }
 
   private static BootConfig withDemoMessage(BootConfig config, String message) {
     return new BootConfig(
-        config.port(), config.dataDir(), true, message, config.mcpLinks(), config.mcpExpose());
+        config.port(),
+        config.dataDir(),
+        true,
+        message,
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort());
   }
 
   private static BootConfig withMcpLinks(BootConfig config, Path mcpLinks) {
@@ -135,7 +160,9 @@ public final class Main {
         config.demo(),
         config.demoMessage(),
         mcpLinks,
-        config.mcpExpose());
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort());
   }
 
   private static BootConfig withMcpExpose(BootConfig config, boolean mcpExpose) {
@@ -145,7 +172,33 @@ public final class Main {
         config.demo(),
         config.demoMessage(),
         config.mcpLinks(),
-        mcpExpose);
+        mcpExpose,
+        config.a2aHost(),
+        config.a2aPort());
+  }
+
+  private static BootConfig withA2aAddress(BootConfig config, String a2aAddress) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        a2aAddress,
+        config.a2aPort());
+  }
+
+  private static BootConfig withA2aPort(BootConfig config, int a2aPort) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        a2aPort);
   }
 
   private static int health() {
@@ -223,6 +276,8 @@ public final class Main {
              --demo-message <t> 启动时跑指定内容的脚本问答
              --mcp-link <p>    外部 MCP stdio server 配置（mcp-links.json，数组格式）
              --no-mcp-expose   关闭主 Agent 工具面经 stdio MCP server 暴露（默认启用）
+             --a2a-address <h>  A2A 网关绑定地址（默认 127.0.0.1；对外打开须显式配置）
+             --a2a-port <n>     A2A 网关端口（默认 0 = 空闲端口自动分配）
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）

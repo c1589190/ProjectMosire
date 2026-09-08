@@ -20,6 +20,10 @@ import java.util.Objects;
  * 一个 Agent 实例的编排根（计划 §4.1）：装配配置/LLM/工具/权限/事件，派生主循环。
  *
  * <p>同一个类同时服务主 Agent 与子 Agent——差异 = 配置（id/工具集/权限集/配额），渲染成 运行时字段而不是类型分支（计划 §四契约）。
+ *
+ * <p><b>并发约定（R11 未尽项落定）</b>：一个实例的会话历史（{@link AgentPipeline} 内部）非线程安全——要么<b>每任务一个 runtime
+ * 实例</b>（任务间完全隔离），要么<b>对同一实例的 {@link #chat} 调用串行化</b>（如 A2A 任务经单线程执行器按提交序执行， 语义 = 一个 Agent
+ * 实例的连续对话）；跨任务并发调用是未定义行为。本类不自加锁。
  */
 public final class AgentRuntime implements AutoCloseable {
 
@@ -85,7 +89,11 @@ public final class AgentRuntime implements AutoCloseable {
         Map.of("action", "started", "agent", config.id(), "model", config.model()));
   }
 
-  /** 跑一回合（用户输入 → 终止）；多轮连续对话共享 history。 */
+  /**
+   * 跑一回合（用户输入 → 终止）；多轮连续对话共享 history。
+   *
+   * <p><b>调用约定</b>：同步、重入不设防——同一实例的 {chat} 调用必须串行（或每任务一个实例），详见类 Javadoc 并发约定。
+   */
   public TurnResult chat(String userMessage) {
     ensureOpen();
     return pipeline.run(userMessage);

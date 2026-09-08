@@ -20,12 +20,22 @@ import io.mosire.brain.runtime.TurnResult;
 import io.mosire.main.Version;
 import io.mosire.main.gateway.AdminHttpServer;
 import io.mosire.main.gateway.StatusSnapshot;
+import io.mosire.main.gateway.a2a.A2aAgentRunner;
+import io.mosire.main.gateway.a2a.A2aHttpServer;
+import io.mosire.main.gateway.a2a.A2aJsonRpcHandler;
+import io.mosire.main.gateway.a2a.A2aTaskService;
+import io.mosire.main.gateway.a2a.EventStoreA2aTaskStore;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import org.a2aproject.sdk.spec.AgentCapabilities;
+import org.a2aproject.sdk.spec.AgentCard;
+import org.a2aproject.sdk.spec.AgentInterface;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,6 +48,12 @@ import org.slf4j.LoggerFactory;
  *
  * <p>W2a（本类新增）：{@code --mcp-link} 配置驱动外部 MCP stdio server 工具接入（W2 步骤 1）；主 Agent 的 ToolRegistry 经
  * {@link AgentToMcpServer} 以 stdio 暴露（W2 步骤 2，默认启用）——注意主进程 stdout 即 MCP 流， 进程日志必须只走 stderr。
+ *
+ * <p>W2b（本类新增）：A2A 网关接入——{@code A2aTaskService} + {@link A2aAgentRunner}（任务消息 → 主 Agent {@code
+ * chat}）+ {@link A2aHttpServer}（Agent Card + JSON-RPC + SSE，地址/端口来自 {@code
+ * --a2a-address/--a2a-port}， 默认 127.0.0.1 + 空闲端口）。任务执行串行化（单线程执行器——Rul B：不引入 A2A 并发任务； {@code
+ * AgentPipeline.history} 实例级共享且非线程安全，串行化即不变量，见 Brain Javadoc）。 关停顺序：A2A 任务服务先行合成
+ * FAILED（在订阅的客户端收终态）→ A2A 网关关闭 → 既有关停链（原因见 {@link #close()} 说明）。
  */
 public final class App implements AutoCloseable {
 
@@ -47,6 +63,9 @@ public final class App implements AutoCloseable {
       "你是 Mosire 主 Agent——一个模块化、可自管理、受权限约束的 Agent。" + "保持诚实：无工具可用时直接说明，不虚构执行过程。";
   public static final String DEMO_USER_MESSAGE = "你好，请确认你的骨架已就绪。";
 
+  /** 非 demo 模式下 FakeLlmClient 的默认骨架回复（A2A 等调用面无脚本时也能完成一回合；真实模型 M3 接入）。 */
+  public static final String DEFAULT_LLM_REPLY = "我是 Mosire 主 Agent（M1 骨架 LLM，离线占位回复）。消息已收到。";
+
   private final EventStore events;
   private final EventBus bus;
   private final AgentRuntime runtime;
@@ -54,11 +73,22 @@ public final class App implements AutoCloseable {
   private final AgentToMcpServer mcpServer;
   private final List<McpToolSource> mcpSources;
   private final List<McpSourceBridge> mcpBridges;
+  private final A2aHttpServer a2aServer;
+  private final A2aTaskService a2aTaskService;
   private final CountDownLatch terminated = new CountDownLatch(1);
   private volatile boolean closed;
 
-  /** 启动：拉起存储/运行时/MCP（链接+暴露）/AdminREST，注册 SIGTERM/SIGINT 优雅关停钩子（计划 §5.1）。 */
+  /** 启动：拉起存储/运行时/MCP（链接+暴露）/网关（AdminREST/A2A），注册 SIGTERM/SIGINT 优雅关停钩子（计划 §5.1）。 */
   public static App start(BootConfig config) {
+    return start(config, null);
+  }
+
+  /**
+   * 启动（LLM 覆盖入口——测试注入脚本化 {@link FakeLlmClient} 用；{@code llmOverride == null} 时按配置脚本化）。
+   *
+   * <p>覆盖仅影响主 AgentRuntime 装配，不改变生命周期行为。
+   */
+  public static App start(BootConfig config, LlmClient llmOverride) {
     try {
       Files.createDirectories(config.dataDir());
     } catch (IOException e) {
@@ -70,6 +100,8 @@ public final class App implements AutoCloseable {
     // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
     McpLinks links = wireMcpLinks(config.mcpLinks(), tools);
     AgentToMcpServer mcpServer = null;
+    A2aHttpServer a2aServer = null;
+    A2aTaskService a2aTaskService = null;
     try {
       // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）
       mcpServer =
@@ -81,7 +113,8 @@ public final class App implements AutoCloseable {
               .description("主 Agent（M1 骨架）")
               .build();
       AgentRuntime runtime =
-          new AgentRuntime(agentConfig, scriptedLlm(config), tools, events, bus, permissionSet);
+          new AgentRuntime(
+              agentConfig, scriptedLlm(config, llmOverride), tools, events, bus, permissionSet);
       AdminHttpServer http =
           AdminHttpServer.start(
               config.port(),
@@ -89,7 +122,32 @@ public final class App implements AutoCloseable {
                   StatusSnapshot.healthy(
                       Version.ARTIFACT_ID, Version.VERSION, agentConfig.id(), events.count()));
 
-      App app = new App(events, bus, runtime, http, mcpServer, links.sources(), links.bridges());
+      // W2 步骤 3：A2A 接入——状态存储=EventStore（Task 快照）+ runner 桥 → 主 Agent chat；
+      // 任务执行串行化（Rul B：A2A 不引入并发任务——单线程执行器 + Pipeline history 实例级共享（非线程安全），串行即不变量）
+      a2aTaskService =
+          new A2aTaskService(
+              new EventStoreA2aTaskStore(events),
+              new A2aAgentRunner(runtime),
+              Executors.newSingleThreadExecutor(Thread.ofVirtual().name("a2a-task-").factory()));
+      a2aServer =
+          A2aHttpServer.start(
+              new InetSocketAddress(config.a2aHost(), config.a2aPort()),
+              port -> a2aCard(a2aBaseUrl(config.a2aHost(), port)),
+              // handler 卡仅用于版本协商（URL 无关——真实绑定后的卡片经 cardFactory 构建）
+              new A2aJsonRpcHandler(
+                  a2aCard(a2aBaseUrl(config.a2aHost(), config.a2aPort())), a2aTaskService));
+
+      App app =
+          new App(
+              events,
+              bus,
+              runtime,
+              http,
+              mcpServer,
+              links.sources(),
+              links.bridges(),
+              a2aServer,
+              a2aTaskService);
 
       if (config.demo()) {
         String message = config.demoMessage().isEmpty() ? DEMO_USER_MESSAGE : config.demoMessage();
@@ -98,7 +156,13 @@ public final class App implements AutoCloseable {
       Runtime.getRuntime().addShutdownHook(new Thread(app::close, "mosire-shutdown"));
       return app;
     } catch (RuntimeException e) {
-      // 装配中途失败（如端口占用）：回收已起的 MCP 子进程，避免启动失败后残留僵尸进程
+      // 装配中途失败（如端口占用）：回收已起的网关/MCP 子进程，避免启动失败后残留僵尸进程
+      if (a2aServer != null) {
+        a2aServer.close();
+      }
+      if (a2aTaskService != null) {
+        a2aTaskService.close();
+      }
       if (mcpServer != null) {
         mcpServer.close();
       }
@@ -143,10 +207,32 @@ public final class App implements AutoCloseable {
         app.events.count());
   }
 
-  private static LlmClient scriptedLlm(BootConfig config) {
-    // M1：只支持脚本 LLM；非 demo 模式仅占位（真实供应商在 M3 按 ModelRoute 接入）
+  /** A2A Agent Card（卡片 URL = 实际监听地址；handler 侧版本协商只用 supportedInterfaces）。 */
+  private static AgentCard a2aCard(String url) {
+    return AgentCard.builder()
+        .name("mosire-main")
+        .description("ProjectMosire 主 Agent（A2A 网关）")
+        .version(Version.VERSION)
+        .capabilities(AgentCapabilities.builder().streaming(true).build())
+        .defaultInputModes(List.of("application/json"))
+        .defaultOutputModes(List.of("application/json"))
+        .skills(List.of())
+        .url(url)
+        .supportedInterfaces(List.of(new AgentInterface("JSONRPC", url)))
+        .build();
+  }
+
+  private static String a2aBaseUrl(String host, int port) {
+    return "http://" + host + ":" + port;
+  }
+
+  private static LlmClient scriptedLlm(BootConfig config, LlmClient llmOverride) {
+    if (llmOverride != null) {
+      return llmOverride;
+    }
+    // M1：只支持脚本 LLM；非 demo 模式给默认骨架回复（供 A2A 等调用面直接应答，真实供应商在 M3 按 ModelRoute 接入）
     if (!config.demo()) {
-      return FakeLlmClient.with();
+      return FakeLlmClient.with(LlmResponse.text(DEFAULT_LLM_REPLY));
     }
     return FakeLlmClient.with(
         LlmResponse.text("你好！Mosire 主 Agent 骨架已就绪，事件存储与权限门禁在线。" + "这是我首次运行的自检回复。"));
@@ -159,7 +245,9 @@ public final class App implements AutoCloseable {
       AdminHttpServer http,
       AgentToMcpServer mcpServer,
       List<McpToolSource> mcpSources,
-      List<McpSourceBridge> mcpBridges) {
+      List<McpSourceBridge> mcpBridges,
+      A2aHttpServer a2aServer,
+      A2aTaskService a2aTaskService) {
     this.events = events;
     this.bus = bus;
     this.runtime = runtime;
@@ -167,6 +255,8 @@ public final class App implements AutoCloseable {
     this.mcpServer = mcpServer;
     this.mcpSources = List.copyOf(mcpSources);
     this.mcpBridges = List.copyOf(mcpBridges);
+    this.a2aServer = a2aServer;
+    this.a2aTaskService = a2aTaskService;
   }
 
   /** 阻塞直到 close()（由 shutdown 钩子触发）。 */
@@ -192,9 +282,21 @@ public final class App implements AutoCloseable {
     return http.boundPort();
   }
 
+  /** A2A 网关实际监听端口（0 = 自动分配场景下由调用方取实际值；未装配时为空）。 */
+  public int a2aPort() {
+    return a2aServer.port();
+  }
+
   /**
-   * 优雅关停（计划 §5.1）：网关 drain → MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接
-   * bridge.close（整组下架工具）→ source.close（回收子进程）→ 运行时 → 事件存储 checkpoint。
+   * 优雅关停（计划 §5.1）：A2A 任务服务先行（合成 FAILED 让在订阅的客户端收到终态——必须赶在 HTTP 服务断连之前）→ A2A 网关关闭 （停止接入）→ 网关 drain →
+   * MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接 bridge.close（整组下架工具）→ source.close（回收子进程）→
+   * 运行时 → 事件存储 checkpoint。
+   *
+   * <p>（顺序说明）任务要求表述为"A2A server 先行关闭"，但 {@code HttpServer.stop(0)} 会即时掐断在途 SSE 连接——若先关 server，周迟合的
+   * FAILED 时序事件早已不可达订阅者（R8 验收不成立）；故先合成终态、后断连接；“A2A 先行于既有关停链” 的本意（网关先于
+   * runtime/事件库关闭）保持不变。服务关闭窗口内到达的新任务按 R8 走 RejectedExecutionException → 合成 FAILED。
+   *
+   * <p>每项关闭单独 try/catch：单项失败只记录日志（警告），close 链必须走完（{@code terminated.countDown()} 保证释放 等待方）。
    */
   @Override
   public void close() {
@@ -202,31 +304,42 @@ public final class App implements AutoCloseable {
       return;
     }
     closed = true;
-    LOG.info("正在停止：网关 drain → MCP 暴露/链接 → 运行时 → 事件存储 checkpoint");
-    try {
-      http.close();
-    } finally {
-      try {
-        if (mcpServer != null) {
-          mcpServer.close();
-        }
-        closeLinks(new McpLinks(mcpSources, mcpBridges));
-      } finally {
-        runtime.close();
-      }
-    }
-    events.close();
-    bus.close();
+    LOG.info("正在停止：A2A 任务/网关 → 网关 drain → MCP 暴露/链接 → 运行时 → 事件存储 checkpoint");
+    closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
+    closeQuietly("A2A 网关", () -> a2aServer.close());
+    closeQuietly("AdminREST 网关", () -> http.close());
+    closeQuietly("MCP 暴露", () -> mcpServer.close());
+    closeQuietly("MCP 链接", () -> closeLinks(new McpLinks(mcpSources, mcpBridges)));
+    closeQuietly("Agent 运行时", () -> runtime.close());
+    closeQuietly("事件存储", () -> events.close());
+    closeQuietly("事件总线", () -> bus.close());
     terminated.countDown();
   }
 
-  /** 链接回收（共享给关停与装配失败路径）：先 bridge（整组下架工具），再 source（回收子进程）。 */
+  /** 单项资源关闭：异常只记日志（继续执行后续关闭——close 链不因单项失败中断）。 */
+  private static void closeQuietly(String what, Runnable closer) {
+    try {
+      closer.run();
+    } catch (RuntimeException e) {
+      LOG.warn("关闭 {} 失败（继续执行后续关闭）", what, e);
+    }
+  }
+
+  /** 链接回收（共享给关停与装配失败路径）：先 bridge（整组下架工具），再 source（回收子进程）；逐项异常不中断整组回收。 */
   private static void closeLinks(McpLinks links) {
     for (McpSourceBridge bridge : links.bridges()) {
-      bridge.close();
+      try {
+        bridge.close();
+      } catch (RuntimeException e) {
+        LOG.warn("关闭 MCP 桥失败（继续回收其余桥/源）", e);
+      }
     }
     for (McpToolSource source : links.sources()) {
-      source.close();
+      try {
+        source.close();
+      } catch (RuntimeException e) {
+        LOG.warn("关闭 MCP 源失败（继续回收其余源）", e);
+      }
     }
   }
 

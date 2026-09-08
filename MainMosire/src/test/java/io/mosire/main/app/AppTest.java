@@ -21,7 +21,8 @@ class AppTest {
   @Test
   void demoBootRunsTurnPersistsEventsAndServesHealth() throws Exception {
     BootConfig config =
-        new BootConfig(0, tempDir.resolve("data"), true, App.DEMO_USER_MESSAGE, null, true);
+        new BootConfig(
+            0, tempDir.resolve("data"), true, App.DEMO_USER_MESSAGE, null, true, "127.0.0.1", 0);
     App app = App.start(config);
     try (app) {
       // demo 回合结果：事件已入库（lifecycle + turn 至少 2 条）
