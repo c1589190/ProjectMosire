@@ -10,6 +10,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.a2aproject.sdk.jsonrpc.common.wrappers.ListTasksResult;
 import org.a2aproject.sdk.spec.A2AError;
@@ -360,13 +361,45 @@ public final class A2aTaskService implements AutoCloseable {
     }
   }
 
+  /**
+   * 关闭：停接新任务 → 对<b>全部</b>非终态任务合成 FAILED → 有界等待在途任务退场——保证 close 之后不存在悬挂的非终态任务 （订阅者观察到终态而非永久等待；类契约）。
+   *
+   * <p><b>合成先于等待</b>：{@code shutdownNow} 中断了在途 runner 线程——其退场路径（管线中断 → runner 抛 {@link
+   * A2AError}）虽然也会调 {@link #failToState}，但该线程带着中断标记，终态帧投递经过的阻塞入队会因中断 直接失效（丢帧）。故先由未被中断的 close 线程合成
+   * FAILED（在途任务在此收终态），再等 runner 退场； 若 runner 先得锁合成，投递由 {@link A2aHttpServer} 的 offer 入队兜底（见其 feeder
+   * 说明）。
+   *
+   * <p>两次扫描覆盖的竞态窗口：
+   *
+   * <ul>
+   *   <li>扫描①（入口，锁外取，避免持锁调 store.list）：close 开始时刻的非终态任务；
+   *   <li>{@code shutdownNow}：丢弃已入队而未启动的 runMessage（execute 已被接受）——被丢弃的任务没人会自行合成 FAILED；
+   *   <li>扫描②（{@code awaitTermination} 之后）：覆盖"扫描①与 shutdownNow 之间"被 put 的新任务（其 execute 在
+   *       shutdownNow 前被接受、入队、随后被丢弃）——扫描①见不到、异常路径也不会触发，只有二次扫描能接住；
+   *   <li>shutdownNow 之后的新提交 → {@code executor.execute} 抛 {@link RejectedExecutionException} →
+   *       {@link #sendMessage}/{@link #continueMessageLocked} 既有路径自行合成 FAILED（任务已入库），无需第三次扫描。
+   * </ul>
+   */
   @Override
   public void close() {
-    // 快照在锁外取（避免持锁调 store.list）；先关停执行器，再把所有非终态任务合成 FAILED——
-    // 保证 close 之后不存在悬挂的非终态任务（订阅者观察到终态而非永久等待）
-    List<Task> snapshot = store.list(null, Integer.MAX_VALUE, 0);
+    List<Task> firstScan = store.list(null, Integer.MAX_VALUE, 0);
     executor.shutdownNow();
-    for (Task task : snapshot) {
+    synthesizeFailed(firstScan);
+    // 有界等待在途 runner 退场：其管线回调还会向 EventStore/EventBus 写事件，App.close 将随后关掉存储——
+    // 超时不阻塞（任务已中断，残留写由事件层兜底），只记警告
+    try {
+      if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+        LOG.warn("A2A 任务执行器未在 2 秒内退出，继续关闭");
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+    synthesizeFailed(store.list(null, Integer.MAX_VALUE, 0));
+  }
+
+  /** 对非终态任务合成 FAILED（单个失败只记日志不阻断整批；幂等——已终态/终态重放均安全）。 */
+  private void synthesizeFailed(List<Task> tasks) {
+    for (Task task : tasks) {
       if (!task.status().state().isFinal()) {
         try {
           failToState(task.id(), TaskState.TASK_STATE_FAILED, "A2A 服务已关闭，任务强制失败");

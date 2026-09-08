@@ -220,9 +220,6 @@ class AppA2aE2eTest {
       String taskId = extractTaskId(sendResp.body());
       awaitState(app, taskId, TaskState.TASK_STATE_WORKING);
 
-      // 顺带断言 tool.call/tool.result 事件已流出（Task 7 事件面预留的验证点）
-      assertThat(app.queryEvents(new EventQuery("", EventTypes.TOOL_CALL, "", -1, 10))).hasSize(1);
-
       List<Object> events = new CopyOnWriteArrayList<>();
       CountDownLatch firstEvent = new CountDownLatch(1);
       CountDownLatch finalEvent = new CountDownLatch(1);
@@ -230,6 +227,8 @@ class AppA2aE2eTest {
           new TaskIdParams(taskId, null),
           List.of(
               (event, card) -> {
+                // 先 add 后 countDown：唤醒等待方后立刻读列表必须看到已入列的元素
+                events.add(event);
                 if (event instanceof TaskEvent e) {
                   firstEvent.countDown();
                 } else if (event instanceof TaskUpdateEvent e) {
@@ -238,26 +237,27 @@ class AppA2aE2eTest {
                     finalEvent.countDown();
                   }
                 }
-                events.add(event);
               }),
           t -> {},
           new ClientCallContext(Map.of(), Map.of()));
       assertThat(firstEvent.await(10, TimeUnit.SECONDS)).isTrue();
 
-      // close：A2A 网关先行关闭 → 服务合成 FAILED → 订阅流收终态
+      // close：任务服务先行合成 FAILED → 网关 stop(1) 排空断连 → 订阅流收终态
       app.close();
       assertThat(finalEvent.await(10, TimeUnit.SECONDS)).isTrue();
 
       TaskUpdateEvent last = (TaskUpdateEvent) events.get(events.size() - 1);
       assertThat(last.getTask().status().state()).isEqualTo(TaskState.TASK_STATE_FAILED);
 
-      // 持久化检查：closed 后事件库重开仍可读（FAILED 快照已落库）
+      // 持久化检查：closed 后事件库重开仍可读（FAILED 快照 + TOOL_CALL 均已落库；TOOL_CALL 放这里断言——
+      // awaitState(WORKING) 只保证已 WORKING，FakeLlm 毫秒级执行下可能尚未入库；close 之后必然已写）
       try (SqliteEventStore reopened =
           SqliteEventStore.open(tempDir.resolve("data").resolve("events.db"))) {
         List<io.mosire.agentlib.event.Event> snapshots =
             reopened.query(new EventQuery("", EventStoreA2aTaskStore.SNAPSHOT_TYPE, taskId, -1, 5));
         assertThat(snapshots).isNotEmpty();
         assertThat(snapshots.get(0).payload()).contains("TASK_STATE_FAILED");
+        assertThat(reopened.query(new EventQuery("", EventTypes.TOOL_CALL, "", -1, 10))).hasSize(1);
       }
     } finally {
       release.countDown();

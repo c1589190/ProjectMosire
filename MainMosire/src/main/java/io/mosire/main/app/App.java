@@ -308,7 +308,13 @@ public final class App implements AutoCloseable {
     closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
     closeQuietly("A2A 网关", () -> a2aServer.close());
     closeQuietly("AdminREST 网关", () -> http.close());
-    closeQuietly("MCP 暴露", () -> mcpServer.close());
+    closeQuietly(
+        "MCP 暴露",
+        () -> {
+          if (mcpServer != null) {
+            mcpServer.close();
+          }
+        });
     closeQuietly("MCP 链接", () -> closeLinks(new McpLinks(mcpSources, mcpBridges)));
     closeQuietly("Agent 运行时", () -> runtime.close());
     closeQuietly("事件存储", () -> events.close());

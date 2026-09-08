@@ -185,11 +185,8 @@ public final class A2aHttpServer implements AutoCloseable {
                   } catch (Throwable t) {
                     LOG.error("SSE 事件源异常中断", t);
                   } finally {
-                    try {
-                      queue.put(END);
-                    } catch (InterruptedException e) {
-                      Thread.currentThread().interrupt();
-                    }
+                    // offer：无界队列必成功且不检查中断——事件源线程即使带着中断标记也要让走流句柄收到 END 收尾
+                    queue.offer(END);
                   }
                 });
     try (OutputStream out = exchange.getResponseBody()) {
@@ -206,15 +203,15 @@ public final class A2aHttpServer implements AutoCloseable {
     }
   }
 
-  /** BlockingQueue :: put 的方法引用不满足 Consumer（checked exception），显式包装。 */
+  /**
+   * 终态帧入队（Consumer 包装）。
+   *
+   * <p>用 {@code offer} 而非 {@code put}：① 无界 {@link LinkedBlockingQueue} 必然成功（永不拒收）；② {@code put} 的
+   * {@code lockInterruptibly()} 会把"已中断线程"直接判定为失败（R8 关停时在途 runner 线程带 {@code shutdownNow}
+   * 的中断标记投递终态帧——实测 {@code put} 抛 {@link InterruptedException} 丢帧，订阅者只见连接切断不见 FAILED，正是 R8 要消灭的现象）。
+   */
   private static Consumer<String> feeder(BlockingQueue<String> queue) {
-    return data -> {
-      try {
-        queue.put(data);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    };
+    return queue::offer;
   }
 
   private String cardPrimaryVersion() {
