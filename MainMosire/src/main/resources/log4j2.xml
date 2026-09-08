@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- 简单控制台输出（需求：进程日志肉眼可读即可，结构化落盘交给事件存储） -->
+<!-- 简单控制台输出（需求：进程日志肉眼可读即可，结构化落盘交给事件存储）。
+     目标 SYSTEM_ERR：主进程 stdout 是 MCP stdio 协议流（AgentToMcpServer 默认启用），任何 stdout 日志都会破坏协议帧。 -->
 <Configuration status="WARN">
   <Appenders>
-    <Console name="Console" target="SYSTEM_OUT">
+    <Console name="Console" target="SYSTEM_ERR">
       <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level %logger{24} - %msg%n"/>
     </Console>
   </Appenders>

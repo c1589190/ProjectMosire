@@ -74,6 +74,8 @@ public final class Main {
         case "--data-dir" -> config = withDataDir(config, Path.of(requireValue(args, ++i)));
         case "--demo" -> config = withDemo(config, true);
         case "--demo-message" -> config = withDemoMessage(config, requireValue(args, ++i));
+        case "--mcp-link" -> config = withMcpLinks(config, Path.of(requireValue(args, ++i)));
+        case "--no-mcp-expose" -> config = withMcpExpose(config, false);
         default -> {
           System.err.println("未知参数: " + args[i]);
           return 2;
@@ -81,7 +83,8 @@ public final class Main {
       }
     }
     App app = App.start(config);
-    System.out.printf(
+    // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
+    System.err.printf(
         "Mosire v%s 已启动: http://127.0.0.1:%d%s%n",
         Version.VERSION, app.boundPort(), config.demo() ? "（demo 模式）" : "");
     app.awaitTermination();
@@ -96,19 +99,53 @@ public final class Main {
   }
 
   private static BootConfig withPort(BootConfig config, int port) {
-    return new BootConfig(port, config.dataDir(), config.demo(), config.demoMessage());
+    return new BootConfig(
+        port,
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose());
   }
 
   private static BootConfig withDataDir(BootConfig config, Path dataDir) {
-    return new BootConfig(config.port(), dataDir, config.demo(), config.demoMessage());
+    return new BootConfig(
+        config.port(),
+        dataDir,
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose());
   }
 
   private static BootConfig withDemo(BootConfig config, boolean demo) {
-    return new BootConfig(config.port(), config.dataDir(), demo, "");
+    return new BootConfig(
+        config.port(), config.dataDir(), demo, "", config.mcpLinks(), config.mcpExpose());
   }
 
   private static BootConfig withDemoMessage(BootConfig config, String message) {
-    return new BootConfig(config.port(), config.dataDir(), true, message);
+    return new BootConfig(
+        config.port(), config.dataDir(), true, message, config.mcpLinks(), config.mcpExpose());
+  }
+
+  private static BootConfig withMcpLinks(BootConfig config, Path mcpLinks) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        mcpLinks,
+        config.mcpExpose());
+  }
+
+  private static BootConfig withMcpExpose(BootConfig config, boolean mcpExpose) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        mcpExpose);
   }
 
   private static int health() {
@@ -184,6 +221,8 @@ public final class Main {
              --data-dir <p>  数据目录（默认 .work/mosire）
              --demo          启动时先跑一条脚本问答（自检：事件入库）
              --demo-message <t> 启动时跑指定内容的脚本问答
+             --mcp-link <p>    外部 MCP stdio server 配置（mcp-links.json，数组格式）
+             --no-mcp-expose   关闭主 Agent 工具面经 stdio MCP server 暴露（默认启用）
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）
