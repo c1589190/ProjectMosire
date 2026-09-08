@@ -11,5 +11,7 @@ public enum StopReason {
   /** 超出 timeBudget 硬顶。 */
   TIME_BUDGET,
   /** 超出 token 配额（计划 D10）。 */
-  QUOTA
+  QUOTA,
+  /** LLM 调用失败（网络/协议/供应商错误），管线优雅终止而非异常穿透。 */
+  LLM_ERROR
 }

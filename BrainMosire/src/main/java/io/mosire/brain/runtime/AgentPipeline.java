@@ -53,7 +53,7 @@ public final class AgentPipeline {
   private final AccessToken caller;
   private final AgentPermissionSet permissionSet;
 
-  /** 会话历史（进程内）；ConversationStore 持久化在 M3 接入。 */
+  /** 会话历史（不含 system 头，进程内累积，供下一回合原样回灌）；ConversationStore 持久化在 M3 接入。 */
   private final List<LlmMessage> history = new ArrayList<>();
 
   public AgentPipeline(
@@ -88,8 +88,10 @@ public final class AgentPipeline {
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
     List<AgentTool> tools = registry.list();
+    // 历史回灌：assembler 契约保证 messages[0] 是 system、history 紧随其后、本轮 user 收尾
     List<LlmMessage> messages =
-        new ArrayList<>(assembler.buildRequest(config, userMessage, tools).messages());
+        new ArrayList<>(
+            assembler.buildRequest(config, userMessage, List.copyOf(history), tools).messages());
 
     int turns = 0;
     int totalToolCalls = 0;
@@ -98,19 +100,23 @@ public final class AgentPipeline {
     while (true) {
       if (turns >= config.maxTurns()) {
         emitDecision("TURN_LIMIT", Map.of("maxTurns", config.maxTurns()));
+        saveHistory(messages);
         return new TurnResult(StopReason.TURN_LIMIT, turns, totalToolCalls, finalText);
       }
       if (Instant.now().isAfter(deadline)) {
         emitDecision("TIME_BUDGET", Map.of("timeBudget", config.timeBudget().toString()));
+        saveHistory(messages);
         return new TurnResult(StopReason.TIME_BUDGET, turns, totalToolCalls, finalText);
       }
 
       LlmResponse response;
       try {
         response = llm.chat(new LlmRequest(List.copyOf(messages), toolsDefs(tools)));
-      } catch (io.mosire.agentlib.llm.QuotaExceededException e) {
-        emitDecision("QUOTA", Map.of("reason", e.getMessage()));
-        return new TurnResult(StopReason.QUOTA, turns, totalToolCalls, finalText);
+      } catch (io.mosire.agentlib.llm.LlmException e) {
+        // LlmClient 契约只抛 LlmException；此刻 assistant 消息尚未入列，历史以工具结果干净收尾
+        emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(e.getMessage())));
+        saveHistory(messages);
+        return new TurnResult(StopReason.LLM_ERROR, turns, totalToolCalls, finalText);
       }
       turns++;
       if (quota != null) {
@@ -118,6 +124,7 @@ public final class AgentPipeline {
           quota.record(response.inputTokens(), response.outputTokens());
         } catch (io.mosire.agentlib.llm.QuotaExceededException e) {
           emitDecision("QUOTA", Map.of("reason", e.getMessage()));
+          saveHistory(messages);
           return new TurnResult(StopReason.QUOTA, turns, totalToolCalls, finalText);
         }
       }
@@ -143,8 +150,7 @@ public final class AgentPipeline {
               .toList();
 
       if (toolCalls.isEmpty()) {
-        history.clear();
-        history.addAll(messages);
+        saveHistory(messages);
         return new TurnResult(
             StopReason.FINISHED, turns, totalToolCalls, response.textPart().orElse(""));
       }
@@ -153,8 +159,14 @@ public final class AgentPipeline {
         emitDecision(
             "TOOL_CALL_LIMIT",
             Map.of("toolCalls", toolCalls.size(), "max", config.maxToolCallsPerTurn()));
-        history.clear();
-        history.addAll(messages);
+        // 悬空 tool_call 修复：本回合一个都没执行，回灌前为每个调用补占位失败结果——
+        // 否则历史里存在无应答的 tool_call，下一回合部分供应商会拒收请求
+        for (ContentPart.ToolCall call : toolCalls) {
+          messages.add(
+              LlmMessage.tool(
+                  new ContentPart.ToolResult(call.id(), call.name(), null, "回合因单次响应工具调用数超限中止")));
+        }
+        saveHistory(messages);
         return new TurnResult(
             StopReason.TOOL_CALL_LIMIT, turns, totalToolCalls, response.textPart().orElse(""));
       }
@@ -164,6 +176,17 @@ public final class AgentPipeline {
         executeToolCall(messages, call);
       }
     }
+  }
+
+  /**
+   * 把本回合的消息序列剥离 system 头后存入历史（依赖 assembler 契约"第一条必为 system"）。
+   *
+   * <p>六条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR）都必须先经过这里再
+   * return——否则下一回合回灌的历史残缺，Agent 就会失忆。
+   */
+  private void saveHistory(List<LlmMessage> messages) {
+    history.clear();
+    history.addAll(messages.subList(1, messages.size()));
   }
 
   private void executeToolCall(List<LlmMessage> messages, ContentPart.ToolCall call) {
@@ -199,7 +222,11 @@ public final class AgentPipeline {
         LlmMessage.tool(new ContentPart.ToolResult(call.id(), call.name(), content, error)));
   }
 
-  /** 最近一次回合的消息序列快照（M2 供 A2A/AG-UI 读会话用；M3 交 ConversationStore）。 */
+  /**
+   * 最近一次回合的会话历史快照（<b>不含 system 头</b>；M2 供 A2A/AG-UI 读会话用；M3 交 ConversationStore）。
+   *
+   * <p>与 {@link #run(String)} 内部消息序列的关系：{@code [system] + lastHistory()} 即完整请求消息。
+   */
   public List<LlmMessage> lastHistory() {
     return List.copyOf(history);
   }
