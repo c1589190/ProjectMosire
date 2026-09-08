@@ -46,6 +46,10 @@ public final class ManagedProcess implements AutoCloseable {
   private final Process process;
 
   private final Optional<OutputStream> stdin;
+
+  /** stdout 是否归协议层（true = 不启动诊断泵，{@link #stdout()} 暴露原始流）。 */
+  private final boolean protocolStdout;
+
   private final long maxOutputBytes;
   private final Consumer<ManagedProcess> onStopped;
   private final Object tailLock = new Object();
@@ -60,9 +64,19 @@ public final class ManagedProcess implements AutoCloseable {
       Process process,
       long maxOutputBytes,
       Consumer<ManagedProcess> onStopped) {
+    this(handle, process, maxOutputBytes, false, onStopped);
+  }
+
+  ManagedProcess(
+      ProcessHandle handle,
+      Process process,
+      long maxOutputBytes,
+      boolean protocolStdout,
+      Consumer<ManagedProcess> onStopped) {
     this.handle = handle;
     this.process = process;
     this.maxOutputBytes = maxOutputBytes;
+    this.protocolStdout = protocolStdout;
     this.onStopped = onStopped;
     this.stdin = Optional.ofNullable(process == null ? null : process.getOutputStream());
     // 自然退出的实例也要从 manager 集合移除，避免 managed() 积累僵尸条目；与 stopGracefully
@@ -88,6 +102,17 @@ public final class ManagedProcess implements AutoCloseable {
   /** stdin（spawn 模式有；adopt 模式恒 empty——管道归外部所有者）。 */
   public Optional<OutputStream> stdin() {
     return stdin;
+  }
+
+  /**
+   * stdout 原始流（仅 {@code protocolStdout=true} 时有；adopt 模式与默认模式恒 empty——协议层 是 spawn 模式下 stdout
+   * 的唯一读者，诊断泵已按协议接管约定跳过）。
+   */
+  public Optional<InputStream> stdout() {
+    if (!protocolStdout || process == null) {
+      return Optional.empty();
+    }
+    return Optional.of(process.getInputStream());
   }
 
   /** 是否因输出超过上限而被强制终止。 */
@@ -156,14 +181,19 @@ public final class ManagedProcess implements AutoCloseable {
     stopGracefully(SubprocessManager.DEFAULT_GRACE);
   }
 
-  /** 由 manager 在注册后调用：启动 stdout/stderr 捕获虚拟线程（adopt 模式无流可读，空操作）。 */
+  /**
+   * 由 manager 在注册后调用：启动 stdout/stderr 捕获虚拟线程（adopt 模式无流可读，空操作；协议接管模式的 stdout 不启泵——流归协议层，见类
+   * Javadoc）。
+   */
   void startOutputPumps() {
     if (process == null) {
       return;
     }
-    Thread.ofVirtual()
-        .name("mosire-proc-" + pid() + "-stdout")
-        .start(() -> pump(process.getInputStream()));
+    if (!protocolStdout) {
+      Thread.ofVirtual()
+          .name("mosire-proc-" + pid() + "-stdout")
+          .start(() -> pump(process.getInputStream()));
+    }
     Thread.ofVirtual()
         .name("mosire-proc-" + pid() + "-stderr")
         .start(() -> pump(process.getErrorStream()));

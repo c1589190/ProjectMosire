@@ -2,13 +2,18 @@ package io.mosire.brain.subagent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.brain.runtime.AgentConfig;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
-/** {@link InProcessExecutor} 的假执行体契约：体在虚拟线程异步跑、句柄如实反映存亡、 close 幂等（Manager 的杀流程可能多次触发）。 */
+/**
+ * {@link InProcessExecutor} 的假执行体契约：体在虚拟线程异步跑、句柄如实反映存亡、 close 幂等（Manager 的杀流程可能多次触发）。W3b 起 launch
+ * 收实例快照。
+ */
 class InProcessExecutorTest {
 
   @Test
@@ -23,7 +28,7 @@ class InProcessExecutorTest {
             });
     AgentConfig config = AgentConfig.builder("sleuth-1").systemPrompt("只读调查").build();
 
-    LaunchedSubagent handle = executor.launch("sleuth-1", config);
+    LaunchedSubagent handle = executor.launch(instance("sleuth-1", config));
 
     waitUntilDead(handle);
     assertThat(seenId).hasValue("sleuth-1");
@@ -38,7 +43,7 @@ class InProcessExecutorTest {
     InProcessExecutor executor =
         new InProcessExecutor((instanceId, config) -> running.await(2, TimeUnit.SECONDS));
 
-    LaunchedSubagent handle = executor.launch("a-1", AgentConfig.builder("a-1").build());
+    LaunchedSubagent handle = executor.launch(instance("a-1", AgentConfig.builder("a-1").build()));
     assertThat(handle.isAlive()).isTrue();
 
     handle.close();
@@ -46,6 +51,17 @@ class InProcessExecutorTest {
 
     assertThat(handle.isAlive()).isFalse();
     executor.close();
+  }
+
+  private static SubagentInstance instance(String id, AgentConfig config) {
+    return new SubagentInstance(
+        id,
+        "reader",
+        "g",
+        config,
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allow("echo").build(),
+        1,
+        SubagentStatus.RUNNING);
   }
 
   private static void waitUntilDead(LaunchedSubagent handle) throws InterruptedException {

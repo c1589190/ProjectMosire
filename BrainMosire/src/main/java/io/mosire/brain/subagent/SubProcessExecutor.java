@@ -1,48 +1,114 @@
 package io.mosire.brain.subagent;
 
+import io.mosire.agentlib.mcp.AgentToMcpServer;
 import io.mosire.agentlib.proc.ManagedProcess;
 import io.mosire.agentlib.proc.SpawnSpec;
 import io.mosire.agentlib.proc.SubprocessException;
 import io.mosire.agentlib.proc.SubprocessManager;
-import io.mosire.brain.runtime.AgentConfig;
+import io.mosire.agentlib.tool.ToolContext;
+import io.mosire.agentlib.tool.ToolRegistry;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 默认执行体：同 jar {@code agent} 子命令的真实子进程（计划 §4.4 SubProcessExecutor）。
  *
+ * <p><strong>两种形态</strong>：
+ *
+ * <ul>
+ *   <li>W3a 基础形态（{@link #SubProcessExecutor(SubprocessManager, AgentCommand)}）：只起进程，无协议层；
+ *   <li>W3b 链接形态（{@link #SubProcessExecutor(SubprocessManager, AgentCommand, ToolRegistry, String,
+ *       String)}）：子进程 stdin/stdout 被父侧接管为 MCP stdio 链接（{@code protocolStdout=true}，stdout
+ *       泵让位），父侧为每个子 Agent 起一个 {@link AgentToMcpServer}，以<b>子 Agent 自身的权限集</b>调用 父级工具（红线 R7：不经此默认
+ *       GUEST/unrestricted；调用者身份=子体身份，父级 SYSTEM 权限不外借）。
+ * </ul>
+ *
  * <p>进程级生命周期全委托 {@link SubprocessManager}（红线 5：进程句柄与管道归进程装配层持有， 本类只是委托入口，不外泄任何流/句柄给工具层）；启动命令按 Rul C
  * 由装配层注入 {@link AgentCommand}（Brain 不做文件系统假设）。三层关停（关 stdin → SIGTERM → 宽限等待 → 树级 SIGKILL）由 {@link
- * ManagedProcess#stopGracefully} 承担，本类经 {@link LaunchedSubagent} 窄缝转发。
+ * ManagedProcess#stopGracefully} 承担，本类经 {@link LaunchedSubagent} 窄缝转发；链接形态先关父侧 MCP
+ * 服务再关进程（协议先停摆，子进程经 EOF 感知关停信号自然收尾）。
  */
 public final class SubProcessExecutor implements AgentExecutor {
+
+  private static final Logger LOG = LoggerFactory.getLogger(SubProcessExecutor.class);
 
   private final SubprocessManager processes;
   private final AgentCommand command;
 
+  /** 非 null = W3b 链接形态（父侧暴露的工具注册表 + server 名/版本）。 */
+  private final ToolRegistry parentTools;
+
+  private final String serverName;
+  private final String serverVersion;
+
   public SubProcessExecutor(SubprocessManager processes, AgentCommand command) {
+    this(processes, command, null, null, null);
+  }
+
+  /**
+   * W3b 链接形态：每个子 Agent 启动时在父侧挂一个 MCP server（stdio，读子 stdout / 写子 stdin）， 暴露父级工具、以子体权限调用。
+   *
+   * <p>前置：{@code command.parentLink()} 必须为 true（子体 argv 需带 {@code --parent-link} 才会走 MCP client
+   * 形态；二者不同步会静默产生无协议客户端的空链接——这里宁可启动前就失败）。
+   */
+  public SubProcessExecutor(
+      SubprocessManager processes,
+      AgentCommand command,
+      ToolRegistry parentTools,
+      String serverName,
+      String serverVersion) {
     this.processes = Objects.requireNonNull(processes, "processes");
     this.command = Objects.requireNonNull(command, "command");
+    if (parentTools != null) {
+      if (!command.parentLink()) {
+        throw new IllegalArgumentException(
+            "链接形态的 AgentCommand 必须 parentLink=true——子体重定向走 --parent-link");
+      }
+      this.parentTools = parentTools;
+      this.serverName = Objects.requireNonNull(serverName, "serverName");
+      this.serverVersion = Objects.requireNonNull(serverVersion, "serverVersion");
+    } else {
+      this.parentTools = null;
+      this.serverName = null;
+      this.serverVersion = null;
+    }
   }
 
   @Override
-  public LaunchedSubagent launch(String instanceId, AgentConfig childConfig) {
-    List<String> argv = command.argv(instanceId);
+  public LaunchedSubagent launch(SubagentInstance instance) {
+    List<String> argv = command.argv(instance);
     SpawnSpec spec =
         new SpawnSpec(
             argv.get(0),
             argv.subList(1, argv.size()),
             Map.of(),
             null,
-            SpawnSpec.DEFAULT_MAX_OUTPUT_BYTES);
+            SpawnSpec.DEFAULT_MAX_OUTPUT_BYTES,
+            parentTools != null);
     ManagedProcess managed;
     try {
       managed = processes.spawn(spec);
     } catch (SubprocessException e) {
       throw new SubagentLaunchException("子 Agent 子进程启动失败: " + e.getMessage(), e);
     }
-    return new ManagedHandle(managed);
+    if (parentTools == null) {
+      return new ManagedHandle(managed);
+    }
+    AgentToMcpServer server =
+        AgentToMcpServer.start(
+            parentTools,
+            serverName,
+            serverVersion,
+            ToolContext.of(
+                instance.permissions().grantedToken(),
+                // 红线 R7：父侧调用上下文 = 子体自身权限集（非父级 SYSTEM/unrestricted）
+                instance.permissions()),
+            managed.stdout().orElseThrow(() -> new SubagentLaunchException("子 Agent stdout 不可用")),
+            managed.stdin().orElseThrow(() -> new SubagentLaunchException("子 Agent stdin 不可用")));
+    return new LinkedHandle(managed, server);
   }
 
   /** 关闭自身资源：无（SubprocessManager 归装配层持有并统一关停——红线 5；本类不拥有子进程）。 幂等。 */
@@ -66,6 +132,38 @@ public final class SubProcessExecutor implements AgentExecutor {
     @Override
     public void close() {
       // 三层关停标准入口（宽限 10s——SubprocessManager.DEFAULT_GRACE，与 SubprocessManager.close 同源）
+      managed.stopGracefully(SubprocessManager.DEFAULT_GRACE);
+    }
+  }
+
+  /** 链接形态句柄：先关父侧 MCP server（协议停摆），再走标准三层关停；幂等（子进程已死时 server 关闭无副作用）。 */
+  private static final class LinkedHandle implements LaunchedSubagent {
+
+    private final ManagedProcess managed;
+    private final AgentToMcpServer server;
+    private volatile boolean closed;
+
+    LinkedHandle(ManagedProcess managed, AgentToMcpServer server) {
+      this.managed = managed;
+      this.server = server;
+    }
+
+    @Override
+    public boolean isAlive() {
+      return managed.isAlive();
+    }
+
+    @Override
+    public void close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      try {
+        server.close();
+      } catch (RuntimeException e) {
+        LOG.warn("父侧子 Agent MCP 服务关闭异常 pid={}", managed.pid(), e);
+      }
       managed.stopGracefully(SubprocessManager.DEFAULT_GRACE);
     }
   }

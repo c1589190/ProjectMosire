@@ -85,6 +85,28 @@ public final class AgentToMcpServer implements AutoCloseable {
         new StdioServerTransportProvider(McpJsonDefaults.getMapper()));
   }
 
+  /**
+   * 以给定的流对启动（W3b 父子 stdio 链接的父侧：子进程的 stdIn/stdout 已被父进程接管，本 server 直接 在注入的流上服务，不复用 3 参重载的独立 spawn
+   * 流程）。语义与 {@link #start(ToolRegistry, String, String, ToolContext)} 相同。
+   *
+   * @param caller 经 MCP 暴露的工具在 {@code tools/call} 时使用的执行身份（W3b 子侧必须传子 Agent 自身的 权限集，红线 R7：子体不能沿父级
+   *     SYSTEM 权限执行）
+   */
+  public static AgentToMcpServer start(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      java.io.InputStream in,
+      java.io.OutputStream out) {
+    return startWith(
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        new StdioServerTransportProvider(McpJsonDefaults.getMapper(), in, out));
+  }
+
   /** 供测试注入自定义 transport（如管道流）；语义与默认 stdio 相同。 */
   static AgentToMcpServer startWith(
       ToolRegistry registry,

@@ -53,7 +53,12 @@ public final class SubprocessManager implements AutoCloseable {
       throw new SubprocessException("启动子进程失败: " + spec.command(), e);
     }
     ManagedProcess managed =
-        new ManagedProcess(process.toHandle(), process, spec.maxOutputBytes(), this::removeStopped);
+        new ManagedProcess(
+            process.toHandle(),
+            process,
+            spec.maxOutputBytes(),
+            spec.protocolStdout(),
+            this::removeStopped);
     // 先注册后启动捕获线程：若溢出强杀抢在注册前发生，实例会以"已停止"状态被重新注册而泄漏在集合里
     synchronized (lock) {
       processes.add(managed);

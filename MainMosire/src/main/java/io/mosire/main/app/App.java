@@ -13,10 +13,18 @@ import io.mosire.agentlib.mcp.McpServerLinkConfig;
 import io.mosire.agentlib.mcp.McpSourceBridge;
 import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.proc.SubprocessManager;
+import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.TurnResult;
+import io.mosire.brain.subagent.AgentCommand;
+import io.mosire.brain.subagent.AgentTemplateStore;
+import io.mosire.brain.subagent.SubProcessExecutor;
+import io.mosire.brain.subagent.SubagentInstance;
+import io.mosire.brain.subagent.SubagentManager;
+import io.mosire.brain.subagent.SubagentOrchestrationTools;
 import io.mosire.main.Version;
 import io.mosire.main.gateway.AdminHttpServer;
 import io.mosire.main.gateway.StatusSnapshot;
@@ -54,10 +62,19 @@ import org.slf4j.LoggerFactory;
  * --a2a-address/--a2a-port}， 默认 127.0.0.1 + 空闲端口）。任务执行串行化（单线程执行器——Rul B：不引入 A2A 并发任务； {@code
  * AgentPipeline.history} 实例级共享且非线程安全，串行化即不变量，见 Brain Javadoc）。 关停顺序：A2A 任务服务先行合成
  * FAILED（在订阅的客户端收终态）→ A2A 网关关闭 → 既有关停链（原因见 {@link #close()} 说明）。
+ *
+ * <p>W3b（本类新增）：子 Agent 编排装配——{@code BootConfig.templatesDir} 非空时装载模板库、注入 {@link
+ * SubagentManager}（{@code parentDepth=0}、父权限=主 Agent 自身权限集），编排工具（spawn/kill/list）注册进主 Agent
+ * 工具面；子进程命令按"当前 java + 本进程 classpath + {@code Main agent}"注入（Rul C），链接形态 （{@code --parent-link}）+
+ * 内存 cap {@code -Xmx128m}，子 Agent 数据目录隔离在 {@code <dataDir>/subagents/<instanceId>}。{@code
+ * templatesDir} 为空 = 本进程不启用子 Agent 编排。
  */
 public final class App implements AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(App.class);
+
+  /** 子 Agent 链接的父侧 MCP server 自报名（子体按"parent"源名识别——仅日志/审计语义）。 */
+  private static final String PARENT_SERVER_NAME = "mosire-parent";
 
   public static final String DEFAULT_SYSTEM_PROMPT =
       "你是 Mosire 主 Agent——一个模块化、可自管理、受权限约束的 Agent。" + "保持诚实：无工具可用时直接说明，不虚构执行过程。";
@@ -75,6 +92,13 @@ public final class App implements AutoCloseable {
   private final List<McpSourceBridge> mcpBridges;
   private final A2aHttpServer a2aServer;
   private final A2aTaskService a2aTaskService;
+
+  /** W3b 子 Agent 编排（templatesDir 未配置时为 null——进程内无该能力）。 */
+  private final SubagentManager subagentManager;
+
+  /** 子进程生命周期兜底（同一条件装配：与 subagentManager 同生共死；红线 5：归装配层持有）。 */
+  private final SubprocessManager subagentProcesses;
+
   private final CountDownLatch terminated = new CountDownLatch(1);
   private volatile boolean closed;
 
@@ -89,6 +113,11 @@ public final class App implements AutoCloseable {
    * <p>覆盖仅影响主 AgentRuntime 装配，不改变生命周期行为。
    */
   public static App start(BootConfig config, LlmClient llmOverride) {
+    return start(config, llmOverride, List.of());
+  }
+
+  /** 启动（额外工具注入入口——测试注入 echo 等演示工具用；{@code extraTools} 在主 Agent 工具面与 MCP 暴露快照之前注册）。 */
+  public static App start(BootConfig config, LlmClient llmOverride, List<AgentTool> extraTools) {
     try {
       Files.createDirectories(config.dataDir());
     } catch (IOException e) {
@@ -97,21 +126,30 @@ public final class App implements AutoCloseable {
     EventStore events = SqliteEventStore.open(config.dataDir().resolve("events.db"));
     EventBus bus = new EventBus();
     ToolRegistry tools = new ToolRegistry();
+    tools.registerAll(extraTools == null ? List.of() : extraTools);
     // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
     McpLinks links = wireMcpLinks(config.mcpLinks(), tools);
     AgentToMcpServer mcpServer = null;
     A2aHttpServer a2aServer = null;
     A2aTaskService a2aTaskService = null;
+    SubagentManager subagentManager = null;
+    SubprocessManager subagentProcesses = null;
     try {
-      // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）
-      mcpServer =
-          config.mcpExpose() ? AgentToMcpServer.start(tools, "mosire-main", Version.VERSION) : null;
       AgentPermissionSet permissionSet = AgentPermissionSet.system();
       AgentConfig agentConfig =
           AgentConfig.builder("main")
               .systemPrompt(DEFAULT_SYSTEM_PROMPT)
               .description("主 Agent（M1 骨架）")
               .build();
+      // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
+      if (config.templatesDir() != null) {
+        SubagentRig rig = wireSubagents(config, tools, events, bus, agentConfig, permissionSet);
+        subagentManager = rig.manager();
+        subagentProcesses = rig.processes();
+      }
+      // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）
+      mcpServer =
+          config.mcpExpose() ? AgentToMcpServer.start(tools, "mosire-main", Version.VERSION) : null;
       AgentRuntime runtime =
           new AgentRuntime(
               agentConfig, scriptedLlm(config, llmOverride), tools, events, bus, permissionSet);
@@ -147,7 +185,9 @@ public final class App implements AutoCloseable {
               links.sources(),
               links.bridges(),
               a2aServer,
-              a2aTaskService);
+              a2aTaskService,
+              subagentManager,
+              subagentProcesses);
 
       if (config.demo()) {
         String message = config.demoMessage().isEmpty() ? DEMO_USER_MESSAGE : config.demoMessage();
@@ -156,7 +196,7 @@ public final class App implements AutoCloseable {
       Runtime.getRuntime().addShutdownHook(new Thread(app::close, "mosire-shutdown"));
       return app;
     } catch (RuntimeException e) {
-      // 装配中途失败（如端口占用）：回收已起的网关/MCP 子进程，避免启动失败后残留僵尸进程
+      // 装配中途失败（如端口占用）：回收已起的网关/MCP 子进程/子 Agent 编排，避免启动失败后残留僵尸进程
       if (a2aServer != null) {
         a2aServer.close();
       }
@@ -166,9 +206,53 @@ public final class App implements AutoCloseable {
       if (mcpServer != null) {
         mcpServer.close();
       }
+      if (subagentManager != null) {
+        subagentManager.close();
+      }
+      if (subagentProcesses != null) {
+        subagentProcesses.close();
+      }
       closeLinks(links);
       throw e;
     }
+  }
+
+  /**
+   * W3b 子 Agent 编排装配：模板库装载（fail-fast——坏模板/缺目录在启动期暴露）→ 子进程管理器 + 链接形态 {@link AgentCommand}（当前 java +
+   * 本进程 classpath + {@code Main agent}，JVM 内存 cap -Xmx128m，目录注入，{@code --parent-link}）→ {@link
+   * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 三个内置编排工具注册进工具面。
+   */
+  private static SubagentRig wireSubagents(
+      BootConfig config,
+      ToolRegistry tools,
+      EventStore events,
+      EventBus bus,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions) {
+    AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
+    templateStore.load();
+    SubprocessManager processes = new SubprocessManager();
+    SubProcessExecutor executor =
+        new SubProcessExecutor(
+            processes, subagentCommand(config), tools, PARENT_SERVER_NAME, Version.VERSION);
+    SubagentManager manager =
+        new SubagentManager(
+            templateStore, executor, events, bus, parentConfig, parentPermissions, 0);
+    tools.registerAll(SubagentOrchestrationTools.of(manager));
+    return new SubagentRig(manager, processes);
+  }
+
+  /** 子 Agent 启动命令（Rul C：装配层注入，Brain 不做文件系统假设——java 与 classpath 都是"当前进程自带信息"）。 */
+  private static AgentCommand subagentCommand(BootConfig config) {
+    String java = ProcessHandle.current().info().command().filter(c -> !c.isBlank()).orElse("java");
+    return new AgentCommand(
+        java,
+        List.of("-Xmx128m"),
+        List.of("-cp", System.getProperty("java.class.path", ""), "io.mosire.main.Main", "agent"),
+        "--id",
+        config.templatesDir().toString(),
+        config.dataDir().resolve("subagents").toString(),
+        true);
   }
 
   /**
@@ -247,7 +331,9 @@ public final class App implements AutoCloseable {
       List<McpToolSource> mcpSources,
       List<McpSourceBridge> mcpBridges,
       A2aHttpServer a2aServer,
-      A2aTaskService a2aTaskService) {
+      A2aTaskService a2aTaskService,
+      SubagentManager subagentManager,
+      SubprocessManager subagentProcesses) {
     this.events = events;
     this.bus = bus;
     this.runtime = runtime;
@@ -257,6 +343,8 @@ public final class App implements AutoCloseable {
     this.mcpBridges = List.copyOf(mcpBridges);
     this.a2aServer = a2aServer;
     this.a2aTaskService = a2aTaskService;
+    this.subagentManager = subagentManager;
+    this.subagentProcesses = subagentProcesses;
   }
 
   /** 阻塞直到 close()（由 shutdown 钩子触发）。 */
@@ -287,10 +375,15 @@ public final class App implements AutoCloseable {
     return a2aServer.port();
   }
 
+  /** 子 Agent 实例快照（按实例 id 升序；未装配子 Agent 编排时为空表）。 */
+  public List<SubagentInstance> subagents() {
+    return subagentManager == null ? List.of() : subagentManager.list();
+  }
+
   /**
    * 优雅关停（计划 §5.1）：A2A 任务服务先行（合成 FAILED 让在订阅的客户端收到终态——必须赶在 HTTP 服务断连之前）→ A2A 网关关闭 （停止接入）→ 网关 drain →
-   * MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接 bridge.close（整组下架工具）→ source.close（回收子进程）→
-   * 运行时 → 事件存储 checkpoint。
+   * MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接 bridge.close（整组下架工具）→ source.close（回收子进程）→ 子
+   * Agent 编排（逐个终止 + launcher 关闭）→ 子进程管理器兜底收割 → 运行时 → 事件存储 checkpoint。
    *
    * <p>（顺序说明）任务要求表述为"A2A server 先行关闭"，但 {@code HttpServer.stop(0)} 会即时掐断在途 SSE 连接——若先关 server，周迟合的
    * FAILED 时序事件早已不可达订阅者（R8 验收不成立）；故先合成终态、后断连接；“A2A 先行于既有关停链” 的本意（网关先于
@@ -304,7 +397,7 @@ public final class App implements AutoCloseable {
       return;
     }
     closed = true;
-    LOG.info("正在停止：A2A 任务/网关 → 网关 drain → MCP 暴露/链接 → 运行时 → 事件存储 checkpoint");
+    LOG.info("正在停止：A2A 任务/网关 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 事件存储 checkpoint");
     closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
     closeQuietly("A2A 网关", () -> a2aServer.close());
     closeQuietly("AdminREST 网关", () -> http.close());
@@ -316,6 +409,20 @@ public final class App implements AutoCloseable {
           }
         });
     closeQuietly("MCP 链接", () -> closeLinks(new McpLinks(mcpSources, mcpBridges)));
+    closeQuietly(
+        "子 Agent 编排",
+        () -> {
+          if (subagentManager != null) {
+            subagentManager.close();
+          }
+        });
+    closeQuietly(
+        "子进程管理器",
+        () -> {
+          if (subagentProcesses != null) {
+            subagentProcesses.close();
+          }
+        });
     closeQuietly("Agent 运行时", () -> runtime.close());
     closeQuietly("事件存储", () -> events.close());
     closeQuietly("事件总线", () -> bus.close());
@@ -356,4 +463,7 @@ public final class App implements AutoCloseable {
       return new McpLinks(List.of(), List.of());
     }
   }
+
+  /** 子 Agent 编排装配产物（管理核心 + 进程兜底，生命周期均归 App，close 顺序 manager → processes）。 */
+  private record SubagentRig(SubagentManager manager, SubprocessManager processes) {}
 }

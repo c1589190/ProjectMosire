@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
+import io.mosire.main.agent.SubagentProcessMain;
 import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
 import java.nio.file.Path;
@@ -15,7 +16,8 @@ import java.util.Map;
  * 入口/CLI 分发（手写子命令分派——决策 D3：不引 CLI 框架，保持零依赖）。
  *
  * <p>子命令：{@code run}（M1：网关守护 + --demo 自检回合）、{@code health}（当前进程自检）、 {@code events}（查看本地事件库尾部，便于无
- * sqlite3 环境验收）、{@code agent}/{@code doctor}/ {@code config}（M2/M3 实现）。
+ * sqlite3 环境验收）、{@code agent}（W3b：子 Agent stdio 进程形态——runtime + MCP client，无网关）、 {@code
+ * doctor}/{@code config}（M3 实现）。
  */
 public final class Main {
 
@@ -52,8 +54,7 @@ public final class Main {
       case "events":
         return events(args);
       case "agent":
-        System.err.println("agent 子命令在 M2（子 Agent stdio 模式）实现");
-        return 1;
+        return agent(args);
       case "doctor":
         System.err.println("doctor 子命令在 M3 实现");
         return 1;
@@ -79,6 +80,8 @@ public final class Main {
         case "--a2a-address" -> config = withA2aAddress(config, requireValue(args, ++i));
         case "--a2a-port" ->
             config = withA2aPort(config, Integer.parseInt(requireValue(args, ++i)));
+        case "--templates-dir" ->
+            config = withTemplatesDir(config, Path.of(requireValue(args, ++i)));
         default -> {
           System.err.println("未知参数: " + args[i]);
           return 2;
@@ -88,14 +91,54 @@ public final class Main {
     App app = App.start(config);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
-        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d%s%n",
+        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d%s%s%n",
         Version.VERSION,
         app.boundPort(),
         config.a2aHost(),
         app.a2aPort(),
-        config.demo() ? "（demo 模式）" : "");
+        config.demo() ? "（demo 模式）" : "",
+        config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
     return 0;
+  }
+
+  /**
+   * 子 Agent stdio 进程形态（W3b）：运行模板驱动的 runtime；{@code --parent-link} 时以 MCP client 身份接管父侧建好的
+   * stdin/stdout 链路，跑完任务后阻塞到父侧关停信号（EOF）。本进程不启动任何 HTTP 网关。
+   */
+  private static int agent(String[] args) {
+    String instanceId = null;
+    String templateId = null;
+    String goal = null;
+    Path templatesDir = null;
+    Path dataDir = null;
+    boolean parentLink = false;
+    for (int i = 1; i < args.length; i++) {
+      switch (args[i]) {
+        case "--id" -> instanceId = requireValue(args, ++i);
+        case "--template" -> templateId = requireValue(args, ++i);
+        case "--goal" -> goal = requireValue(args, ++i);
+        case "--templates-dir" -> templatesDir = Path.of(requireValue(args, ++i));
+        case "--data-dir" -> dataDir = Path.of(requireValue(args, ++i));
+        case "--parent-link" -> parentLink = true;
+        default -> {
+          System.err.println("未知参数: " + args[i]);
+          return 2;
+        }
+      }
+    }
+    if (instanceId == null || templateId == null || goal == null) {
+      System.err.println("agent 参数不完整: --id/--template/--goal 为必填");
+      return 2;
+    }
+    try {
+      return SubagentProcessMain.execute(
+          new SubagentProcessMain.Options(
+              instanceId, templateId, goal, templatesDir, dataDir, parentLink));
+    } catch (IllegalArgumentException e) {
+      System.err.println("参数错误: " + e.getMessage());
+      return 2;
+    }
   }
 
   private static String requireValue(String[] args, int index) {
@@ -114,7 +157,8 @@ public final class Main {
         config.mcpLinks(),
         config.mcpExpose(),
         config.a2aHost(),
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withDataDir(BootConfig config, Path dataDir) {
@@ -126,7 +170,8 @@ public final class Main {
         config.mcpLinks(),
         config.mcpExpose(),
         config.a2aHost(),
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withDemo(BootConfig config, boolean demo) {
@@ -138,7 +183,8 @@ public final class Main {
         config.mcpLinks(),
         config.mcpExpose(),
         config.a2aHost(),
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withDemoMessage(BootConfig config, String message) {
@@ -150,7 +196,8 @@ public final class Main {
         config.mcpLinks(),
         config.mcpExpose(),
         config.a2aHost(),
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withMcpLinks(BootConfig config, Path mcpLinks) {
@@ -162,7 +209,8 @@ public final class Main {
         mcpLinks,
         config.mcpExpose(),
         config.a2aHost(),
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withMcpExpose(BootConfig config, boolean mcpExpose) {
@@ -174,7 +222,8 @@ public final class Main {
         config.mcpLinks(),
         mcpExpose,
         config.a2aHost(),
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withA2aAddress(BootConfig config, String a2aAddress) {
@@ -186,7 +235,8 @@ public final class Main {
         config.mcpLinks(),
         config.mcpExpose(),
         a2aAddress,
-        config.a2aPort());
+        config.a2aPort(),
+        config.templatesDir());
   }
 
   private static BootConfig withA2aPort(BootConfig config, int a2aPort) {
@@ -198,7 +248,21 @@ public final class Main {
         config.mcpLinks(),
         config.mcpExpose(),
         config.a2aHost(),
-        a2aPort);
+        a2aPort,
+        config.templatesDir());
+  }
+
+  private static BootConfig withTemplatesDir(BootConfig config, Path templatesDir) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort(),
+        templatesDir);
   }
 
   private static int health() {
@@ -278,11 +342,18 @@ public final class Main {
              --no-mcp-expose   关闭主 Agent 工具面经 stdio MCP server 暴露（默认启用）
              --a2a-address <h>  A2A 网关绑定地址（默认 127.0.0.1；对外打开须显式配置）
              --a2a-port <n>     A2A 网关端口（默认 0 = 空闲端口自动分配）
+             --templates-dir <p> 子 Agent 模板目录（configs/agents；缺省不启用编排）
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）
              --limit <n>     显示条数（默认 10）
-          agent           （M2）子 Agent stdio 进程模式
+          agent           W3b 子 Agent stdio 进程形态（runtime + MCP client；无网关）
+             --id <id>       实例 id（必填，父装配层生成）
+             --template <t>  模板 id（必填）
+             --goal <g>      目标任务（必填）
+             --templates-dir <p> 模板目录（默认 configs/agents）
+             --data-dir <p>  数据目录（默认 .work/mosire）
+             --parent-link   以 MCP client 身份接管 stdin/stdout（父侧已建链接）
           doctor          （M3）自检
           config          （M3）配置管理
         """

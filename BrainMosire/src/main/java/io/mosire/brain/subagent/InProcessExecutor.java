@@ -43,7 +43,7 @@ public final class InProcessExecutor implements AgentExecutor {
   }
 
   @Override
-  public LaunchedSubagent launch(String instanceId, AgentConfig childConfig) {
+  public LaunchedSubagent launch(SubagentInstance instance) {
     if (closed) {
       throw new IllegalStateException("InProcessExecutor 已关闭");
     }
@@ -51,11 +51,11 @@ public final class InProcessExecutor implements AgentExecutor {
     workers.execute(
         () -> {
           try {
-            body.run(instanceId, childConfig);
+            body.run(instance.instanceId(), instance.config());
           } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
           } catch (Exception e) {
-            LOG.debug("InProcessExecutor 体异常 instanceId={}", instanceId, e);
+            LOG.debug("InProcessExecutor 体异常 instanceId={}", instance.instanceId(), e);
           } finally {
             handle.markFinished();
           }

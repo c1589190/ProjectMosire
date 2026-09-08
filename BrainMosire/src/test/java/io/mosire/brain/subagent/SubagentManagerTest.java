@@ -277,8 +277,11 @@ class SubagentManagerTest {
     assertThat(child.allowedTools()).containsExactly("read");
     assertThat(child.deniedTools()).contains("rm");
     assertThat(child.systemPrompt()).isEqualTo(template.systemPrompt());
-    // 传给 executor 的正是这份收紧后的配置
-    assertThat(launcher.lastConfig()).isSameAs(child);
+    // 传给 executor 的正是这份收紧后的配置（实例快照携带同一对象引用）
+    assertThat(launcher.lastInstance()).isNotNull();
+    assertThat(launcher.lastInstance().config()).isSameAs(child);
+    assertThat(launcher.lastInstance().instanceId()).isEqualTo(spawned.instanceId());
+    assertThat(launcher.lastInstance().templateId()).isEqualTo("sleuth");
     // 权限集与配置同源收紧：extraDenied 并入 denied
     assertThat(spawned.permissions().deniedTools()).contains("rm");
     // 收紧后仍落在父级之内
@@ -327,8 +330,8 @@ class SubagentManagerTest {
         manager.spawn(new SubagentLaunchRequest("sleuth", "调查", Set.of(), null, null, 1500L));
 
     assertThat(spawned.config().quotaMaxTokens()).isEqualTo(1500);
-    // 模板/请求/父级均不限时仍是 0（不限）——有别于被 0 静默收紧
-    assertThat(launcher.lastConfig()).isSameAs(spawned.config());
+    // 模板/请求/父级均不限时仍是 0（不限）——有别于被 0 静默收紧；launcher 收到的配置同源
+    assertThat(launcher.lastInstance().config()).isSameAs(spawned.config());
   }
 
   @Test
@@ -475,7 +478,8 @@ class SubagentManagerTest {
         maxTurns,
         maxToolCallsPerTurn,
         timeBudgetSeconds,
-        quotaMaxTokens);
+        quotaMaxTokens,
+        List.of());
   }
 
   private void awaitStatus(SubagentManager manager, String id, SubagentStatus status)
@@ -547,7 +551,7 @@ class SubagentManagerTest {
     }
 
     @Override
-    public LaunchedSubagent launch(String instanceId, AgentConfig childConfig) {
+    public LaunchedSubagent launch(SubagentInstance instance) {
       entered.countDown();
       try {
         release.await(5, TimeUnit.SECONDS);
@@ -578,7 +582,7 @@ class SubagentManagerTest {
     private final AtomicBoolean alive = new AtomicBoolean(true);
     private final AtomicInteger closeCalls = new AtomicInteger();
     private final AtomicInteger selfCloseCalls = new AtomicInteger();
-    private volatile AgentConfig lastConfig;
+    private volatile SubagentInstance lastInstance;
 
     int closeCalls() {
       return closeCalls.get();
@@ -588,13 +592,13 @@ class SubagentManagerTest {
       return selfCloseCalls.get();
     }
 
-    AgentConfig lastConfig() {
-      return lastConfig;
+    SubagentInstance lastInstance() {
+      return lastInstance;
     }
 
     @Override
-    public LaunchedSubagent launch(String instanceId, AgentConfig childConfig) {
-      lastConfig = childConfig;
+    public LaunchedSubagent launch(SubagentInstance instance) {
+      lastInstance = instance;
       return new LaunchedSubagent() {
         @Override
         public boolean isAlive() {

@@ -161,7 +161,8 @@ public final class SubagentManager implements AutoCloseable {
                 lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
       }
       try {
-        handle = launcher.launch(instanceId, childConfig);
+        // W3b：launcher 拿完整实例快照（id/模板/目标/权限）拼 agent --id 命令与父侧 MCP 服务
+        handle = launcher.launch(configured);
       } catch (SubagentLaunchException e) {
         transition(
             instanceId,

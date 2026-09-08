@@ -5,12 +5,14 @@ import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.ServerParameters;
 import io.modelcontextprotocol.client.transport.StdioClientTransport;
 import io.modelcontextprotocol.json.McpJsonDefaults;
+import io.modelcontextprotocol.spec.McpClientTransport;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpTransportException;
 import io.modelcontextprotocol.spec.McpTransportSessionClosedException;
 import io.modelcontextprotocol.spec.McpTransportSessionNotFoundException;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolResult;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -20,6 +22,15 @@ import java.util.stream.Collectors;
 
 /**
  * MCP 工具源（单向：拉起一个外部 stdio server，把其工具映射进本地 {@code ToolRegistry}）。
+ *
+ * <p>两种连接形态：
+ *
+ * <ul>
+ *   <li>{@link #McpToolSource(McpServerLinkConfig)} + {@link #connect()}——标准形态：按配置自己 spawn 外部 stdio
+ *       server（M2）；
+ *   <li>{@link #McpToolSource(String)} + {@link #connect(McpClientTransport)}——接管形态（W3b 子 Agent
+ *       进程侧）：进程的 stdin/stdout 已由父进程建好（MCP stdio 链接），复用该传输握手，不再 spawn。
+ * </ul>
  *
  * <p>用法：
  *
@@ -36,6 +47,13 @@ import java.util.stream.Collectors;
  */
 public final class McpToolSource implements AutoCloseable {
 
+  /** 建连超时默认值——与 {@link McpServerLinkConfig} 的缺省一致（接管形态无 config 时的兜底）。 */
+  private static final Duration DEFAULT_STARTUP_TIMEOUT = Duration.ofSeconds(15);
+
+  /** 请求超时默认值——与 {@link McpServerLinkConfig} 的缺省一致。 */
+  private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(60);
+
+  private final String name;
   private final McpServerLinkConfig config;
   private McpSyncClient client;
   private volatile List<AgentTool> cached = List.of();
@@ -54,11 +72,18 @@ public final class McpToolSource implements AutoCloseable {
 
   public McpToolSource(McpServerLinkConfig config) {
     this.config = Objects.requireNonNull(config, "config");
+    this.name = config.name();
   }
 
-  /** 配置里声明的源名（日志与审计用）。 */
+  /** 接管形态：只声明源名，连接经 {@link #connect(McpClientTransport)} 注入已建好的传输。 */
+  public McpToolSource(String name) {
+    this.config = null;
+    this.name = Objects.requireNonNull(name, "name");
+  }
+
+  /** 源名（日志与审计用）。 */
   public String name() {
-    return config.name();
+    return name;
   }
 
   /** 拉起子进程并完成 MCP 握手；幂等（已连接则直接返回）。 */
@@ -66,14 +91,42 @@ public final class McpToolSource implements AutoCloseable {
     if (client != null) {
       return;
     }
+    if (config == null) {
+      throw new IllegalStateException("接管形态的 MCP 工具源只能经 connect(McpClientTransport) 连接");
+    }
     ServerParameters parameters =
         ServerParameters.builder(config.command()).args(config.args()).env(config.env()).build();
     StdioClientTransport transport =
         new StdioClientTransport(parameters, McpJsonDefaults.getMapper());
+    connect(
+        transport, config.startupTimeout(), config.requestTimeout(), () -> disconnected = false);
+  }
+
+  /**
+   * 以注入的传输握手（接管形态入口；W3b 子 Agent 进程用父进程建好的管道流传输）。
+   *
+   * <p>幂等：已连接则直接返回；成功后复位断连标记（初始基线目录立即回放给订阅者）。
+   */
+  public synchronized void connect(McpClientTransport transport) {
+    if (client != null) {
+      return;
+    }
+    if (transport == null) {
+      throw new IllegalArgumentException("传输不能为空");
+    }
+    connect(
+        transport, DEFAULT_STARTUP_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, () -> disconnected = false);
+  }
+
+  private void connect(
+      McpClientTransport transport,
+      Duration startupTimeout,
+      Duration requestTimeout,
+      Runnable onConnected) {
     McpSyncClient newClient =
         McpClient.sync(transport)
-            .requestTimeout(config.requestTimeout())
-            .initializationTimeout(config.startupTimeout())
+            .requestTimeout(requestTimeout)
+            .initializationTimeout(startupTimeout)
             .toolsChangeConsumer(this::onServerToolsChanged)
             .build();
     newClient.initialize();
@@ -81,7 +134,7 @@ public final class McpToolSource implements AutoCloseable {
     // 初始基线：tools/list_changed 之外的首次快照（若有订阅者立即回放）
     cacheAndNotify(newClient.listTools().tools());
     // 重连成功（connect 是唯一建立连接的入口）：复位断连标记
-    this.disconnected = false;
+    onConnected.run();
   }
 
   /**

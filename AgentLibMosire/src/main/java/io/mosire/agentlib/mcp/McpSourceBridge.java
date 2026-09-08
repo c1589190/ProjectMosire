@@ -7,6 +7,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,6 +30,7 @@ public final class McpSourceBridge implements AutoCloseable {
 
   private final McpToolSource source;
   private final ToolRegistry registry;
+  private final Predicate<String> filter;
 
   /** 私有锁对象（SpotBugs USO：避免类固有锁被外泄——bind 静态工厂会共享实例）。 */
   private final Object lock = new Object();
@@ -35,9 +38,10 @@ public final class McpSourceBridge implements AutoCloseable {
   private volatile boolean closed;
   private volatile Set<String> registeredNames = Set.of();
 
-  private McpSourceBridge(McpToolSource source, ToolRegistry registry) {
+  private McpSourceBridge(McpToolSource source, ToolRegistry registry, Predicate<String> filter) {
     this.source = Objects.requireNonNull(source, "source");
     this.registry = Objects.requireNonNull(registry, "registry");
+    this.filter = Objects.requireNonNull(filter, "filter");
   }
 
   /**
@@ -47,7 +51,19 @@ public final class McpSourceBridge implements AutoCloseable {
    * @param registry 目标注册表
    */
   public static McpSourceBridge bind(McpToolSource source, ToolRegistry registry) {
-    McpSourceBridge bridge = new McpSourceBridge(source, registry);
+    return bind(source, registry, name -> true);
+  }
+
+  /**
+   * 绑定（带名字过滤；W3b 子 Agent 侧白名单落地）：只把过滤命中的工具同步进注册表，未命中的（父侧 暴露面全量中的其余工具）对子侧不可见。
+   *
+   * @param source 已连接或未连接均可（见类注释时序）
+   * @param registry 目标注册表
+   * @param filter 工具名过滤器（命中才同步；每次目录变更重放时都按新全量重新过滤，目录收窄会自动下架）
+   */
+  public static McpSourceBridge bind(
+      McpToolSource source, ToolRegistry registry, Predicate<String> filter) {
+    McpSourceBridge bridge = new McpSourceBridge(source, registry, filter);
     source.onToolsChanged(bridge::sync);
     return bridge;
   }
@@ -58,12 +74,19 @@ public final class McpSourceBridge implements AutoCloseable {
       if (closed) {
         return;
       }
-      Set<String> desired = new LinkedHashSet<>(tools.stream().map(AgentTool::name).toList());
+      Set<String> desired =
+          tools.stream()
+              .map(AgentTool::name)
+              .filter(filter)
+              .collect(Collectors.toCollection(LinkedHashSet::new));
       List<String> toRemove = new ArrayList<>(registeredNames);
       toRemove.removeAll(desired);
       registry.unregisterAll(toRemove);
       List<AgentTool> toAdd =
-          tools.stream().filter(t -> !registeredNames.contains(t.name())).toList();
+          tools.stream()
+              .filter(t -> filter.test(t.name()))
+              .filter(t -> !registeredNames.contains(t.name()))
+              .toList();
       registry.registerAll(toAdd);
       registeredNames = desired;
       LOG.debug("MCP 工具源同步: source={} 现有 {} 个", source.name(), desired.size());

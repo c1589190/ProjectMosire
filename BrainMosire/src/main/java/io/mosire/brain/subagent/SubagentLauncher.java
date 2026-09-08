@@ -1,7 +1,5 @@
 package io.mosire.brain.subagent;
 
-import io.mosire.brain.runtime.AgentConfig;
-
 /**
  * 子进程启动缝（W3a 只定义契约，W3b 接真实 {@code agent --id} stdio 子进程）。
  *
@@ -13,15 +11,14 @@ import io.mosire.brain.runtime.AgentConfig;
 public interface SubagentLauncher extends AutoCloseable {
 
   /**
-   * 启动一个子 Agent 进程/执行体。
+   * 启动一个子 Agent 进程/执行体（W3b 签名：完整实例快照而非"id + 配置"——真实执行体需要模板 id、 目标与权限集来拼装 {@code agent --id} 命令与父侧
+   * MCP 服务，数据都来自快照，不留缺省假设）。
    *
-   * @param instanceId 实例 id（事件 correlationId 与进程标识；W3b 映射为 {@code agent --id}）
-   * @param childConfig 子 Agent 配置（数据不是代码——launcher 只读取，不改动）
+   * @param instance 已通过守卫的实例快照（只读数据；launcher 不改动，状态推进归 Manager）
    * @return 存活句柄
    * @throws SubagentLaunchException 启动失败（含原因）
    */
-  LaunchedSubagent launch(String instanceId, AgentConfig childConfig)
-      throws SubagentLaunchException;
+  LaunchedSubagent launch(SubagentInstance instance) throws SubagentLaunchException;
 
   /** 幂等关闭 launcher 自身资源。 */
   @Override
