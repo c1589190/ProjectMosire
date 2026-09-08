@@ -225,8 +225,7 @@ class McpToolSourceTest {
               return ToolResult.ok("late");
             }
           });
-      try (AgentToMcpServer server =
-          AgentToMcpServer.start(tools, "hang-server", "0.1.0-test")) {
+      try (AgentToMcpServer server = AgentToMcpServer.start(tools, "hang-server", "0.1.0-test")) {
         while (!Files.exists(quitMarker)) {
           Thread.sleep(50);
         }

@@ -140,8 +140,8 @@ public final class McpToolSource implements AutoCloseable {
   }
 
   /**
-   * 沿 cause 链识别“远程侧不可用”类失败：传输层异常或 {@link TimeoutException}（同步客户端把请求超时经
-   * reactor 包装后抛出，故须沿链识别）。本地代码错误（如参数 NPE）不在此列：映射错误结果但不标记断连。
+   * 沿 cause 链识别“远程侧不可用”类失败：传输层异常或 {@link TimeoutException}（同步客户端把请求超时经 reactor
+   * 包装后抛出，故须沿链识别）。本地代码错误（如参数 NPE）不在此列：映射错误结果但不标记断连。
    */
   private static Throwable findRemoteFailure(Throwable e) {
     for (Throwable t = e; t != null; t = t.getCause()) {
