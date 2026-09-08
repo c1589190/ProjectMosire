@@ -92,6 +92,9 @@ class W3SubagentE2ETest {
       Path readerEvents = childEvents(dataDir, reader.instanceId());
       // 子体经 MCP 回环调用父级 echo：tool.call + tool.result（成功）落在子体事件库
       awaitEvent(readerEvents, EventTypes.TOOL_RESULT, "tool", "echo", "ok", true);
+      // 往返原文钉住：result.message 是父侧 echo 工具的真实返回（模板脚本传入文本 → "echo:" 前缀）
+      awaitEventContaining(
+          readerEvents, EventTypes.TOOL_RESULT, "tool", "echo", "message", "echo:你好，子 Agent 报到");
       assertThat(eventsOf(readerEvents, EventTypes.TOOL_CALL))
           .extracting(e -> payload(e, "tool"))
           .contains("echo");
@@ -102,8 +105,14 @@ class W3SubagentE2ETest {
       SubagentInstance grand = awaitChild(app, "grand");
       Path grandEvents = childEvents(dataDir, grand.instanceId());
       // grand 子体提权派生 → 父侧编排工具内联 SYSTEM 校验拒绝 → permission.denied 落在子体事件库
-      awaitEvent(
-          grandEvents, EventTypes.PERMISSION_DENIED, "tool", "spawn_sub_agent", "reason", null);
+      // reason 钉住拒绝 actor：文本是父侧 systemOnly 的文案（子体侧 guard 因适配器默认身份放行——R7 防线变更会使本断言转红）
+      awaitEventContaining(
+          grandEvents,
+          EventTypes.PERMISSION_DENIED,
+          "tool",
+          "spawn_sub_agent",
+          "reason",
+          "仅限主 Agent");
       // 拒绝后子体继续（echo 仍可服务）：tool.result 成功
       awaitEvent(grandEvents, EventTypes.TOOL_RESULT, "tool", "echo", "ok", true);
 
@@ -260,13 +269,33 @@ class W3SubagentE2ETest {
 
   private void awaitEvent(
       Path db, String type, String key, String value, String key2, Object value2) throws Exception {
-    // Map.of/Map.entry 拒绝 null 值——"key 存在即可"约定（value2==null 时只校验 key2 存在）改用 HashMap
+    // Map.of/Map.entry 拒绝 null 值——约定 value2==null = 仅要求 key2 字段存在且值非空（匹配循环对 null 期望值走存在性分支）
     Map<String, Object> expected = new HashMap<>();
     expected.put(key, value);
     if (key2 != null) {
       expected.put(key2, value2);
     }
     awaitEvent(db, type, expected);
+  }
+
+  /** 轮询事件（type + key/value 精确匹配、key2 子串匹配——钉住拒绝方/往返原文的断言变体）。 */
+  private void awaitEventContaining(
+      Path db, String type, String key, Object value, String key2, String contained)
+      throws Exception {
+    await(
+        () -> {
+          for (Event event : eventsOf(db, type)) {
+            Object actual2 = payload(event, key2);
+            if (value.equals(payload(event, key))
+                && actual2 != null
+                && String.valueOf(actual2).contains(contained)) {
+              return true;
+            }
+          }
+          return false;
+        },
+        45_000,
+        "等待事件 " + type + " " + key + "=" + value + " 且 " + key2 + " 含 [" + contained + "]");
   }
 
   /** 轮询某子 Agent 的生命周期动作序列（父级事件库）。 */

@@ -74,14 +74,20 @@ public final class SubagentOrchestrationTools {
           if (templateId == null || goal == null) {
             return ToolResult.error("INVALID_ARGUMENTS", "templateId 与 goal 为必填参数");
           }
-          SubagentLaunchRequest request =
-              new SubagentLaunchRequest(
-                  templateId,
-                  goal,
-                  strSetArg(context, "extraDenied"),
-                  intArg(context, "maxTurnsCap"),
-                  longArg(context, "timeBudgetSecondsCap"),
-                  longArg(context, "quotaMaxTokensCap"));
+          SubagentLaunchRequest request;
+          try {
+            request =
+                new SubagentLaunchRequest(
+                    templateId,
+                    goal,
+                    strSetArg(context, "extraDenied"),
+                    intArg(context, "maxTurnsCap"),
+                    longArg(context, "timeBudgetSecondsCap"),
+                    longArg(context, "quotaMaxTokensCap"));
+          } catch (IllegalArgumentException e) {
+            // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
+            return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());
+          }
           SubagentInstance instance;
           try {
             instance = manager.spawn(request);
@@ -219,6 +225,10 @@ public final class SubagentOrchestrationTools {
     return java.util.Set.of(String.valueOf(value));
   }
 
+  /**
+   * 整数参数：字段缺失 → {@code null}（调用方按"未收紧"处理，合法）；字段存在但非数字 → 抛 {@link IllegalArgumentException}（调用方落地
+   * {@code INVALID_ARGUMENTS}——绝不静默退化为"未收紧"，那会无抱怨地放宽上限）。
+   */
   private static Integer intArg(ToolContext context, String name) {
     Object value = context.arguments().get(name);
     if (value == null) {
@@ -230,10 +240,11 @@ public final class SubagentOrchestrationTools {
     try {
       return Integer.parseInt(String.valueOf(value));
     } catch (NumberFormatException e) {
-      return null;
+      throw new IllegalArgumentException("参数 " + name + " 必须是整数: " + value);
     }
   }
 
+  /** 同 {@link #intArg(ToolContext, String)} 的 long 版。 */
   private static Long longArg(ToolContext context, String name) {
     Object value = context.arguments().get(name);
     if (value == null) {
@@ -245,7 +256,7 @@ public final class SubagentOrchestrationTools {
     try {
       return Long.parseLong(String.valueOf(value));
     } catch (NumberFormatException e) {
-      return null;
+      throw new IllegalArgumentException("参数 " + name + " 必须是整数: " + value);
     }
   }
 

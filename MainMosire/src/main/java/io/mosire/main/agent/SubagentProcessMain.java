@@ -49,9 +49,6 @@ import java.util.function.Predicate;
  */
 public final class SubagentProcessMain {
 
-  /** {@code --parent-link} 子命令形态里父侧 MCP server 自报的名字（本进程只作目录同步，不作身份依据）。 */
-  static final String PARENT_LINK_SERVER_NAME = "mosire-parent";
-
   private SubagentProcessMain() {}
 
   /**

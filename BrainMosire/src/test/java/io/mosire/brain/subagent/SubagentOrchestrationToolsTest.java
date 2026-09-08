@@ -241,6 +241,43 @@ class SubagentOrchestrationToolsTest {
     f.close();
   }
 
+  @Test
+  void nonNumericCapArgumentsYieldInvalidArgumentsInsteadOfRelaxing() {
+    Fixture f = fixture(systemParent(), null);
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    // "1e4"（科学计数写法，Integer/Long.parse 不认）：字段存在但非数字 → INVALID_ARGUMENTS
+    // （不得静默退化为"未收紧"——那会是无抱怨地放宽上限，反转 fail-safe 方向）
+    ToolResult badTurns =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            context(Map.of("templateId", "reader", "goal", "g", "maxTurnsCap", "1e4")));
+    assertThat(badTurns.success()).isFalse();
+    assertThat(badTurns.code()).isEqualTo("INVALID_ARGUMENTS");
+    assertThat(badTurns.message()).contains("maxTurnsCap").contains("必须是整数");
+
+    ToolResult badQuota =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            context(Map.of("templateId", "reader", "goal", "g", "quotaMaxTokensCap", "1e4")));
+    assertThat(badQuota.success()).isFalse();
+    assertThat(badQuota.code()).isEqualTo("INVALID_ARGUMENTS");
+    assertThat(badQuota.message()).contains("quotaMaxTokensCap");
+
+    // 解析期拒绝：无实例落地（fail-safe）；字段缺失仍为"不收紧"（null 合法），合法数字照常放行
+    assertThat(f.manager().list()).isEmpty();
+    ToolResult ok =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            context(Map.of("templateId", "reader", "goal", "g", "maxTurnsCap", 10)));
+    assertThat(ok.success()).isTrue();
+    f.close();
+  }
+
   // ---- fixtures ----
 
   /** 管理器 + 事件库 + 总线（测试自建并注入，便于直接查事件）。 */
