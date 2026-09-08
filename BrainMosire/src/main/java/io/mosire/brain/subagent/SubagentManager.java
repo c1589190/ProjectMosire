@@ -143,19 +143,23 @@ public final class SubagentManager implements AutoCloseable {
             permissions,
             depth,
             SubagentStatus.CONFIGURED);
-    synchronized (lock) {
-      ensureOpen();
-      instances.put(instanceId, configured);
-      emitLifecycle(instanceId, template.id(), "configured", depth, request.goal(), null);
-    }
     SubagentInstance running;
     LaunchedSubagent handle = null;
     try {
-      running =
-          transition(
-              instanceId,
-              SubagentStatus.SPAWNING,
-              lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
+      // 两转换同锁封窗：CONFIGURED 记录建立（+configured 事件）与 SPAWNING 推进置于同一临界区——CONFIGURED
+      // 状态对其它线程不可观测（锁上只能看到 SPAWNING 及之后），kill 的 terminate 分支结构上不可能读到
+      // CONFIGURED，从而消除"kill 落在 CONFIGURED 窗口"竞态（历史上 terminate 对 CONFIGURED 推 FAILED
+      // 会因 canTransition 不允许 CONFIGURED→FAILED 而抛裸 ISE）。
+      synchronized (lock) {
+        ensureOpen();
+        instances.put(instanceId, configured);
+        emitLifecycle(instanceId, template.id(), "configured", depth, request.goal(), null);
+        running =
+            transition(
+                instanceId,
+                SubagentStatus.SPAWNING,
+                lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
+      }
       try {
         handle = launcher.launch(instanceId, childConfig);
       } catch (SubagentLaunchException e) {
@@ -175,14 +179,23 @@ public final class SubagentManager implements AutoCloseable {
               lifecyclePayload("running", template.id(), depth, null, null));
       armWatch(instanceId, handle);
     } catch (IllegalStateException e) {
-      // 并发 kill-before-running（CONFIGURED→SPAWNING 窗口或句柄 put 后 RUNNING 前）：另一线程已把状态
-      // 推至 FAILED/KILLED。句柄可能被 kill 抢先摘除并关停，也可能刚 put 进来无人收尾——统一从句柄表摘除并关闭，
-      // 避免孤儿句柄泄漏；返回当前最新快照（FAILED/KILLED），不让裸 IllegalStateException 泄漏给调用方。
+      // 并发 kill-before-running（launch 卡住期，或句柄 put 后 RUNNING 前）：kill 已把状态推至 FAILED/KILLED。
+      // 句柄可能被 kill 抢先摘除并关停，也可能刚 put 进来无人收尾——在同一个临界区内取终态快照并摘除孤儿句柄，
+      // 锁外关闭（真实 executor 下 stopGracefully 宽限可达 10s，不得占用锁，同 terminate 的写法），
+      // 返回终态快照（FAILED/KILLED），不让裸 IllegalStateException 泄漏给调用方。
       LOG.warn("spawn 与 kill 竞态: 子 Agent 在确认存活前已被终止 {}", instanceId);
+      SubagentInstance snapshot;
+      LaunchedSubagent orphaned;
       synchronized (lock) {
-        closeQuietly(handles.remove(instanceId));
+        snapshot = instances.get(instanceId);
+        orphaned = handles.remove(instanceId);
       }
-      return instances.get(instanceId);
+      if (snapshot == null) {
+        // 实例记录从未建立（如并发 close 在临界区内拒绝的 ensureOpen 路径）：非 kill 竞态，原样传播
+        throw e;
+      }
+      closeQuietly(orphaned);
+      return snapshot;
     }
     return running;
   }
@@ -206,8 +219,9 @@ public final class SubagentManager implements AutoCloseable {
   /**
    * kill：Manager 编排入口（红线 5，非"工具关进程"）。
    *
-   * <p>RUNNING → TERMINATING（事件）→ launcher 句柄关闭（真实实现 = 三层关停）→ 终态确认 → KILLED
-   * （事件）；CONFIGURED/SPAWNING → FAILED（kill-before-running）。终态/TERMINATING 重复调用为空操作。
+   * <p>RUNNING → TERMINATING（事件）→ launcher 句柄关闭（真实实现 = 三层关停）→ 终态确认 → KILLED （事件）；SPAWNING →
+   * FAILED（kill-before-running，合法推进）。CONFIGURED 对外不可观测（spawn 两转换 同锁，见 spawn），terminate 的 CONFIGURED
+   * 分支仅为防御守卫，返回 false。终态/TERMINATING 重复调用为空操作。
    *
    * @return true = 本次调用实际发起了终止（状态已推进）；false = 已是终态/已在终止（幂等空操作）
    * @throws IllegalArgumentException 未知 id
@@ -474,10 +488,10 @@ public final class SubagentManager implements AutoCloseable {
   // ---- 内部：kill 编排与退出观测 ----
 
   private boolean terminate(String instanceId) {
-    LaunchedSubagent handle;
+    LaunchedSubagent handle = null;
     String templateId;
     int depth;
-    String goal;
+    boolean killBeforeRunning = false;
     synchronized (lock) {
       SubagentInstance current = instances.get(instanceId);
       if (current == null) {
@@ -485,28 +499,38 @@ public final class SubagentManager implements AutoCloseable {
       }
       templateId = current.templateId();
       depth = current.depth();
-      goal = current.goal();
       SubagentStatus status = current.status();
       if (status == SubagentStatus.TERMINATING || status.isFinal()) {
+        return false; // 幂等空操作
+      }
+      if (status == SubagentStatus.CONFIGURED) {
+        // 防御守卫（不可达）：spawn 把 CONFIGURED 记录建立与 SPAWNING 推进放在同一临界区（见 spawn），
+        // 其它线程在锁上不可能观察到 CONFIGURED。若未来改动破坏该不变量而触达此分支，返回 false——
+        // 不推进非法状态（canTransition 仅允许 CONFIGURED→SPAWNING；对 CONFIGURED 推 FAILED 会抛裸 ISE，
+        // 即修复轮 2 重审发现的原始缺陷），也不把裸 IllegalStateException 泄漏给 kill 调用方。
         return false;
       }
-      if (status == SubagentStatus.CONFIGURED || status == SubagentStatus.SPAWNING) {
+      if (status == SubagentStatus.SPAWNING) {
+        // kill-before-running：SPAWNING→FAILED 为合法推进；句柄从表摘除，统一在锁外关闭
         handle = handles.remove(instanceId);
         transition(
             instanceId,
             SubagentStatus.FAILED,
             lifecyclePayload("failed", templateId, depth, null, "kill-before-running"));
-        closeQuietly(handle);
-        return true;
+        killBeforeRunning = true;
+      } else {
+        // RUNNING：TERMINATING 先于句柄关闭（状态与事件的因果一致性）
+        transition(
+            instanceId,
+            SubagentStatus.TERMINATING,
+            lifecyclePayload("terminating", templateId, depth, null, null));
+        handle = handles.get(instanceId);
       }
-      // RUNNING：TERMINATING 先于句柄关闭（状态与事件的因果一致性）
-      transition(
-          instanceId,
-          SubagentStatus.TERMINATING,
-          lifecyclePayload("terminating", templateId, depth, null, null));
-      handle = handles.get(instanceId);
     }
-    closeQuietly(handle); // 三层关停入口：launcher → SubprocessManager/ManagedProcess
+    closeQuietly(handle); // 锁外三层关停入口（stopGracefully 宽限最长 10s，任何路径都不占锁）
+    if (killBeforeRunning) {
+      return true;
+    }
     boolean dead = handle == null || awaitDead(handle, KILL_CONFIRM_MILLIS);
     if (dead) {
       synchronized (lock) {

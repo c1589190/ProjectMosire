@@ -210,8 +210,10 @@ class SubagentManagerTest {
     SubagentManager manager =
         manager(templateStore, launcher, parentConfig(), AgentPermissionSet.system(), 0);
 
-    // spawn 卡在 launcher.launch（SPAWNING）期间被 kill → kill 推 FAILED；launch 返回后 spawn 的 RUNNING
-    // 推进必然撞终态——必须收敛为 FAILED 快照、不得把裸 IllegalStateException 抛给调用方、孤儿句柄只关一次
+    // 覆盖范围说明：本用例确定性命中的是 SPAWNING 窗口（launch 卡住期）——kill 推 FAILED 后 spawn 的
+    // RUNNING 推进撞终态，断言 spawn 收敛为 FAILED 快照（而非裸 ISE）、孤儿句柄仅关闭一次、事件链为
+    // [configured, spawning, failed]。CONFIGURED 窗口已被"两转换同锁"结构性关闭（见 spawn 注释），现有缝
+    // 无法确定性落窗——判别性回归需生产级 spawn-stage 钩子，按 YAGNI 不加（见修复轮 2 报告）。
     CompletableFuture<SubagentInstance> spawnFuture =
         CompletableFuture.supplyAsync(
             () -> manager.spawn(new SubagentLaunchRequest("reader", "任务", null, null, null, null)));
@@ -240,6 +242,9 @@ class SubagentManagerTest {
         .hasValueSatisfying(i -> assertThat(i.status()).isEqualTo(SubagentStatus.FAILED));
     assertThat(lifecycleActions(id)).containsExactly("configured", "spawning", "failed");
     // 句柄在 spawn 收尾路径关闭一次（kill 抢先时句柄尚未入表，未二次关停）
+    assertThat(launcher.closeCalls()).isEqualTo(1);
+    // kill 契约尾：终态后重复 kill 为幂等空操作（false），且全程不抛裸 IllegalStateException 类异常
+    assertThat(manager.kill(id)).isFalse();
     assertThat(launcher.closeCalls()).isEqualTo(1);
   }
 
