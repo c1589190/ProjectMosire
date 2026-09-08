@@ -12,6 +12,9 @@ import io.mosire.agentlib.tool.ToolResult;
  */
 final class McpWireCode {
 
+  /** 通用远程调用错误码：带内无码时的解码回退与 {@link McpToolSource} 远程异常映射共用。 */
+  static final String MCP_TOOL_ERROR = "MCP_TOOL_ERROR";
+
   private static final String PREFIX = "[mosire:code=";
   private static final String SUFFIX = "]";
 
@@ -38,6 +41,6 @@ final class McpWireCode {
       String message = text.substring(suffixAt + 1).stripLeading();
       return new String[] {code, message.isEmpty() ? fallbackMessage : message};
     }
-    return new String[] {"MCP_TOOL_ERROR", text == null || text.isBlank() ? fallbackMessage : text};
+    return new String[] {MCP_TOOL_ERROR, text == null || text.isBlank() ? fallbackMessage : text};
   }
 }

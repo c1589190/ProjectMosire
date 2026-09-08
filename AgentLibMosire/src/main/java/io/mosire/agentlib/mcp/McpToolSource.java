@@ -6,11 +6,15 @@ import io.modelcontextprotocol.client.transport.ServerParameters;
 import io.modelcontextprotocol.client.transport.StdioClientTransport;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.modelcontextprotocol.spec.McpSchema;
+import io.modelcontextprotocol.spec.McpTransportException;
+import io.modelcontextprotocol.spec.McpTransportSessionClosedException;
+import io.modelcontextprotocol.spec.McpTransportSessionNotFoundException;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolResult;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -36,6 +40,17 @@ public final class McpToolSource implements AutoCloseable {
   private McpSyncClient client;
   private volatile List<AgentTool> cached = List.of();
   private volatile Consumer<List<AgentTool>> changeListener;
+  private volatile boolean disconnected;
+
+  /**
+   * 远程侧是否已不可用。
+   *
+   * <p>触发点：{@link #callRemote} 捕获到传输层失败或请求超时（同步客户端对远程进程死亡的直接表象 即超时，无法区分“进程死亡”与“呼叫挂起”，故一并标记）。
+   * 复位时机：{@link #connect()} 成功建立新连接时。是否重连以及如何重连由接线层决定（本类只标记）。
+   */
+  public boolean isDisconnected() {
+    return disconnected;
+  }
 
   public McpToolSource(McpServerLinkConfig config) {
     this.config = Objects.requireNonNull(config, "config");
@@ -65,6 +80,8 @@ public final class McpToolSource implements AutoCloseable {
     this.client = newClient;
     // 初始基线：tools/list_changed 之外的首次快照（若有订阅者立即回放）
     cacheAndNotify(newClient.listTools().tools());
+    // 重连成功（connect 是唯一建立连接的入口）：复位断连标记
+    this.disconnected = false;
   }
 
   /**
@@ -107,9 +124,45 @@ public final class McpToolSource implements AutoCloseable {
   private ToolResult callRemote(String name, Map<String, Object> arguments) {
     // 经同步访问器取 client：唯一不在 synchronized 方法里的字段访问也走同一把锁（SpotBugs IS2 一致性）
     McpSyncClient connected = requireConnected();
-    McpSchema.CallToolResult result =
-        connected.callTool(new McpSchema.CallToolRequest(name, Map.copyOf(arguments), Map.of()));
+    McpSchema.CallToolResult result;
+    try {
+      result =
+          connected.callTool(new McpSchema.CallToolRequest(name, Map.copyOf(arguments), Map.of()));
+    } catch (RuntimeException e) {
+      // 契约：IO/远程错误映射为 ToolResult，不得穿透 AgentTool.execute——仅远程侧失败额外标记断连
+      Throwable remoteFailure = findRemoteFailure(e);
+      if (remoteFailure != null) {
+        this.disconnected = true;
+      }
+      return ToolResult.error(McpWireCode.MCP_TOOL_ERROR, remoteFailureMessage(remoteFailure, e));
+    }
     return map(result);
+  }
+
+  /**
+   * 沿 cause 链识别“远程侧不可用”类失败：传输层异常或 {@link TimeoutException}（同步客户端把请求超时经
+   * reactor 包装后抛出，故须沿链识别）。本地代码错误（如参数 NPE）不在此列：映射错误结果但不标记断连。
+   */
+  private static Throwable findRemoteFailure(Throwable e) {
+    for (Throwable t = e; t != null; t = t.getCause()) {
+      if (t instanceof McpTransportException
+          || t instanceof McpTransportSessionClosedException
+          || t instanceof McpTransportSessionNotFoundException
+          || t instanceof TimeoutException) {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  /** 失败描述：超时用中文短语；异常消息为空时以类名兜底。 */
+  private static String remoteFailureMessage(Throwable remoteFailure, Throwable e) {
+    Throwable source = remoteFailure != null ? remoteFailure : e;
+    if (source instanceof TimeoutException) {
+      return "MCP 远程调用超时";
+    }
+    String detail = source.getMessage() != null ? source.getMessage() : source.toString();
+    return "MCP 远程调用失败: " + detail;
   }
 
   /** CallToolResult → ToolResult（文本内容拼接；isError 映射为错误码）。 */
