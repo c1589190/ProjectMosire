@@ -8,8 +8,9 @@ import java.util.Set;
  * Agent 配置（数据不是代码——计划 D10）。
  *
  * <p>M1 为构造器 + 校验；M3 起由 ConfigStore 经 JSON Schema（{@code configs/schemas/}）装载， 本类的构造器保持不变、新增一个
- * fromJson。默认值即硬顶常量（计划 D10）： {@code maxTurns=20} / {@code maxToolCallsPerTurn=30} / {@code
- * timeBudget=10min}； 一个 Agent 实例可以解绑自己的配额（配额归调用方：子 Agent 的配额由父级决定，M2）。
+ * fromJson。默认值即硬顶常量（计划 D10，2026-09-08 用户修订 maxTurns 20→2000）： {@code maxTurns=2000} / {@code
+ * maxToolCallsPerTurn=30} / {@code timeBudget=10min}； 一个 Agent 实例可以解绑自己的配额（配额归调用方：子 Agent
+ * 的配额由父级决定，M2）。
  */
 public record AgentConfig(
     String id,
@@ -23,7 +24,14 @@ public record AgentConfig(
     Duration timeBudget,
     long quotaMaxTokens) {
 
-  public static final int DEFAULT_MAX_TURNS = 20;
+  /**
+   * 默认轮次硬顶（计划 D10；2026-09-08 用户修订 20→2000）。
+   *
+   * <p>为什么放大：20 轮对长任务（多文件改造、深链调查）明显不够用；防跑飞的实际兜底由 {@link #DEFAULT_TIME_BUDGET}（墙钟）承担——
+   * 轮次硬顶只防御"每轮极快的空转循环"，预算硬顶防御"真实耗时失控"。
+   */
+  public static final int DEFAULT_MAX_TURNS = 2000;
+
   public static final int DEFAULT_MAX_TOOL_CALLS_PER_TURN = 30;
   public static final Duration DEFAULT_TIME_BUDGET = Duration.ofMinutes(10);
 
