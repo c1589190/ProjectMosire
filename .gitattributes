@@ -1,0 +1,6 @@
+# 行尾规范化：防止 mvnw 等 shell 脚本再被 CRLF 污染（shebang 损坏导致 Linux 上无法执行）
+* text=auto
+mvnw text eol=lf
+*.sh text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
