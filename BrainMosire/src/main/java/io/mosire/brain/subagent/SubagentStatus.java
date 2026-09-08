@@ -17,6 +17,9 @@ public enum SubagentStatus {
   /** 子进程已确认存活。 */
   RUNNING,
 
+  // BLOCKED 预留：4.4 审批门控（AG-UI 未来项），本波不含——若需落地，插在 RUNNING 与 TERMINATING 之间
+  // （图 RUNNING→BLOCKED→RUNNING），迁移点仅 SubagentStatus 与 canTransition；评审裁定 W3 省略可接受。
+
   /** 终止流程进行中（已请求停进程、尚未确认）。 */
   TERMINATING,
 

@@ -21,6 +21,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -200,6 +202,48 @@ class SubagentManagerTest {
   }
 
   @Test
+  void killDuringSpawningReturnsFailedSnapshotNotRawIllegalState() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    AgentTemplateStore templateStore = store();
+    GatedLauncher launcher = new GatedLauncher();
+    SubagentManager manager =
+        manager(templateStore, launcher, parentConfig(), AgentPermissionSet.system(), 0);
+
+    // spawn 卡在 launcher.launch（SPAWNING）期间被 kill → kill 推 FAILED；launch 返回后 spawn 的 RUNNING
+    // 推进必然撞终态——必须收敛为 FAILED 快照、不得把裸 IllegalStateException 抛给调用方、孤儿句柄只关一次
+    CompletableFuture<SubagentInstance> spawnFuture =
+        CompletableFuture.supplyAsync(
+            () -> manager.spawn(new SubagentLaunchRequest("reader", "任务", null, null, null, null)));
+
+    launcher.awaitLaunchStarted(2, TimeUnit.SECONDS);
+    String id;
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (true) {
+      List<SubagentInstance> all = manager.list();
+      if (!all.isEmpty()) {
+        id = all.get(0).instanceId();
+        break;
+      }
+      if (System.nanoTime() > deadline) {
+        throw new AssertionError("spawn 未建立实例记录");
+      }
+      Thread.sleep(20);
+    }
+    assertThat(manager.list().get(0).status()).isEqualTo(SubagentStatus.SPAWNING);
+    assertThat(manager.kill(id)).isTrue();
+    launcher.release();
+
+    SubagentInstance result = spawnFuture.get(5, TimeUnit.SECONDS);
+    assertThat(result.status()).isEqualTo(SubagentStatus.FAILED);
+    assertThat(manager.get(id))
+        .hasValueSatisfying(i -> assertThat(i.status()).isEqualTo(SubagentStatus.FAILED));
+    assertThat(lifecycleActions(id)).containsExactly("configured", "spawning", "failed");
+    // 句柄在 spawn 收尾路径关闭一次（kill 抢先时句柄尚未入表，未二次关停）
+    assertThat(launcher.closeCalls()).isEqualTo(1);
+  }
+
+  @Test
   void childCapsAreDerivedFromTemplateRequestAndParentOnlySmaller() {
     AgentTemplate template =
         template("sleuth", Set.of("read"), Set.of(), true, false, true, 2000, 30, 600, 2000);
@@ -261,6 +305,25 @@ class SubagentManagerTest {
 
     assertThat(spawned.config().quotaMaxTokens()).isEqualTo(1500);
     assertThat(spawned.config().timeBudget()).isEqualTo(Duration.ofSeconds(60));
+  }
+
+  @Test
+  void templateZeroQuotaIsUnconstrainedSoRequestTighteningStillApplies() {
+    // 模板配额 0 = 不限（AgentTemplate 校验 ≥0）：请求收紧 1500 应保留，而非被 0 吞掉退回 "不限"
+    AgentTemplate template =
+        template("sleuth", Set.of("read"), Set.of(), true, false, true, 2000, 30, 600, 0);
+    write(template);
+    AgentTemplateStore templateStore = store();
+    RecordingLauncher launcher = new RecordingLauncher();
+    SubagentManager manager =
+        manager(templateStore, launcher, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("sleuth", "调查", Set.of(), null, null, 1500L));
+
+    assertThat(spawned.config().quotaMaxTokens()).isEqualTo(1500);
+    // 模板/请求/父级均不限时仍是 0（不限）——有别于被 0 静默收紧
+    assertThat(launcher.lastConfig()).isSameAs(spawned.config());
   }
 
   @Test
@@ -454,6 +517,54 @@ class SubagentManagerTest {
     } catch (Exception ex) {
       throw new AssertionError("事件 payload 解析失败: " + e.payload(), ex);
     }
+  }
+
+  /** 门闩 launcher：launch 进入后阻塞，直到 {@link #release()}——确定性复现 SPAWNING 窗口 kill 竞态。 */
+  private static final class GatedLauncher implements SubagentLauncher {
+
+    private final AtomicBoolean alive = new AtomicBoolean(true);
+    private final CountDownLatch entered = new CountDownLatch(1);
+    private final CountDownLatch release = new CountDownLatch(1);
+    private final AtomicInteger closeCalls = new AtomicInteger();
+
+    void awaitLaunchStarted(long seconds, TimeUnit unit) throws InterruptedException {
+      if (!entered.await(seconds, unit)) {
+        throw new AssertionError("launcher.launch 未进入（spawn 未走到 SPAWNING 阶段）");
+      }
+    }
+
+    void release() {
+      release.countDown();
+    }
+
+    int closeCalls() {
+      return closeCalls.get();
+    }
+
+    @Override
+    public LaunchedSubagent launch(String instanceId, AgentConfig childConfig) {
+      entered.countDown();
+      try {
+        release.await(5, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      return new LaunchedSubagent() {
+        @Override
+        public boolean isAlive() {
+          return alive.get();
+        }
+
+        @Override
+        public void close() {
+          closeCalls.incrementAndGet();
+          alive.set(false);
+        }
+      };
+    }
+
+    @Override
+    public void close() {}
   }
 
   /** 在管 launcher 记录每一次 launch/close（断言"close 只经 Manager 编排一次"）。 */

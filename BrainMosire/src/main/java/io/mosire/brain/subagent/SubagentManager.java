@@ -148,40 +148,42 @@ public final class SubagentManager implements AutoCloseable {
       instances.put(instanceId, configured);
       emitLifecycle(instanceId, template.id(), "configured", depth, request.goal(), null);
     }
-    transition(
-        instanceId,
-        SubagentStatus.SPAWNING,
-        lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
-
-    LaunchedSubagent handle;
-    try {
-      handle = launcher.launch(instanceId, childConfig);
-    } catch (SubagentLaunchException e) {
-      transition(
-          instanceId,
-          SubagentStatus.FAILED,
-          lifecyclePayload("failed", template.id(), depth, null, e.getMessage()));
-      throw e;
-    }
-    synchronized (lock) {
-      handles.put(instanceId, handle);
-    }
     SubagentInstance running;
+    LaunchedSubagent handle = null;
     try {
+      running =
+          transition(
+              instanceId,
+              SubagentStatus.SPAWNING,
+              lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
+      try {
+        handle = launcher.launch(instanceId, childConfig);
+      } catch (SubagentLaunchException e) {
+        transition(
+            instanceId,
+            SubagentStatus.FAILED,
+            lifecyclePayload("failed", template.id(), depth, null, e.getMessage()));
+        throw e;
+      }
+      synchronized (lock) {
+        handles.put(instanceId, handle);
+      }
       running =
           transition(
               instanceId,
               SubagentStatus.RUNNING,
               lifecyclePayload("running", template.id(), depth, null, null));
+      armWatch(instanceId, handle);
     } catch (IllegalStateException e) {
-      // 仅在并发 kill-before-running（SPAWNING 期另一线程 kill）时可达：句柄已关，状态已 FAILED
+      // 并发 kill-before-running（CONFIGURED→SPAWNING 窗口或句柄 put 后 RUNNING 前）：另一线程已把状态
+      // 推至 FAILED/KILLED。句柄可能被 kill 抢先摘除并关停，也可能刚 put 进来无人收尾——统一从句柄表摘除并关闭，
+      // 避免孤儿句柄泄漏；返回当前最新快照（FAILED/KILLED），不让裸 IllegalStateException 泄漏给调用方。
       LOG.warn("spawn 与 kill 竞态: 子 Agent 在确认存活前已被终止 {}", instanceId);
-      closeQuietly(handle);
       synchronized (lock) {
-        return instances.get(instanceId);
+        closeQuietly(handles.remove(instanceId));
       }
+      return instances.get(instanceId);
     }
-    armWatch(instanceId, handle);
     return running;
   }
 
@@ -394,21 +396,21 @@ public final class SubagentManager implements AutoCloseable {
     return requestCap != null && requestCap > 0 ? Math.min(value, requestCap) : value;
   }
 
-  /** 配额 min 语义：0（不限）的参与者不约束。 */
+  /** 配额 min 语义：0（不限）的参与者不约束（模板、请求、父级三者同规）。 */
   private static long minQuota(long templateValue, Long requestCap, long parentValue) {
-    long value = templateValue;
+    long value = templateValue > 0 ? templateValue : Long.MAX_VALUE; // 模板 0 = 不限，不参与 min
     if (requestCap != null && requestCap > 0) {
       value = Math.min(value, requestCap);
     }
     if (parentValue > 0) {
       value = Math.min(value, parentValue);
     }
-    return value;
+    return value == Long.MAX_VALUE ? 0 : value; // 三者均不限 → 仍是不限（0）
   }
 
   // ---- 内部：状态机与事件 ----
 
-  /** 推进到 {@code to} 并发 lifecycle 事件；非法推进抛错、终态→同态幂等返回。 */
+  /** 推进到 {@code to} 并发 lifecycle 事件；非法推进抛错、终态→同态幂等返回（不重复发事件）。 */
   private SubagentInstance transition(
       String instanceId, SubagentStatus to, Map<String, Object> lifecyclePayload) {
     synchronized (lock) {
@@ -416,10 +418,14 @@ public final class SubagentManager implements AutoCloseable {
       if (current == null) {
         throw new IllegalStateException("未知子 Agent 推进: " + instanceId);
       }
-      if (!SubagentStatus.canTransition(current.status(), to)) {
-        if (current.status().isFinal() && current.status() == to) {
-          return current; // 终态幂等：不重复发事件
+      if (current.status().isFinal()) {
+        if (current.status() == to) {
+          return current; // 终态→同态：幂等静默（并发 kill 后 launch 失败的 FAILED 重复推进即此路径）
         }
+        throw new IllegalStateException(
+            "非法状态推进 " + current.status() + "→" + to + "（" + instanceId + "）");
+      }
+      if (!SubagentStatus.canTransition(current.status(), to)) {
         throw new IllegalStateException(
             "非法状态推进 " + current.status() + "→" + to + "（" + instanceId + "）");
       }

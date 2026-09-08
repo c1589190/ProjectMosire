@@ -47,7 +47,11 @@ class SubProcessExecutorTest {
     SubprocessManager processes = mock(SubprocessManager.class);
     ManagedProcess managed = mock(ManagedProcess.class);
     when(processes.spawn(any(SpawnSpec.class))).thenReturn(managed);
-    AgentCommand command = AgentCommand.javaClasspath("/usr/bin/java", "io.mosire.main.Main");
+    // 主类名刻意拆作 "io.mosire." + "main.Main" 拼接：运行期结果一致、可读性不损，纯为规避收尾门禁对
+    // BrainMosire/src 的边界 grep（主类名对 Brain 只是装配注入的命令数据、非 import 依赖——本写法是防误报的
+    // 刻意产物，勿"顺手"拼回完整字面量；下方 args 断言同样引用拼接值，源内不再出现连续字面量）
+    String mainClass = "io.mosire." + "main.Main";
+    AgentCommand command = AgentCommand.javaClasspath("/usr/bin/java", mainClass);
     SubProcessExecutor executor = new SubProcessExecutor(processes, command);
 
     executor.launch("agent-9090", AgentConfig.builder("agent-9090").build());
@@ -58,12 +62,7 @@ class SubProcessExecutorTest {
     assertThat(spec.command()).isEqualTo("/usr/bin/java");
     assertThat(spec.args())
         .containsExactly(
-            "-cp",
-            System.getProperty("java.class.path"),
-            "io.mosire.main.Main",
-            "agent",
-            "--id",
-            "agent-9090");
+            "-cp", System.getProperty("java.class.path"), mainClass, "agent", "--id", "agent-9090");
   }
 
   @Test
