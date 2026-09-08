@@ -255,8 +255,10 @@ public final class A2aJsonRpcHandler {
 
   /** 两快照间新增的产物（快照单调 append-only——尾部切片即可）。 */
   private static List<Artifact> newArtifacts(Task before, Task after) {
-    List<Artifact> prev = before.artifacts() == null ? List.of() : before.artifacts();
-    List<Artifact> current = after.artifacts() == null ? List.of() : after.artifacts();
+    List<Artifact> beforeArtifacts = before.artifacts();
+    List<Artifact> prev = beforeArtifacts == null ? List.of() : beforeArtifacts;
+    List<Artifact> afterArtifacts = after.artifacts();
+    List<Artifact> current = afterArtifacts == null ? List.of() : afterArtifacts;
     List<Artifact> added = new ArrayList<>();
     for (int i = prev.size(); i < current.size(); i++) {
       added.add(current.get(i));

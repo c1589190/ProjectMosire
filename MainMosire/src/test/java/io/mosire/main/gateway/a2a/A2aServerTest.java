@@ -32,6 +32,16 @@ class A2aServerTest {
     };
   }
 
+  /** runner 收窄为 {@code throws A2AError} 后，受检的 InterruptedException 在测试 runner 内就地包装。 */
+  private static void awaitRelease(CountDownLatch release) {
+    try {
+      release.await(5, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(e);
+    }
+  }
+
   private static A2aHttpServer start(A2aTaskService service) {
     return A2aHttpServer.start(
         new InetSocketAddress("127.0.0.1", 0),
@@ -127,7 +137,7 @@ class A2aServerTest {
         start(
             (taskId, message, editor) -> {
               started.countDown();
-              release.await(5, TimeUnit.SECONDS);
+              awaitRelease(release);
               editor.transition(TaskState.TASK_STATE_WORKING);
               editor.transition(TaskState.TASK_STATE_COMPLETED);
             })) {
@@ -155,7 +165,7 @@ class A2aServerTest {
         start(
             (taskId, message, editor) -> {
               started.countDown();
-              release.await(5, TimeUnit.SECONDS);
+              awaitRelease(release);
             })) {
       String url = A2aTestSupport.baseUrl(server);
       HttpResponse<String> send = post(url, rpc("SendMessage", USER_MESSAGE_PARAMS), "1.0");
@@ -252,7 +262,7 @@ class A2aServerTest {
         start(
             (taskId, message, editor) -> {
               started.countDown();
-              release.await(5, TimeUnit.SECONDS);
+              awaitRelease(release);
               editor.transition(TaskState.TASK_STATE_WORKING);
               editor.transition(TaskState.TASK_STATE_COMPLETED);
             })) {
@@ -301,7 +311,7 @@ class A2aServerTest {
         start(
             (taskId, message, editor) -> {
               started.countDown();
-              release.await(5, TimeUnit.SECONDS);
+              awaitRelease(release);
               editor.transition(TaskState.TASK_STATE_COMPLETED);
             })) {
       String url = A2aTestSupport.baseUrl(server);

@@ -46,7 +46,12 @@ class A2aClientRoundTripTest {
                 new MemoryA2aTaskStore(),
                 (taskId, message, editor) -> {
                   started.countDown();
-                  release.await(10, TimeUnit.SECONDS);
+                  try {
+                    release.await(10, TimeUnit.SECONDS);
+                  } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                  }
                   editor.transition(
                       TaskState.TASK_STATE_WORKING, A2A.toAgentMessage("working on it"));
                   editor.appendArtifact(
@@ -146,7 +151,12 @@ class A2aClientRoundTripTest {
                 new MemoryA2aTaskStore(),
                 (taskId, message, editor) -> {
                   started.countDown();
-                  release.await(5, TimeUnit.SECONDS);
+                  try {
+                    release.await(5, TimeUnit.SECONDS);
+                  } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                  }
                 },
                 Executors.newVirtualThreadPerTaskExecutor());
         A2aHttpServer server =

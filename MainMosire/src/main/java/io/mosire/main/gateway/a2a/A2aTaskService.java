@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Consumer;
 import org.a2aproject.sdk.jsonrpc.common.wrappers.ListTasksResult;
 import org.a2aproject.sdk.spec.A2AError;
@@ -49,7 +50,7 @@ public final class A2aTaskService implements AutoCloseable {
   /** 任务推进器：服务在执行器上异步调用；经 {@link TaskEditor} 推进状态。 */
   @FunctionalInterface
   public interface A2aMessageRunner {
-    void run(String taskId, Message message, TaskEditor editor) throws Exception;
+    void run(String taskId, Message message, TaskEditor editor) throws A2AError;
   }
 
   /** 任务状态编辑句柄（runner 唯一推进入口；全部转移经状态机校验）。 */
@@ -111,10 +112,12 @@ public final class A2aTaskService implements AutoCloseable {
    */
   public Task sendMessage(Message message) {
     synchronized (lock) {
-      if (message.taskId() != null && !message.taskId().isBlank()) {
-        return continueMessageLocked(message.taskId(), message);
+      String incomingTaskId = message.taskId();
+      if (incomingTaskId != null && !incomingTaskId.isBlank()) {
+        return continueMessageLocked(incomingTaskId, message);
       }
       String taskId = java.util.UUID.randomUUID().toString();
+      String incomingContextId = message.contextId();
       // contextId 透传首条消息；缺失（null/空白）→ 生成 UUID——镜像 server-common RequestContext 的 coalesce
       // 语义（builder → message → generate，ListTasks 的 contextId 过滤因此成立）。偏差：官方对 "" 原样保留，
       // 但 spec Task 构造器断言 contextId 非空，且官方客户端把 wire 上的空 contextId 归一化为 null
@@ -123,15 +126,22 @@ public final class A2aTaskService implements AutoCloseable {
           Task.builder()
               .id(taskId)
               .contextId(
-                  message.contextId() == null || message.contextId().isBlank()
+                  incomingContextId == null || incomingContextId.isBlank()
                       ? java.util.UUID.randomUUID().toString()
-                      : message.contextId())
+                      : incomingContextId)
               .status(new TaskStatus(TaskState.TASK_STATE_SUBMITTED))
               .history(List.of(message))
               .build();
       store.put(task);
       notifySubscribers(task);
-      executor.execute(() -> runMessage(taskId, message));
+      // 执行器已关闭时任务已入库，不能把拒绝抛给 HTTP 层：合成 FAILED 并回读终态快照返回
+      try {
+        executor.execute(() -> runMessage(taskId, message));
+      } catch (RejectedExecutionException e) {
+        LOG.warn("执行器已关闭，任务未调度: {}", taskId, e);
+        failToState(taskId, TaskState.TASK_STATE_FAILED, "执行器已关闭，任务未调度");
+        return requireTask(taskId);
+      }
       return task;
     }
   }
@@ -146,7 +156,13 @@ public final class A2aTaskService implements AutoCloseable {
             .build();
     store.put(next);
     notifySubscribers(next);
-    executor.execute(() -> runMessage(taskId, message));
+    try {
+      executor.execute(() -> runMessage(taskId, message));
+    } catch (RejectedExecutionException e) {
+      LOG.warn("执行器已关闭，任务未调度: {}", taskId, e);
+      failToState(taskId, TaskState.TASK_STATE_FAILED, "执行器已关闭，任务未调度");
+      return requireTask(taskId);
+    }
     return next;
   }
 
@@ -256,8 +272,9 @@ public final class A2aTaskService implements AutoCloseable {
     }
     if (!metadata.isEmpty()) {
       Map<String, Object> merged = new HashMap<>();
-      if (current.metadata() != null) {
-        merged.putAll(current.metadata());
+      Map<String, Object> currentMetadata = current.metadata();
+      if (currentMetadata != null) {
+        merged.putAll(currentMetadata);
       }
       merged.putAll(metadata);
       builder.metadata(Map.copyOf(merged));
@@ -282,8 +299,9 @@ public final class A2aTaskService implements AutoCloseable {
   private Task appendArtifact(String taskId, Artifact artifact) {
     synchronized (lock) {
       Task current = store.get(taskId).orElseThrow(TaskNotFoundError::new);
+      List<Artifact> currentArtifacts = current.artifacts();
       List<Artifact> artifacts =
-          current.artifacts() == null ? new ArrayList<>() : new ArrayList<>(current.artifacts());
+          currentArtifacts == null ? new ArrayList<>() : new ArrayList<>(currentArtifacts);
       artifacts.add(artifact);
       Task next = Task.builder(current).artifacts(List.copyOf(artifacts)).build();
       store.put(next);
@@ -344,6 +362,18 @@ public final class A2aTaskService implements AutoCloseable {
 
   @Override
   public void close() {
+    // 快照在锁外取（避免持锁调 store.list）；先关停执行器，再把所有非终态任务合成 FAILED——
+    // 保证 close 之后不存在悬挂的非终态任务（订阅者观察到终态而非永久等待）
+    List<Task> snapshot = store.list(null, Integer.MAX_VALUE, 0);
     executor.shutdownNow();
+    for (Task task : snapshot) {
+      if (!task.status().state().isFinal()) {
+        try {
+          failToState(task.id(), TaskState.TASK_STATE_FAILED, "A2A 服务已关闭，任务强制失败");
+        } catch (RuntimeException e) {
+          LOG.warn("关闭时合成任务 FAILED 状态失败: {}", task.id(), e);
+        }
+      }
+    }
   }
 }

@@ -74,6 +74,16 @@ class A2aTaskServiceTest {
     throw new AssertionError("task " + taskId + " did not reach final state");
   }
 
+  /** runner 收窄为 {@code throws A2AError} 后，受检的 InterruptedException 在测试 runner 内就地包装。 */
+  private static void awaitRelease(CountDownLatch release) {
+    try {
+      release.await(5, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException(e);
+    }
+  }
+
   @Test
   void newTaskIsSubmittedWithMessageInHistoryThenRunsToCompletion() throws Exception {
     service(happyPath());
@@ -99,7 +109,7 @@ class A2aTaskServiceTest {
     service(
         (taskId, message, editor) -> {
           started.countDown();
-          release.await(5, TimeUnit.SECONDS);
+          awaitRelease(release);
           editor.transition(TaskState.TASK_STATE_COMPLETED);
         });
     Task first = service.sendMessage(USER_MSG);
@@ -152,7 +162,7 @@ class A2aTaskServiceTest {
     service(
         (taskId, message, editor) -> {
           started.countDown();
-          release.await(5, TimeUnit.SECONDS);
+          awaitRelease(release);
           // 取消后尝试推进 COMPLETED：状态机拒绝 → 合成失败被幂等跳过
           editor.transition(TaskState.TASK_STATE_COMPLETED);
         });
@@ -192,7 +202,7 @@ class A2aTaskServiceTest {
     service(
         (taskId, message, editor) -> {
           started.countDown();
-          release.await(5, TimeUnit.SECONDS);
+          awaitRelease(release);
           editor.transition(TaskState.TASK_STATE_WORKING);
           editor.transition(TaskState.TASK_STATE_COMPLETED);
         });

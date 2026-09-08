@@ -185,7 +185,11 @@ public final class A2aHttpServer implements AutoCloseable {
                   } catch (Throwable t) {
                     LOG.error("SSE 事件源异常中断", t);
                   } finally {
-                    queue.offer(END);
+                    try {
+                      queue.put(END);
+                    } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                    }
                   }
                 });
     try (OutputStream out = exchange.getResponseBody()) {
