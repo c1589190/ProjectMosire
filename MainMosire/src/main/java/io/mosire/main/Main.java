@@ -73,6 +73,7 @@ public final class Main {
         case "--port" -> config = withPort(config, Integer.parseInt(requireValue(args, ++i)));
         case "--data-dir" -> config = withDataDir(config, Path.of(requireValue(args, ++i)));
         case "--demo" -> config = withDemo(config, true);
+        case "--demo-message" -> config = withDemoMessage(config, requireValue(args, ++i));
         default -> {
           System.err.println("未知参数: " + args[i]);
           return 2;
@@ -104,6 +105,10 @@ public final class Main {
 
   private static BootConfig withDemo(BootConfig config, boolean demo) {
     return new BootConfig(config.port(), config.dataDir(), demo, "");
+  }
+
+  private static BootConfig withDemoMessage(BootConfig config, String message) {
+    return new BootConfig(config.port(), config.dataDir(), true, message);
   }
 
   private static int health() {
@@ -178,6 +183,7 @@ public final class Main {
              --port <n>      监听端口（默认 8080；0=自动分配）
              --data-dir <p>  数据目录（默认 .work/mosire）
              --demo          启动时先跑一条脚本问答（自检：事件入库）
+             --demo-message <t> 启动时跑指定内容的脚本问答
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）
