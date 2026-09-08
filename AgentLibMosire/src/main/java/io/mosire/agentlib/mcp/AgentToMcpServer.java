@@ -70,6 +70,10 @@ public final class AgentToMcpServer implements AutoCloseable {
    *
    * <p>实现：先枚举 Registry 快照注册初始工具，再 build 启动 transport——两阶段之间 Registry 变化的增量由 onChange 订阅兜底（sync 以
    * server 实况为基准做 diff，天然幂等）。
+   *
+   * <p><b>权限风险</b>：{@code caller} 的权限集决定经 MCP 暴露工具的执行身份（{@code tools/call} 即以该身份构造 {@link
+   * ToolContext} 过运行侧校验）。M3 接线时子 Agent 进程必须传入自身实际权限集；对外暴露面必须用收窄的 guest 只读集， 禁止照抄三参重载的默认 GUEST +
+   * unrestricted 组合。
    */
   public static AgentToMcpServer start(
       ToolRegistry registry, String serverName, String serverVersion, ToolContext caller) {
