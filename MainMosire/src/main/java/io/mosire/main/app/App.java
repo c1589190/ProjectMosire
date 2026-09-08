@@ -67,11 +67,7 @@ public final class App implements AutoCloseable {
             config.port(),
             () ->
                 StatusSnapshot.healthy(
-                    Version.ARTIFACT_ID,
-                    Version.VERSION,
-                    agentConfig.id(),
-                    System.currentTimeMillis(),
-                    events.count()));
+                    Version.ARTIFACT_ID, Version.VERSION, agentConfig.id(), events.count()));
 
     App app = new App(events, bus, runtime, http);
 

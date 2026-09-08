@@ -16,7 +16,7 @@ class AdminHttpServerTest {
   void servesHealthAndStatus() throws Exception {
     AdminHttpServer server =
         AdminHttpServer.start(
-            0, () -> StatusSnapshot.healthy(Version.ARTIFACT_ID, Version.VERSION, "main", 0, 7));
+            0, () -> StatusSnapshot.healthy(Version.ARTIFACT_ID, Version.VERSION, "main", 7));
     try (server) {
       assertThat(server.boundPort()).isGreaterThan(0);
       HttpClient client = HttpClient.newHttpClient();
@@ -48,7 +48,7 @@ class AdminHttpServerTest {
   void bindsLoopbackOnly() throws Exception {
     AdminHttpServer server =
         AdminHttpServer.start(
-            0, () -> StatusSnapshot.healthy(Version.ARTIFACT_ID, Version.VERSION, "main", 0, 0));
+            0, () -> StatusSnapshot.healthy(Version.ARTIFACT_ID, Version.VERSION, "main", 0));
     try (server) {
       InetAddress address = InetAddress.getByName("127.0.0.1");
       assertThat(address.isLoopbackAddress()).isTrue();
