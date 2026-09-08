@@ -144,6 +144,12 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>${maven-surefire-plugin.version}</version>
+          <configuration>
+            <!-- 实验机 1.6GB 内存：测试 fork 堆默认按物理内存 1/4（≈400m），与 Maven JVM
+                 （.mvn/jvm.config 256m）同时驻留即爆内存。固定 288m 堆 + 160m 元空间，
+                 单位级协议/网关测试富余（2026-09-09 实测通过，见 AgentLibMosire 单测）。 -->
+            <argLine>-Xmx288m -XX:MaxMetaspaceSize=160m</argLine>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
