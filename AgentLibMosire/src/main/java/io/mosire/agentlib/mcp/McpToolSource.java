@@ -43,8 +43,8 @@ import java.util.stream.Collectors;
  * }</pre>
  *
  * <p>生命周期：{@link #connect()} 幂等；{@code tools/list_changed} 变化经 {@link
- * McpClient.SyncSpec#toolsChangeConsumer} 捕获后刷新缓存快照，并触发 {@link #onChange} 的全部订阅者（消费方重读
- * {@link #listTools()} 获取新快照，在 Registry 上做增删增量）。
+ * McpClient.SyncSpec#toolsChangeConsumer} 捕获后刷新缓存快照，并触发 {@link #onChange} 的全部订阅者（消费方重读 {@link
+ * #listTools()} 获取新快照，在 Registry 上做增删增量）。
  */
 public final class McpToolSource implements ToolSource, AutoCloseable {
 
@@ -145,8 +145,8 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   }
 
   /**
-   * 订阅工具目录变化。回调无参数：消费方经 {@link #listTools()} 重读缓存快照（连接前订阅 → connect 尾基线触发；连接后订阅
-   * → 不回放当前快照，初始状态由消费方主动读取）。线程：可能在 SDK 通知线程回调，实现须快速返回、勿阻塞。
+   * 订阅工具目录变化。回调无参数：消费方经 {@link #listTools()} 重读缓存快照（连接前订阅 → connect 尾基线触发；连接后订阅 →
+   * 不回放当前快照，初始状态由消费方主动读取）。线程：可能在 SDK 通知线程回调，实现须快速返回、勿阻塞。
    */
   @Override
   public AutoCloseable onChange(Runnable listener) {
@@ -158,8 +158,8 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   /**
    * 当前 MCP server 的工具目录快照（映射为 AgentTool 列表，name 去重保序）。
    *
-   * <p>{@inheritDoc}：快照语义——返回缓存而非活查询。缓存于 {@link #connect()} 成功时建立基线，之后由 {@code
-   * tools/list_changed} 刷新；未连接时返回空列表。
+   * <p>{@inheritDoc}：快照语义——返回缓存而非活查询。缓存于 {@link #connect()} 成功时建立基线，之后由 {@code tools/list_changed}
+   * 刷新；未连接时返回空列表。
    */
   @Override
   public synchronized List<AgentTool> listTools() {

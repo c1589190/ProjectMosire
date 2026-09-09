@@ -47,6 +47,7 @@ public final class AgentToMcpServer implements AutoCloseable {
   private final ToolRegistry registry;
   private final ToolContext caller;
   private final McpSyncServer server;
+
   /** 暴露过滤器：命中才暴露（默认全量）。注册后修改无效——以 server 启动时的实例为准。 */
   private final Predicate<String> include;
 
@@ -90,8 +91,8 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
-   * 启动（带暴露过滤器）：只把 {@code include} 命中的 Registry 工具暴露给 MCP 客户端， 初始注册与后续 Registry 变更同步（{@code sync}）均按此过滤；
-   * 未命中的工具既不新增，也已在暴露面内则被移除。
+   * 启动（带暴露过滤器）：只把 {@code include} 命中的 Registry 工具暴露给 MCP 客户端， 初始注册与后续 Registry 变更同步（{@code
+   * sync}）均按此过滤； 未命中的工具既不新增，也已在暴露面内则被移除。
    *
    * <p>不传本重载的既有 {@code start} 系列保持全量暴露（默认 {@code name -> true}），行为不变。
    *
@@ -145,8 +146,8 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
-   * 供测试注入自定义 transport 并带暴露过滤器；语义与 {@link #startWith(ToolRegistry, String, String,
-   * ToolContext, McpServerTransportProvider)} 相同，仅初始注册与后续同步均以 {@code include} 收窄暴露面。
+   * 供测试注入自定义 transport 并带暴露过滤器；语义与 {@link #startWith(ToolRegistry, String, String, ToolContext,
+   * McpServerTransportProvider)} 相同，仅初始注册与后续同步均以 {@code include} 收窄暴露面。
    */
   static AgentToMcpServer startWith(
       ToolRegistry registry,

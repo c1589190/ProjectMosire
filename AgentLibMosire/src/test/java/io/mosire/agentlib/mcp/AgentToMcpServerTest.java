@@ -240,8 +240,7 @@ class AgentToMcpServerTest {
     }
     String content = readPidFileOrGone(pidFile);
     if (content != null) {
-      ProcessHandle.of(Long.parseLong(content.trim()))
-          .ifPresent(ProcessHandle::destroyForcibly);
+      ProcessHandle.of(Long.parseLong(content.trim())).ifPresent(ProcessHandle::destroyForcibly);
     }
   }
 

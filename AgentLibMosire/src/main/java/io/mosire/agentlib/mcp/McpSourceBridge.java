@@ -16,8 +16,8 @@ import org.slf4j.LoggerFactory;
 /**
  * 工具供给源（{@link ToolSource}，当前即 MCP 工具源）→ 本地 {@link ToolRegistry} 的实时同步桥（MCP 双向闭环的"入"侧）。
  *
- * <p>上游只负责连接与工具目录变更事件；本桥把它变成 Registry 的"活工具集"：bind 时回放当前快照完成初始注册， 之后每次变更事件触发
- * {@code sync()}，按名字做幂等 diff（多余的下架、缺的补上），close 时整组下架（恢复注册表原状）。
+ * <p>上游只负责连接与工具目录变更事件；本桥把它变成 Registry 的"活工具集"：bind 时回放当前快照完成初始注册， 之后每次变更事件触发 {@code sync()}，按名字做幂等
+ * diff（多余的下架、缺的补上），close 时整组下架（恢复注册表原状）。
  *
  * <p>时序：bridge 可在 {@code source.connect()} 前后 bind——未连接时 {@code listTools()} 快照为空（空 diff 为
  * no-op），连接后的基线/变更事件再驱动同步；diff 幂等所以重复触发无副作用。
@@ -71,9 +71,7 @@ public final class McpSourceBridge implements AutoCloseable {
     return new McpSourceBridge(source, registry, filter);
   }
 
-  /**
-   * 按名字 diff 同步（幂等）：读当前快照全集，先清后补，避免两个快照间同名工具"先移除再注册"的竞态（注册表拒绝重名）。
-   */
+  /** 按名字 diff 同步（幂等）：读当前快照全集，先清后补，避免两个快照间同名工具"先移除再注册"的竞态（注册表拒绝重名）。 */
   private void sync() {
     synchronized (lock) {
       if (closed) {
