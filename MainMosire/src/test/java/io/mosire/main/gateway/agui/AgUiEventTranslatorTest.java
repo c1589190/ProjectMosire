@@ -198,18 +198,24 @@ class AgUiEventTranslatorTest {
   }
 
   @Test
-  void runErrorCarriesStopReasonCodeAndMessage() {
+  void runErrorCarriesStopReasonCodeAndMessageOnly() {
     AgUiEvent error =
         new AgUiEventTranslator().runError("s-1", "s-1", StopReason.LLM_ERROR, "LLM 调用失败: x");
     assertThat(error.type()).isEqualTo("RUN_ERROR");
+    // 引用 schema：RunErrorEvent 仅 type/message/code/usage（unevaluatedProperties:false）——
+    // 帧不带 threadId/runId（评审 Important 2a）
     assertThat(error.fields())
-        .containsEntry("threadId", "s-1")
-        .containsEntry("runId", "s-1")
         .containsEntry("code", "LLM_ERROR")
-        .containsEntry("message", "LLM 调用失败: x");
+        .containsEntry("message", "LLM 调用失败: x")
+        .doesNotContainKey("threadId")
+        .doesNotContainKey("runId");
 
     AgUiEvent limit = new AgUiEventTranslator().runError("s-1", "s-1", StopReason.TURN_LIMIT, "0");
     assertThat(limit.fields()).containsEntry("code", "TURN_LIMIT");
+
+    // 无 StopReason 的 code 全权路径（NotScheduled/运行时异常——errorCode 不得被吞，评审 Minor 4）
+    AgUiEvent scheduled = new AgUiEventTranslator().runError("NOT_SCHEDULED", "会话未调度：chat 执行器已关停");
+    assertThat(scheduled.fields()).containsEntry("code", "NOT_SCHEDULED");
   }
 
   @Test

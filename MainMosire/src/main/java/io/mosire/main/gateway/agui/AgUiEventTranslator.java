@@ -9,6 +9,8 @@ import io.mosire.brain.runtime.StopReason;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * AG-UI 事件翻译层（D7：AG-UI 1.0 的变动只改这一层）——[Brain 事件词汇表] → [AG-UI 事件] 的纯映射。
@@ -30,11 +32,13 @@ import java.util.Map;
  * </ul>
  *
  * <p>会话级合成事件（运行桥终态——Brain 没有"回合结束"事件，终态由 {@link AgUiSessionRegistry} 从 TurnResult/StopReason
- * 合成）：{@link #runStarted}/{@link #runFinished}/{@link #runError}。全部字段对齐 schema：RUN_STARTED
+ * 合成）：{@link #runStarted}/{@link #runFinished}/{@link #runError}。帧形状对齐引用 schema：RUN_STARTED
  * {threadId, runId, protocolVersion="1.0", input}；RUN_FINISHED {threadId, runId, result}；RUN_ERROR
- * {threadId, runId, code=StopReason 名, message}。
+ * {code=StopReason 名, message}——RunErrorEvent 依据 schema 仅 type/message/code/usage，不携带 thread/run。
  */
 public final class AgUiEventTranslator {
+
+  private static final Logger LOG = LoggerFactory.getLogger(AgUiEventTranslator.class);
 
   /** W4 快速规格（计划 §5.2.2）要求的 AG-UI 客户端协议版本（Draft schema 快照）。 */
   public static final String PROTOCOL_VERSION = "1.0";
@@ -60,6 +64,7 @@ public final class AgUiEventTranslator {
     // 显式不映射：agent.lifecycle（主 AgentRuntime / SubagentManager 双生产者——D7 边界）、decision
     // （终态由 TurnResult 合成，不采用事件驱动）、permission.denied（管线 {tool,reason} 与子 Agent spawn 拒绝
     // {template,childId,reason} 两种形态）、子 Agent 事件族（P2 暂缓，且保证不泄漏进主会话流）
+    LOG.debug("AG-UI 翻译层忽略事件类型: {} (agent={}, seq={})", type, event.agent(), event.seq());
     return List.of();
   }
 
@@ -87,14 +92,17 @@ public final class AgUiEventTranslator {
   /** 会话级合成（回合未完成——StopReason≠FINISHED 即错误路径，计划 §5.2.2：RUN_ERROR 承载停止原因）。 */
   public AgUiEvent runError(String threadId, String runId, StopReason reason, String message) {
     String code = reason == null ? "RUNTIME_EXCEPTION" : reason.name();
-    return runError(threadId, runId, code, message);
+    return runError(code, message);
   }
 
-  /** 会话级合成（无 StopReason 的异常路径——如执行器已关闭、管线意外异常）。 */
-  public AgUiEvent runError(String threadId, String runId, String code, String message) {
+  /**
+   * 会话级合成（无 StopReason 的异常路径——如执行器已关闭、管线意外异常，code 由调用方给出/errorCode 全权。
+   *
+   * <p>帧形状对齐引用 schema：RunErrorEvent 只声明 type/message/code/usage（unevaluatedProperties:false， 严格校验会拒
+   * threadId/runId 等额外键）→ 不携带 thread/run 字段。
+   */
+  public AgUiEvent runError(String code, String message) {
     Map<String, Object> fields = new LinkedHashMap<>();
-    fields.put("threadId", threadId);
-    fields.put("runId", runId);
     fields.put("code", code);
     fields.put("message", message == null ? "" : message);
     return new AgUiEvent("RUN_ERROR", fields);

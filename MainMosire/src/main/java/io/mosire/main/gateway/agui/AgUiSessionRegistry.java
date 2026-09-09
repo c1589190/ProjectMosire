@@ -28,8 +28,9 @@ import org.slf4j.LoggerFactory;
  * TurnResult}/{@link StopReason} 合成：FINISHED → RUN_FINISHED（result= finalText），否则 →
  * RUN_ERROR（code=StopReason 名；message 尽量带 decision.detail 的 reason）。
  *
- * <p><b>会话隔离</b>：主 Agent 事件在 EventStore 里没有 correlationId，因此按"agent=main + seq 区段 [floor,
- * ceiling)"过滤：floor 在运行入场时捕获、ceiling 在退场时捕获；主 Agent 运行经<b>共享单线程 chat 执行器</b>（与 A2A 同一实例——{@code
+ * <p><b>会话隔离</b>：主 Agent 事件在 EventStore 里没有 correlationId，因此按"agent=main + seq 开区间 （floor,
+ * ceiling］"过滤：floor 在运行入场时捕获（= 入场前末 seq——是<b>上一运行</b>的末事件，排他边界： {@code seq > floor}
+ * 才是本会话的第一个事件）、ceiling 在退场时捕获（= 退场后末 seq，闭边界）；主 Agent 运行经<b>共享单线程 chat 执行器</b>（与 A2A 同一实例——{@code
  * AgentPipeline.history} 实例级共享且非线程安全，串行化即不变量） 串行化，其它运行的 seq 必然落在区间之外。子 Agent 事件族（agent=子 id）与主
  * Agent 上的 spawn 拒绝形态 （agent=main、correlationId=子 id）由翻译层显式过滤（{@link AgUiEventTranslator#translate}
  * 空表）。
@@ -88,8 +89,10 @@ public final class AgUiSessionRegistry implements AutoCloseable {
       throw new DuplicateSessionException(id);
     }
     List<Object> rawMessages = rawMessages(request.get("messages"));
+    // RUN_STARTED.input 回显 = RunAgentInput 最小形状（threadId + runId + messages——schema 的 runId 必填）
     Map<String, Object> input = new LinkedHashMap<>();
     input.put("threadId", id);
+    input.put("runId", id);
     input.put("messages", rawMessages);
     AgUiSession session = new AgUiSession(id, userText, input);
     AgUiSession raced = sessions.putIfAbsent(id, session);
@@ -100,8 +103,10 @@ public final class AgUiSessionRegistry implements AutoCloseable {
     try {
       chatExecutor.execute(() -> runSession(session));
     } catch (RejectedExecutionException e) {
-      // 关停窗：执行器已拒绝（A2A 任务服务先关停共享执行器——关停语义见 App.close 说明）
+      // 关停窗：执行器已拒绝（A2A 任务服务先关停共享执行器——关停语义见 App.close 说明）；
+      // errorCode 必须完整走 RUN_ERROR（terminalEvent 取用顺序：stopReason → errorCode —— 见 AgUiHttpServer）
       session.finish(AgUiSession.Status.ERROR, null, "NOT_SCHEDULED", "会话未调度：chat 执行器已关停", "");
+      session.signal(AgUiSession.TERMINAL);
       LOG.warn("AG-UI 会话未调度（执行器已关停）: {}", id);
     }
     return session;
@@ -144,13 +149,19 @@ public final class AgUiSessionRegistry implements AutoCloseable {
     session.signal(AgUiSession.TERMINAL);
   }
 
-  /** 从 [floor, ceiling) 的 decision 事件里捞停止原因的 detail（尽力而为——没有也不阻塞 RUN_ERROR）。 */
+  /**
+   * 从（floor, ceiling］的 decision 事件里捞停止原因的 detail（尽力而为——没有也不阻塞 RUN_ERROR）。
+   *
+   * <p>{@code beforeSeq = ceiling + 1}——decision（及一切事件）的末 seq == ceiling（count = 末 seq 的存储模型），
+   * beforeSeq 排他语义下用 ceiling 会把**最后一个** decision 事件（LLM_ERROR/TURN_LIMIT 正是管线返回前最后 emit 的）永远挡在窗外。
+   */
   private String reasonDetail(AgUiSession session, StopReason stopReason) {
     if (stopReason == null) {
       return null;
     }
     for (Event event :
-        events.query(new EventQuery("main", "decision", "", session.ceiling(), REASON_LOOKBACK))) {
+        events.query(
+            new EventQuery("main", "decision", "", session.ceiling() + 1, REASON_LOOKBACK))) {
       if (event.seq() < session.floor()) {
         break;
       }

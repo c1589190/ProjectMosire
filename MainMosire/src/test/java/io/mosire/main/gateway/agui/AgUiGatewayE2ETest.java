@@ -235,6 +235,11 @@ class AgUiGatewayE2ETest {
       assertThat(frames.get(0).get("threadId").asText()).isEqualTo("s1");
       assertThat(frames.get(0).get("runId").asText()).isEqualTo("s1");
       assertThat(frames.get(0).get("protocolVersion").asText()).isEqualTo("1.0");
+      // RUN_STARTED.input = RunAgentInput 最小回显（threadId+runId+messages——schema runId 必填，评审
+      // Important 2b）
+      assertThat(frames.get(0).get("input").get("threadId").asText()).isEqualTo("s1");
+      assertThat(frames.get(0).get("input").get("runId").asText()).isEqualTo("s1");
+      assertThat(frames.get(0).get("input").has("messages")).isTrue();
       assertThat(frames.get(1).get("toolCallName").asText()).isEqualTo("echo");
       assertThat(frames.get(2).get("delta").asText()).isEqualTo("{\"x\":1}");
       assertThat(frames.get(4).get("content").asText()).contains("ECHO");
@@ -288,6 +293,59 @@ class AgUiGatewayE2ETest {
       assertThat(frameTypes(frames)).containsExactly("RUN_STARTED", "RUN_ERROR");
       assertThat(frames.get(1).get("code").asText()).isEqualTo("LLM_ERROR");
       assertThat(frames.get(1).get("message").asText()).contains("LLM_ERROR");
+    }
+  }
+
+  @Test
+  void rejectedRunKeepsNotScheduledErrorCodeInRunError() throws Exception {
+    try (Fixture f =
+        new Fixture(FakeLlmClient.with(LlmResponse.text("x")), new ToolRegistry(), tempDir)) {
+      // 关停窗：共享执行器已 shutdownNow → 新 POST 被拒 → 会话终态 NOT_SCHEDULED（评审 Minor 4：
+      // 该 code 不得被默认 RUNTIME_EXCEPTION 吞掉）
+      f.chatExecutor.shutdownNow();
+      post(
+          f.baseUrl(),
+          "{\"threadId\":\"s6\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+      awaitStatus(f, "s6", AgUiSession.Status.ERROR);
+
+      HttpResponse<String> resp = events(f.baseUrl(), "s6");
+      List<JsonNode> frames = dataFrames(resp.body());
+      assertThat(frameTypes(frames)).containsExactly("RUN_STARTED", "RUN_ERROR");
+      assertThat(frames.get(1).get("code").asText()).isEqualTo("NOT_SCHEDULED");
+      assertThat(frames.get(1).get("message").asText()).contains("chat 执行器已关停");
+    }
+  }
+
+  @Test
+  void previousRunOnSameStoreDoesNotLeakIntoNewSessionStream() throws Exception {
+    try (Fixture f =
+        new Fixture(
+            FakeLlmClient.with(LlmResponse.text("先序回答"), LlmResponse.text("会话回答")),
+            new ToolRegistry(),
+            tempDir)) {
+      // 同 store 先跑"先前运行"（模拟先前 demo/A2A 回合——共享执行器串行化前的末事件
+      // 即 floor=count=先前末 seq 的 off-by-one 场景：seq == floor 属上一运行，不得入窗）
+      f.runtime.chat("第一回合");
+      long priorFloor = f.store.count();
+      assertThat(priorFloor).isGreaterThanOrEqualTo(1); // 前置：确有先前事件
+
+      post(
+          f.baseUrl(),
+          "{\"threadId\":\"s5\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+      awaitStatus(f, "s5", AgUiSession.Status.COMPLETED);
+
+      HttpResponse<String> resp = events(f.baseUrl(), "s5");
+      List<JsonNode> frames = dataFrames(resp.body());
+      // 首帧 RUN_STARTED + 精确 5 帧——先前运行的 turn（seq==floor）帧零泄漏
+      assertThat(frames.get(0).get("type").asText()).isEqualTo("RUN_STARTED");
+      assertThat(frameTypes(frames))
+          .containsExactly(
+              "RUN_STARTED",
+              "TEXT_MESSAGE_START",
+              "TEXT_MESSAGE_CONTENT",
+              "TEXT_MESSAGE_END",
+              "RUN_FINISHED");
+      assertThat(frames.get(2).get("delta").asText()).isEqualTo("会话回答");
     }
   }
 

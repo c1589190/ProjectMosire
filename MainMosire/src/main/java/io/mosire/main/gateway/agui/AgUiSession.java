@@ -9,8 +9,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * AG-UI 会话（一次 POST /sessions = 一次运行；sessionId = threadId = runId——W4 一回合模型）。
  *
- * <p>事件隔离模型：本会话的事件只来自主 Agent（agent="main"），且 seq 落在 {@link #floor()}（运行入场时捕获）到 {@link
- * #ceiling()}（运行退场时捕获）之间——主 Agent 运行经共享单线程 chat 执行器串行化（见 {@link AgUiSessionRegistry}），任何其它运行的 seq
+ * <p>事件隔离模型：本会话的事件只来自主 Agent（agent="main"），且 seq 落在半开区间（{@link #floor()}， {@link
+ * #ceiling()}］内（floor=run 入场前末 seq、ceiling=run 退场后末 seq——seq = count 的存储模型下 floor
+ * 是**上一个运行的末事件**，必须排他）——主 Agent 运行经共享单线程 chat 执行器串行化（见 {@link AgUiSessionRegistry}），任何其它运行的 seq
  * 必然落在本区间之外，因此"agent 过滤 + seq 区段"双保险即会话隔离。
  *
  * <p>流订阅模型：同一时刻最多一个 SSE 订阅者（{@link #attachStream()} CAS）；{@link #signal(Object)} 只 offer
@@ -122,15 +123,25 @@ public final class AgUiSession {
     this.finalText = finalText == null ? "" : finalText;
   }
 
-  /** 订阅 SSE 流（同一时刻一个订阅者；false = 已被订阅 → 服务器回 409）。 */
-  boolean attachStream() {
-    return stream.compareAndSet(null, new LinkedBlockingQueue<>());
+  /**
+   * 订阅 SSE 流（同一时刻一个订阅者）；返回本订阅者的唤醒队列（{@code null} = 已被订阅 → 服务器回 409）。
+   *
+   * <p>返回的队列由订阅者持有并轮询；只用于"自己这一支流"——重连既不共享队列也不被他人队列干扰。
+   */
+  BlockingQueue<Object> attachStream() {
+    BlockingQueue<Object> queue = new LinkedBlockingQueue<>();
+    return stream.compareAndSet(null, queue) ? queue : null;
   }
 
-  void detachStream() {
-    stream.set(null);
+  /**
+   * 退订：仅当当前注册队列仍是本订阅者的队列才清除（CAS）——防止"本流迟到的 detach 清掉重连者新队列" （重连竞态：旧流 finally 先于新流 attach
+   * 落地时，清的是新流的注册→新流只能自旋轮询）。
+   */
+  void detachStream(BlockingQueue<Object> queue) {
+    stream.compareAndSet(queue, null);
   }
 
+  /** 当前活动订阅者队列（驱逐/诊断用；{@code null} = 无人订阅）。 */
   BlockingQueue<Object> streamOrNull() {
     return stream.get();
   }

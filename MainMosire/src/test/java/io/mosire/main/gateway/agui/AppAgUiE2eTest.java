@@ -169,6 +169,8 @@ class AppAgUiE2eTest {
     App app = App.start(bootConfig(), FakeLlmClient.with(LlmResponse.text("x")));
     try {
       assertThat(events(aguiBase(app), "ghost").statusCode()).isEqualTo(404);
+      // 语法坏 JSON（JsonProcessingException）→ 400（评审 Important 3：且不得悬挂无响应）
+      assertThat(post(aguiBase(app), "{not-json").statusCode()).isEqualTo(400);
       assertThat(post(aguiBase(app), "{\"threadId\":\"no-messages\"}").statusCode()).isEqualTo(400);
       assertThat(
               post(aguiBase(app), "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hi\"}]}")

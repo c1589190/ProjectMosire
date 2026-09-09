@@ -95,8 +95,11 @@ public final class AgUiHttpServer implements AutoCloseable {
   }
 
   /**
-   * 关闭（优雅，同 A2aHttpServer 推论）：{@code HttpServer.stop(1)}——先停接入，再给在途 SSE 写帧循环 1 秒排空； 配合 App.close
-   * 的顺序（AG-UI 网关于共享 chat 执行器关停之前），在途流能写完终态帧再断开。
+   * 关闭（优雅，同 A2aHttpServer 推论）：{@code HttpServer.stop(1)}——先停接入，再给在途 SSE 写帧循环 1 秒排空。
+   *
+   * <p>（实际关停次序，与 App.close 一致）共享 chat 执行器先被 A2A 任务服务 {@code shutdownNow}——在途 AG-UI 回合被中断、 运行桥 catch
+   * 后立即置 RUN_ERROR 终态并送 TERMINAL 信号；随后本网关 {@code stop(1)} 给在途流排空窗口，窗口内流收终态帧写完。 窗口过后未送达的客户端经重连从
+   * EventStore 重放 + 会话记录终态收齐（见 App.close Javadoc）。
    */
   @Override
   public void close() {
@@ -143,7 +146,8 @@ public final class AgUiHttpServer implements AutoCloseable {
         throw new IllegalArgumentException("请求体必须是 JSON 对象");
       }
       request = JSON.convertValue(parsed, new TypeReference<Map<String, Object>>() {});
-    } catch (IllegalArgumentException e) {
+    } catch (IOException | IllegalArgumentException e) {
+      // JsonProcessingException（语法坏 JSON）同属 IOException——两者都必须是 400（契约：坏 JSON 见 §4）
       respondError(exchange, 400, "请求体不是合法 JSON 对象");
       return;
     }
@@ -180,14 +184,15 @@ public final class AgUiHttpServer implements AutoCloseable {
       exchange.close();
       return;
     }
-    if (!session.attachStream()) {
+    BlockingQueue<Object> streamQueue = session.attachStream();
+    if (streamQueue == null) {
       respondError(exchange, 409, "该会话的 /events 已有一个订阅者（同一时刻仅一个）");
       return;
     }
     exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
     exchange.getResponseHeaders().set("Cache-Control", "no-store");
     exchange.sendResponseHeaders(200, 0);
-    streamLoop(exchange, session);
+    streamLoop(exchange, session, streamQueue);
   }
 
   /**
@@ -195,7 +200,8 @@ public final class AgUiHttpServer implements AutoCloseable {
    * 幂等）。终态（RUN_FINISHED/RUN_ERROR）写出后即断流（计划 §5.2.2："终态收尾"；客户端以流结束为 一回合结束，重连从 EventStore
    * 重放）。循环结构（每迭代）：catch-up（floor/ceiling 最近值）→ 终态检查 → 空闲轮询。
    */
-  private void streamLoop(HttpExchange exchange, AgUiSession session) {
+  private void streamLoop(
+      HttpExchange exchange, AgUiSession session, BlockingQueue<Object> streamQueue) {
     String id = session.id();
     EventBus.Subscription subscription = bus.subscribe(event -> session.signal(AgUiSession.WAKEUP));
     long lastSent = -1L;
@@ -216,14 +222,12 @@ public final class AgUiHttpServer implements AutoCloseable {
           out.flush();
           break;
         }
-        BlockingQueue<Object> queue = session.streamOrNull();
-        if (queue != null) {
-          try {
-            queue.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-          } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            break;
-          }
+        // 空轮询只在本订阅者队列上（自始捕获——重连者另建队列，互不干扰；不存在"队列为 null 自旋"）
+        try {
+          streamQueue.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break;
         }
         // 超时/唤醒都回到 catch-up（幂等；信号丢失安全）
       }
@@ -232,11 +236,12 @@ public final class AgUiHttpServer implements AutoCloseable {
       LOG.info("AG-UI SSE 流断开: {} ({})", id, e.getMessage());
     } finally {
       subscription.close();
-      session.detachStream();
+      // 仅当注册队列仍是自己这支流的队列才清（CAS）——重连竞态：晚到的 detach 不得清掉新订阅者的队列
+      session.detachStream(streamQueue);
     }
   }
 
-  /** 回写 [floor, ceiling) 区间内新事件（DESC 分页回读 → 升序写出；seq 去重由 minSeq 游标保证）。 */
+  /** 回写（floor, ceiling］区间内新事件（DESC 分页回读 → 升序写出；seq 去重由 minSeq 游标保证）。 */
   private long writeCatchup(OutputStream out, AgUiSession session, long lastSent)
       throws IOException {
     for (Event event : readCatchup(session)) {
@@ -251,7 +256,12 @@ public final class AgUiHttpServer implements AutoCloseable {
     return lastSent;
   }
 
-  /** 按代理序分页回读会话窗口内（agent=main、seq∈[floor, ceiling)）的事件并升序归整。 */
+  /**
+   * 按代理序分页回读会话窗口内（agent=main、seq∈(floor, ceiling］）的事件并升序归整。
+   *
+   * <p>（评审 Minor 9 记录项，不修）每迭代全窗回读 = O(N×window) 的信号爆发路径（N=窗口事件数、window=迭代次数）； W4 一回合窗口极小（≤数十条）且迭代受
+   * 300ms 轮询/终态收敛约束，量级无害；留作后续"增量游标 + seq 订阅"优化。
+   */
   private List<Event> readCatchup(AgUiSession session) {
     long floor = session.floor();
     long ceiling = session.ceiling();
@@ -264,7 +274,8 @@ public final class AgUiHttpServer implements AutoCloseable {
       }
       long minSeq = page.get(page.size() - 1).seq();
       for (Event event : page) {
-        if (event.seq() >= floor) {
+        // floor 排他（seq == floor 属上一运行的末事件——AUTOINCREMENT 且无删除时 count == 末 seq）
+        if (event.seq() > floor) {
           collected.add(event);
         }
       }
@@ -277,12 +288,19 @@ public final class AgUiHttpServer implements AutoCloseable {
     return collected;
   }
 
-  /** 终态事件（会话记录合成：COMPLETED → RUN_FINISHED；ERROR → RUN_ERROR——code=StopReason 名）。 */
+  /**
+   * 终态事件（会话记录合成：COMPLETED → RUN_FINISHED；ERROR → RUN_ERROR）。
+   *
+   * <p>RUN_ERROR 的 code 取用顺序：{@code stopReason} 名 → {@code errorCode}（StopReason 缺失时由运行桥/注册表指定
+   * ——如关停窗的 NOT_SCHEDULED，避免被吞成默认 RUNTIME_EXCEPTION）→ 兜底 RUNTIME_EXCEPTION。
+   */
   private AgUiEvent terminalEvent(AgUiSession session) {
     String id = session.id();
-    return session.status() == AgUiSession.Status.COMPLETED
-        ? translator.runFinished(id, id, session.finalText())
-        : translator.runError(id, id, session.stopReason(), session.errorMessage());
+    if (session.status() == AgUiSession.Status.COMPLETED) {
+      return translator.runFinished(id, id, session.finalText());
+    }
+    String code = session.stopReason() != null ? session.stopReason().name() : session.errorCode();
+    return translator.runError(code == null ? "RUNTIME_EXCEPTION" : code, session.errorMessage());
   }
 
   private static String sessionIdOf(String path) {
