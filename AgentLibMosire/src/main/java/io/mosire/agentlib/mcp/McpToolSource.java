@@ -13,6 +13,7 @@ import io.modelcontextprotocol.spec.McpTransportSessionNotFoundException;
 import io.mosire.agentlib.plugin.ToolSource;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolResult;
+import io.mosire.agentlib.tool.ToolResultTruncator;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +55,13 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   /** 请求超时默认值——与 {@link McpServerLinkConfig} 的缺省一致。 */
   private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(60);
 
+  /**
+   * 单次工具结果输出上限（字符数）：成功路径拼装文本经 {@link ToolResultTruncator#truncate} 截到此值（Token 经济：
+   * 工具结果污染治理）。默认 {@link ToolResultTruncator#DEFAULT_MAX_CHARS}；不放 {@link McpServerLinkConfig}
+   * ——record 加字段会波及两模块全部构造点，且接管形态（{@link #McpToolSource(String)}）无 config，源级字段对两种形态统一。
+   */
+  private volatile int maxOutputChars = ToolResultTruncator.DEFAULT_MAX_CHARS;
+
   private final String name;
   private final McpServerLinkConfig config;
   private McpSyncClient client;
@@ -85,6 +93,17 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   /** 源名（日志与审计用）。 */
   public String name() {
     return name;
+  }
+
+  /**
+   * 设置单次工具结果输出上限（字符数），须为正数；影响此后所有调用的成功路径（错误路径永不截断，见 {@link
+   * #map(McpSchema.CallToolResult, int)}）。
+   */
+  public void setMaxOutputChars(int maxOutputChars) {
+    if (maxOutputChars <= 0) {
+      throw new IllegalArgumentException("maxOutputChars 必须为正数: " + maxOutputChars);
+    }
+    this.maxOutputChars = maxOutputChars;
   }
 
   /** 拉起子进程并完成 MCP 握手；幂等（已连接则直接返回）。 */
@@ -199,7 +218,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
       }
       return ToolResult.error(McpWireCode.MCP_TOOL_ERROR, remoteFailureMessage(remoteFailure, e));
     }
-    return map(result);
+    return map(result, maxOutputChars);
   }
 
   /**
@@ -228,8 +247,19 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
     return "MCP 远程调用失败: " + detail;
   }
 
-  /** CallToolResult → ToolResult（文本内容拼接；isError 映射为错误码）。 */
+  /** CallToolResult → ToolResult（文本内容拼接；isError 映射为错误码），输出上限用默认值。 */
   static ToolResult map(McpSchema.CallToolResult result) {
+    return map(result, ToolResultTruncator.DEFAULT_MAX_CHARS);
+  }
+
+  /**
+   * CallToolResult → ToolResult（文本内容拼接；isError 映射为错误码）。
+   *
+   * <p>成功路径的拼装文本经 {@link ToolResultTruncator#truncate} 截到 {@code maxOutputChars}（Token 经济：工具
+   * 结果污染治理，Codex 头尾保留先例）；错误路径不解码不截断——带内错误码标记与错误消息必须原样送达，截断会破坏码
+   * 语义或掩盖根因。
+   */
+  static ToolResult map(McpSchema.CallToolResult result, int maxOutputChars) {
     String text =
         result.content() == null
             ? ""
@@ -239,11 +269,11 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
                         content instanceof McpSchema.TextContent t ? t.text() : content.toString())
                 .collect(Collectors.joining("\n"));
     if (Boolean.TRUE.equals(result.isError())) {
-      // 带内错误码（mosire 间约定）：无标记 → 通用码，见 McpWireCode
+      // 带内错误码（mosire 间约定）：无标记 → 通用码，见 McpWireCode；原样解码，绝不截断
       String[] codeAndMessage = McpWireCode.decode(text, "MCP 工具调用失败");
       return ToolResult.error(codeAndMessage[0], codeAndMessage[1]);
     }
-    return ToolResult.ok(text);
+    return ToolResult.ok(ToolResultTruncator.truncate(text, maxOutputChars));
   }
 
   private synchronized McpSyncClient requireConnected() {

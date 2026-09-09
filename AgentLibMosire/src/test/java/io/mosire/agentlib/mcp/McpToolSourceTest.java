@@ -10,6 +10,7 @@ import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
+import io.mosire.agentlib.tool.ToolResultTruncator;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -69,6 +70,66 @@ class McpToolSourceTest {
     assertThat(mappedError.success()).isFalse();
     assertThat(mappedError.code()).isEqualTo("MCP_TOOL_ERROR");
     assertThat(mappedError.message()).isEqualTo("炸了");
+  }
+
+  @Test
+  void capsLargeOkResultToMaxOutputChars() {
+    String body = "abc".repeat(10_000); // 30000 字符，单行
+    McpSchema.CallToolResult ok =
+        new McpSchema.CallToolResult(
+            List.of(McpSchema.TextContent.builder(body).build()), false, null, Map.of());
+
+    ToolResult capped = McpToolSource.map(ok, 500);
+    assertThat(capped.success()).isTrue();
+    assertThat(capped.message().length()).isLessThanOrEqualTo(500);
+    assertThat(capped.message()).startsWith("Warning: 输出被截断（原始 30000 字符 / 1 行）");
+
+    // 默认上限 = DEFAULT_MAX_CHARS（未显式传参的重载）
+    ToolResult defaulted = McpToolSource.map(ok);
+    assertThat(defaulted.message().length()).isLessThanOrEqualTo(ToolResultTruncator.DEFAULT_MAX_CHARS);
+    assertThat(defaulted.message()).startsWith("Warning: 输出被截断（原始 30000 字符 / 1 行）");
+  }
+
+  @Test
+  void errorPathInBandMessageIsNeverTruncated() {
+    String bigMessage = "炸了-".repeat(5000) + "末尾标记";
+    McpSchema.CallToolResult inBand =
+        new McpSchema.CallToolResult(
+            List.of(McpSchema.TextContent.builder("[mosire:code=BOOM]\n" + bigMessage).build()),
+            true,
+            null,
+            Map.of());
+    ToolResult mapped = McpToolSource.map(inBand, 10); // 上限极小也不得影响错误路径
+    assertThat(mapped.success()).isFalse();
+    assertThat(mapped.code()).isEqualTo("BOOM");
+    assertThat(mapped.message()).isEqualTo(bigMessage);
+
+    String raw = "raw-error-".repeat(5000);
+    McpSchema.CallToolResult generic =
+        new McpSchema.CallToolResult(
+            List.of(McpSchema.TextContent.builder(raw).build()), true, null, Map.of());
+    ToolResult mappedGeneric = McpToolSource.map(generic, 10);
+    assertThat(mappedGeneric.code()).isEqualTo("MCP_TOOL_ERROR");
+    assertThat(mappedGeneric.message()).isEqualTo(raw);
+  }
+
+  @Test
+  void capsLiveToolOutputThroughCallRemote(@TempDir Path tempDir) throws Exception {
+    Path pidFile = tempDir.resolve("cap-echo.pid");
+    Path quitMarker = tempDir.resolve("cap-echo-quit");
+    McpServerLinkConfig config = echoServerConfig(pidFile, quitMarker);
+    try (McpToolSource source = new McpToolSource(config)) {
+      source.setMaxOutputChars(100);
+      source.connect();
+      AgentTool echo = findTool(source.listTools(), "echo");
+      ToolResult result = echo.execute(contextWith("w".repeat(5000)));
+      assertThat(result.success()).isTrue();
+      assertThat(result.message().length()).isLessThanOrEqualTo(100);
+      assertThat(result.message()).startsWith("Warning: 输出被截断");
+    } finally {
+      Files.writeString(quitMarker, "q");
+      waitForExit(pidFile);
+    }
   }
 
   @Test
