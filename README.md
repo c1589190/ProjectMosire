@@ -32,6 +32,6 @@
 |---|---|---|
 | M0 | 仓库与构建骨架 | ✅ 完成（`./mvnw verify` 全绿） |
 | M1 | 骨架 + 主循环 demo（FakeLlmClient 一回合） | ✅ 完成（`./mvnw verify` 全绿；`java -jar MainMosire/target/mosire.jar run --demo` 一回合事件入库、curl /health OK） |
-| M2 | MCP 双向 + A2A server/client + AG-UI SSE 子集 + 子 Agent 子进程 | 进行中（MCP 双向、A2A server/client 已实现并通过互操作测试；AG-UI、子 Agent 编排未开始——缺口与波次见 `开发计划-中期.md`） |
+| M2 | MCP 双向 + A2A server/client + AG-UI SSE 子集 + 子 Agent 子进程 | ✅ 完成（MCP 双向、A2A server/client 互操作、AG-UI SSE 子集、子 Agent 子进程编排均已实现；三模块 188 测试全绿；一键离线验收：`scripts/smoke.sh`；全量 `./mvnw verify` 仅剩既有 SpotBugs 告警——AgentLib 3 + Brain 4 + Main 10，均非本次改动引入，见 `开发计划-中期.md` §二 R2） |
 | M3 | 自管理闭环 + 事件存储 + 记忆 + skills | 未开始（拆解为 M3-A/B/C/D，见 `开发计划-中期.md` §三） |
 | M4 | 后续：MCP 3.0 评估、ACP、jlink/AppCDS、OTel | 未开始 |
