@@ -60,6 +60,9 @@ public final class AgentPipeline {
   /** 会话历史（不含 system 头，进程内累积，供下一回合原样回灌）；ConversationStore 持久化在 M3 接入。 */
   private final List<LlmMessage> history = new ArrayList<>();
 
+  /** 取消请求标志（volatile 保证跨线程可见；只在 run() 入口重置——取消只对"正在跑的回合"生效）。 */
+  private volatile boolean cancelled;
+
   public AgentPipeline(
       AgentConfig config,
       LlmClient llm,
@@ -82,12 +85,24 @@ public final class AgentPipeline {
   }
 
   /**
+   * 请求取消当前运行中的回合（幂等、线程安全）。
+   *
+   * <p>不做硬中断——进行中的 LLM 调用与工具执行照常完成，管线在下一个检查点（循环顶/工具执行前） 就地以 {@link StopReason#CANCELLED}
+   * 终止，终止前保存历史供后续对话回灌。无运行中的回合时调用是空操作 （标志在 {@link #run(String)} 入口重置）。
+   */
+  public void cancel() {
+    cancelled = true;
+  }
+
+  /**
    * 跑一回合：用户输入 →（LLM 循环 + 工具调用）→ 终止。
    *
    * <p>约定：方法是同步的（网络/子进程调用在工具内自行发生）；回合间共享 {@code history} （一个 Agent 实例的连续对话）。
    */
   public TurnResult run(String userMessage) {
     Objects.requireNonNull(userMessage, "userMessage");
+    // 上一次回合的取消请求到此为止：cancel() 只对当时正在跑的回合负责
+    cancelled = false;
 
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
@@ -102,6 +117,11 @@ public final class AgentPipeline {
     String finalText = "";
 
     while (true) {
+      if (cancelled) {
+        emitDecision("CANCELLED", Map.of());
+        saveHistory(messages);
+        return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
+      }
       if (turns >= config.maxTurns()) {
         emitDecision("TURN_LIMIT", Map.of("maxTurns", config.maxTurns()));
         saveHistory(messages);
@@ -176,6 +196,11 @@ public final class AgentPipeline {
       }
 
       for (ContentPart.ToolCall call : toolCalls) {
+        if (cancelled) {
+          emitDecision("CANCELLED", Map.of());
+          saveHistory(messages);
+          return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
+        }
         totalToolCalls++;
         executeToolCall(messages, call);
       }
@@ -185,7 +210,7 @@ public final class AgentPipeline {
   /**
    * 把本回合的消息序列剥离 system 头后存入历史（依赖 assembler 契约"第一条必为 system"）。
    *
-   * <p>六条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR）都必须先经过这里再
+   * <p>七条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR/CANCELLED）都必须先经过这里再
    * return——否则下一回合回灌的历史残缺，Agent 就会失忆。
    */
   private void saveHistory(List<LlmMessage> messages) {

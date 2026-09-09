@@ -13,5 +13,7 @@ public enum StopReason {
   /** 超出 token 配额（计划 D10）。 */
   QUOTA,
   /** LLM 调用失败（网络/协议/供应商错误），管线优雅终止而非异常穿透。 */
-  LLM_ERROR
+  LLM_ERROR,
+  /** 被外部取消（下一个检查点就地终止；不中断进行中的 LLM/工具调用，历史已保存可续聊）。 */
+  CANCELLED
 }

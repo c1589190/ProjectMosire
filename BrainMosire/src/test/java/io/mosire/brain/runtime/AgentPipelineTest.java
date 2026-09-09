@@ -27,6 +27,10 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -303,6 +307,89 @@ class AgentPipelineTest {
     assertThat(pipeline.lastHistory()).isNotEmpty();
   }
 
+  /**
+   * 运行中取消：另一线程在第二次 LLM 调用挂起期间调用 {@code runtime.cancel()} → 管线在下一个检查点 （工具执行前）就地 CANCELLED 终止；历史已保存、
+   * 取消点之后不再执行任何工具调用，且随后的 chat 照常工作（回灌被保存的历史）。
+   */
+  @Test
+  void cancelMidRunStopsAtNextCheckpointAndKeepsHistory() throws Exception {
+    AgentConfig config = AgentConfig.builder("main").maxTurns(5).build();
+    ToolRegistry registry = new ToolRegistry();
+    AtomicInteger executed = new AtomicInteger();
+    registry.register(echoTool(executed));
+    GateLlmClient llm = new GateLlmClient();
+    llm.enqueue(LlmResponse.toolCall("c-1", "echo", Map.of("text", "a")));
+    // 放行后本会返回第二个工具调用，但取消检查点在 executeToolCall 之前——不得执行
+    llm.enqueue(LlmResponse.toolCall("c-2", "echo", Map.of("text", "b")));
+    llm.enqueue(LlmResponse.text("恢复后回答"));
+    AgentRuntime runtime =
+        new AgentRuntime(
+            config,
+            llm,
+            registry,
+            new ToolExecutionGuard(),
+            new BasicContextAssembler(),
+            store,
+            bus,
+            AgentPermissionSet.builder(AccessToken.DEFAULT).allowAll().build());
+
+    AtomicReference<TurnResult> captured = new AtomicReference<>();
+    Thread worker = new Thread(() -> captured.set(runtime.chat("帮我回显")));
+    worker.start();
+    try {
+      assertThat(llm.enteredSecondCall.await(5, TimeUnit.SECONDS)).isTrue();
+      runtime.cancel();
+      runtime.cancel(); // 幂等：重复调用必须无害
+    } finally {
+      llm.releaseSecondCall.countDown();
+    }
+    worker.join(5000);
+    assertThat(worker.isAlive()).isFalse();
+    assertThat(captured.get()).as("chat 线程应正常返回 TurnResult").isNotNull();
+
+    TurnResult cancelled = captured.get();
+    assertThat(cancelled.stopReason()).isEqualTo(StopReason.CANCELLED);
+    assertThat(cancelled.turns()).isEqualTo(2);
+    assertThat(cancelled.toolCalls()).isEqualTo(1); // c-1 已执行，c-2 被检查点拦下
+    assertThat(executed.get()).isEqualTo(1);
+    assertThat(query(EventTypes.DECISION))
+        .anySatisfy(e -> assertThat(e.payload()).contains("CANCELLED"));
+
+    // 取消只结束当前回合：后续 chat 正常完成，并回灌被保存的历史（user + 助手 c-1 往返 + 悬空 c-2 现场）
+    TurnResult resumed = runtime.chat("再问一句");
+    assertThat(resumed.stopReason()).isEqualTo(StopReason.FINISHED);
+    assertThat(llm.requests).hasSize(3);
+    List<LlmMessage> replayed = llm.requests.get(2).messages();
+    assertThat(replayed).hasSize(6);
+    assertThat(replayed.get(0).role()).isEqualTo(LlmMessage.ROLE_SYSTEM);
+    assertThat(replayed.get(1).role()).isEqualTo(LlmMessage.ROLE_USER);
+    assertThat(replayed.get(2).role()).isEqualTo(LlmMessage.ROLE_ASSISTANT);
+    assertThat(replayed.get(3).role()).isEqualTo(LlmMessage.ROLE_TOOL);
+    assertThat(replayed.get(4).role()).isEqualTo(LlmMessage.ROLE_ASSISTANT);
+    assertThat(replayed.get(5).role()).isEqualTo(LlmMessage.ROLE_USER);
+    assertThat(textOf(replayed.get(5))).isEqualTo("再问一句");
+    runtime.close();
+  }
+
+  /** 空闲期 cancel() 无害：取消标志在 run() 入口重置，只对"正在跑的回合"生效，后续 chat 完全正常。 */
+  @Test
+  void cancelWhileIdleIsHarmlessAndNextChatWorksNormally() {
+    AgentConfig config = AgentConfig.builder("main").build();
+    FakeLlmClient llm = FakeLlmClient.with(LlmResponse.text("正常回答"));
+    AgentRuntime runtime =
+        new AgentRuntime(config, llm, new ToolRegistry(), store, bus, AgentPermissionSet.system());
+
+    runtime.cancel();
+    runtime.cancel(); // 幂等
+
+    TurnResult result = runtime.chat("在吗");
+
+    assertThat(result.stopReason()).isEqualTo(StopReason.FINISHED);
+    assertThat(result.turns()).isEqualTo(1);
+    assertThat(llm.calls()).isEqualTo(1);
+    runtime.close();
+  }
+
   private java.util.List<Event> query(String type) {
     return store.query(new EventQuery("", type, "", -1, 100));
   }
@@ -351,7 +438,48 @@ class AgentPipelineTest {
     }
   }
 
+  /** 第 2 次 chat 调用会挂起、等测试线程取消后放行的脚本桩（FakeLlmClient 无挂起能力，运行中取消 需要确定的同步点）；同时记录请求供回灌断言。 */
+  private static final class GateLlmClient implements LlmClient {
+
+    final CountDownLatch enteredSecondCall = new CountDownLatch(1);
+    final CountDownLatch releaseSecondCall = new CountDownLatch(1);
+
+    private final Deque<LlmResponse> script = new ArrayDeque<>();
+    private final List<LlmRequest> requests = new ArrayList<>();
+
+    void enqueue(LlmResponse response) {
+      script.addLast(response);
+    }
+
+    @Override
+    public LlmResponse chat(LlmRequest request) {
+      requests.add(request);
+      if (requests.size() == 2) {
+        enteredSecondCall.countDown();
+        boolean released = false;
+        try {
+          released = releaseSecondCall.await(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        if (!released) {
+          throw new LlmException("GateLlmClient 第二次调用未被放行（取消检查点未生效？）");
+        }
+      }
+      LlmResponse response = script.pollFirst();
+      if (response == null) {
+        throw new LlmException("GateLlmClient 脚本已耗空");
+      }
+      return response;
+    }
+  }
+
   private static AgentTool echoTool() {
+    return echoTool(null);
+  }
+
+  /** 带执行计数的 echo 工具（取消断言用：取消点之后的调用不得执行）。 */
+  private static AgentTool echoTool(AtomicInteger counter) {
     return new AgentTool() {
       @Override
       public String name() {
@@ -360,6 +488,9 @@ class AgentPipelineTest {
 
       @Override
       public ToolResult execute(ToolContext context) {
+        if (counter != null) {
+          counter.incrementAndGet();
+        }
         return ToolResult.ok("echo: " + context.arguments().getOrDefault("text", ""));
       }
     };

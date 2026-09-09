@@ -99,6 +99,16 @@ public final class AgentRuntime implements AutoCloseable {
     return pipeline.run(userMessage);
   }
 
+  /**
+   * 请求取消当前运行中的 {@link #chat}（转发给主循环，幂等、线程安全）。
+   *
+   * <p>不硬中断进行中的 LLM/工具调用：管线在下一个检查点以 {@link StopReason#CANCELLED} 就地终止， 历史已保存，后续 {@link #chat}
+   * 可正常继续。无运行中的回合时调用是空操作，详见 {@link AgentPipeline#cancel()}。
+   */
+  public void cancel() {
+    pipeline.cancel();
+  }
+
   public AgentConfig config() {
     return config;
   }
