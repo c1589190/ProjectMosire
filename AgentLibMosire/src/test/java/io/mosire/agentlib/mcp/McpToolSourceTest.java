@@ -10,7 +10,9 @@ import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
+import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -222,19 +224,30 @@ class McpToolSourceTest {
   private static void waitForExit(Path pidFile) throws Exception {
     long deadline = System.currentTimeMillis() + 10_000;
     while (System.currentTimeMillis() < deadline) {
-      if (!Files.exists(pidFile) || Files.readString(pidFile).isBlank()) {
+      String content = readPidFileOrGone(pidFile);
+      if (content == null || content.isBlank()) {
         return;
       }
-      long pid = Long.parseLong(Files.readString(pidFile).trim());
+      long pid = Long.parseLong(content.trim());
       if (ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)) {
         Thread.sleep(50);
         continue;
       }
       return;
     }
-    if (Files.exists(pidFile)) {
-      long pid = Long.parseLong(Files.readString(pidFile).trim());
-      ProcessHandle.of(pid).ifPresent(ProcessHandle::destroyForcibly);
+    String content = readPidFileOrGone(pidFile);
+    if (content != null) {
+      ProcessHandle.of(Long.parseLong(content.trim()))
+          .ifPresent(ProcessHandle::destroyForcibly);
+    }
+  }
+
+  /** 读取 pid 文件内容；文件不存在（含读取途中被退出的子进程删除）返回 null——避免 exists/read 竞态。 */
+  private static String readPidFileOrGone(Path pidFile) throws IOException {
+    try {
+      return Files.readString(pidFile);
+    } catch (NoSuchFileException e) {
+      return null;
     }
   }
 
