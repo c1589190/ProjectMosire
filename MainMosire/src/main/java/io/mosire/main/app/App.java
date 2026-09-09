@@ -36,6 +36,8 @@ import io.mosire.main.gateway.a2a.A2aTaskService;
 import io.mosire.main.gateway.a2a.EventStoreA2aTaskStore;
 import io.mosire.main.gateway.agui.AgUiHttpServer;
 import io.mosire.main.gateway.agui.AgUiSessionRegistry;
+import io.mosire.main.gateway.debug.DebugChatHttpServer;
+import io.mosire.main.gateway.debug.DebugChatService;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
@@ -103,6 +105,8 @@ public final class App implements AutoCloseable {
   private final A2aTaskService a2aTaskService;
   private final AgUiHttpServer aguiServer;
   private final AgUiSessionRegistry aguiRegistry;
+  private final DebugChatService debugChatService;
+  private final DebugChatHttpServer debugChatServer;
 
   /** W3b 子 Agent 编排（templatesDir 未配置时为 null——进程内无该能力）。 */
   private final SubagentManager subagentManager;
@@ -151,6 +155,8 @@ public final class App implements AutoCloseable {
     A2aTaskService a2aTaskService = null;
     AgUiHttpServer aguiServer = null;
     AgUiSessionRegistry aguiRegistry = null;
+    DebugChatService debugChatService = null;
+    DebugChatHttpServer debugChatServer = null;
     ExecutorService chatExecutor = null;
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
@@ -210,6 +216,10 @@ public final class App implements AutoCloseable {
               events,
               bus);
 
+      // P2-1 Task 3：调试对话——与 A2A/AG-UI 共用同一 chat 执行器（串行化不变量），HTTP 面恒绑 127.0.0.1
+      debugChatService = new DebugChatService(runtime, chatExecutor);
+      debugChatServer = DebugChatHttpServer.start(config.debugPort(), debugChatService);
+
       App app =
           new App(
               events,
@@ -223,6 +233,8 @@ public final class App implements AutoCloseable {
               a2aTaskService,
               aguiServer,
               aguiRegistry,
+              debugChatService,
+              debugChatServer,
               subagentManager,
               subagentProcesses);
 
@@ -245,6 +257,12 @@ public final class App implements AutoCloseable {
       }
       if (a2aTaskService != null) {
         a2aTaskService.close();
+      }
+      if (debugChatServer != null) {
+        debugChatServer.close();
+      }
+      if (debugChatService != null) {
+        debugChatService.close();
       }
       if (chatExecutor != null) {
         chatExecutor.shutdownNow();
@@ -380,6 +398,8 @@ public final class App implements AutoCloseable {
       A2aTaskService a2aTaskService,
       AgUiHttpServer aguiServer,
       AgUiSessionRegistry aguiRegistry,
+      DebugChatService debugChatService,
+      DebugChatHttpServer debugChatServer,
       SubagentManager subagentManager,
       SubprocessManager subagentProcesses) {
     this.events = events;
@@ -393,6 +413,8 @@ public final class App implements AutoCloseable {
     this.a2aTaskService = a2aTaskService;
     this.aguiServer = aguiServer;
     this.aguiRegistry = aguiRegistry;
+    this.debugChatService = debugChatService;
+    this.debugChatServer = debugChatServer;
     this.subagentManager = subagentManager;
     this.subagentProcesses = subagentProcesses;
   }
@@ -430,6 +452,11 @@ public final class App implements AutoCloseable {
     return aguiServer.port();
   }
 
+  /** 调试对话网关实际监听端口（恒绑 127.0.0.1；0 = 自动分配场景下由调用方取实际值）。 */
+  public int debugPort() {
+    return debugChatServer.port();
+  }
+
   /** 子 Agent 实例快照（按实例 id 升序；未装配子 Agent 编排时为空表）。 */
   public List<SubagentInstance> subagents() {
     return subagentManager == null ? List.of() : subagentManager.list();
@@ -458,11 +485,13 @@ public final class App implements AutoCloseable {
     }
     closed = true;
     LOG.info(
-        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 事件存储 checkpoint");
+        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 调试对话 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 事件存储 checkpoint");
     closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
     closeQuietly("A2A 网关", () -> a2aServer.close());
     closeQuietly("AG-UI 网关", () -> aguiServer.close());
     closeQuietly("AG-UI 会话注册表", () -> aguiRegistry.close());
+    closeQuietly("调试对话服务", debugChatServer::close);
+    closeQuietly("调试对话", debugChatService::close);
     closeQuietly("AdminREST 网关", () -> http.close());
     closeQuietly(
         "MCP 暴露",

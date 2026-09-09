@@ -15,6 +15,8 @@ import java.util.Objects;
  * 编排——不装配 SubagentManager，子命令 {@code agent} 仅在装配了这一能力的进程内可用）。
  *
  * <p>W4 新增：{@code aguiHost}/{@code aguiPort}（AG-UI 网关绑定地址/端口，默认同 A2A：127.0.0.1 + 空闲端口）。
+ *
+ * <p>P2-1 Task 3 新增：{@code debugPort}（调试对话网关端口，默认 0 = 空闲端口自动分配，绑定恒为 127.0.0.1）。
  */
 public record BootConfig(
     int port,
@@ -27,7 +29,8 @@ public record BootConfig(
     int a2aPort,
     Path templatesDir,
     String aguiHost,
-    int aguiPort) {
+    int aguiPort,
+    int debugPort) {
 
   public static final Path DEFAULT_DATA_DIR = Path.of(".work/mosire");
 
@@ -42,6 +45,9 @@ public record BootConfig(
 
   /** AG-UI 网关默认端口：0 = 空闲端口自动分配。 */
   public static final int DEFAULT_AGUI_PORT = 0;
+
+  /** 调试对话网关默认端口：0 = 空闲端口自动分配（绑定恒为 127.0.0.1）。 */
+  public static final int DEFAULT_DEBUG_PORT = 0;
 
   /** 子 Agent 模板目录默认位置（{@code <cwd>/configs/agents/<id>.json}，中期计划 W3 约定）。 */
   public static final Path DEFAULT_TEMPLATES_DIR = Path.of("configs", "agents");
@@ -81,7 +87,8 @@ public record BootConfig(
         a2aPort,
         templatesDir,
         DEFAULT_AGUI_HOST,
-        DEFAULT_AGUI_PORT);
+        DEFAULT_AGUI_PORT,
+        DEFAULT_DEBUG_PORT);
   }
 
   public BootConfig {
@@ -97,10 +104,24 @@ public record BootConfig(
     if (aguiPort < 0 || aguiPort > 65535) {
       throw new IllegalArgumentException("AG-UI 端口越界: " + aguiPort);
     }
+    if (debugPort < 0 || debugPort > 65535) {
+      throw new IllegalArgumentException("调试端口越界: " + debugPort);
+    }
   }
 
   public static BootConfig defaults() {
     return new BootConfig(
-        8080, DEFAULT_DATA_DIR, false, "", null, true, DEFAULT_A2A_HOST, DEFAULT_A2A_PORT);
+        8080,
+        DEFAULT_DATA_DIR,
+        false,
+        "",
+        null,
+        true,
+        DEFAULT_A2A_HOST,
+        DEFAULT_A2A_PORT,
+        null,
+        DEFAULT_AGUI_HOST,
+        DEFAULT_AGUI_PORT,
+        DEFAULT_DEBUG_PORT);
   }
 }
