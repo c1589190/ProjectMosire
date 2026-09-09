@@ -166,12 +166,18 @@ public final class App implements AutoCloseable {
       AgentRuntime runtime =
           new AgentRuntime(
               agentConfig, scriptedLlm(config, llmOverride), tools, events, bus, permissionSet);
+      // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
+      // 相同的入参形态）
+      SubagentManager subagentSource = subagentManager;
       AdminHttpServer http =
           AdminHttpServer.start(
               config.port(),
               () ->
                   StatusSnapshot.healthy(
-                      Version.ARTIFACT_ID, Version.VERSION, agentConfig.id(), events.count()));
+                      Version.ARTIFACT_ID, Version.VERSION, agentConfig.id(), events.count()),
+              () -> subagentSource == null ? List.of() : subagentSource.list(),
+              () -> tools.list().stream().map(AgentTool::name).toList(),
+              events::query);
 
       // W2 步骤 3：A2A 接入——状态存储=EventStore（Task 快照）+ runner 桥 → 主 Agent chat；
       // 任务执行串行化（Rul B：不引入并发任务——单线程执行器 + Pipeline history 实例级共享（非线程安全），串行即不变量）；

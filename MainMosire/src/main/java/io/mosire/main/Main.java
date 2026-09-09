@@ -4,9 +4,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
+import io.mosire.agentlib.llm.FakeLlmClient;
+import io.mosire.agentlib.llm.LlmClient;
+import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.main.agent.SubagentProcessMain;
 import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
+import io.mosire.main.app.FakeLlmScript;
 import java.nio.file.Path;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -69,6 +73,8 @@ public final class Main {
 
   private static int run(String[] args) throws InterruptedException {
     BootConfig config = BootConfig.defaults();
+    boolean fake = false;
+    String fakeScript = null;
     for (int i = 1; i < args.length; i++) {
       switch (args[i]) {
         case "--port" -> config = withPort(config, Integer.parseInt(requireValue(args, ++i)));
@@ -85,13 +91,23 @@ public final class Main {
             config = withAguiPort(config, Integer.parseInt(requireValue(args, ++i)));
         case "--templates-dir" ->
             config = withTemplatesDir(config, Path.of(requireValue(args, ++i)));
+        case "--fake" -> fake = true;
+        case "--fake-script" -> fakeScript = requireValue(args, ++i);
         default -> {
           System.err.println("未知参数: " + args[i]);
           return 2;
         }
       }
     }
-    App app = App.start(config);
+    if (fake && fakeScript != null) {
+      throw new IllegalArgumentException("--fake 与 --fake-script 不能同时指定");
+    }
+    // W5：离线 LLM 显式声明面——smoke.sh 断言"断网可测"；非 demo 默认即 FakeLlm（App.scriptedLlm），显式开关是明示
+    LlmClient llmOverride =
+        fakeScript != null
+            ? FakeLlmScript.parse(fakeScript)
+            : fake ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY)) : null;
+    App app = App.start(config, llmOverride);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
         "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d%s%s%n",
@@ -396,6 +412,9 @@ public final class Main {
              --agui-address <h>  AG-UI 网关绑定地址（默认 127.0.0.1；对外打开须显式配置）
              --agui-port <n>    AG-UI 网关端口（默认 0 = 空闲端口自动分配）
              --templates-dir <p> 子 Agent 模板目录（configs/agents；缺省不启用编排）
+             --fake          显式启用离线假 LLM（FakeLlmClient 骨架回复；不触任何网络）
+             --fake-script <s> 离线脚本 LLM：分号分隔步骤，text:<回复> 或 tool:<工具>:<args JSON>；
+                               args 字符串值 $spawnedId 替换为最近一次 spawn_sub_agent 结果实例 id
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）
