@@ -134,6 +134,7 @@ public final class AgentPipeline {
       }
 
       LlmResponse response;
+      long startedNanos = System.nanoTime();
       try {
         response = llm.chat(new LlmRequest(List.copyOf(messages), toolsDefs(tools)));
       } catch (io.mosire.agentlib.llm.LlmException e) {
@@ -142,7 +143,26 @@ public final class AgentPipeline {
         saveHistory(messages);
         return new TurnResult(StopReason.LLM_ERROR, turns, totalToolCalls, finalText);
       }
+      long latencyMs = Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
       turns++;
+      // llm.call 记账（D18）在配额判定之前落库：超限终止也不能丢"这次调用确实发生了"的事实
+      emit(
+          EventTypes.LLM_CALL,
+          Map.of(
+              "inputTokens",
+              response.inputTokens(),
+              "outputTokens",
+              response.outputTokens(),
+              "cacheReadTokens",
+              response.cacheReadTokens(),
+              "cacheWriteTokens",
+              response.cacheWriteTokens(),
+              "model",
+              response.model(),
+              "latencyMs",
+              latencyMs,
+              "turns",
+              turns));
       if (quota != null) {
         try {
           quota.record(response.inputTokens(), response.outputTokens());

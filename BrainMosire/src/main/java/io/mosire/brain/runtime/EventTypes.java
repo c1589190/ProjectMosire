@@ -13,6 +13,13 @@ public final class EventTypes {
   /** 一次 LLM 回合。payload: {@code {"turns":1,"input":"...","output":"..."}}。 */
   public static final String CONVERSATION_TURN = "conversation.turn";
 
+  /**
+   * 一次成功 LLM 调用的记账（D18：token 经济走 EventStore，不走 OTel）。payload: {@code
+   * {"inputTokens":..,"outputTokens":..,"cacheReadTokens":..,"cacheWriteTokens":..,"model":"..",
+   * "latencyMs":..,"turns":..}}；未知 token 记 {@code -1}。
+   */
+  public static final String LLM_CALL = "llm.call";
+
   /** 一次工具调用（请求）。payload: {@code {"tool":"...","args":{...}}}。 */
   public static final String TOOL_CALL = "tool.call";
 

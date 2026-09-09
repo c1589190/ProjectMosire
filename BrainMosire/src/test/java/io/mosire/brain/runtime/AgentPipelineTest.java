@@ -67,12 +67,80 @@ class AgentPipelineTest {
     assertThat(result.stopReason()).isEqualTo(StopReason.FINISHED);
     assertThat(result.turns()).isEqualTo(1);
     assertThat(result.finalText()).hasValue("你好，我在。");
-    // 事件链：lifecycle(started) + conversation.turn
-    assertThat(store.count()).isEqualTo(2);
+    // 事件链：lifecycle(started) + llm.call + conversation.turn
+    assertThat(store.count()).isEqualTo(3);
     assertThat(query(EventTypes.CONVERSATION_TURN)).hasSize(1);
     assertThat(query(EventTypes.AGENT_LIFECYCLE)).hasSize(1);
 
     runtime.close();
+  }
+
+  /**
+   * llm.call 记账事件（D18）：每次成功的 LLM 调用落一条，带 input/output token 与缓存 token—— token 经济的 EventStore
+   * 底座，供应商上报真实数值时如实入库（FakeLlmClient 脚本可直接构造带用量的响应）。
+   */
+  @Test
+  void llmCallEventLandsWithTokenAccountingPerCall() {
+    AgentConfig config = AgentConfig.builder("main").build();
+    LlmResponse usage =
+        new LlmResponse(
+            LlmMessage.assistant(List.of(new ContentPart.Text("回答"))), "gpt-test", 120, 45, 90, 30);
+    FakeLlmClient llm = FakeLlmClient.with(usage);
+    AgentPipeline pipeline =
+        new AgentPipeline(
+            config,
+            llm,
+            new ToolRegistry(),
+            new ToolExecutionGuard(),
+            new BasicContextAssembler(),
+            store,
+            bus,
+            AgentPermissionSet.system().grantedToken(),
+            AgentPermissionSet.system());
+
+    TurnResult result = pipeline.run("记账一次");
+
+    assertThat(result.stopReason()).isEqualTo(StopReason.FINISHED);
+    List<Event> calls = query(EventTypes.LLM_CALL);
+    assertThat(calls).hasSize(1);
+    String payload = calls.get(0).payload();
+    assertThat(payload)
+        .contains("\"inputTokens\":120")
+        .contains("\"outputTokens\":45")
+        .contains("\"cacheReadTokens\":90")
+        .contains("\"cacheWriteTokens\":30")
+        .contains("\"model\":\"gpt-test\"")
+        .contains("\"latencyMs\":")
+        .contains("\"turns\":1");
+  }
+
+  /** 供应商不报用量时（UNKNOWN_TOKENS=-1）llm.call 仍如实入库，不编造 0。 */
+  @Test
+  void llmCallEventKeepsUnknownTokensAsIs() {
+    AgentConfig config = AgentConfig.builder("main").build();
+    FakeLlmClient llm = FakeLlmClient.with(LlmResponse.text("不知道用量"));
+    AgentPipeline pipeline =
+        new AgentPipeline(
+            config,
+            llm,
+            new ToolRegistry(),
+            new ToolExecutionGuard(),
+            new BasicContextAssembler(),
+            store,
+            bus,
+            AgentPermissionSet.system().grantedToken(),
+            AgentPermissionSet.system());
+
+    pipeline.run("随便问");
+
+    List<Event> calls = query(EventTypes.LLM_CALL);
+    assertThat(calls).hasSize(1);
+    String payload = calls.get(0).payload();
+    assertThat(payload)
+        .contains("\"inputTokens\":" + LlmResponse.UNKNOWN_TOKENS)
+        .contains("\"outputTokens\":" + LlmResponse.UNKNOWN_TOKENS)
+        .contains("\"cacheReadTokens\":" + LlmResponse.UNKNOWN_TOKENS)
+        .contains("\"cacheWriteTokens\":" + LlmResponse.UNKNOWN_TOKENS);
   }
 
   @Test
