@@ -10,6 +10,7 @@ import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.main.agent.SubagentProcessMain;
 import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
+import io.mosire.main.app.ContextReport;
 import io.mosire.main.app.FakeLlmScript;
 import java.nio.file.Path;
 import java.time.format.DateTimeFormatter;
@@ -20,8 +21,8 @@ import java.util.Map;
  * 入口/CLI 分发（手写子命令分派——决策 D3：不引 CLI 框架，保持零依赖）。
  *
  * <p>子命令：{@code run}（M1：网关守护 + --demo 自检回合）、{@code health}（当前进程自检）、 {@code events}（查看本地事件库尾部，便于无
- * sqlite3 环境验收）、{@code agent}（W3b：子 Agent stdio 进程形态——runtime + MCP client，无网关）、 {@code
- * doctor}/{@code config}（M3 实现）。
+ * sqlite3 环境验收）、{@code context}（llm.call token 记账汇总，D18 Token Economy 可观测）、 {@code agent}（W3b：子
+ * Agent stdio 进程形态——runtime + MCP client，无网关）、 {@code doctor}/{@code config}（M3 实现）。
  */
 public final class Main {
 
@@ -57,6 +58,8 @@ public final class Main {
         return health();
       case "events":
         return events(args);
+      case "context":
+        return context(args);
       case "agent":
         return agent(args);
       case "doctor":
@@ -422,6 +425,31 @@ public final class Main {
     }
   }
 
+  /** context 子命令：llm.call 记账 token 汇总（D18 Token Economy 可观测）。 */
+  private static int context(String[] args) {
+    Path dataDir = BootConfig.DEFAULT_DATA_DIR;
+    for (int i = 1; i < args.length; i += 2) {
+      if (i + 1 >= args.length) {
+        System.err.println("context 参数成对出现: --data-dir <dir>");
+        return 2;
+      }
+      switch (args[i]) {
+        case "--data-dir" -> dataDir = Path.of(args[i + 1]);
+        default -> {
+          System.err.println("未知参数: " + args[i]);
+          return 2;
+        }
+      }
+    }
+    try (SqliteEventStore store = SqliteEventStore.open(dataDir.resolve("events.db"))) {
+      System.out.print(ContextReport.render(store));
+      return 0;
+    } catch (Exception e) {
+      System.err.println("统计 LLM 调用 token 失败: " + e.getMessage());
+      return 1;
+    }
+  }
+
   private static void usage() {
     // 占位符 + replace 而非 %s + formatted：文本块是普通字符串，避免 SpotBugs VA_FORMAT_STRING_USES_NEWLINE（改用 %n
     // 的提醒）
@@ -452,6 +480,8 @@ public final class Main {
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）
              --limit <n>     显示条数（默认 10）
+          context         查看 LLM 调用 token 统计（llm.call 事件汇总）
+             --data-dir <p>  数据目录（默认 .work/mosire）
           agent           W3b 子 Agent stdio 进程形态（runtime + MCP client；无网关）
              --id <id>       实例 id（必填，父装配层生成）
              --template <t>  模板 id（必填）
