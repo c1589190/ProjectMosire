@@ -1,5 +1,6 @@
 package io.mosire.main.app;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -126,7 +127,13 @@ public final class App implements AutoCloseable {
     return start(config, llmOverride, List.of());
   }
 
-  /** 启动（额外工具注入入口——测试注入 echo 等演示工具用；{@code extraTools} 在主 Agent 工具面与 MCP 暴露快照之前注册）。 */
+  /**
+   * 启动（额外工具注入入口——测试注入 echo 等演示工具用；{@code extraTools} 在主 Agent 工具面与 MCP 暴露快照之前注册）。
+   *
+   * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装配失败=快速失败契约（端口占用/坏配置等一律 RuntimeException 原样上抛， 由
+   * CLI（Main）以非零退出与 stderr 呈现——既有 M0/M1 启动语义）；中间已回收启动期网关/进程资源后重抛，无更窄的异常类型。
+   */
+  @SuppressFBWarnings("THROWS_METHOD_THROWS_RUNTIMEEXCEPTION")
   public static App start(BootConfig config, LlmClient llmOverride, List<AgentTool> extraTools) {
     try {
       Files.createDirectories(config.dataDir());

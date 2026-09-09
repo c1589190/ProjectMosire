@@ -41,6 +41,14 @@
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
     </dependency>
+    <!-- SpotBugs 抑制注解：按设计意图持有注入对象（jsonMapper/管道流）的告警标记（编译期仅为注解）；
+         与 BrainMosire 同款（见 BrainMosire/pom.xml 对应条目） -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>

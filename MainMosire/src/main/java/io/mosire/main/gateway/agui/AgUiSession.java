@@ -1,5 +1,6 @@
 package io.mosire.main.gateway.agui;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.brain.runtime.StopReason;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -146,7 +147,14 @@ public final class AgUiSession {
     return stream.get();
   }
 
-  /** 队列信号（offer 不等待——R8 教训：put 在关闭窗可用中断标志、迟到不再唤醒；信号丢失由超时回读兜底）。 */
+  /**
+   * 队列信号（offer 不等待——R8 教训：put 在关闭窗可用中断标志、迟到不再唤醒；信号丢失由超时回读兜底）。
+   *
+   * <p>RV_RETURN_VALUE_IGNORED_BAD_PRACTICE 抑制：无界 {@link LinkedBlockingQueue} 上 {@code offer}
+   * 必成功；且该处的语义是"尽力唤醒" （信号是 best-effort、丢失/迟到无害——流循环 300ms 超时回读兜底，见 AgUiHttpServer.streamLoop）——若改用
+   * {@code put} 等待 会被中断标志卡在关闭窗（R8 实测教训）。
+   */
+  @SuppressFBWarnings("RV_RETURN_VALUE_IGNORED_BAD_PRACTICE")
   void signal(Object marker) {
     BlockingQueue<Object> queue = stream.get();
     if (queue != null) {

@@ -2,6 +2,7 @@ package io.mosire.main.gateway.a2a;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.main.gateway.a2a.A2aJsonRpcHandler.Outcome;
 import io.mosire.main.gateway.a2a.A2aJsonRpcHandler.Outcome.Single;
 import io.mosire.main.gateway.a2a.A2aJsonRpcHandler.Outcome.Stream;
@@ -171,7 +172,14 @@ public final class A2aHttpServer implements AutoCloseable {
     }
   }
 
-  /** SSE 写帧（handler 线程）：从无界队列逐帧写 {@code data:/id:}，END 哨兵后关闭；客户端断连则中断生产者。 */
+  /**
+   * SSE 写帧（handler 线程）：从无界队列逐帧写 {@code data:/id:}，END 哨兵后关闭；客户端断连则中断生产者。
+   *
+   * <p>RV_RETURN_VALUE_IGNORED_BAD_PRACTICE 抑制（END 哨兵 {@code offer}）：无界 {@link LinkedBlockingQueue}
+   * 必成功； 且 {@code put} 的 {@code lockInterruptibly()} 会把"已中断线程"判为失败——R8 关停时在途 runner 线程带 {@code
+   * shutdownNow} 的中断标记投帧，若用 {@code put} 会丢终态帧（订阅者只见断连不见收尾）——offer 不检查中断是 R8 教训的既有设计。
+   */
+  @SuppressFBWarnings("RV_RETURN_VALUE_IGNORED_BAD_PRACTICE")
   private static void writeSse(HttpExchange exchange, Stream stream) throws IOException {
     StreamSource source = stream.source();
     BlockingQueue<String> queue = new LinkedBlockingQueue<>();

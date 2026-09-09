@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -199,7 +200,12 @@ public final class AgUiHttpServer implements AutoCloseable {
    * SSE 写帧循环：EventBus 订阅仅作"唤醒信号"，有序数据从 EventStore 回读（订阅丢失/信号迟到都无害——回读 catch-up
    * 幂等）。终态（RUN_FINISHED/RUN_ERROR）写出后即断流（计划 §5.2.2："终态收尾"；客户端以流结束为 一回合结束，重连从 EventStore
    * 重放）。循环结构（每迭代）：catch-up（floor/ceiling 最近值）→ 终态检查 → 空闲轮询。
+   *
+   * <p>RV_RETURN_VALUE_IGNORED 抑制（{@code poll} 等待）：队列元素仅为唤醒令牌（{@link AgUiSession#WAKEUP}）或超时 {@code
+   * null}——poll 的语义就是"定时等到一个唤醒或超时"，两者都回到 catch-up 而无须消费返回内容 （唤醒信号丢失/迟到无害——catch-up 幂等）；若改用 {@code
+   * take} 会失去"定时回到 catch-up"的能力。
    */
+  @SuppressFBWarnings("RV_RETURN_VALUE_IGNORED")
   private void streamLoop(
       HttpExchange exchange, AgUiSession session, BlockingQueue<Object> streamQueue) {
     String id = session.id();
@@ -215,8 +221,9 @@ public final class AgUiHttpServer implements AutoCloseable {
         if (session.status().isTerminal()) {
           // 终态补一轮 catch-up：桥先置 ceiling 再置终态（runSession），终态判定晚于任何落库——
           // 覆盖"上一轮 catch-up 之后、终态判定之前"的迟到窗口；随后写终态帧并断流
+          // （返回的游标不再使用——马上断流，保留赋值反而形成死存储）
           if (session.ceiling() >= 0) {
-            lastSent = writeCatchup(out, session, lastSent);
+            writeCatchup(out, session, lastSent);
           }
           writeFrame(out, terminalEvent(session));
           out.flush();

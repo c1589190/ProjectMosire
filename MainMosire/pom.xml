@@ -29,6 +29,14 @@
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
     </dependency>
+    <!-- SpotBugs 抑制注解：网关/装配层“设计意图”告警标记（R8 中断语义 offer、fail-fast start、注入持有器等——编译期仅为注解）；
+         与 BrainMosire 同款（见 BrainMosire/pom.xml 对应条目） -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
     <!-- AdminREST JSON（版本由根 pom jackson-bom 管理） -->
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>

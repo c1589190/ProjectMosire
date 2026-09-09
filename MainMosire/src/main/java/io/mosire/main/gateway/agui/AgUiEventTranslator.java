@@ -186,7 +186,8 @@ public final class AgUiEventTranslator {
       if (parsed instanceof ObjectNode objectNode) {
         node = objectNode;
       }
-    } catch (Exception e) {
+    } catch (JsonProcessingException e) {
+      // 语法坏 JSON → 空表（坏数据不崩溃；其余异常属编程错误不打伞）
       return null;
     }
     return node;

@@ -1,5 +1,6 @@
 package io.mosire.agentlib.mcp;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.modelcontextprotocol.json.McpJsonMapper;
 import io.modelcontextprotocol.json.TypeRef;
 import io.modelcontextprotocol.spec.McpClientTransport;
@@ -68,6 +69,9 @@ public final class PipeMcpClientTransport implements McpClientTransport {
    * @param inputMaxSize 单行输入上限（字节），必须为正；超限按类内 {@link LineTooLongException} 语义处理（记录并关闭传输，与官方
    *     MaxSizeExceededException 行为对齐）
    */
+  // 注入的 jsonMapper 与管道流仅作内部只读/受控使用（写侧 synchronized(out)），均不向外暴露引用，
+  // 也不写入（mapper 只做序列化配置读取）；按构造注入 + 独占持有是传输对象的设计意图——EI_EXPOSE_REP2 抑制。
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public PipeMcpClientTransport(
       McpJsonMapper jsonMapper, InputStream in, OutputStream out, int inputMaxSize) {
     if (jsonMapper == null || in == null || out == null) {
@@ -82,9 +86,14 @@ public final class PipeMcpClientTransport implements McpClientTransport {
     this.inputMaxSize = inputMaxSize;
   }
 
-  /** 管道关闭（对端断开 / 优雅关停）时完成；对 {@code whenClosed().get()} 的调用方是唯一阻塞等待者。 */
+  /**
+   * 管道关闭（对端断开 / 优雅关停）时完成；对 {@code whenClosed().get()} 的调用方是唯一阻塞等待者。
+   *
+   * <p>返回副本（{@link CompletableFuture#copy()}）：完成时机/值与原 Future 一致，但调用方拿不到内部引用、
+   * 也不能经该副本反向操纵本实例（EI_EXPOSE_REP 防御性拷贝）。
+   */
   public CompletableFuture<Void> whenClosed() {
-    return closed;
+    return closed.copy();
   }
 
   @Override

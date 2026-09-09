@@ -1,8 +1,10 @@
 package io.mosire.main.gateway.agui;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -59,6 +61,11 @@ public final class AgUiSessionRegistry implements AutoCloseable {
   private final Map<String, AgUiSession> sessions = new ConcurrentHashMap<>();
   private volatile boolean closed;
 
+  /**
+   * EI_EXPOSE_REP2 抑制：四个注入件均为装配层按实例共享的<b>长生命周期</b>组件（运行时/事件存储/事件总线/共享执行器），注册表的职责就是 贯穿持有它们（M2
+   * 网关层同类持有语义，类 Javadoc "与 A2A 共享同一个单线程执行器"）；本类只读使用、不向外暴露 任何引用（无对应 getter）——按构造注入 + 独占持有是设计意图。
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public AgUiSessionRegistry(
       AgentRuntime runtime, EventStore events, EventBus bus, ExecutorService chatExecutor) {
     this.runtime = runtime;
@@ -166,7 +173,11 @@ public final class AgUiSessionRegistry implements AutoCloseable {
         break;
       }
       try {
-        JsonNode parsed = JSON.readTree(event.payload());
+        String payload = event.payload();
+        if (payload == null) {
+          continue;
+        }
+        JsonNode parsed = JSON.readTree(payload);
         if (!(parsed instanceof ObjectNode node)) {
           continue;
         }
@@ -179,8 +190,8 @@ public final class AgUiSessionRegistry implements AutoCloseable {
           }
           return null;
         }
-      } catch (Exception e) {
-        // 坏事件跳过——reasonDetail 是尽力而为
+      } catch (JsonProcessingException e) {
+        // 坏事件跳过——reasonDetail 是尽力而为（readTree 仅受检 JsonProcessingException；null payload 已被前置守卫）
       }
     }
     return null;

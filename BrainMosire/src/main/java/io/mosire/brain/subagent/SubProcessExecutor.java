@@ -1,5 +1,6 @@
 package io.mosire.brain.subagent;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.mcp.AgentToMcpServer;
 import io.mosire.agentlib.proc.ManagedProcess;
 import io.mosire.agentlib.proc.SpawnSpec;
@@ -53,7 +54,11 @@ public final class SubProcessExecutor implements AgentExecutor {
    *
    * <p>前置：{@code command.parentLink()} 必须为 true（子体 argv 需带 {@code --parent-link} 才会走 MCP client
    * 形态；二者不同步会静默产生无协议客户端的空链接——这里宁可启动前就失败）。
+   *
+   * <p>EI_EXPOSE_REP2 抑制：{@code parentTools} 为装配层按实例共享的<b>实时</b>工具注册表（R7 语义——子体调用的父级工具面，
+   * 工具随后随时可能注册进来，必须持有引用而非快照）；本类只读使用、不对外暴露——与 {@code AgentRuntime.registry()} 同类设计先例。
    */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public SubProcessExecutor(
       SubprocessManager processes,
       AgentCommand command,

@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//root/.ssh/**)",
+      "Bash(git -C /root/ProjectMosire remote -v)",
+      "Bash(gh auth *)",
+      "Bash(ssh-keygen -t ed25519 -C \"mosire-dev@github\" -f /root/.ssh/id_ed25519 -N \"\" -q)",
+      "Bash(git config *)",
+      "Bash(git check-ignore *)",
+      "Bash(git -C Research/repos/a2a-java status --short)",
+      "Bash(git -C Research/repos/a2a-java log --oneline -1)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Read(//root/.claude/**)",
+      "Read(//root/.claude/projects/**)",
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
+    ]
+  }
+}

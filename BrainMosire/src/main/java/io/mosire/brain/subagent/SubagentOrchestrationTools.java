@@ -184,7 +184,8 @@ public final class SubagentOrchestrationTools {
 
       @Override
       public Map<String, Object> jsonSchema() {
-        return schema;
+        // 防御性拷贝（快照 schema 多为 Map.of 常量；copyOf 对不可变映射零拷贝、对可变映射挡住外部改写）
+        return Map.copyOf(schema);
       }
 
       @Override

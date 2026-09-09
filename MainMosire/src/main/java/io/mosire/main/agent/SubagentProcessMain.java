@@ -63,7 +63,6 @@ public final class SubagentProcessMain {
     PrintStream diagnostics = new PrintStream(System.err, true, StandardCharsets.UTF_8);
     System.setOut(diagnostics);
 
-    AgentTemplateStore templateStore = null;
     McpToolSource source = null;
     McpSourceBridge bridge = null;
     PipeMcpClientTransport transport = null;
@@ -71,9 +70,9 @@ public final class SubagentProcessMain {
     SqliteEventStore events = null;
     EventBus bus = null;
     try {
+      // 模板库是只读快照（进程级无需释放），局部使用即可（无 finally 回收——避免死存储）
       AgentTemplateStore store = new AgentTemplateStore(options.templatesDir());
       store.load();
-      templateStore = store;
       AgentTemplate template =
           store
               .get(options.templateId())

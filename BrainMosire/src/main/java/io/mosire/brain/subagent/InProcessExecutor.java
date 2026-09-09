@@ -21,11 +21,16 @@ public final class InProcessExecutor implements AgentExecutor {
 
   private static final Logger LOG = LoggerFactory.getLogger(InProcessExecutor.class);
 
-  /** 子 Agent 体：模拟一次子 Agent 运行（测试用门闩控制完成时机）。 */
+  /**
+   * 子 Agent 体：模拟一次子 Agent 运行（测试用门闩控制完成时机）。
+   *
+   * <p>throws 子句按需收窄为 {@link InterruptedException}——现存体仅此一种受检异常（门闩等待）；体内的其余失败 一律按非受检异常（{@code
+   * launch} 的分类处理不依赖 throws 子句）。
+   */
   @FunctionalInterface
   public interface AgentBody {
 
-    void run(String instanceId, AgentConfig config) throws Exception;
+    void run(String instanceId, AgentConfig config) throws InterruptedException;
   }
 
   private final AgentBody body;

@@ -154,11 +154,10 @@ public final class SubagentManager implements AutoCloseable {
         ensureOpen();
         instances.put(instanceId, configured);
         emitLifecycle(instanceId, template.id(), "configured", depth, request.goal(), null);
-        running =
-            transition(
-                instanceId,
-                SubagentStatus.SPAWNING,
-                lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
+        transition(
+            instanceId,
+            SubagentStatus.SPAWNING,
+            lifecyclePayload("spawning", template.id(), depth, request.goal(), null));
       }
       try {
         // W3b：launcher 拿完整实例快照（id/模板/目标/权限）拼 agent --id 命令与父侧 MCP 服务
