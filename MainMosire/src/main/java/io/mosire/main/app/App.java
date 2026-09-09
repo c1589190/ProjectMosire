@@ -20,6 +20,7 @@ import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
+import io.mosire.brain.runtime.AgentSpec;
 import io.mosire.brain.runtime.TurnResult;
 import io.mosire.brain.subagent.AgentCommand;
 import io.mosire.brain.subagent.AgentTemplateStore;
@@ -168,6 +169,8 @@ public final class App implements AutoCloseable {
               .systemPrompt(DEFAULT_SYSTEM_PROMPT)
               .description("主 Agent（M1 骨架）")
               .build();
+      // D17：主 Agent 以 AgentSpec 装配（组合既有 AgentConfig，二期字段暂取默认值——P2-2 Task 6 仅承载不接线）
+      AgentSpec agentSpec = AgentSpec.builder(agentConfig).build();
       // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
       if (config.templatesDir() != null) {
         SubagentRig rig = wireSubagents(config, tools, events, bus, agentConfig, permissionSet);
@@ -179,7 +182,7 @@ public final class App implements AutoCloseable {
           config.mcpExpose() ? AgentToMcpServer.start(tools, "mosire-main", Version.VERSION) : null;
       AgentRuntime runtime =
           new AgentRuntime(
-              agentConfig, scriptedLlm(config, llmOverride), tools, events, bus, permissionSet);
+              agentSpec, scriptedLlm(config, llmOverride), tools, events, bus, permissionSet);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;

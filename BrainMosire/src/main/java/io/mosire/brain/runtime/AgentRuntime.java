@@ -30,12 +30,32 @@ public final class AgentRuntime implements AutoCloseable {
   private static final ObjectMapper JSON = new ObjectMapper();
 
   private final AgentConfig config;
+  private final AgentSpec spec;
   private final AgentPermissionSet permissionSet;
   private final ToolRegistry registry;
   private final EventStore events;
   private final EventBus bus;
   private final AgentPipeline pipeline;
   private boolean closed;
+
+  /** 便捷装配（AgentSpec 形态——D17：一个 runtime 类 + 不同 Spec，见 {@link AgentSpec}）；默认守卫/上下文组装。 */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet) {
+    this(
+        spec,
+        llm,
+        registry,
+        new ToolExecutionGuard(),
+        new BasicContextAssembler(),
+        events,
+        bus,
+        permissionSet);
+  }
 
   /** 便捷装配：默认守卫/上下文组装；文件存储由调用方（Main）持有并统一关停。 */
   public AgentRuntime(
@@ -56,7 +76,7 @@ public final class AgentRuntime implements AutoCloseable {
         permissionSet);
   }
 
-  /** 全参装配（测试/自定义组装器）。 */
+  /** 全参装配（测试/自定义组装器）——既有 {@link AgentConfig} 形态保持兼容，内部包装为默认 {@link AgentSpec}。 */
   public AgentRuntime(
       AgentConfig config,
       LlmClient llm,
@@ -66,6 +86,20 @@ public final class AgentRuntime implements AutoCloseable {
       EventStore events,
       EventBus bus,
       AgentPermissionSet permissionSet) {
+    this(new AgentSpec(config), llm, registry, guard, assembler, events, bus, permissionSet);
+  }
+
+  private AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet) {
+    this.spec = Objects.requireNonNull(spec, "spec");
+    AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
     this.registry = Objects.requireNonNull(registry, "registry");
     this.events = Objects.requireNonNull(events, "events");
@@ -111,6 +145,11 @@ public final class AgentRuntime implements AutoCloseable {
 
   public AgentConfig config() {
     return config;
+  }
+
+  /** 本实例的规格（D17）；既有 AgentConfig 构造路径包装为默认 Spec，恒非 null。 */
+  public AgentSpec spec() {
+    return spec;
   }
 
   /** 暴露实时注册表（有意为可变共享对象：调用方即管线装配者/运行时使用者；EI_EXPOSE_REP 为设计意图）。 */
