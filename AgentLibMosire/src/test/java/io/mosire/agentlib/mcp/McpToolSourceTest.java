@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.plugin.ToolSource;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
@@ -14,6 +15,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -118,6 +120,42 @@ class McpToolSourceTest {
       assertThat(failed.code()).isEqualTo("MCP_TOOL_ERROR");
       assertThat(failed.message()).isNotBlank();
       assertThat(source.isDisconnected()).isTrue();
+    } finally {
+      Files.writeString(quitMarker, "q");
+      waitForExit(pidFile);
+    }
+  }
+
+  @Test
+  void implementsToolSourceWithIdAndCachedSnapshot() {
+    try (McpToolSource source = new McpToolSource("spi-test")) {
+      // ToolSource 契约：id() 即源名
+      assertThat(source).isInstanceOf(ToolSource.class);
+      assertThat(source.id()).isEqualTo("spi-test");
+      // 快照语义：未连接时返回空缓存而非抛异常（ToolSource.listTools() 是"当前快照"不是"活查询"）
+      assertThat(source.listTools()).isEmpty();
+    }
+  }
+
+  @Test
+  void onChangeNotifiesEveryListenerOnConnectBaseline(@TempDir Path tempDir) throws Exception {
+    Path pidFile = tempDir.resolve("spi-echo.pid");
+    Path quitMarker = tempDir.resolve("spi-echo-quit");
+    McpServerLinkConfig config = echoServerConfig(pidFile, quitMarker);
+    try (McpToolSource source = new McpToolSource(config)) {
+      AtomicInteger fired = new AtomicInteger();
+      AutoCloseable first = source.onChange(fired::incrementAndGet);
+      AutoCloseable second = source.onChange(fired::incrementAndGet);
+
+      // 连接尾基线回放：每个订阅者各触发一次（无参数回调，消费方经 listTools() 重读快照）
+      source.connect();
+      assertThat(fired.get()).isEqualTo(2);
+      assertThat(source.listTools()).extracting(AgentTool::name).contains("echo");
+
+      // 撤销订阅：句柄 close 后源仍可用、快照读取不受影响
+      first.close();
+      second.close();
+      assertThat(source.listTools()).extracting(AgentTool::name).contains("echo");
     } finally {
       Files.writeString(quitMarker, "q");
       waitForExit(pidFile);

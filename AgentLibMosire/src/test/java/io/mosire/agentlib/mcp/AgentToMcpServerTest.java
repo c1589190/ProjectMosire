@@ -141,10 +141,10 @@ class AgentToMcpServerTest {
       assertThat(bad.success()).isFalse();
       assertThat(bad.code()).isEqualTo("BOOM");
 
-      // onToolsChanged：连接后订阅 → 回放当前缓存一次
+      // onChange：连接后订阅不回放快照（初始状态由消费方经 listTools() 主动读取）
       AtomicInteger notifications = new AtomicInteger();
-      source.onToolsChanged(list -> notifications.incrementAndGet());
-      assertThat(notifications.get()).isEqualTo(1);
+      source.onChange(notifications::incrementAndGet);
+      assertThat(notifications.get()).isEqualTo(0);
     } finally {
       Files.writeString(quitMarker, "q");
     }

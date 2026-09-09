@@ -10,14 +10,15 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpTransportException;
 import io.modelcontextprotocol.spec.McpTransportSessionClosedException;
 import io.modelcontextprotocol.spec.McpTransportSessionNotFoundException;
+import io.mosire.agentlib.plugin.ToolSource;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolResult;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -42,10 +43,10 @@ import java.util.stream.Collectors;
  * }</pre>
  *
  * <p>生命周期：{@link #connect()} 幂等；{@code tools/list_changed} 变化经 {@link
- * McpClient.SyncSpec#toolsChangeConsumer} 捕获，映射后经 {@link #onToolsChanged} 回放全量新列表（消费方在 Registry
- * 上做增删增量）。
+ * McpClient.SyncSpec#toolsChangeConsumer} 捕获后刷新缓存快照，并触发 {@link #onChange} 的全部订阅者（消费方重读
+ * {@link #listTools()} 获取新快照，在 Registry 上做增删增量）。
  */
-public final class McpToolSource implements AutoCloseable {
+public final class McpToolSource implements ToolSource, AutoCloseable {
 
   /** 建连超时默认值——与 {@link McpServerLinkConfig} 的缺省一致（接管形态无 config 时的兜底）。 */
   private static final Duration DEFAULT_STARTUP_TIMEOUT = Duration.ofSeconds(15);
@@ -57,7 +58,7 @@ public final class McpToolSource implements AutoCloseable {
   private final McpServerLinkConfig config;
   private McpSyncClient client;
   private volatile List<AgentTool> cached = List.of();
-  private volatile Consumer<List<AgentTool>> changeListener;
+  private final CopyOnWriteArrayList<Runnable> changeListeners = new CopyOnWriteArrayList<>();
   private volatile boolean disconnected;
 
   /**
@@ -137,22 +138,32 @@ public final class McpToolSource implements AutoCloseable {
     onConnected.run();
   }
 
-  /**
-   * 订阅工具目录变化。回调参数 = 全量映射后的新列表（保证不会漏掉变化：连接前订阅 → connect 尾回放； 连接后订阅 → 回放缓存）。 线程：可能在 SDK 通知线程回调，可重入契约与
-   * listTools 相同。
-   */
-  public synchronized void onToolsChanged(Consumer<List<AgentTool>> listener) {
-    this.changeListener = Objects.requireNonNull(listener, "listener");
-    if (client != null) {
-      listener.accept(cached);
-    }
+  /** {@inheritDoc}：ToolSource 唯一标识 = 源名（与 {@link #name()} 同值）。 */
+  @Override
+  public String id() {
+    return name;
   }
 
-  /** 当前 MCP server 的工具目录（映射为 AgentTool 列表，name 去重保序）。 */
+  /**
+   * 订阅工具目录变化。回调无参数：消费方经 {@link #listTools()} 重读缓存快照（连接前订阅 → connect 尾基线触发；连接后订阅
+   * → 不回放当前快照，初始状态由消费方主动读取）。线程：可能在 SDK 通知线程回调，实现须快速返回、勿阻塞。
+   */
+  @Override
+  public AutoCloseable onChange(Runnable listener) {
+    Objects.requireNonNull(listener, "listener");
+    changeListeners.add(listener);
+    return () -> changeListeners.remove(listener);
+  }
+
+  /**
+   * 当前 MCP server 的工具目录快照（映射为 AgentTool 列表，name 去重保序）。
+   *
+   * <p>{@inheritDoc}：快照语义——返回缓存而非活查询。缓存于 {@link #connect()} 成功时建立基线，之后由 {@code
+   * tools/list_changed} 刷新；未连接时返回空列表。
+   */
+  @Override
   public synchronized List<AgentTool> listTools() {
-    requireConnected();
-    McpSchema.ListToolsResult result = client.listTools();
-    return mapAll(result.tools());
+    return cached;
   }
 
   private void onServerToolsChanged(List<McpSchema.Tool> tools) {
@@ -162,9 +173,8 @@ public final class McpToolSource implements AutoCloseable {
   private void cacheAndNotify(List<McpSchema.Tool> tools) {
     List<AgentTool> mapped = mapAll(tools);
     this.cached = mapped;
-    Consumer<List<AgentTool>> listener = this.changeListener;
-    if (listener != null) {
-      listener.accept(mapped);
+    for (Runnable listener : changeListeners) {
+      listener.run();
     }
   }
 
