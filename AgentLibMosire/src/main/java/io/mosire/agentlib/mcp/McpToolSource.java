@@ -163,7 +163,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
    */
   @Override
   public synchronized List<AgentTool> listTools() {
-    return cached;
+    return List.copyOf(cached);
   }
 
   private void onServerToolsChanged(List<McpSchema.Tool> tools) {
