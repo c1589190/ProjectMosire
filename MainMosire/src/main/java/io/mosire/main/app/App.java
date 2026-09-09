@@ -14,6 +14,7 @@ import io.mosire.agentlib.mcp.McpServerLinkConfig;
 import io.mosire.agentlib.mcp.McpSourceBridge;
 import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolRegistry;
@@ -284,7 +285,7 @@ public final class App implements AutoCloseable {
   /**
    * W3b 子 Agent 编排装配：模板库装载（fail-fast——坏模板/缺目录在启动期暴露）→ 子进程管理器 + 链接形态 {@link AgentCommand}（当前 java +
    * 本进程 classpath + {@code Main agent}，JVM 内存 cap -Xmx128m，目录注入，{@code --parent-link}）→ {@link
-   * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 三个内置编排工具注册进工具面。
+   * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 三个内置编排工具以 builtin 供给源注册进工具面（二期 L2：sourceId 归属）。
    */
   private static SubagentRig wireSubagents(
       BootConfig config,
@@ -302,7 +303,11 @@ public final class App implements AutoCloseable {
     SubagentManager manager =
         new SubagentManager(
             templateStore, executor, events, bus, parentConfig, parentPermissions, 0);
-    tools.registerAll(SubagentOrchestrationTools.of(manager));
+    BuiltinToolSource builtin =
+        new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager));
+    for (AgentTool tool : builtin.listTools()) {
+      tools.register(builtin.id(), tool);
+    }
     return new SubagentRig(manager, processes);
   }
 

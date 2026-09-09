@@ -100,6 +100,40 @@ class AgentToMcpServerTest {
   }
 
   @Test
+  void includeFilterExposesOnlyMatchingToolsAndKeepsThemOut() throws Exception {
+    ToolRegistry registry = new ToolRegistry();
+    registry.register(echoTool("ping"));
+    registry.register(echoTool("secret"));
+    PipedInputStream serverReads = new PipedInputStream();
+    PipedOutputStream clientWrites = new PipedOutputStream(serverReads);
+    PipedInputStream clientReads = new PipedInputStream();
+    PipedOutputStream serverWrites = new PipedOutputStream(clientReads);
+    try (AgentToMcpServer server =
+        AgentToMcpServer.startWith(
+            registry,
+            "include-test",
+            "0.1.0",
+            ToolContext.of(AccessToken.GUEST, AgentPermissionSet.unrestricted(AccessToken.GUEST)),
+            new StdioServerTransportProvider(
+                McpJsonDefaults.getMapper(), serverReads, serverWrites),
+            name -> !name.startsWith("secret"))) {
+      // 初始注册即过滤：secret 不暴露
+      assertThat(server.toolNames()).containsExactly("ping");
+      // 后续变更：命中的加入，被排除的始终在外
+      registry.register(echoTool("pong"));
+      registry.register(echoTool("secret2"));
+      assertThat(server.toolNames()).containsExactlyInAnyOrder("ping", "pong");
+      // 暴露面收窄：已暴露工具被排除后（如过滤器语义变化），下次同步时被移除
+      registry.register(echoTool("ping2"));
+      assertThat(server.toolNames()).containsExactlyInAnyOrder("ping", "ping2", "pong");
+      registry.unregister("ping2");
+      registry.unregister("ping");
+      assertThat(server.toolNames()).containsExactly("pong");
+      assertThat(server.toolNames()).doesNotContain("secret", "secret2");
+    }
+  }
+
+  @Test
   void e2eTalkToStdioSubProcess(@TempDir Path tempDir) throws Exception {
     Path pidFile = tempDir.resolve("echo.pid");
     Path quitMarker = tempDir.resolve("quit");

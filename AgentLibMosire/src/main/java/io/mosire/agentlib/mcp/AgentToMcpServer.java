@@ -16,7 +16,9 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +47,8 @@ public final class AgentToMcpServer implements AutoCloseable {
   private final ToolRegistry registry;
   private final ToolContext caller;
   private final McpSyncServer server;
+  /** 暴露过滤器：命中才暴露（默认全量）。注册后修改无效——以 server 启动时的实例为准。 */
+  private final Predicate<String> include;
 
   /** 空实现兜底：在 startWith 的赋值前任何 close() 都是安全的（UwF 告警解除）。 */
   private AutoCloseable registrySubscription = () -> {};
@@ -86,6 +90,29 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
+   * 启动（带暴露过滤器）：只把 {@code include} 命中的 Registry 工具暴露给 MCP 客户端， 初始注册与后续 Registry 变更同步（{@code sync}）均按此过滤；
+   * 未命中的工具既不新增，也已在暴露面内则被移除。
+   *
+   * <p>不传本重载的既有 {@code start} 系列保持全量暴露（默认 {@code name -> true}），行为不变。
+   *
+   * @param include 工具名过滤器（命中才暴露；谓词在 server 生命周期内应保持纯函数）
+   */
+  public static AgentToMcpServer start(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      Predicate<String> include) {
+    return startWith(
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        new StdioServerTransportProvider(McpJsonDefaults.getMapper()),
+        include);
+  }
+
+  /**
    * 以给定的流对启动（W3b 父子 stdio 链接的父侧：子进程的 stdIn/stdout 已被父进程接管，本 server 直接 在注入的流上服务，不复用 3 参重载的独立 spawn
    * 流程）。语义与 {@link #start(ToolRegistry, String, String, ToolContext)} 相同。
    *
@@ -114,15 +141,33 @@ public final class AgentToMcpServer implements AutoCloseable {
       String serverVersion,
       ToolContext caller,
       McpServerTransportProvider transport) {
+    return startWith(registry, serverName, serverVersion, caller, transport, name -> true);
+  }
+
+  /**
+   * 供测试注入自定义 transport 并带暴露过滤器；语义与 {@link #startWith(ToolRegistry, String, String,
+   * ToolContext, McpServerTransportProvider)} 相同，仅初始注册与后续同步均以 {@code include} 收窄暴露面。
+   */
+  static AgentToMcpServer startWith(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      McpServerTransportProvider transport,
+      Predicate<String> include) {
+    Objects.requireNonNull(include, "include");
     // sync() 声明返回 Self 型链（serverInfo/toolCall 声明为 SyncSpecification<S>），末端缩窄为 S 实例
     McpServer.SingleSessionSyncSpecification spec =
         (McpServer.SingleSessionSyncSpecification)
             McpServer.sync(transport).serverInfo(serverName, serverVersion);
     for (AgentTool tool : registry.list()) {
+      if (!include.test(tool.name())) {
+        continue;
+      }
       spec.toolCall(toMcpTool(tool), (exchange, request) -> handleCall(registry, caller, request));
     }
     McpSyncServer server = spec.build();
-    AgentToMcpServer self = new AgentToMcpServer(registry, caller, server);
+    AgentToMcpServer self = new AgentToMcpServer(registry, caller, server, include);
     // 先建对象再订阅（lambda 捕获 self）；订阅前错过的变化由 sync 的幂等 diff 兜底
     self.registrySubscription = registry.onChange(self::sync);
     LOG.info(
@@ -133,16 +178,19 @@ public final class AgentToMcpServer implements AutoCloseable {
     return self;
   }
 
-  private AgentToMcpServer(ToolRegistry registry, ToolContext caller, McpSyncServer server) {
+  private AgentToMcpServer(
+      ToolRegistry registry, ToolContext caller, McpSyncServer server, Predicate<String> include) {
     this.registry = registry;
     this.caller = caller;
     this.server = server;
+    this.include = include;
   }
 
-  /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）。 */
+  /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）；过滤器命中的才在暴露面内。 */
   private void sync() {
     List<AgentTool> tools = registry.list();
-    Set<String> desired = tools.stream().map(AgentTool::name).collect(Collectors.toSet());
+    Set<String> desired =
+        tools.stream().map(AgentTool::name).filter(include).collect(Collectors.toSet());
     List<String> existing = server.listTools().stream().map(McpSchema.Tool::name).toList();
     for (String name : existing) {
       if (!desired.contains(name)) {
@@ -153,7 +201,7 @@ public final class AgentToMcpServer implements AutoCloseable {
     Set<String> stillThere =
         server.listTools().stream().map(McpSchema.Tool::name).collect(Collectors.toSet());
     for (AgentTool tool : tools) {
-      if (!stillThere.contains(tool.name())) {
+      if (include.test(tool.name()) && !stillThere.contains(tool.name())) {
         server.addTool(new McpServerFeatures.SyncToolSpecification(toMcpTool(tool), this::handle));
         LOG.debug("MCP 工具注册: {}", tool.name());
       }
