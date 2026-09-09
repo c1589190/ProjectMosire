@@ -80,6 +80,9 @@ public final class Main {
         case "--a2a-address" -> config = withA2aAddress(config, requireValue(args, ++i));
         case "--a2a-port" ->
             config = withA2aPort(config, Integer.parseInt(requireValue(args, ++i)));
+        case "--agui-address" -> config = withAguiAddress(config, requireValue(args, ++i));
+        case "--agui-port" ->
+            config = withAguiPort(config, Integer.parseInt(requireValue(args, ++i)));
         case "--templates-dir" ->
             config = withTemplatesDir(config, Path.of(requireValue(args, ++i)));
         default -> {
@@ -91,11 +94,13 @@ public final class Main {
     App app = App.start(config);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
-        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d%s%s%n",
+        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d%s%s%n",
         Version.VERSION,
         app.boundPort(),
         config.a2aHost(),
         app.a2aPort(),
+        config.aguiHost(),
+        app.aguiPort(),
         config.demo() ? "（demo 模式）" : "",
         config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
@@ -158,7 +163,9 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         config.a2aPort(),
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withDataDir(BootConfig config, Path dataDir) {
@@ -171,7 +178,9 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         config.a2aPort(),
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withDemo(BootConfig config, boolean demo) {
@@ -184,7 +193,9 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         config.a2aPort(),
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withDemoMessage(BootConfig config, String message) {
@@ -197,7 +208,9 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         config.a2aPort(),
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withMcpLinks(BootConfig config, Path mcpLinks) {
@@ -210,7 +223,9 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         config.a2aPort(),
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withMcpExpose(BootConfig config, boolean mcpExpose) {
@@ -223,7 +238,9 @@ public final class Main {
         mcpExpose,
         config.a2aHost(),
         config.a2aPort(),
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withA2aAddress(BootConfig config, String a2aAddress) {
@@ -249,7 +266,9 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         a2aPort,
-        config.templatesDir());
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort());
   }
 
   private static BootConfig withTemplatesDir(BootConfig config, Path templatesDir) {
@@ -262,7 +281,39 @@ public final class Main {
         config.mcpExpose(),
         config.a2aHost(),
         config.a2aPort(),
-        templatesDir);
+        templatesDir,
+        config.aguiHost(),
+        config.aguiPort());
+  }
+
+  private static BootConfig withAguiAddress(BootConfig config, String aguiAddress) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort(),
+        config.templatesDir(),
+        aguiAddress,
+        config.aguiPort());
+  }
+
+  private static BootConfig withAguiPort(BootConfig config, int aguiPort) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort(),
+        config.templatesDir(),
+        config.aguiHost(),
+        aguiPort);
   }
 
   private static int health() {
@@ -342,6 +393,8 @@ public final class Main {
              --no-mcp-expose   关闭主 Agent 工具面经 stdio MCP server 暴露（默认启用）
              --a2a-address <h>  A2A 网关绑定地址（默认 127.0.0.1；对外打开须显式配置）
              --a2a-port <n>     A2A 网关端口（默认 0 = 空闲端口自动分配）
+             --agui-address <h>  AG-UI 网关绑定地址（默认 127.0.0.1；对外打开须显式配置）
+             --agui-port <n>    AG-UI 网关端口（默认 0 = 空闲端口自动分配）
              --templates-dir <p> 子 Agent 模板目录（configs/agents；缺省不启用编排）
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部

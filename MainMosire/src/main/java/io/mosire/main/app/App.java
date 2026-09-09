@@ -33,6 +33,8 @@ import io.mosire.main.gateway.a2a.A2aHttpServer;
 import io.mosire.main.gateway.a2a.A2aJsonRpcHandler;
 import io.mosire.main.gateway.a2a.A2aTaskService;
 import io.mosire.main.gateway.a2a.EventStoreA2aTaskStore;
+import io.mosire.main.gateway.agui.AgUiHttpServer;
+import io.mosire.main.gateway.agui.AgUiSessionRegistry;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
@@ -40,6 +42,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.a2aproject.sdk.spec.AgentCapabilities;
 import org.a2aproject.sdk.spec.AgentCard;
@@ -68,6 +71,11 @@ import org.slf4j.LoggerFactory;
  * 工具面；子进程命令按"当前 java + 本进程 classpath + {@code Main agent}"注入（Rul C），链接形态 （{@code --parent-link}）+
  * 内存 cap {@code -Xmx128m}，子 Agent 数据目录隔离在 {@code <dataDir>/subagents/<instanceId>}。{@code
  * templatesDir} 为空 = 本进程不启用子 Agent 编排。
+ *
+ * <p>W4（本类新增）：AG-UI 网关——{@code AgUiSessionRegistry}（POST /sessions 建会话 + 运行桥）+ {@link
+ * AgUiHttpServer}（GET /sessions/{id}/events SSE）。主 Agent 回合执行器与 A2A 共享<b>同一个单线程执行器</b> （Rul B 串行化 =
+ * AgentPipeline.history 非线程安全的不变量，也是 AG-UI 会话 seq 区间隔离的前提——见 AgUiSessionRegistry 说明）。关停顺序：A2A
+ * 任务服务（合成 FAILED + 关停共享执行器）→ A2A 网关 → AG-UI 网关 （stop(1) 给在途流排空）→ AG-UI 注册表（封创建口）→ 既有关停链。
  */
 public final class App implements AutoCloseable {
 
@@ -92,6 +100,8 @@ public final class App implements AutoCloseable {
   private final List<McpSourceBridge> mcpBridges;
   private final A2aHttpServer a2aServer;
   private final A2aTaskService a2aTaskService;
+  private final AgUiHttpServer aguiServer;
+  private final AgUiSessionRegistry aguiRegistry;
 
   /** W3b 子 Agent 编排（templatesDir 未配置时为 null——进程内无该能力）。 */
   private final SubagentManager subagentManager;
@@ -132,6 +142,9 @@ public final class App implements AutoCloseable {
     AgentToMcpServer mcpServer = null;
     A2aHttpServer a2aServer = null;
     A2aTaskService a2aTaskService = null;
+    AgUiHttpServer aguiServer = null;
+    AgUiSessionRegistry aguiRegistry = null;
+    ExecutorService chatExecutor = null;
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
     try {
@@ -161,12 +174,12 @@ public final class App implements AutoCloseable {
                       Version.ARTIFACT_ID, Version.VERSION, agentConfig.id(), events.count()));
 
       // W2 步骤 3：A2A 接入——状态存储=EventStore（Task 快照）+ runner 桥 → 主 Agent chat；
-      // 任务执行串行化（Rul B：A2A 不引入并发任务——单线程执行器 + Pipeline history 实例级共享（非线程安全），串行即不变量）
+      // 任务执行串行化（Rul B：不引入并发任务——单线程执行器 + Pipeline history 实例级共享（非线程安全），串行即不变量）；
+      // W4：主 Agent 回合执行器与 A2A 共享同一实例（AG-UI 会话隔离的前提——见 AgUiSessionRegistry）
+      chatExecutor = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("chat-").factory());
       a2aTaskService =
           new A2aTaskService(
-              new EventStoreA2aTaskStore(events),
-              new A2aAgentRunner(runtime),
-              Executors.newSingleThreadExecutor(Thread.ofVirtual().name("a2a-task-").factory()));
+              new EventStoreA2aTaskStore(events), new A2aAgentRunner(runtime), chatExecutor);
       a2aServer =
           A2aHttpServer.start(
               new InetSocketAddress(config.a2aHost(), config.a2aPort()),
@@ -174,6 +187,15 @@ public final class App implements AutoCloseable {
               // handler 卡仅用于版本协商（URL 无关——真实绑定后的卡片经 cardFactory 构建）
               new A2aJsonRpcHandler(
                   a2aCard(a2aBaseUrl(config.a2aHost(), config.a2aPort())), a2aTaskService));
+
+      // W4：AG-UI 接入——会话注册表（运行桥）+ SSE 网关（POST /sessions + GET /sessions/{id}/events）
+      aguiRegistry = new AgUiSessionRegistry(runtime, events, bus, chatExecutor);
+      aguiServer =
+          AgUiHttpServer.start(
+              new InetSocketAddress(config.aguiHost(), config.aguiPort()),
+              aguiRegistry,
+              events,
+              bus);
 
       App app =
           new App(
@@ -186,6 +208,8 @@ public final class App implements AutoCloseable {
               links.bridges(),
               a2aServer,
               a2aTaskService,
+              aguiServer,
+              aguiRegistry,
               subagentManager,
               subagentProcesses);
 
@@ -197,11 +221,20 @@ public final class App implements AutoCloseable {
       return app;
     } catch (RuntimeException e) {
       // 装配中途失败（如端口占用）：回收已起的网关/MCP 子进程/子 Agent 编排，避免启动失败后残留僵尸进程
+      if (aguiServer != null) {
+        aguiServer.close();
+      }
+      if (aguiRegistry != null) {
+        aguiRegistry.close();
+      }
       if (a2aServer != null) {
         a2aServer.close();
       }
       if (a2aTaskService != null) {
         a2aTaskService.close();
+      }
+      if (chatExecutor != null) {
+        chatExecutor.shutdownNow();
       }
       if (mcpServer != null) {
         mcpServer.close();
@@ -332,6 +365,8 @@ public final class App implements AutoCloseable {
       List<McpSourceBridge> mcpBridges,
       A2aHttpServer a2aServer,
       A2aTaskService a2aTaskService,
+      AgUiHttpServer aguiServer,
+      AgUiSessionRegistry aguiRegistry,
       SubagentManager subagentManager,
       SubprocessManager subagentProcesses) {
     this.events = events;
@@ -343,6 +378,8 @@ public final class App implements AutoCloseable {
     this.mcpBridges = List.copyOf(mcpBridges);
     this.a2aServer = a2aServer;
     this.a2aTaskService = a2aTaskService;
+    this.aguiServer = aguiServer;
+    this.aguiRegistry = aguiRegistry;
     this.subagentManager = subagentManager;
     this.subagentProcesses = subagentProcesses;
   }
@@ -375,6 +412,11 @@ public final class App implements AutoCloseable {
     return a2aServer.port();
   }
 
+  /** AG-UI 网关实际监听端口（0 = 自动分配场景下由调用方取实际值）。 */
+  public int aguiPort() {
+    return aguiServer.port();
+  }
+
   /** 子 Agent 实例快照（按实例 id 升序；未装配子 Agent 编排时为空表）。 */
   public List<SubagentInstance> subagents() {
     return subagentManager == null ? List.of() : subagentManager.list();
@@ -389,6 +431,11 @@ public final class App implements AutoCloseable {
    * FAILED 时序事件早已不可达订阅者（R8 验收不成立）；故先合成终态、后断连接；“A2A 先行于既有关停链” 的本意（网关先于
    * runtime/事件库关闭）保持不变。服务关闭窗口内到达的新任务按 R8 走 RejectedExecutionException → 合成 FAILED。
    *
+   * <p>（W4 关停语义——与 R8 的差异）AG-UI 没有可合成"诚实终态"的持久状态机（A2A 的 FAILED 合成基于任务状态机；AG-UI 会话终态来自运行桥的
+   * TurnResult），故不仿照 R8 强制合成：共享执行器关停（A2A 任务服务先行）后，在途 AG-UI 回合被中断 → 运行桥 catch 后置 RUN_ERROR 终态（{@code
+   * RUNTIME_EXCEPTION}），随后 AG-UI 网关 {@code stop(1)} 排空在途流—— 排空窗口内仍可收到终态；窗口过后未收到的客户端按"重放 +
+   * 会话记录终态"兜底（GET 永远从 EventStore 回读，终态是会话 记录而不是幂等状态机，因此重连即收齐——这是相对 R8 的实现差异，见 Task-7 报告）。
+   *
    * <p>每项关闭单独 try/catch：单项失败只记录日志（警告），close 链必须走完（{@code terminated.countDown()} 保证释放 等待方）。
    */
   @Override
@@ -397,9 +444,12 @@ public final class App implements AutoCloseable {
       return;
     }
     closed = true;
-    LOG.info("正在停止：A2A 任务/网关 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 事件存储 checkpoint");
+    LOG.info(
+        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 事件存储 checkpoint");
     closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
     closeQuietly("A2A 网关", () -> a2aServer.close());
+    closeQuietly("AG-UI 网关", () -> aguiServer.close());
+    closeQuietly("AG-UI 会话注册表", () -> aguiRegistry.close());
     closeQuietly("AdminREST 网关", () -> http.close());
     closeQuietly(
         "MCP 暴露",
