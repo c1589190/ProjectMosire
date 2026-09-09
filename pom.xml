@@ -32,6 +32,8 @@
     <sqlite-jdbc.version>3.53.4.0</sqlite-jdbc.version>
     <slf4j.version>2.0.19</slf4j.version>
     <log4j.version>2.26.1</log4j.version>
+    <!-- 插件框架（二期 D13：ToolSource 扩展点 SPI；季度复核同上） -->
+    <pf4j.version>3.15.1</pf4j.version>
 
     <junit.version>6.1.3</junit.version>
     <assertj.version>3.27.7</assertj.version>
@@ -100,6 +102,11 @@
         <groupId>org.apache.logging.log4j</groupId>
         <artifactId>log4j-slf4j2-impl</artifactId>
         <version>${log4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.pf4j</groupId>
+        <artifactId>pf4j</artifactId>
+        <version>${pf4j.version}</version>
       </dependency>
 
       <!-- 测试 -->

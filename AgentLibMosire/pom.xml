@@ -41,6 +41,12 @@
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
     </dependency>
+    <!-- 插件框架：ToolSource 扩展点 SPI（二期 P2-2 D13；版本由父 pom dependencyManagement 锁定，
+         传递依赖 java-semver / slf4j 属预期） -->
+    <dependency>
+      <groupId>org.pf4j</groupId>
+      <artifactId>pf4j</artifactId>
+    </dependency>
     <!-- SpotBugs 抑制注解：按设计意图持有注入对象（jsonMapper/管道流）的告警标记（编译期仅为注解）；
          与 BrainMosire 同款（见 BrainMosire/pom.xml 对应条目） -->
     <dependency>

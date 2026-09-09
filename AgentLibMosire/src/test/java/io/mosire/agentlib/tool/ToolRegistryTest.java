@@ -69,6 +69,55 @@ class ToolRegistryTest {
         .isInstanceOf(UnsupportedOperationException.class);
   }
 
+  @Test
+  void registerWithSourceThenUnregisterAllBySourceLeavesOtherSources() {
+    ToolRegistry registry = new ToolRegistry();
+    registry.register("srcA", fakeTool("a1"));
+    registry.register("srcA", fakeTool("a2"));
+    registry.register("srcB", fakeTool("b1"));
+    // 无源注册（内建路径）：不得被按源移除波及
+    registry.register(fakeTool("builtin"));
+
+    assertThat(registry.unregisterAllBySource("srcA")).isEqualTo(2);
+    assertThat(registry.list()).extracting(AgentTool::name).containsExactly("b1", "builtin");
+    assertThat(registry.find("a1")).isEmpty();
+    assertThat(registry.find("a2")).isEmpty();
+    // 重复按源移除：幂等，返回 0
+    assertThat(registry.unregisterAllBySource("srcA")).isZero();
+    assertThat(registry.size()).isEqualTo(2);
+  }
+
+  @Test
+  void unregisterAllBySourceBroadcastsOncePerBatch() throws Exception {
+    ToolRegistry registry = new ToolRegistry();
+    registry.register("srcA", fakeTool("a1"));
+    registry.register("srcA", fakeTool("a2"));
+    List<Integer> sizesAfterChange = new CopyOnWriteArrayList<>();
+    AutoCloseable subscription = registry.onChange(() -> sizesAfterChange.add(registry.size()));
+
+    assertThat(registry.unregisterAllBySource("srcA")).isEqualTo(2);
+    subscription.close();
+    // 整源移除只广播一次，且取消订阅后不再广播
+    registry.register("srcB", fakeTool("b1"));
+    assertThat(sizesAfterChange).containsExactly(0);
+  }
+
+  @Test
+  void sourceBookkeepingFollowsEveryRemovalPath() {
+    ToolRegistry registry = new ToolRegistry();
+    // 单个 unregister 也要清掉来源归属：同名工具换源再注册后，按新源可整组移除
+    registry.register("srcA", fakeTool("t"));
+    registry.unregister("t");
+    registry.register("srcB", fakeTool("t"));
+    assertThat(registry.unregisterAllBySource("srcB")).isEqualTo(1);
+
+    // 批量 unregisterAll(Collection) 同样清掉来源归属
+    registry.register("srcA", fakeTool("t"));
+    assertThat(registry.unregisterAll(List.of("t"))).isEqualTo(1);
+    assertThat(registry.unregisterAllBySource("srcA")).isZero();
+    assertThat(registry.size()).isZero();
+  }
+
   private static AgentTool fakeTool(String name) {
     return new AgentTool() {
       @Override
