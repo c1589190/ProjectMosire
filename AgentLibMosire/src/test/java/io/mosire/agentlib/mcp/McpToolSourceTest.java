@@ -86,7 +86,8 @@ class McpToolSourceTest {
 
     // 默认上限 = DEFAULT_MAX_CHARS（未显式传参的重载）
     ToolResult defaulted = McpToolSource.map(ok);
-    assertThat(defaulted.message().length()).isLessThanOrEqualTo(ToolResultTruncator.DEFAULT_MAX_CHARS);
+    assertThat(defaulted.message().length())
+        .isLessThanOrEqualTo(ToolResultTruncator.DEFAULT_MAX_CHARS);
     assertThat(defaulted.message()).startsWith("Warning: 输出被截断（原始 30000 字符 / 1 行）");
   }
 

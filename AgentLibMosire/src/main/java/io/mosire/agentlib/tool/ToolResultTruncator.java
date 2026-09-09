@@ -7,8 +7,8 @@ package io.mosire.agentlib.tool;
  * 开头交代任务与参数背景，结尾交代最终状态/错误信息，中段以省略标记替代；并在输出最前附一条截断提示（含原始字符数与
  * 行数），让模型明确知晓"当前看到的是残片"，可自行决定是否用更精确的手段重取（分页、grep、缩小范围等）。
  *
- * <p>纯字符串函数：不依赖 EventStore、不产生 docId（超限大结果的落库持久化属后续波次，见开发计划 P2-5 Bash）；
- * {@link ToolResult} 的 {@code assetDocIds} 语义不受本类影响。
+ * <p>纯字符串函数：不依赖 EventStore、不产生 docId（超限大结果的落库持久化属后续波次，见开发计划 P2-5 Bash）； {@link ToolResult} 的 {@code
+ * assetDocIds} 语义不受本类影响。
  */
 public final class ToolResultTruncator {
 

@@ -56,9 +56,9 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(60);
 
   /**
-   * 单次工具结果输出上限（字符数）：成功路径拼装文本经 {@link ToolResultTruncator#truncate} 截到此值（Token 经济：
-   * 工具结果污染治理）。默认 {@link ToolResultTruncator#DEFAULT_MAX_CHARS}；不放 {@link McpServerLinkConfig}
-   * ——record 加字段会波及两模块全部构造点，且接管形态（{@link #McpToolSource(String)}）无 config，源级字段对两种形态统一。
+   * 单次工具结果输出上限（字符数）：成功路径拼装文本经 {@link ToolResultTruncator#truncate} 截到此值（Token 经济： 工具结果污染治理）。默认
+   * {@link ToolResultTruncator#DEFAULT_MAX_CHARS}；不放 {@link McpServerLinkConfig} ——record
+   * 加字段会波及两模块全部构造点，且接管形态（{@link #McpToolSource(String)}）无 config，源级字段对两种形态统一。
    */
   private volatile int maxOutputChars = ToolResultTruncator.DEFAULT_MAX_CHARS;
 
@@ -96,8 +96,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   }
 
   /**
-   * 设置单次工具结果输出上限（字符数），须为正数；影响此后所有调用的成功路径（错误路径永不截断，见 {@link
-   * #map(McpSchema.CallToolResult, int)}）。
+   * 设置单次工具结果输出上限（字符数），须为正数；影响此后所有调用的成功路径（错误路径永不截断，见 {@link #map(McpSchema.CallToolResult, int)}）。
    */
   public void setMaxOutputChars(int maxOutputChars) {
     if (maxOutputChars <= 0) {
@@ -256,8 +255,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
    * CallToolResult → ToolResult（文本内容拼接；isError 映射为错误码）。
    *
    * <p>成功路径的拼装文本经 {@link ToolResultTruncator#truncate} 截到 {@code maxOutputChars}（Token 经济：工具
-   * 结果污染治理，Codex 头尾保留先例）；错误路径不解码不截断——带内错误码标记与错误消息必须原样送达，截断会破坏码
-   * 语义或掩盖根因。
+   * 结果污染治理，Codex 头尾保留先例）；错误路径不解码不截断——带内错误码标记与错误消息必须原样送达，截断会破坏码 语义或掩盖根因。
    */
   static ToolResult map(McpSchema.CallToolResult result, int maxOutputChars) {
     String text =
