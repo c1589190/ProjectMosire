@@ -2,9 +2,11 @@ package io.mosire.brain.memory;
 
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.retrieval.EmbeddingProvider;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * 记忆检索流水线（计划 §4.3）：元数据过滤 → 关键词匹配 → 取前 K 条。
@@ -17,8 +19,13 @@ import java.util.Objects;
  *   <li><b>取 K</b>：FTS 路径按 bm25 相关度升序，LIKE 路径按写入倒序。
  * </ol>
  *
- * <p>本波次不做 scope 过滤（user/project/local 只写不筛），也不发射 {@code memory.recall} 事件—— 两者都留给后续波次；embedding
- * 语义召回由 Task 13 的 SPI 接入点负责，本类当前不依赖它。
+ * <p>本波次不做 scope 过滤（user/project/local 只写不筛），也不发射 {@code memory.recall} 事件——两者都留给后续波次。
+ *
+ * <p><b>语义召回接入点（D15 预留，本波次未接线）</b>：可选的 {@link EmbeddingProvider} 经构造注入，由 {@link
+ * #embeddingProvider()} 暴露。它在流水线中的消费位置是<b>元数据/关键词过滤 + FTS5 之后、预留的 rerank 之前</b> ——先把候选集用 SQL
+ * 收窄到"可见且关键词命中"，再对该候选集批量编码做语义序。顺序不可颠倒：反过来会对
+ * 越权行与无关行做无谓编码，既是算力浪费也是越权面（向量化即把内容送进模型）。本波次该引用<b>只存不调</b>， 不注入时检索行为与接线前逐字节一致；将来接线后若实现仍未落地，SPI 侧由
+ * {@link io.mosire.agentlib.retrieval.NoopEmbeddingProvider} 显式抛错挡下，而非静默返回空结果。
  */
 public final class MemoryRetriever {
 
@@ -30,8 +37,30 @@ public final class MemoryRetriever {
 
   private final MemoryStore store;
 
+  /** D15 预留的语义召回实现；{@code null} 表示未注入（本波次的默认形态）。只存不调——消费时机见类 Javadoc"语义召回接入点"。 */
+  private final EmbeddingProvider embeddingProvider;
+
+  /** 不注入 embedding：二期检索只有 FTS5/LIKE（D15）。 */
   public MemoryRetriever(MemoryStore store) {
+    this(store, null);
+  }
+
+  /**
+   * 注入 D15 预留的语义召回实现（本波次只存不调，见类 Javadoc）。
+   *
+   * @param embeddingProvider 语义召回实现；{@code null} 等价于"不注入"（与单参构造同义），使未来接线层无需为 "可能没有"另写分支
+   */
+  public MemoryRetriever(MemoryStore store, EmbeddingProvider embeddingProvider) {
     this.store = Objects.requireNonNull(store, "store");
+    this.embeddingProvider = embeddingProvider;
+  }
+
+  /**
+   * D15 预留的 embedding 实现（本波次默认即空）。当前只作装配与可观测用途：检索路径尚未消费它——语义召回实现 未落地，接上就是空转；接线位置见类
+   * Javadoc"语义召回接入点"。
+   */
+  public Optional<EmbeddingProvider> embeddingProvider() {
+    return Optional.ofNullable(embeddingProvider);
   }
 
   /** 按默认 K（{@link #DEFAULT_K}）检索调用者可见的记忆。 */

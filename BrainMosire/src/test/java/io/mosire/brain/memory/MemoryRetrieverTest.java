@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.retrieval.EmbeddingProvider;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -130,6 +132,45 @@ class MemoryRetrieverTest {
       // 空/空白查询不得退化成 LIKE '%%' 全量倾倒
       assertThat(retriever.retrieve("", caller)).isEmpty();
       assertThat(retriever.retrieve("   ", caller)).isEmpty();
+    }
+  }
+
+  /** D15：embedding 接入点是"预留"——默认不注入，故默认实例必须给出空的 provider。 */
+  @Test
+  void embeddingProviderIsAbsentByDefault() {
+    try (MemoryStore store = openStore()) {
+      MemoryRetriever retriever = new MemoryRetriever(store);
+
+      assertThat(retriever.embeddingProvider()).isEmpty();
+    }
+  }
+
+  /**
+   * D15 验收守卫：注入了 provider，本波次检索仍不得调用它（语义召回实现未落地，接上就是空转或误召回）。
+   *
+   * <p>当后续波次真正落 {@link EmbeddingProvider} 实现并接线时，本用例是**必须被有意改写**的那个——它会红， 提醒改动者"接线了"这件事是决策而非顺带。
+   */
+  @Test
+  void injectedEmbeddingProviderIsExposedButNotConsultedThisWave() {
+    try (MemoryStore store = openStore()) {
+      store.remember("偏好", "用户喜欢用 Kafka", "local", AccessToken.DEFAULT);
+      AgentPermissionSet caller = AgentPermissionSet.unrestricted(AccessToken.DEFAULT);
+      List<String> embeddedTexts = new ArrayList<>();
+      EmbeddingProvider recording =
+          texts -> {
+            embeddedTexts.addAll(texts);
+            return List.of();
+          };
+
+      MemoryRetriever retriever = new MemoryRetriever(store, recording);
+
+      assertThat(retriever.embeddingProvider()).containsSame(recording);
+      // 与未注入 provider 的实例逐条一致：接线前检索行为不得有任何变化
+      assertThat(retriever.retrieve("Kafka", caller))
+          .isEqualTo(new MemoryRetriever(store).retrieve("Kafka", caller));
+      assertThat(retriever.retrieve("Kafka", caller, 1))
+          .isEqualTo(new MemoryRetriever(store).retrieve("Kafka", caller, 1));
+      assertThat(embeddedTexts).isEmpty();
     }
   }
 }
