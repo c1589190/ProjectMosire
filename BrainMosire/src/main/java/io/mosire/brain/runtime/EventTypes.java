@@ -17,8 +17,21 @@ public final class EventTypes {
    * 一次成功 LLM 调用的记账（D18：token 经济走 EventStore，不走 OTel）。payload: {@code
    * {"inputTokens":..,"outputTokens":..,"cacheReadTokens":..,"cacheWriteTokens":..,"model":"..",
    * "latencyMs":..,"turns":..}}；未知 token 记 {@code -1}。
+   *
+   * <p>{@code Compactor} 发起的摘要调用也落本类型（R7：压缩成本必须可见），额外带 {@code "phase":"compact"} 且<b>不带</b> {@code
+   * turns}——它不是主循环的回合，是系统级维护调用。
    */
   public static final String LLM_CALL = "llm.call";
+
+  /**
+   * 一次会话压缩（{@code Compactor} 的产物；{@code 开发计划.md:101}）。payload: {@code
+   * {"tier":"micro|summary|snapshot","droppedMessages":..,"keptMessages":..,"summaryTokens":..}}——{@code
+   * droppedMessages} 是本次被移出请求的会话消息数（档 1 另有占位消息在会话里披露同一数字），{@code summaryTokens} 为 {@code -1}
+   * 表示本次没有摘要（档 1）。
+   *
+   * <p>全零成本档（未触门 / 无安全切点）不落本事件；降级（摘要不可用→退回档 1）额外落 {@code decision} 带 {@code COMPACT_DEGRADED}。
+   */
+  public static final String CONVERSATION_COMPACT = "conversation.compact";
 
   /** 一次工具调用（请求）。payload: {@code {"tool":"...","args":{...}}}。 */
   public static final String TOOL_CALL = "tool.call";

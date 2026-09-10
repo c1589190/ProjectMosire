@@ -20,10 +20,13 @@ import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
+import io.mosire.brain.context.CompactSummarySlot;
+import io.mosire.brain.context.Compactor;
 import io.mosire.brain.context.ContextAssembler;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import org.slf4j.Logger;
@@ -46,6 +49,11 @@ import org.slf4j.LoggerFactory;
  * <p><b>会话持久化（T16）</b>：带 {@code (store, conversationId)} 的构造把历史落到 {@link ConversationStore}——构造时
  * {@code load} 灌入内存工作集（重启续聊），每回合只把<b>新增的尾部</b>追加进去（prompt-cache 不变量：已落库的消息永不改写）。不带 store
  * 的构造委派到"不落库"实现，行为与持久化接入前逐字节一致。
+ *
+ * <p><b>会话压缩（T17）</b>：带 {@code (compactor, compactSummary)} 的构造在<b>每个回合的边界</b>（组请求之前）跑一次 {@link
+ * Compactor}：超预算时按 micro → 局部摘要 → 快照续接三档压缩会话工作集，并落 {@code conversation.compact} 事件（摘要调用另落 {@code
+ * llm.call} 记账，R7）。压缩只改<b>内存工作集</b>（档 1/2）或经显式 {@code compact} 记录落库（档 3）——持久层的 append-only
+ * 不变量不因压缩而放宽。不接 {@code Compactor} 的构造行为与压缩接线前逐字节一致。
  */
 public final class AgentPipeline {
 
@@ -63,6 +71,12 @@ public final class AgentPipeline {
   private final AgentPermissionSet permissionSet;
   private final ConversationStore store;
   private final String conversationId;
+
+  /** 会话压缩器；{@code null} = 未接线（既有构造的取法，行为与压缩接线前逐字节一致）。 */
+  private final Compactor compactor;
+
+  /** 当前生效摘要的槽：<b>必须与装配器共用同一个</b>（否则档 2 的摘要在请求里不可见）——本类只写不读（除回传给 Compactor 做并集）。 */
+  private final CompactSummarySlot compactSummary;
 
   /** 会话历史（不含 system 头，进程内累积 + 每回合把新增尾部落库，供下一回合原样回灌）；构造时由 {@link #store} 灌入。 */
   private final List<LlmMessage> history = new ArrayList<>();
@@ -124,6 +138,51 @@ public final class AgentPipeline {
       AgentPermissionSet permissionSet,
       ConversationStore store,
       String conversationId) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        null,
+        CompactSummarySlot.empty());
+  }
+
+  /**
+   * 全参装配 + 会话持久化 + 会话压缩（T17）：每回合边界按 token 预算门跑一次 {@link Compactor}。
+   *
+   * <p><b>压缩的落库只用本实例持有的那个 {@link ConversationStore}</b>（档 3）：这是"撕裂读"（R11）的结构性回避——管线存活期间不存在第二个 store
+   * 实例/第二条连接，{@code load()} 的两条查询之间不可能插进另一次 {@code compact()}。因此 {@code compactor} 与 {@code store}
+   * 必须成对给出，且压缩只在回合边界串行发生（本类的并发约定已然：同一实例任意时刻只跑一个回合）。
+   *
+   * @param store 会话存储（非 null）
+   * @param conversationId 会话标识（非 null）
+   * @param compactor 压缩器；{@code null} = 不压缩（与既有构造同行为）
+   * @param compactSummary 摘要槽；<b>必须与 {@code assembler} 共用同一个实例</b>（否则档 2 的摘要进不了 COMPACT_SUMMARY 层；
+   *     未接线压缩时给 {@link CompactSummarySlot#empty()} 即可）
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary) {
+    this.compactor = compactor;
+    this.compactSummary = Objects.requireNonNull(compactSummary, "compactSummary");
     this.config = Objects.requireNonNull(config, "config");
     this.llm = Objects.requireNonNull(llm, "llm");
     this.registry = Objects.requireNonNull(registry, "registry");
@@ -163,6 +222,9 @@ public final class AgentPipeline {
     Objects.requireNonNull(userMessage, "userMessage");
     // 上一次回合的取消请求到此为止：cancel() 只对当时正在跑的回合负责
     cancelled = false;
+    // 压缩触发点：回合边界（组请求之前）。此处既没有在途的落库（上一回合早已 return），也没有并发的第二个 store
+    // 实例——档 3 的 compact/load 用的是本实例持有的同一个 store，撕裂读在结构上不可达
+    compactIfNeeded();
 
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
@@ -292,6 +354,104 @@ public final class AgentPipeline {
   }
 
   /**
+   * 会话压缩的接线点（T17）：回合边界跑一次 {@link Compactor}，把结果落到工作集/槽/存储与事件上。
+   *
+   * <p><b>档 1/2 只改内存工作集</b>（{@link #replaceWorkingSet}）：档 1 把中段换成披露占位；档 2 把中段摘要写进 {@link
+   * CompactSummarySlot}（装配器据此渲染 {@code COMPACT_SUMMARY} 层），工作集只剩尾部。两者都<b>不碰</b>存储——已落库的行照旧
+   * append-only， 重启后 load 回来的是完整历史（档 2 的压缩<b>本就</b>是volatile 的：R1 档 3 的存在意义就是让压缩基线跨重启存活）。
+   *
+   * <p><b>档 3 落库</b>（{@link #persistSnapshot}）：摘要经显式 {@code compact} 记录进入会话，随后工作集按 {@code load}
+   * 的权威形态重灌， 槽清空（摘要已进入会话本身，层里再留一份就是同一内容出现两遍）。
+   *
+   * <p><b>事件（R4/R7/披露）</b>：{@code conversation.compact}（档位/丢弃条数/保留条数/摘要 token）、摘要调用的 {@code
+   * llm.call} 记账、以及降级与"无可切点"的 {@code decision}——压缩这件事在事件流里全程可见。
+   */
+  private void compactIfNeeded() {
+    if (compactor == null) {
+      return;
+    }
+    Compactor.Result result = compactor.compact(history, compactSummary.current());
+    if (result.summarizerCall() != null) {
+      // R7：摘要是额外 LLM 调用——不记账的话，P2-3 的 token 汇总看不见压缩成本（D18 名不副实）
+      Compactor.SummarizerCall call = result.summarizerCall();
+      LlmResponse response = call.response();
+      emit(
+          EventTypes.LLM_CALL,
+          Map.of(
+              "phase",
+              "compact",
+              "inputTokens",
+              response.inputTokens(),
+              "outputTokens",
+              response.outputTokens(),
+              "cacheReadTokens",
+              response.cacheReadTokens(),
+              "cacheWriteTokens",
+              response.cacheWriteTokens(),
+              "model",
+              response.model(),
+              "latencyMs",
+              call.latencyMs()));
+    }
+    if (result.note() != null) {
+      // 降级（摘要不可用→退回档 1）或无可切点：绝不静默——档位与原因都落 decision
+      emitDecision(
+          result.compacted() ? "COMPACT_DEGRADED" : "COMPACT_SKIPPED",
+          Map.of("reason", result.note()));
+    }
+    switch (result.tier()) {
+      case NONE -> {
+        // 未压缩：工作集原样
+      }
+      case MICRO, SUMMARY -> {
+        replaceWorkingSet(result.workingSet());
+        if (result.summary() != null) {
+          compactSummary.set(result.summary());
+        }
+      }
+      case SNAPSHOT -> persistSnapshot(result);
+    }
+    if (result.compacted()) {
+      emit(
+          EventTypes.CONVERSATION_COMPACT,
+          Map.of(
+              "tier",
+              result.tier().name().toLowerCase(Locale.ROOT),
+              "droppedMessages",
+              result.droppedMessages(),
+              "keptMessages",
+              history.size(),
+              "summaryTokens",
+              result.summary() == null ? -1 : result.summary().render().length() / 4));
+    }
+  }
+
+  /** 换掉内存工作集（{@link #history} 是 final 字段，只能就地替换内容）。 */
+  private void replaceWorkingSet(List<LlmMessage> workingSet) {
+    history.clear();
+    history.addAll(workingSet);
+  }
+
+  /**
+   * 档 3（快照续接）的落库：用本实例持有的 {@link #store} 先把摘要写成显式 {@code compact} 记录，再按 {@code load} 的权威形态重灌工作集。
+   *
+   * <p><b>顺序有讲究</b>：落库失败时异常向上抛、工作集<b>一个字节都没动</b>（先清空再落库的话，失败就会留下空工作集）。
+   *
+   * <p><b>空会话守卫</b>：落库成功后 {@code load} 必然至少返回摘要本身（{@code render()} 恒非空）——回来是空列表说明这个 store 根本
+   * 没接受压缩（例如"不落库"的空实现被误接了压缩器）→ 响亮失败，绝不静默把工作集清空。
+   */
+  private void persistSnapshot(Compactor.Result result) {
+    store.compact(conversationId, result.summary().render());
+    List<LlmMessage> rehydrated = store.load(conversationId);
+    if (rehydrated.isEmpty()) {
+      throw new IllegalStateException(
+          "压缩已落库但 load 回来是空会话——store 未接线压缩记录（拒绝静默清空工作集）: " + conversationId);
+    }
+    replaceWorkingSet(rehydrated);
+    compactSummary.clear();
+  }
+
+  /**
    * 把本回合<b>新增的尾部</b>追加进历史：内存 {@link #history} 与 {@link #store} 都只追加，绝不重写已有前缀。
    *
    * <p>为什么不是"清空重写全量"：机制上的 clear+addAll 直译到持久层就变成每回合 DELETE + 全量 INSERT——行标识与插入 时序每回合全变，是
@@ -306,8 +466,9 @@ public final class AgentPipeline {
    * 且错位多数<b>不</b>落在越界上——不抛任何异常，只是写错（越界时 {@code ArrayList.subList} 抛的也是 {@link
    * IllegalArgumentException}，不是 {@link IndexOutOfBoundsException}）。故切片前先按契约校验（见下），把静默错写一律变成响亮失败。
    *
-   * <p><b>前置守卫不误伤合法压缩</b>：合法压缩走 {@link ConversationStore#compact} 落库后重灌，{@code history} 变短是合法的——
-   * {@code replayedSize} 取的是组请求前的实际长度，回灌长度随之一同变短，守卫不响。
+   * <p><b>前置守卫不误伤合法压缩</b>：合法压缩（T17 三档都算：档 3 走 {@link ConversationStore#compact} 落库后重灌，档 1/2
+   * 只换内存工作集）改的都是 {@code history} 本身，而 {@code replayedSize} 取的是<b>组请求前</b>的实际长度——回灌长度随之一同变短，
+   * 守卫只看"回灌长度是否被原样尊重"、不看长短，故不响。被守卫拦下的是"assembler <b>擅自</b>改回灌长度/本轮 user 位置"，与压缩无关。
    *
    * <p><b>守卫的辨识范围（别把它想得比实际宽）</b>：它<b>只</b>校验两点——{@code size ≥ replayedSize + 2}，且 {@code
    * messages[replayedSize + 1]} 这条的 role 是 {@code user}。落在其外的情形<b>不</b>被辨识：等长的内容改写/重排（与"不比对内容"的
@@ -409,9 +570,10 @@ public final class AgentPipeline {
    * 头、返回不可变快照（后续回合不回改已发出的快照）。
    *
    * <p><b>压缩之后的形状（按实例状态分两种，勿混为一谈）</b>：{@code "摘要 + 压缩点之后的消息"} 只对<b>新实例 hydrate 之后</b>为真（构造时 {@code
-   * store.load(...)} 灌入，故进程重启即反映最近一次压缩）。<b>活实例</b>的工作集只在构造时灌一次，外部调用 {@link
-   * ConversationStore#compact} 之后<b>不会</b>被回灌——本方法仍返回压缩前的全量、不含摘要（并且下一回合会把压缩点之前的内容重新送进
-   * 请求，反而抵消压缩）。把已持久化的压缩结果重新注入活实例的工作集归 T17，本类不做。
+   * store.load(...)} 灌入，故进程重启即反映最近一次压缩）。<b>活实例</b>的工作集只在构造时灌一次——T17
+   * 接线压缩后，本方法反映的是<b>本实例最近一次压缩后的工作集</b>： 档 3 落库后（压缩点即当时的末尾）等于 {@code load} 的权威形态（摘要消息打头）；档 1/2
+   * 是纯内存视图（各自的压缩形态）。 <b>外部</b>（不经本类的压缩器）调用 {@link ConversationStore#compact}
+   * 仍不会被回灌——那是"另一个写者"的情形，不在本类契约内。
    */
   public List<LlmMessage> lastHistory() {
     return List.copyOf(history);
