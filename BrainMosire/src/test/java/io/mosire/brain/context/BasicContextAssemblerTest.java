@@ -132,6 +132,21 @@ class BasicContextAssemblerTest {
         .isEqualTo(plain.buildRequest(config, "干活", history(), twoTools()).messages());
   }
 
+  /** 空内容源构造（P2-4 接线入口）与既有构造逐字节一致——未注入协作者时不产生任何新段落。 */
+  @Test
+  void constructorWithEmptySourcesIsByteIdenticalToLegacyConstructors() {
+    BasicContextAssembler noArg = new BasicContextAssembler();
+    BasicContextAssembler emptySources =
+        new BasicContextAssembler(ContextPolicy.defaults(), ContextSources.none());
+    AgentConfig config = config();
+
+    assertThat(emptySources.sources()).isEqualTo(ContextSources.none());
+    assertThat(emptySources.buildRequest(config, "干活", history(), twoTools()))
+        .isEqualTo(noArg.buildRequest(config, "干活", history(), twoTools()));
+    assertThat(emptySources.composition(config, "干活", history(), twoTools()))
+        .isEqualTo(noArg.composition(config, "干活", history(), twoTools()));
+  }
+
   /** 无参与 defaults() 构造等价（同一行为）。 */
   @Test
   void defaultConstructorMatchesDefaultsPolicyConstructor() {
