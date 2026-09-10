@@ -299,7 +299,8 @@ class ShellToolTest {
   @Test
   @Timeout(30)
   void endlessFloodIsBoundedByTheCaptureCapAndStillTimesOut() {
-    // exec 让 shell 自身变成 yes：直接子进程被杀即管道关闭。yes 永不结束地刷 stdout，
+    // exec 让 shell 自身变成 yes（单条简单命令本来也会被 bash exec 替换，写 exec 只为显式声明意图）：
+    // 直接子进程被杀即管道关闭。yes 永不结束地刷 stdout，
     // 档 1 必须在采集期就压住内存（超限不入内存），且工具不被自己的读取拖住
     ShellTool tool =
         new ShellTool(tempDir, OutputSink.none(), ShellOutputTruncator.Mode.NORMAL, 1024, 8000);
@@ -314,8 +315,9 @@ class ShellToolTest {
   @Test
   @Timeout(30)
   void descendantHoldingThePipeDoesNotBlockTheTool() throws Exception {
-    // 不加 exec：bash 会 fork 出 yes（不让它变成直接子进程）；后代 PID 写进文件，用例结束自行收殓——
-    // 空转的 yes 会一直烧 CPU，把同门用例（乃至门禁里的其它模块）拖成随机失败。
+    // 复合命令（后台作业 + wait）：bash 不会被 exec 替换，故直接子进程是 bash，yes/sleep 是**真后代**——
+    // 单条简单命令（如 `yes`）会被 bash exec 替换，直接子进程就是 yes 本身、根本构造不出"后代持有管道"的形态。
+    // 后代 PID 写进文件，用例结束自行收殓：空转的 yes 会一直烧 CPU，把同门用例（乃至门禁里的其它模块）拖成随机失败。
     // 这就是类 Javadoc 写明的取舍：本工具不回收进程树，故读取线程有界等待、宁可少读也不永久阻塞（朴素 join 会让本用例挂到超时）
     ShellTool tool = new ShellTool(tempDir);
     Path strayYes = tempDir.resolve("stray-yes.pid");
@@ -446,7 +448,7 @@ class ShellToolTest {
     Path pidFile = tempDir.resolve("child.pid");
     long startedAt = System.nanoTime();
 
-    // 用 exec 让 shell 自身变成 sleep：直接子进程被杀后管道即关闭，读取线程收尾、已捕获输出可见
+    // 用 exec 让 shell 自身变成 sleep（意图显式化）：直接子进程被杀后管道即关闭，读取线程收尾、已捕获输出可见
     // （后代仍持有管道的形态属类 Javadoc 写明的取舍，不在本用例断言范围）
     ToolResult result =
         new ShellTool(tempDir)
