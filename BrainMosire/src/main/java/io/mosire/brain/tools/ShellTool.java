@@ -1,5 +1,6 @@
 package io.mosire.brain.tools;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
@@ -229,6 +230,15 @@ public final class ShellTool implements AgentTool {
         + "大输出会被截断，非零退出不代表调用失败。破坏性操作：需显式放行。";
   }
 
+  /**
+   * 声明的入参 schema（{@link #SCHEMA} 常量，构造期算一次，所有调用方共享同一实例）。
+   *
+   * <p>EI_EXPOSE_REP 抑制：{@code SCHEMA} 是 {@code Map.of}/List.of/字符串/装箱标量组成的<b>深不可变</b>树（无数组、无可变集合——
+   * 嵌套值要么是同样的不可变容器、要么是标量），共享实例不存在被调用方改写、进而污染其它调用方的可能。因此不做防御性拷贝：
+   * 那会在每次工具装配（逐回合）路径上分配一份新树，去防一件本就不可能发生的事。与 {@code AgentRuntime.registry()} 的
+   * "有意为共享对象"先例同类，但这里的理由更强——那个共享对象是可变的（设计意图），这个连可变都谈不上。
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP")
   @Override
   public Map<String, Object> jsonSchema() {
     return SCHEMA;
