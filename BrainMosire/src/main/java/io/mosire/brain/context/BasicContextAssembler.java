@@ -15,6 +15,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 基础实现：system = 行为提示 + 工具目录（一行一个名字+描述）；历史逐条原样；user 原样；工具定义照传。
@@ -71,6 +73,11 @@ public final class BasicContextAssembler implements ContextAssembler {
 
   /** 失败原因进 prompt 前截断到的字符数上限：异常消息里的路径可能很长，目录档要便宜。 */
   private static final int MAX_LOAD_FAILURE_REASON_CHARS = 120;
+
+  /** 原因不可用时的固定代称：内部异常类名不进 prompt，固定 token 让"标注里没有类名"这件事可断言。 */
+  private static final String UNKNOWN_REASON = "原因未知";
+
+  private static final Logger LOG = LoggerFactory.getLogger(BasicContextAssembler.class);
 
   private final ContextPolicy policy;
   private final ContextSources sources;
@@ -238,6 +245,9 @@ public final class BasicContextAssembler implements ContextAssembler {
    * <p>目录里<b>有</b>这个技能、但读盘失败（被删/写坏）时<b>不抛</b>：自动预载是每回合都走的路，一次坏磁盘让 整个回合崩掉的代价远大于不带这份正文。失败改由 {@link
    * #markLoadFailures} 在目录档该行可见地披露（绝不静默跳过靠 可见性兑现，不靠崩）。注意边界在哪儿：<b>显式</b>激活路径（{@link
    * SkillCatalog#load}）的契约不变，未知名字与坏文件 照抛——那条路是调用方明确要求读这个技能，静默降级反而会掩盖错误。
+   *
+   * <p><b>降级不静默</b>：每次失败都按 {@code warn} 记日志并带上原始异常（堆栈进日志、不进 prompt——两处的信息量刻意不对称： prompt
+   * 只要"这行没带上"这一条单行信息，诊断细节归日志）。这正覆盖"编程缺陷也走降级"的情形：回合不崩，但痕迹必须在。
    */
   private PreloadedSkills loadPreloadedSkills() {
     Set<String> preloaded = sources.preloadedSkills();
@@ -254,7 +264,11 @@ public final class BasicContextAssembler implements ContextAssembler {
       try {
         body = sources.skills().load(skill.name());
       } catch (RuntimeException e) {
-        failures.put(skill.name(), shortReason(e));
+        String reason = shortReason(e);
+        // 降级必须留痕：prompt 里只放单行短原因（无堆栈、无类名），完整异常归日志——那里才是诊断的地方。
+        // 尤其重要的是"编程缺陷"（load 内部 NPE）也走这条路：不崩回合，但绝不能连日志都没有
+        LOG.warn("自动预载技能正文失败，本回合跳过该技能正文并标注目录行：技能={}，原因={}", skill.name(), reason, e);
+        failures.put(skill.name(), reason);
         continue;
       }
       if (!body.isBlank()) {
@@ -264,10 +278,17 @@ public final class BasicContextAssembler implements ContextAssembler {
     return new PreloadedSkills(loaded, failures);
   }
 
-  /** 失败原因收成单行短文本（异常类名与堆栈不进 prompt）：空白折叠、去首尾、超长尾部截断。 */
-  private static String shortReason(RuntimeException e) {
+  /**
+   * 失败原因收成单行短文本：空白折叠、去首尾、超长尾部截断。
+   *
+   * <p>进 prompt 的边界很硬——<b>异常类名与堆栈都不许来</b>（对模型没有意义，还会把内部名词漏进前缀）。消息缺失或全空白时 退化为固定 token {@link
+   * #UNKNOWN_REASON}，而不是异常类简名（后者会把 {@code "…Exception"} 带进 prompt，与本节表述自相矛盾）。
+   *
+   * <p>包级可见仅为让测试直接喂合成异常（{@link SkillCatalog} 是 final，消息缺失的失败在生产里走不到）；生产调用点只有本类的自动预载路径。
+   */
+  static String shortReason(RuntimeException e) {
     String message = e.getMessage();
-    String reason = message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
+    String reason = message == null || message.isBlank() ? UNKNOWN_REASON : message;
     reason = reason.replaceAll("\\s+", " ").strip();
     return reason.length() <= MAX_LOAD_FAILURE_REASON_CHARS
         ? reason

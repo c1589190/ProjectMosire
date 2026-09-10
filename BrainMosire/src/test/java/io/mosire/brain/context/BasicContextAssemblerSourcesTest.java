@@ -214,7 +214,7 @@ class BasicContextAssemblerSourcesTest {
     assertThat(text).contains("- broken: 坏技能（正文加载失败：技能目录缺少 SKILL.md：");
     assertThat(text)
         .contains("- corrupt: 坏 frontmatter（正文加载失败：SKILL.md 必须以 frontmatter 分隔行 --- 开头：");
-    // 标注是单行短文本：异常类名/堆栈不进 prompt
+    // 标注是单行短文本：异常类名/堆栈不进 prompt（消息缺失时也走固定 token，见下面的清洗器用例）
     assertThat(text).doesNotContain("Exception").doesNotContain("\tat ").doesNotContain("\n\t");
     // 标记只出现在失败行：健康行一个字节都不加（ruling 1 的 byte-identical 由"无失败 = 无标记"承接）
     assertThat(text).doesNotContain("- alpha: 第一（正文加载失败：");
@@ -226,6 +226,26 @@ class BasicContextAssemblerSourcesTest {
             text.indexOf(SKILL_INDEX_HEADER), text.indexOf("\n\n" + LOADED_SKILLS_HEADER));
     assertThat(assembler.composition(config(), "干活", List.of(), List.of()).estimatedTokens())
         .containsEntry(ContextLayer.SKILL_INDEX, indexBlock.length() / 4);
+  }
+
+  /**
+   * 失败原因清洗器：进 prompt 的永远是单行短文本——消息缺失时退化为固定 token，绝不把内部异常类名泄露给模型 （那是上面 {@code
+   * doesNotContain("Exception")} 断言成立的前提）。
+   */
+  @Test
+  void loadFailureReasonFallsBackToAFixedTokenAndStaysSingleLine() {
+    // 无消息 / 只有空白的合成异常：生产今天到不了这里（SkillLoader 的失败一律带消息），但兜底路径必须有确定行为
+    assertThat(BasicContextAssembler.shortReason(new IllegalStateException())).isEqualTo("原因未知");
+    assertThat(BasicContextAssembler.shortReason(new IllegalStateException("   ")))
+        .isEqualTo("原因未知");
+    // 换行/制表折叠成单空格：prompt 里不许出现多行噪声
+    assertThat(BasicContextAssembler.shortReason(new IllegalStateException("半行\n\t又半行")))
+        .isEqualTo("半行 又半行");
+    // 超长尾部截断 + 省略号（上限 120 字符 + 1 个省略号）
+    assertThat(BasicContextAssembler.shortReason(new IllegalStateException("x".repeat(500))))
+        .hasSize(121)
+        .endsWith("…")
+        .startsWith("x");
   }
 
   // ---------- 记忆 recall ----------
