@@ -307,9 +307,13 @@ public final class AgentPipeline {
    * IllegalArgumentException}，不是 {@link IndexOutOfBoundsException}）。故切片前先按契约校验（见下），把静默错写一律变成响亮失败。
    *
    * <p><b>前置守卫不误伤合法压缩</b>：合法压缩走 {@link ConversationStore#compact} 落库后重灌，{@code history} 变短是合法的——
-   * {@code replayedSize} 取的是组请求前的实际长度，回灌长度随之一同变短，守卫不响。守卫只认"assembler <b>擅自</b>改变回灌长度或
-   * 位置"这一种情形：这是编程契约违反，不是运行期数据状态，故抛 {@link IllegalStateException} 而非参数类异常。守卫在
-   * 任何内存/落库写入<b>之前</b>求值——不满足时不留下半截写入。
+   * {@code replayedSize} 取的是组请求前的实际长度，回灌长度随之一同变短，守卫不响。
+   *
+   * <p><b>守卫的辨识范围（别把它想得比实际宽）</b>：它<b>只</b>校验两点——{@code size ≥ replayedSize + 2}，且 {@code
+   * messages[replayedSize + 1]} 这条的 role 是 {@code user}。落在其外的情形<b>不</b>被辨识：等长的内容改写/重排（与"不比对内容"的
+   * 设计取舍相抵）、在本轮 user <b>之后</b>再插消息（回合内本就会追加 assistant/tool，无法与之区分）。它拦的是"assembler
+   * <b>擅自</b>改变回灌长度或本轮 user 位置"这一类<b>编程契约违反</b>，不是运行期数据状态，故抛 {@link IllegalStateException}
+   * 而非参数类异常。守卫在任何内存/落库写入<b>之前</b>求值——不满足时不留下半截写入。
    *
    * <p>七条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR/CANCELLED）都必须先经过这里再
    * return——否则下一回合回灌的历史残缺，Agent 就会失忆。
