@@ -298,8 +298,18 @@ public final class AgentPipeline {
    * prompt-cache 前缀稳定的隐性敌人。这里改成内容与机制一致的 append-only。
    *
    * <p><b>增量怎么算</b>：{@code messages} 的结构恒为 {@code [system] + 回合起点历史 + 本回合新增...}（assembler 契约：第一条必为
-   * system、回合起点历史紧随其后、本轮 user 收尾），故 {@code messages[replayedSize + 1]} 起就是本回合
-   * 新增的部分——用同一份列表按下标推出，不靠猜、不比对内容。{@code replayedSize} 是组请求前取定的历史长度。
+   * system、回合起点历史<b>原样</b>紧随其后、本轮 user 收尾），故 {@code messages[replayedSize + 1]} 起就是本回合新增的部分——
+   * 用同一份列表按下标推出，不比对内容（{@code replayedSize} 是组请求前取定的历史长度）。推导式本身是精确算术，不靠猜。
+   *
+   * <p><b>但下标推导有条件</b>：本轮 user 必须<b>恰好</b>落在 {@code replayedSize + 1}。assembler 少回灌历史（该下标落到别处）或在头部
+   * 多插一条（下标整体前移）都会让切片错位，表现从"静默丢弃本回合尾部"到"把已落库的历史当新增重复追加"（append-only 库里留下重复前缀）不等；
+   * 且错位多数<b>不</b>落在越界上——不抛任何异常，只是写错（越界时 {@code ArrayList.subList} 抛的也是 {@link
+   * IllegalArgumentException}，不是 {@link IndexOutOfBoundsException}）。故切片前先按契约校验（见下），把静默错写一律变成响亮失败。
+   *
+   * <p><b>前置守卫不误伤合法压缩</b>：合法压缩走 {@link ConversationStore#compact} 落库后重灌，{@code history} 变短是合法的——
+   * {@code replayedSize} 取的是组请求前的实际长度，回灌长度随之一同变短，守卫不响。守卫只认"assembler <b>擅自</b>改变回灌长度或
+   * 位置"这一种情形：这是编程契约违反，不是运行期数据状态，故抛 {@link IllegalStateException} 而非参数类异常。守卫在
+   * 任何内存/落库写入<b>之前</b>求值——不满足时不留下半截写入。
    *
    * <p>七条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR/CANCELLED）都必须先经过这里再
    * return——否则下一回合回灌的历史残缺，Agent 就会失忆。
@@ -308,6 +318,18 @@ public final class AgentPipeline {
    * ConversationStore}）——中途失败会留下"已落库的前缀"，重启后正是从那个前缀续起。
    */
   private void saveHistory(List<LlmMessage> messages, int replayedSize) {
+    // assembler 契约校验：本轮 user 必须恰好是 messages[replayedSize + 1]。最小合法长度 = [system] + 回灌历史
+    // （replayedSize 条）+ 本轮 user = replayedSize + 2（此刻本回合尚未产生任何新消息）；长度不足或该位不是
+    // user → 下标推导失去意义，响亮失败
+    if (messages.size() < replayedSize + 2
+        || !LlmMessage.ROLE_USER.equals(messages.get(replayedSize + 1).role())) {
+      throw new IllegalStateException(
+          "assembler 违反契约：历史未按其长度原样回灌、本轮 user 未紧随其后（replayedSize="
+              + replayedSize
+              + ", size="
+              + messages.size()
+              + "）");
+    }
     List<LlmMessage> appended = messages.subList(replayedSize + 1, messages.size());
     history.addAll(appended);
     for (LlmMessage message : appended) {
@@ -380,7 +402,12 @@ public final class AgentPipeline {
    * <p>与 {@link #run(String)} 内部消息序列的关系：{@code [system] + lastHistory()} 即完整请求消息。
    *
    * <p><b>契约冻结</b>：接 {@link ConversationStore} 之后本方法读的仍是内存工作集（不是库），形状与语义与持久化前一致—— 不含 system
-   * 头、返回不可变快照（后续回合不回改已发出的快照）。compact 之后它是"摘要 + 压缩点之后的消息"。
+   * 头、返回不可变快照（后续回合不回改已发出的快照）。
+   *
+   * <p><b>压缩之后的形状（按实例状态分两种，勿混为一谈）</b>：{@code "摘要 + 压缩点之后的消息"} 只对<b>新实例 hydrate 之后</b>为真（构造时 {@code
+   * store.load(...)} 灌入，故进程重启即反映最近一次压缩）。<b>活实例</b>的工作集只在构造时灌一次，外部调用 {@link
+   * ConversationStore#compact} 之后<b>不会</b>被回灌——本方法仍返回压缩前的全量、不含摘要（并且下一回合会把压缩点之前的内容重新送进
+   * 请求，反而抵消压缩）。把已持久化的压缩结果重新注入活实例的工作集归 T17，本类不做。
    */
   public List<LlmMessage> lastHistory() {
     return List.copyOf(history);

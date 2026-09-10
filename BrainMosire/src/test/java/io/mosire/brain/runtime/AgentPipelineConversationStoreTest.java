@@ -15,9 +15,12 @@ import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.store.SqliteConversationStore;
+import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
+import io.mosire.brain.context.ContextAssembler;
+import io.mosire.brain.context.ContextComposition;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -27,6 +30,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -188,16 +192,133 @@ class AgentPipelineConversationStoreTest {
     }
   }
 
+  /**
+   * M3 判别性用例 1：assembler 少回灌一条历史 → 守卫响亮失败，而不是静默丢本回合尾部。
+   *
+   * <p>去掉守卫后本用例必红，且红的方式<b>不是</b>"换一种异常抛"：本回合无 LLM 响应（空脚本 → LLM_ERROR 终止，assistant 消息未入列），{@code
+   * messages} 恰为 {@code [system] + 少一条的历史 + [本轮 user]} 共 3 条，而 {@code subList(replayedSize + 1,
+   * messages.size())} = {@code subList(3, 3)} 是空区间（fromIndex == toIndex，不越界）—— 本回合的 user
+   * 被静默丢光、内存与库都不写，{@code run()} 正常返回一个 LLM_ERROR 的 TurnResult，没有任何异常可循。
+   */
+  @Test
+  void assemblerDroppingHistoryIsRejectedLoudlyInsteadOfSilentlyDroppingTheTail() {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      RecordingLlmClient first = new RecordingLlmClient();
+      first.enqueue(LlmResponse.text("第一轮回答"));
+      pipeline(first, events, bus, store).run("问题一"); // 正常回合：历史成为 2 条
+
+      RecordingLlmClient second = new RecordingLlmClient(); // 空脚本
+      AgentPipeline pipeline =
+          pipeline(
+              second,
+              events,
+              bus,
+              store,
+              new ContractViolatingAssembler(ContractBreach.DROP_ONE_HISTORY));
+
+      assertThatThrownBy(() -> pipeline.run("问题二"))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("assembler 违反契约")
+          .hasMessageContaining("replayedSize=2")
+          .hasMessageContaining("size=3");
+
+      // 守卫在任何内存/落库写入之前：违规回合没有留下半截痕迹
+      assertThat(pipeline.lastHistory()).hasSize(2);
+      assertThat(store.load(CONV)).hasSize(2);
+    }
+  }
+
+  /**
+   * M3 判别性用例 2：assembler 保留全量历史、但在 system 之后多插一条摘要 → 守卫响亮失败，而不是把已落库的历史当新增重复追加。
+   *
+   * <p>去掉守卫后本用例必红：本轮的 assistant 已入列，{@code messages} = {@code [system, 摘要, 历史×2, user, assistant]}
+   * 共 6 条，切片下标整体前移一位——{@code subList(replayedSize + 1, size)} = {@code subList(3, 6)}
+   * 会把<b>已落库的历史尾条</b>连同本轮 user 与 assistant 再 append 一次，append-only 库里出现重复前缀， 且不抛任何异常。
+   */
+  @Test
+  void assemblerPrependingSummaryOverFullHistoryIsRejectedLoudlyInsteadOfDuplicatingPrefix() {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      RecordingLlmClient first = new RecordingLlmClient();
+      first.enqueue(LlmResponse.text("第一轮回答"));
+      pipeline(first, events, bus, store).run("问题一"); // 正常回合：历史成为 2 条
+
+      RecordingLlmClient second = new RecordingLlmClient();
+      second.enqueue(LlmResponse.text("第二轮回答"));
+      AgentPipeline pipeline =
+          pipeline(
+              second,
+              events,
+              bus,
+              store,
+              new ContractViolatingAssembler(ContractBreach.PREPEND_SUMMARY));
+
+      // [system, 摘要, 历史×2, user, assistant] = 6 条：长度够，但 messages[replayedSize + 1] 是回灌历史的尾条
+      // （assistant）而非本轮 user
+      assertThatThrownBy(() -> pipeline.run("问题二"))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("assembler 违反契约")
+          .hasMessageContaining("replayedSize=2")
+          .hasMessageContaining("size=6");
+
+      assertThat(pipeline.lastHistory()).hasSize(2);
+      assertThat(store.load(CONV)).hasSize(2);
+    }
+  }
+
+  /**
+   * M4 pin：落库失败不吞——{@code append} 第 2 条抛异常时，异常穿透 {@code run()}（不被吞成正常 TurnResult），库里只剩已落库的<b>前缀</b>
+   * （第 1 条），而内存 {@code lastHistory()} 已含完整尾部。
+   *
+   * <p>"库里有前缀" + "内存有全量"共同定义重启语义：新实例 hydrate 到的是前缀，Agent 不会失忆到最后一条落库消息之前，也不会凭空
+   * 看到一条从未落库的消息。库与内存<b>不一致</b>是这条契约的既定形态，不是缺陷。
+   */
+  @Test
+  void persistFailurePropagatesOutOfRunAndLeavesOnlyThePersistedPrefix() {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      RecordingLlmClient llm = new RecordingLlmClient();
+      llm.enqueue(LlmResponse.text("第一轮回答"));
+      AgentPipeline pipeline =
+          pipeline(llm, events, bus, new FailingOnSecondAppendConversationStore(store));
+
+      assertThatThrownBy(() -> pipeline.run("问题一"))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("注入的落库失败");
+
+      // 库里只剩前缀：第 1 条（本轮 user）已落，第 2 条（本轮 assistant）起没有
+      assertThat(store.load(CONV)).containsExactly(LlmMessage.user("问题一"));
+      // 内存已含完整尾部：本回合的 assistant 回复没有因落库失败而丢（memory 与库的不一致是既定语义）
+      assertThat(pipeline.lastHistory())
+          .containsExactly(
+              LlmMessage.user("问题一"), LlmMessage.assistant(List.of(new ContentPart.Text("第一轮回答"))));
+    }
+  }
+
   /** 新增重载：9 参构造之外的 {@code (store, conversationId)}（R2/R3——conversationId 是显式参数）。 */
   private static AgentPipeline pipeline(
       LlmClient llm, EventStore events, EventBus bus, ConversationStore store) {
+    return pipeline(llm, events, bus, store, new BasicContextAssembler());
+  }
+
+  /** 同上，但装配器由调用方给定（守卫用例需要违反契约的桩）。 */
+  private static AgentPipeline pipeline(
+      LlmClient llm,
+      EventStore events,
+      EventBus bus,
+      ConversationStore store,
+      ContextAssembler assembler) {
     AgentConfig config = AgentConfig.builder("main").build();
     return new AgentPipeline(
         config,
         llm,
         new ToolRegistry(),
         new ToolExecutionGuard(),
-        new BasicContextAssembler(),
+        assembler,
         events,
         bus,
         AgentPermissionSet.system().grantedToken(),
@@ -243,6 +364,80 @@ class AgentPipelineConversationStoreTest {
         throw new LlmException("RecordingLlmClient 脚本已耗空");
       }
       return response;
+    }
+  }
+
+  /** 契约破坏的两种档位（守卫用例的判别性输入）。 */
+  private enum ContractBreach {
+    /** 少回灌一条历史：回灌长度不再是 history.size()，本轮 user 也不再落在 {@code replayedSize + 1}。 */
+    DROP_ONE_HISTORY,
+    /** 保留全量历史、但在 system 之后多插一条摘要：本轮 user 的绝对下标整体前移一位。 */
+    PREPEND_SUMMARY
+  }
+
+  /**
+   * 违反 {@link ContextAssembler} 契约的桩：正常装配器恒返回 {@code [system] + history（原样）+ [user]}，本桩刻意破坏其中一处，
+   * 用来证明管线守卫把"静默错写"变成"响亮失败"。
+   */
+  private static final class ContractViolatingAssembler implements ContextAssembler {
+
+    private final ContractBreach breach;
+
+    ContractViolatingAssembler(ContractBreach breach) {
+      this.breach = breach;
+    }
+
+    @Override
+    public LlmRequest buildRequest(
+        AgentConfig config, String userMessage, List<LlmMessage> history, List<AgentTool> tools) {
+      List<LlmMessage> replayed = history;
+      if (breach == ContractBreach.DROP_ONE_HISTORY && !history.isEmpty()) {
+        replayed = history.subList(1, history.size());
+      }
+      List<LlmMessage> messages = new ArrayList<>(replayed.size() + 3);
+      messages.add(LlmMessage.system("桩 system"));
+      if (breach == ContractBreach.PREPEND_SUMMARY) {
+        messages.add(LlmMessage.assistant(List.of(new ContentPart.Text("压缩摘要"))));
+      }
+      messages.addAll(replayed);
+      messages.add(LlmMessage.user(userMessage));
+      return new LlmRequest(messages, List.of());
+    }
+
+    @Override
+    public ContextComposition composition(
+        AgentConfig config, String userMessage, List<LlmMessage> history, List<AgentTool> tools) {
+      return new ContextComposition(Map.of());
+    }
+  }
+
+  /** 落库失败桩：{@code append} 第 2 次调用抛（第 1 条已委托落库），且不吞、不包装——验证异常穿透 {@code run()}。 */
+  private static final class FailingOnSecondAppendConversationStore implements ConversationStore {
+
+    private final ConversationStore delegate;
+    private int appends;
+
+    FailingOnSecondAppendConversationStore(ConversationStore delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public void append(String conversationId, LlmMessage message) {
+      appends++;
+      if (appends == 2) {
+        throw new IllegalStateException("注入的落库失败：第 2 条消息写盘失败");
+      }
+      delegate.append(conversationId, message);
+    }
+
+    @Override
+    public List<LlmMessage> load(String conversationId) {
+      return delegate.load(conversationId);
+    }
+
+    @Override
+    public void compact(String conversationId, String summary) {
+      delegate.compact(conversationId, summary);
     }
   }
 }

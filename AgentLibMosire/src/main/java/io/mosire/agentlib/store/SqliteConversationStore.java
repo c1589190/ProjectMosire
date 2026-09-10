@@ -42,7 +42,12 @@ import java.util.Objects;
  *
  * <p><b>压缩</b>：{@code conversations.compacted_thru_id} 是压缩点（压缩当时会话的最大行 id），{@code summary}
  * 是摘要正文；两者只在 {@link #compact} 里被写。压缩点之前的 {@code messages} 行<b>不删除</b>（留档可审计），只是不再被 {@link #load}
- * 返回。摘要以 {@code role = assistant} 的消息形态回灌：保持 user/assistant 交替（严格供应商也收），且它本就是模型自己 对压缩前对话的记忆替身。
+ * 返回。摘要以 {@code role = assistant} 的单文本消息形态回灌，且置于 {@link #load} 结果的首位（它本就是模型自己对压缩前对话的记忆替身）。
+ *
+ * <p><b>本类不承诺"首条非 system 消息为 user"，也不承诺相邻 role 交替</b>：摘要的 role 恒为 {@code assistant}，于是它一旦存在就是
+ * {@link #load} 的首条——首条非 system 消息即 assistant；压缩点又可能落在回合中段，紧随摘要的也可能是 assistant/tool。 Anthropic
+ * 类"首个非 system 消息必须是 user"的严格供应商因此会拒收这种形状。这是刻意的取舍（改成 {@code user} 只会把风险从"首条非 user"换成"可能连续两条
+ * user"，更差）；摘要在请求里的最终形态（例如合并进 system 段）属于后续压缩接线的设计空间，本类只负责按上述形态存取。
  *
  * <p><b>消息内容编码</b>（内部格式，随本类演进）：一条消息 = 一行，{@code role} 单列 + {@code content} 列存分片数组的 JSON（每个分片带
  * {@code type} 判别符：{@code text}/{@code tool_call}/{@code tool_result}）。手写这层判别符而不用 Jackson
