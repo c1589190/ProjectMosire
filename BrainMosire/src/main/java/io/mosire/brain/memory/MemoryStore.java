@@ -1,5 +1,6 @@
 package io.mosire.brain.memory;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.permission.AccessToken;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -78,14 +79,19 @@ public final class MemoryStore implements AutoCloseable {
   private static final String INSERT_FTS =
       "INSERT INTO memory_fts (rowid, topic, text) VALUES (?, ?, ?)";
 
-  /** {@code %s} 处填身份占位符列表；{@code bm25()} 越小越相关，故升序取前 K。 */
+  // 模板占位符用 {tokens} + String.replace，而不是 %s + String.formatted：文本块是普通字符串，
+  // formatted 会把它当格式串，SpotBugs 据此报 VA_FORMAT_STRING_USES_NEWLINE（建议改用 %n——但 %n 会写入
+  // 平台相关换行符，SQL 里不适用）与 SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING。
+  // replace 是字面替换，无格式串语义，两条告警一并消失；参数仍全部走 ? 绑定（同 Main.usage 先例）。
+
+  /** {@code {tokens}} 处填身份占位符列表；{@code bm25()} 越小越相关，故升序取前 K。 */
   private static final String SELECT_BY_FTS =
       """
       SELECT m.id, m.ts, m.topic, m.text, m.scope
       FROM memory_fts
         JOIN memory m ON m.id = memory_fts.rowid
       WHERE memory_fts MATCH ?
-        AND m.required_token IN (%s)
+        AND m.required_token IN ({tokens})
       ORDER BY bm25(memory_fts)
       LIMIT ?
       """;
@@ -95,7 +101,7 @@ public final class MemoryStore implements AutoCloseable {
       """
       SELECT m.id, m.ts, m.topic, m.text, m.scope
       FROM memory m
-      WHERE m.required_token IN (%s)
+      WHERE m.required_token IN ({tokens})
         AND (m.topic LIKE ? ESCAPE '\\' OR m.text LIKE ? ESCAPE '\\')
       ORDER BY m.id DESC
       LIMIT ?
@@ -179,11 +185,16 @@ public final class MemoryStore implements AutoCloseable {
    * FTS5 子串匹配（trigram）：查询串整体作为一个 phrase，内部双引号翻倍转义——避免用户输入里的 {@code *} {@code (} {@code -} 等被当成 FTS5
    * 查询语法。
    *
+   * <p>SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING 抑制：IN 列表长度随调用者可见身份数变化，只能动态拼
+   * ——但插进去的只是 {@link #placeholders} 生成的 {@code ?} 计数串，枚举名与检索词全部走 {@code setString} 绑定，没有任何值进入 SQL
+   * 文本，注入面为零（同类先例：{@code SqliteEventStore.query} 的动态 WHERE）。
+   *
    * @param visibleTokens 可见身份集合（{@code required_token} 命中其一即可见）
    */
+  @SuppressFBWarnings("SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING")
   List<MemoryRecord> searchByFts(String query, List<AccessToken> visibleTokens, int k) {
     String phrase = "\"" + query.replace("\"", "\"\"") + "\"";
-    String sql = SELECT_BY_FTS.formatted(placeholders(visibleTokens.size()));
+    String sql = SELECT_BY_FTS.replace("{tokens}", placeholders(visibleTokens.size()));
     synchronized (lock) {
       try (PreparedStatement ps = connection.prepareStatement(sql)) {
         int index = 1;
@@ -199,10 +210,16 @@ public final class MemoryStore implements AutoCloseable {
     }
   }
 
-  /** 短查询回退：{@code LIKE '%term%'} 子串匹配（trigram 无法处理 <3 字符查询），语义与 trigram 一致。 */
+  /**
+   * 短查询回退：{@code LIKE '%term%'} 子串匹配（trigram 无法处理 <3 字符查询），语义与 trigram 一致。
+   *
+   * <p>SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING 抑制理由同 {@link #searchByFts}：动态部分只有
+   * {@code ?} 计数，检索词经 {@code escapeLike} 转义后仍走 {@code setString} 绑定。
+   */
+  @SuppressFBWarnings("SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING")
   List<MemoryRecord> searchByLike(String query, List<AccessToken> visibleTokens, int k) {
     String pattern = "%" + escapeLike(query) + "%";
-    String sql = SELECT_BY_LIKE.formatted(placeholders(visibleTokens.size()));
+    String sql = SELECT_BY_LIKE.replace("{tokens}", placeholders(visibleTokens.size()));
     synchronized (lock) {
       try (PreparedStatement ps = connection.prepareStatement(sql)) {
         int index = 1;
