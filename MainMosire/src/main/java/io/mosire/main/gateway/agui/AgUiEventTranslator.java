@@ -27,8 +27,10 @@ import org.slf4j.LoggerFactory;
  *   <li>{@code tool.result} →
  *       TOOL_CALL_RESULT（messageId="tm-&lt;seq&gt;"，toolCallId，content=message，role="tool"；ok=false
  *       仍映射 message——失败信息对客户端同样有意义）；
- *   <li>其余类型（agent.lifecycle——主/子双生产者、decision、permission.denied——管线与 spawn 两种形态、以及任何子 Agent 事件族）→
- *       空表：显式不映射而非静默透传（决策见 README/报告）。
+ *   <li>其余类型（agent.lifecycle——主/子双生产者、decision、permission.denied——管线与 spawn 两种形态、 {@code
+ *       conversation.compact}——T17 会话压缩、以及任何子 Agent 事件族）→ 空表：显式不映射而非静默透传（决策见
+ *       README/报告）。压缩事件落在这一侧的理由：AG-UI 1.0 Draft 子集里没有"会话被压缩"的帧，最接近的 TEXT_MESSAGE_* 语义是"模型说了什么"——把
+ *       tier/计数塞进去是发明协议；压缩的可见性由事件流与 {@code context} CLI 承载。
  * </ul>
  *
  * <p>会话级合成事件（运行桥终态——Brain 没有"回合结束"事件，终态由 {@link AgUiSessionRegistry} 从 TurnResult/StopReason
@@ -63,7 +65,8 @@ public final class AgUiEventTranslator {
     }
     // 显式不映射：agent.lifecycle（主 AgentRuntime / SubagentManager 双生产者——D7 边界）、decision
     // （终态由 TurnResult 合成，不采用事件驱动）、permission.denied（管线 {tool,reason} 与子 Agent spawn 拒绝
-    // {template,childId,reason} 两种形态）、子 Agent 事件族（P2 暂缓，且保证不泄漏进主会话流）
+    // {template,childId,reason} 两种形态）、conversation.compact（T17：AG-UI 子集无对应帧，压缩只在事件流/CLI
+    // 可见——见类 Javadoc）、子 Agent 事件族（P2 暂缓，且保证不泄漏进主会话流）
     LOG.debug("AG-UI 翻译层忽略事件类型: {} (agent={}, seq={})", type, event.agent(), event.seq());
     return List.of();
   }

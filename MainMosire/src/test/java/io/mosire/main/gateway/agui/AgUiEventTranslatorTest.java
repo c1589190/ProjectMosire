@@ -3,6 +3,7 @@ package io.mosire.main.gateway.agui;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.mosire.agentlib.event.Event;
+import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.StopReason;
 import java.time.Instant;
 import java.util.List;
@@ -13,8 +14,8 @@ import org.junit.jupiter.api.Test;
  * D7 翻译层单测：事件词汇表映射表（计划 §5.2.2 子集）——"事件 → AG-UI 事件"的纯映射契约。
  *
  * <p>覆盖：① 三个映射源（conversation.turn/tool.call/tool.result）的逐字段产出；② 不映射类型
- * （agent.lifecycle/decision/permission.denied 两种 payload/子 Agent 事件）显式返回空表（不得崩溃、不得误映射）； ③
- * 会话级合成事件（RUN_STARTED/RUN_FINISHED/RUN_ERROR）的字段。
+ * （agent.lifecycle/decision/permission.denied 两种 payload/conversation.compact/子 Agent
+ * 事件）显式返回空表（不得崩溃、不得误映射）； ③ 会话级合成事件（RUN_STARTED/RUN_FINISHED/RUN_ERROR）的字段。
  */
 class AgUiEventTranslatorTest {
 
@@ -157,6 +158,28 @@ class AgUiEventTranslatorTest {
                     "main",
                     "{\"template\":\"t1\",\"childId\":\"sub-1\",\"reason\":\"not subset\"}",
                     "sub-1")))
+        .isEmpty();
+  }
+
+  /**
+   * R4（T17）：会话压缩事件 {@code conversation.compact} 显式<b>不</b>映射——AG-UI 1.0 Draft 子集里没有"会话被压缩"的帧， 最接近的
+   * TEXT_MESSAGE_* 语义是"模型说了什么"；把 tier/计数塞进去是发明协议。压缩的可见性由事件流与 {@code context} CLI 承载。
+   *
+   * <p>判别性：这条用例与其它不映射类型的用例<b>同形</b>，但单独立一条是因为 T17 新增了这个事件类型——没有它，翻译层的行为
+   * 无人钉住（"顺手把它映射成某个现有帧"的实现能让客户端看到莫名其妙的文本消息）。同时钉住常量字面量：AG-UI 侧认的是字符串， 常量改名而这里不改就是漂移。
+   */
+  @Test
+  void conversationCompactEventIsExplicitlyNotMapped() {
+    assertThat(EventTypes.CONVERSATION_COMPACT).isEqualTo("conversation.compact");
+
+    assertThat(
+            new AgUiEventTranslator()
+                .translate(
+                    event(
+                        36,
+                        EventTypes.CONVERSATION_COMPACT,
+                        "{\"tier\":\"summary\",\"droppedMessages\":12,\"keptMessages\":6,"
+                            + "\"summaryTokens\":88}")))
         .isEmpty();
   }
 
