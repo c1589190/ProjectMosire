@@ -10,6 +10,7 @@ import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -33,7 +34,8 @@ import java.util.Set;
  *
  * <ul>
  *   <li>{@code SKILL_INDEX}：{@code "你有以下技能可用（只列名称与用途）："} + 换行 + {@link
- *       SkillCatalog#listing()}（扫描序，每行 {@code "- 名字: 用途"}）；
+ *       SkillCatalog#listing()}（扫描序，每行 {@code "- 名字: 用途"}）；自动预载失败的技能在该行尾追加 {@code
+ *       "（正文加载失败：<简短原因>）"}——健康行一个字节都不加；
  *   <li>{@code LOADED_SKILLS}：{@code "已激活技能正文："} + 空行 + 每技能一块 {@code "## 技能 <名>（资源目录：<dir>）"} + 换行
  *       + 正文，块间空行；块序 = 目录扫描序（不是预载集顺序）；
  *   <li>{@code MEMORY}：{@code "与本轮输入相关的记忆（按相关度排序，最多 <k> 条）："} + 每行 {@code "- (<主题>) <正文>"}，行序 =
@@ -61,6 +63,14 @@ public final class BasicContextAssembler implements ContextAssembler {
   private static final String LOADED_SKILL_TITLE_PREFIX = "## 技能 ";
 
   private static final String LOADED_SKILL_TITLE_SEPARATOR = "（资源目录：";
+
+  /** 自动预载失败时加在该技能目录行尾的标注：失败必须可见（模型看得到"这个技能这回合没带上"），但不值得崩掉整个回合。 */
+  private static final String LOAD_FAILURE_MARKER_PREFIX = "（正文加载失败：";
+
+  private static final String LOAD_FAILURE_MARKER_SUFFIX = "）";
+
+  /** 失败原因进 prompt 前截断到的字符数上限：异常消息里的路径可能很长，目录档要便宜。 */
+  private static final int MAX_LOAD_FAILURE_REASON_CHARS = 120;
 
   private final ContextPolicy policy;
   private final ContextSources sources;
@@ -131,6 +141,18 @@ public final class BasicContextAssembler implements ContextAssembler {
   private record LoadedSkill(Skill skill, String body) {}
 
   /**
+   * 一次自动预载的结果：读成功的正文块（扫描序）+ 读失败的技能名 → 简短原因（扫描序）。
+   *
+   * <p>失败不丢：正文块照常只剩成功的，失败信息转由 {@code SKILL_INDEX} 对应行尾标注披露——"绝不静默跳过"要靠可见性兑现， 不靠崩回合。
+   */
+  private record PreloadedSkills(List<LoadedSkill> bodies, Map<String, String> failures) {
+
+    static PreloadedSkills empty() {
+      return new PreloadedSkills(List.of(), Map.of());
+    }
+  }
+
+  /**
    * 按 {@link ContextLayer} 声明顺序产出 system 消息的段落。SYSTEM 恒为第一段且字节与接线前一致；SKILL_INDEX → LOADED_SKILLS →
    * MEMORY 依次追加（RULES/COMPACT_SUMMARY 仍为空占位，留给后续任务）。空内容的层不产出段落。
    *
@@ -144,9 +166,9 @@ public final class BasicContextAssembler implements ContextAssembler {
     if (sources.hasSkills()) {
       // 顺序有讲究：先读第二档正文（load 会记下"刚激活"），再渲染第一档目录——listing 在预算吃紧时按激活新近度淘汰，
       // 先记激活能让目录档从第一回合起就是稳态，而不是第二回合因首回合的激活而改写前缀（前缀只追加不改写）
-      List<LoadedSkill> loaded = loadPreloadedSkills();
-      addIfPresent(segments, ContextLayer.SKILL_INDEX, skillIndexText());
-      addIfPresent(segments, ContextLayer.LOADED_SKILLS, loadedSkillsText(loaded));
+      PreloadedSkills preloaded = loadPreloadedSkills();
+      addIfPresent(segments, ContextLayer.SKILL_INDEX, skillIndexText(preloaded));
+      addIfPresent(segments, ContextLayer.LOADED_SKILLS, loadedSkillsText(preloaded.bodies()));
     }
     if (sources.hasMemory()) {
       addIfPresent(segments, ContextLayer.MEMORY, memoryText(userMessage));
@@ -174,35 +196,82 @@ public final class BasicContextAssembler implements ContextAssembler {
   }
 
   /** 第一档：目录档（名字 + 用途）；目录档为空（没扫到技能或预算为 0）时返回空串，由 {@link #addIfPresent} 挡下。 */
-  private String skillIndexText() {
+  private String skillIndexText(PreloadedSkills preloaded) {
     String listing = sources.skills().listing();
-    return listing.isBlank() ? "" : SKILL_INDEX_HEADER + "\n" + listing;
+    if (listing.isBlank()) {
+      return "";
+    }
+    return SKILL_INDEX_HEADER + "\n" + markLoadFailures(listing, preloaded.failures());
   }
 
   /**
-   * 第二档：预载技能的正文，块序 = 目录扫描序（不是预载集顺序——Set 无序，逐字节确定只能靠扫描序）。
+   * 在目录档里把自动预载失败的技能行标出来：{@code （正文加载失败：<简短原因>）} 追加在 {@code "- <名>: "} 行尾。
+   *
+   * <p>只加在失败行、无失败时逐字节原样返回（ruling 1 的 byte-identity 由此不受影响）；失败集为空是常态， 这里也走同一路径，不搞特殊分支。
+   */
+  private static String markLoadFailures(String listing, Map<String, String> failures) {
+    if (failures.isEmpty()) {
+      return listing;
+    }
+    String[] lines = listing.split("\n", -1);
+    for (int i = 0; i < lines.length; i++) {
+      for (Map.Entry<String, String> failure : failures.entrySet()) {
+        if (lines[i].startsWith("- " + failure.getKey() + ": ")) {
+          lines[i] =
+              lines[i]
+                  + LOAD_FAILURE_MARKER_PREFIX
+                  + failure.getValue()
+                  + LOAD_FAILURE_MARKER_SUFFIX;
+          break;
+        }
+      }
+    }
+    return String.join("\n", lines);
+  }
+
+  /**
+   * 第二档：自动预载技能的正文，块序 = 目录扫描序（不是预载集顺序——Set 无序，逐字节确定只能靠扫描序）。
    *
    * <p>预载集里目录没有的名字被<b>跳过而非抛错</b>：spec 里一个陈旧名字不该让每个回合都崩。做法是按目录遍历再查预载集，不存在的 名字根本不会被访问（{@link
    * SkillCatalog#load} 对未知名字是抛错的，不能拿它当存在性检查）。正文为空的技能不进第二档—— 只留一个空标题纯属占 token，且会让"空层不占位"破功。
    *
-   * <p>边界的另一侧：目录里<b>有</b>这个技能、但读盘失败（被删/写坏）时异常照抛——那是真配置错误，按目录自身"绝不静默跳过"的 契约往上冒泡，不在这里吞掉。
+   * <p>目录里<b>有</b>这个技能、但读盘失败（被删/写坏）时<b>不抛</b>：自动预载是每回合都走的路，一次坏磁盘让 整个回合崩掉的代价远大于不带这份正文。失败改由 {@link
+   * #markLoadFailures} 在目录档该行可见地披露（绝不静默跳过靠 可见性兑现，不靠崩）。注意边界在哪儿：<b>显式</b>激活路径（{@link
+   * SkillCatalog#load}）的契约不变，未知名字与坏文件 照抛——那条路是调用方明确要求读这个技能，静默降级反而会掩盖错误。
    */
-  private List<LoadedSkill> loadPreloadedSkills() {
+  private PreloadedSkills loadPreloadedSkills() {
     Set<String> preloaded = sources.preloadedSkills();
     if (preloaded.isEmpty()) {
-      return List.of();
+      return PreloadedSkills.empty();
     }
     List<LoadedSkill> loaded = new ArrayList<>(preloaded.size());
+    Map<String, String> failures = new LinkedHashMap<>();
     for (Skill skill : sources.skills().catalog()) {
       if (!preloaded.contains(skill.name())) {
         continue;
       }
-      String body = sources.skills().load(skill.name());
+      String body;
+      try {
+        body = sources.skills().load(skill.name());
+      } catch (RuntimeException e) {
+        failures.put(skill.name(), shortReason(e));
+        continue;
+      }
       if (!body.isBlank()) {
         loaded.add(new LoadedSkill(skill, body));
       }
     }
-    return loaded;
+    return new PreloadedSkills(loaded, failures);
+  }
+
+  /** 失败原因收成单行短文本（异常类名与堆栈不进 prompt）：空白折叠、去首尾、超长尾部截断。 */
+  private static String shortReason(RuntimeException e) {
+    String message = e.getMessage();
+    String reason = message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
+    reason = reason.replaceAll("\\s+", " ").strip();
+    return reason.length() <= MAX_LOAD_FAILURE_REASON_CHARS
+        ? reason
+        : reason.substring(0, MAX_LOAD_FAILURE_REASON_CHARS) + "…";
   }
 
   private static String loadedSkillsText(List<LoadedSkill> loaded) {

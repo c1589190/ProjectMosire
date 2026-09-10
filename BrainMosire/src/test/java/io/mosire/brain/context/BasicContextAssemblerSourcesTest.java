@@ -18,6 +18,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
@@ -104,23 +105,46 @@ class BasicContextAssemblerSourcesTest {
             ContextLayer.SKILL_INDEX, (SKILL_INDEX_HEADER + "\n- alpha: 第一个技能").length() / 4);
   }
 
-  /** 目录序 = 扫描序：预载集是无序 Set，但目录行与正文块都按目录扫描序产出（跨机器确定）。 */
+  /**
+   * 目录序 = 扫描序：预载集是无序 Set，但目录行与正文块都按目录扫描序产出（跨机器确定）。
+   *
+   * <p>预载名字<b>按扫描序的逆序</b>装入、且给足 5 个：若实现偷懒拿预载集的迭代序当输出序，"恰好撞上扫描序"的概率约 1/120（2 个名字时约
+   * 1/2——那样的断言在坏实现下有一半的运行能蒙混过关），一次运行就能把这种实现揪出来。
+   */
   @Test
   void skillLinesAndBodiesFollowCatalogScanOrderNotPreloadSetOrder() {
-    writeSkill("charlie", "第三", "CHARLIE 正文");
-    writeSkill("alpha", "第一", "ALPHA 正文");
-    writeSkill("bravo", "第二", "BRAVO 正文");
+    String[] names = {"alpha", "bravo", "charlie", "delta", "echo"};
+    String[] bodies = {"ALPHA 正文", "BRAVO 正文", "CHARLIE 正文", "DELTA 正文", "ECHO 正文"};
+    for (int i = 0; i < names.length; i++) {
+      writeSkill(names[i], "第" + (i + 1) + "个", bodies[i]);
+    }
     SkillCatalog catalog = new SkillCatalog();
     catalog.scan(skillsDir());
+    Set<String> reverseScanOrder =
+        new LinkedHashSet<>(List.of("echo", "delta", "charlie", "bravo", "alpha"));
     BasicContextAssembler assembler =
         new BasicContextAssembler(
-            ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of("bravo", "alpha")));
+            ContextPolicy.defaults(), ContextSources.skills(catalog, reverseScanOrder));
 
     String text = systemTextOf(assembler.buildRequest(config(), "干活", List.of(), List.of()));
 
-    assertThat(text.indexOf("- alpha: 第一")).isLessThan(text.indexOf("- bravo: 第二"));
-    assertThat(text.indexOf("- bravo: 第二")).isLessThan(text.indexOf("- charlie: 第三"));
-    assertThat(text.indexOf("ALPHA 正文")).isLessThan(text.indexOf("BRAVO 正文"));
+    // 先钉存在性、再钉顺序：顺序断言用 indexOf，缺项时 -1 也"小于"任何下标，不能被它蒙混过去
+    assertThat(text).contains(LOADED_SKILLS_HEADER);
+    for (String body : bodies) {
+      assertThat(text).contains(body);
+    }
+    for (int i = 0; i + 1 < names.length; i++) {
+      assertThat(text.indexOf("- " + names[i] + ": "))
+          .isLessThan(text.indexOf("- " + names[i + 1] + ": "));
+      assertThat(text.indexOf(bodies[i])).isLessThan(text.indexOf(bodies[i + 1]));
+    }
+    // 换一个无序 Set 实现（Set.of 与 LinkedHashSet 的迭代序来源不同）逐字节同输出：输入集的迭代序一个字都不该漏进前缀
+    BasicContextAssembler unmodifiableVariant =
+        new BasicContextAssembler(
+            ContextPolicy.defaults(),
+            ContextSources.skills(catalog, Set.of("echo", "delta", "charlie", "bravo", "alpha")));
+    assertThat(systemTextOf(unmodifiableVariant.buildRequest(config(), "干活", List.of(), List.of())))
+        .isEqualTo(text);
     // 同一输入重复装配逐字节相同（前缀契约的确定性前提）
     assertThat(systemTextOf(assembler.buildRequest(config(), "干活", List.of(), List.of())))
         .isEqualTo(text);
@@ -154,6 +178,54 @@ class BasicContextAssemblerSourcesTest {
     assertThat(systemTextOf(mixed.buildRequest(config(), "干活", List.of(), List.of())))
         .contains(LOADED_SKILLS_HEADER)
         .contains("ALPHA 正文");
+  }
+
+  // ---------- 自动预载路径：坏技能降级为可见标注 ----------
+
+  /**
+   * 目录里有、读盘却失败的技能：不进第二档正文，但在它自己那条目录行上可见地标注失败——既不静默吞掉，也不让每个回合都崩。
+   *
+   * <p>删除与写坏两种形态都测：技能库被 Agent 自己重写（learning loop）时文件会短暂不存在，而写坏 frontmatter 是另一种常见的
+   * "半套状态"。标注必须是单行短文本（不带堆栈、不带多行），否则每回合都会把噪声灌进前缀。
+   *
+   * <p>显式激活路径不受本降级影响：{@link SkillCatalog#load} 照旧抛错——那里的失败是调用者的即时错误，应当响亮。
+   */
+  @Test
+  void unreadableSkillBodyIsSkippedAndMarkedOnItsIndexLine() {
+    writeSkill("alpha", "第一", "ALPHA 正文");
+    writeSkill("broken", "坏技能", "BROKEN 正文");
+    writeSkill("corrupt", "坏 frontmatter", "CORRUPT 正文");
+    SkillCatalog catalog = new SkillCatalog();
+    catalog.scan(skillsDir());
+    deleteBodyOf("broken");
+    corruptBodyOf("corrupt");
+    BasicContextAssembler assembler =
+        new BasicContextAssembler(
+            ContextPolicy.defaults(),
+            ContextSources.skills(catalog, Set.of("broken", "corrupt", "alpha")));
+
+    String text = systemTextOf(assembler.buildRequest(config(), "干活", List.of(), List.of()));
+
+    // 回合不崩：健康的兄弟技能照常进第二档正文
+    assertThat(text).contains("## 技能 alpha（资源目录：" + skillsDir().resolve("alpha") + "）");
+    assertThat(text).contains("ALPHA 正文");
+    // 坏技能：正文一个字都不进请求，但失败在目录档那一行可见
+    assertThat(text).doesNotContain("BROKEN 正文").doesNotContain("CORRUPT 正文");
+    assertThat(text).contains("- broken: 坏技能（正文加载失败：技能目录缺少 SKILL.md：");
+    assertThat(text)
+        .contains("- corrupt: 坏 frontmatter（正文加载失败：SKILL.md 必须以 frontmatter 分隔行 --- 开头：");
+    // 标注是单行短文本：异常类名/堆栈不进 prompt
+    assertThat(text).doesNotContain("Exception").doesNotContain("\tat ").doesNotContain("\n\t");
+    // 标记只出现在失败行：健康行一个字节都不加（ruling 1 的 byte-identical 由"无失败 = 无标记"承接）
+    assertThat(text).doesNotContain("- alpha: 第一（正文加载失败：");
+    // 显式激活路径仍照抛（本任务不改 SkillCatalog.load 的契约）
+    assertThatThrownBy(() -> catalog.load("broken")).isInstanceOf(IllegalArgumentException.class);
+    // 记账同源：目录档 token = 含标注后的该段文本长度 / 4
+    String indexBlock =
+        text.substring(
+            text.indexOf(SKILL_INDEX_HEADER), text.indexOf("\n\n" + LOADED_SKILLS_HEADER));
+    assertThat(assembler.composition(config(), "干活", List.of(), List.of()).estimatedTokens())
+        .containsEntry(ContextLayer.SKILL_INDEX, indexBlock.length() / 4);
   }
 
   // ---------- 记忆 recall ----------
@@ -315,15 +387,32 @@ class BasicContextAssemblerSourcesTest {
 
   /** 落盘 {@code <skillsDir>/<dirName>/SKILL.md}（frontmatter 的 name ≡ 目录名，正文只留 body）。 */
   private void writeSkill(String dirName, String description, String body) {
+    writeRawSkill(
+        dirName, "---\nname: " + dirName + "\ndescription: " + description + "\n---\n" + body);
+  }
+
+  /** 直接写入 SKILL.md 原文（测坏 frontmatter 形态）。 */
+  private void writeRawSkill(String dirName, String content) {
     Path dir = skillsDir().resolve(dirName);
     try {
       Files.createDirectories(dir);
-      Files.writeString(
-          dir.resolve(Skill.SKILL_FILE_NAME),
-          "---\nname: " + dirName + "\ndescription: " + description + "\n---\n" + body,
-          StandardCharsets.UTF_8);
+      Files.writeString(dir.resolve(Skill.SKILL_FILE_NAME), content, StandardCharsets.UTF_8);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  /** 扫描后删掉 SKILL.md：目录快照里技能仍在，读盘必然失败。 */
+  private void deleteBodyOf(String dirName) {
+    try {
+      Files.delete(skillsDir().resolve(dirName).resolve(Skill.SKILL_FILE_NAME));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /** 扫描后把正文写成没有 frontmatter 的内容：文件在、内容坏。 */
+  private void corruptBodyOf(String dirName) {
+    writeRawSkill(dirName, "没有 frontmatter 的正文");
   }
 }
