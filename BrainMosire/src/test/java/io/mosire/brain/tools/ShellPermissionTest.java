@@ -188,8 +188,11 @@ class ShellPermissionTest {
   }
 
   /**
-   * 同一注册表/同一权限集上真实守卫的判定结果（拒绝路径无副作用：判定先于执行）。管线把守卫的 {@link ToolResult} 吞在内部，这是取到 {@code code ==
-   * PERMISSION_DENIED} 的唯一现场。
+   * 同一注册表/同一权限集上真实守卫的判定结果（拒绝路径无副作用：判定先于执行）。
+   *
+   * <p><b>这不是唯一现场</b>（勿据此以为少了它就观测不到）：{@code AgentPipeline} 只在 {@code DENIED.equals(result.code())}
+   * 时才发 {@code permission.denied}，故 {@link #reasonOf} 的事件断言（{@code hasSize(1)}）已<b>蕴含</b>
+   * code==DENIED。本方法是个 <b>冗余但直接</b>的观测点——直接向守卫取一次，读起来比"从事件反推"更直白，且给 R8 的字面断言（code 取值）一个落脚处。
    */
   private static ToolResult guardVerdict(
       ToolRegistry registry, AgentPermissionSet permissions, String command) {

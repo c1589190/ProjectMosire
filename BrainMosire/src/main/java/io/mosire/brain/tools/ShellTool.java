@@ -75,7 +75,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p><strong>大输出落库</strong>：输出被裁（档 1 截断或档 2 超预算）时，把<b>采集到的完整文本</b>交给构造注入的 {@link
  * OutputSink}，拿到的引用放进 {@link ToolResult#assetDocIds()}（既有字段）。缺省实现 {@link OutputSink#none()} 不落库； 真实
- * EventStore 接线属 T15。落库是尽力而为：sink 抛异常只降级为"无引用"，不改变命令结果。
+ * EventStore 接线归 <b>P2-7</b>（与 App 装配同批；原计划写 T15，已由控制者裁决改归 P2-7）。落库是尽力而为：sink 抛异常只降级为"无引用"，不改变命令结果。
  *
  * <p><strong>token 预算</strong>：进上下文的文本（成功与失败两条路径）恒受 {@code maxInjectedChars} 约束——失败路径的命令回显
  * 先收短再随整个消息过同一份预算（超时/中断可逐回合重现，整段照抄命令就是绕过预算的后门）；只有 {@link
@@ -132,7 +132,7 @@ public final class ShellTool implements AgentTool {
    *
    * <p>约定：返回非 null 的 {@link Optional}；{@link Optional#empty()} = 未落库（本阶段就是缺省行为）。实现抛异常视为落库失败，
    * 调用方降级为"无引用"，不影响命令结果。为什么用注入而非 {@link ToolContext#config()}：落库是宿主能力（离线单测不该被事件库绑架）， 而 {@code
-   * config} 只承载"工具自身配置"；真实接线属 T15。
+   * config} 只承载"工具自身配置"；真实接线归 <b>P2-7</b>（原计划写 T15，已由控制者裁决改归 P2-7）。
    */
   public interface OutputSink {
 
