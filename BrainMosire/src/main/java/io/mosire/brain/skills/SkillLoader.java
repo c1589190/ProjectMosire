@@ -39,7 +39,10 @@ public final class SkillLoader {
   private SkillLoader() {}
 
   /**
-   * 只读第一档元数据（frontmatter）：正文一个字节都不进内存，这是渐进披露的省 token 起点。
+   * 只取第一档元数据（frontmatter）：正文不进返回的元数据、不进上下文、不被缓存，这是渐进披露的省 token 起点。
+   *
+   * <p>口径说明：实现是 {@link Files#readAllLines} 整文件读入后只留 frontmatter 行（正文会作为中间结果短暂过一趟
+   * 内存，不留用）；真正被保证的是<b>正文不进入上下文/提示词、不跨调用驻留</b>，而不是"不从盘上读"。省 token 的收益 来自前者，与读盘方式无关。
    *
    * @param skillDirectory 技能根目录（{@code <skillsDir>/<name>}）
    * @return 校验过的技能元数据（name ≡ 目录名、description 1–1024）

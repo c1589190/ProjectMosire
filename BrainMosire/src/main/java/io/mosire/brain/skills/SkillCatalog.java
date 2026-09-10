@@ -29,8 +29,8 @@ import java.util.stream.Stream;
  * </ol>
  *
  * <p><b>listing 的确定性（prompt-cache 前缀契约）</b>：{@link #listing()} 的输出恒为<b>扫描序</b>（目录名升序）——
- * 层序与内容一旦发布就只追加不改写，重排会让 prompt-cache 前缀失效。超预算时的淘汰同样确定：丢最久未激活的，平局 （含"都没激活过"）按扫描序靠前者优先留下，于是预算吃紧时
- * listing 退化为扫描序前缀——新增技能只追加在尾部，不挤走既有行。
+ * 层序与内容一旦发布就只追加不改写，重排会让 prompt-cache 前缀失效。超预算时的淘汰同样确定：只从最久未激活的一端丢，平局
+ * （含"都没激活过"）按扫描序靠前者优先留下（被丢的一律是优先级尾巴，不会出现留下旧的、丢掉新的），于是预算吃紧时 listing 退化为扫描序前缀——新增技能只追加在尾部，不挤走既有行。
  *
  * <p>预算单位是<b>字符数</b>（同 {@link #MAX_ENTRY_CHARS} 口径，token ≈ 字符 / 4，见 {@code ContextComposition}
  * 的估算法）；后续接线时可由 {@code ContextPolicy.budgetFor(ContextLayer.SKILL_INDEX)} 换算注入。
@@ -85,7 +85,7 @@ public final class SkillCatalog {
   }
 
   /**
-   * 扫描技能目录（第一档）：只解析每个 {@code <name>/SKILL.md} 的 frontmatter，正文不读。
+   * 扫描技能目录（第一档）：只取每个 {@code <name>/SKILL.md} 的 frontmatter，正文不进元数据、不入上下文。
    *
    * <p>扫描序 = 子目录名的升序（{@link Files#list} 的返回顺序依赖文件系统，不能作为序的来源），这样 listing 与激活时间戳 平局判定才有跨机器的确定性。
    *
@@ -150,7 +150,8 @@ public final class SkillCatalog {
    * 第一档的可披露文本（每行一条技能），供 {@code ContextLayer.SKILL_INDEX} 携带：恒按扫描序输出，行内不出现正文。
    *
    * <p>规则：单行超过 {@link #MAX_ENTRY_CHARS} → 头部截断 + {@link #TRUNCATION_MARKER}；全部行加起来超过 {@link
-   * #budget()} → 丢最久未激活的（平局按扫描序靠前者优先），逐条贪心直到装不下为止。
+   * #budget()} →
+   * 丢最久未激活的（平局按扫描序靠前者优先），按"最近激活优先"自上而下装填，<b>遇到第一个装不下的就停</b>。停而不是跳过，是为了保证被丢的一律是优先级尾巴：绝不会出现"留下没激活过的小行、丢掉刚激活的大行"；代价是优先级高的大行放不下时目录可能比预算允许的更短——确定性优先于装填率。
    */
   public String listing() {
     List<Skill> inScanOrder = snapshot;
@@ -170,7 +171,9 @@ public final class SkillCatalog {
       String line = rendered.get(skill.name());
       int cost = line.length() + (kept.isEmpty() ? 0 : LINE_SEPARATOR.length());
       if (used + cost > listingBudget) {
-        continue; // 装不下：本行被淘汰（越靠后越不常用）
+        // 装不下：就地停止装填（不是跳过它继续试后面的）——留下的条目优先级一律高于被丢的，
+        // 否则会出现"留下没激活过的小行、丢掉刚激活的大行"，即淘汰的恰恰是最常用的那条
+        break;
       }
       kept.add(skill.name());
       used += cost;
@@ -203,9 +206,21 @@ public final class SkillCatalog {
           .append(String.join(", ", new TreeSet<>(skill.allowedTools())))
           .append(')');
     }
-    return line.length() <= MAX_ENTRY_CHARS
-        ? line.toString()
-        : line.substring(0, MAX_ENTRY_CHARS - TRUNCATION_MARKER.length()) + TRUNCATION_MARKER;
+    return line.length() <= MAX_ENTRY_CHARS ? line.toString() : truncateEntry(line.toString());
+  }
+
+  /**
+   * 头部截断 + 省略标记，总长 ≤ {@link #MAX_ENTRY_CHARS}（无代理对时恰为上限）。
+   *
+   * <p>截断点避开 UTF-16 代理对：若切点正好落在高代理项与低代理项之间，就再退一个字符——否则行尾留下孤立高代理项， 这份 listing 进上下文/落事件后就是坏字符串（emoji
+   * 描述在 1535 字符处被腰斩并非理论问题）。退一格使实际内容少 1 字符（1535），上限仍是"≤"，长度口径不变（UTF-16 code unit）。
+   */
+  private static String truncateEntry(String line) {
+    int cut = MAX_ENTRY_CHARS - TRUNCATION_MARKER.length();
+    if (Character.isHighSurrogate(line.charAt(cut - 1))) {
+      cut--;
+    }
+    return line.substring(0, cut) + TRUNCATION_MARKER;
   }
 
   private static boolean isHidden(Path path) {

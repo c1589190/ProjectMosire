@@ -253,9 +253,69 @@ class SkillCatalogTest {
     catalog.scan(skillsDir());
 
     String line = catalog.listing();
-    assertThat(line).hasSizeLessThanOrEqualTo(SkillCatalog.MAX_ENTRY_CHARS).endsWith("…");
+    assertThat(line).hasSize(SkillCatalog.MAX_ENTRY_CHARS).endsWith("…");
     // 渲染截断不反噬元数据：catalog() 里的 description 仍是完整的 1024 字符
     assertThat(catalog.catalog().get(0).description()).isEqualTo(description);
+  }
+
+  /** 恰好等于上限的行不截断、不加省略标记——"超限才截"的边界另一侧。 */
+  @Test
+  void listingLineExactlyAtMaxEntryCharsIsLeftIntact() {
+    String description = "x".repeat(Skill.MAX_DESCRIPTION_LENGTH);
+    String prefix = "- t: " + description + " (allowed-tools: ";
+    String tool = "a".repeat(SkillCatalog.MAX_ENTRY_CHARS - 1 - prefix.length());
+    writeSkill("t", "t", description, tool, "正文");
+
+    SkillCatalog catalog = new SkillCatalog();
+    catalog.scan(skillsDir());
+
+    String line = catalog.listing();
+    assertThat(line).hasSize(SkillCatalog.MAX_ENTRY_CHARS).doesNotEndWith("…");
+    assertThat(line).isEqualTo(prefix + tool + ")");
+  }
+
+  /** 截断点不得把 UTF-16 代理对腰斩成行尾的孤立高代理项（星平面字符如 emoji 会撞上 1535 这个切点）。 */
+  @Test
+  void truncationDoesNotSplitASurrogatePair() {
+    String description = "x".repeat(Skill.MAX_DESCRIPTION_LENGTH);
+    String prefix = "- t: " + description + " (allowed-tools: ";
+    // 按渲染格式反推填充：让 emoji 的高代理项正好落在被切掉的最后一个单元位置（MAX_ENTRY_CHARS - 2）
+    String tool =
+        "a".repeat(SkillCatalog.MAX_ENTRY_CHARS - 2 - prefix.length()) + "🙂" + "b".repeat(30);
+    String full = prefix + tool + ")";
+    // 自检：切点确实落在代理对中间，否则本用例退化成一个普通截断断言
+    assertThat(Character.isHighSurrogate(full.charAt(SkillCatalog.MAX_ENTRY_CHARS - 2))).isTrue();
+    writeSkill("t", "t", description, tool, "正文");
+
+    SkillCatalog catalog = new SkillCatalog();
+    catalog.scan(skillsDir());
+
+    String line = catalog.listing();
+    // 上限是"≤"：为躲开腰斩代理对会让出 1 个字符（1535），行尾不留孤立高代理项
+    assertThat(line).hasSizeLessThanOrEqualTo(SkillCatalog.MAX_ENTRY_CHARS).endsWith("…");
+    assertThat(Character.isHighSurrogate(line.charAt(line.length() - 2))).isFalse();
+  }
+
+  /**
+   * 行大小不齐时的淘汰方向：装填按"最近激活优先"自上而下，<b>遇到第一个装不下的就停</b>。
+   *
+   * <p>这正是"跳过装不下的继续试"会翻车的地方：那样会把刚激活的大行丢掉、留下从未激活的小行——淘汰的恰好是最常用的一条。
+   */
+  @Test
+  void listingNeverKeepsALessUsedSkillWhileDroppingAMoreRecentOne() {
+    // a：15 字符小行、从未激活；b：1029 字符大行（描述取上限 1024）、刚激活；预算 100 装得下 a、装不下 b
+    writeSkill("a", "a", "x".repeat(10), null, "正文");
+    writeSkill("b", "b", "y".repeat(Skill.MAX_DESCRIPTION_LENGTH), null, "正文");
+    SkillCatalog catalog = new SkillCatalog(100);
+    catalog.scan(skillsDir());
+    catalog.load("b");
+
+    // b 装不下就整条停：目录宁可空着，也不出现"留旧的（a）、丢新的（b）"
+    assertThat(catalog.listing()).isEmpty();
+
+    // a 被激活后成为最常用的小行 → 轮到它进目录，b 仍在它后面被丢
+    catalog.load("a");
+    assertThat(catalog.listing()).isEqualTo("- a: xxxxxxxxxx");
   }
 
   // ---------- listing 预算：丢最不常用，平局按扫描序 ----------
