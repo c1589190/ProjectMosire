@@ -10,6 +10,7 @@ import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.brain.tools.ShellTool.OutputSink;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -168,6 +169,131 @@ class ShellToolTest {
     assertThat(result.message().length()).isLessThan(2000);
   }
 
+  // ---------- 后代进程占着管道时的输出完整性（评审 Critical 回归） ----------
+
+  /**
+   * 静默后代（本轮评审 Critical 的探针场景逐字回归）：直接子进程（bash）退出后，后代（sleep）仍占着管道写端 （本工具不回收进程树，见类 Javadoc）。
+   *
+   * <p>旧实现里读取线程永久阻塞在 {@code read} 上、采集缓冲只在读取返回时才发布 → 工具拿到空快照，把"命令明明打了哨兵"回报成 {@code exitCode: 0} +
+   * {@code stdout:\n\nstderr:\n}（静默的错误输出，比报错更糟）。哨兵必须出现——已读到的字节不得因为 流没有等到可观测尽头而整体丢弃。
+   */
+  @Test
+  @Timeout(60)
+  void silentDescendantStillYieldsItsOutput() {
+    ToolResult result =
+        new ShellTool(tempDir)
+            .execute(
+                context(
+                    Map.of(
+                        "command",
+                        // 评审探针用的是 sleep 3600；这里 10 秒足够跑完本次调用，且不给门禁留下长命孤儿
+                        "sleep 10 & echo VISIBLE-STDOUT-SENTINEL; echo VISIBLE-ERR-SENTINEL 1>&2",
+                        "timeout",
+                        10)));
+
+    assertThat(result.code()).isNull();
+    assertThat(result.message())
+        .contains("exitCode: 0")
+        .contains("VISIBLE-STDOUT-SENTINEL")
+        .contains("VISIBLE-ERR-SENTINEL");
+    // 旧失败形态：成功 + 空输出（什么都没报到）
+    assertThat(result.message()).doesNotContain("stdout:\n\nstderr:\n");
+    assertThat(result.message()).doesNotContain(ShellOutputTruncator.INCOMPLETE_TAG);
+  }
+
+  /**
+   * 可观测边界（如实钉住，不是想要的行为）：直接子进程被 JDK 回收器回收的瞬间，管道读端就被强制关闭——此后进程树里任何进程的 写入都不可能再被读到（{@code
+   * ProcessPipeInputStream.processExited()} 只把回收那一刻管道里的残留字节搬进内存流）。
+   *
+   * <p>因此"晚到的后代输出"既捕获不到、也无法逐条披露（它与"干净结束"不可区分）。这是取舍的代价，不是本实现的选择：要治理这种 输出得靠子 Agent 级的进程树归属（类 Javadoc
+   * 的取舍）。回收前已进入管道的字节照常捕获——上一用例是它的回归面。
+   */
+  @Test
+  @Timeout(60)
+  void descendantWritesAfterTheDirectChildIsReapedAreBeyondObservability() {
+    long startedAt = System.nanoTime();
+
+    ToolResult result =
+        new ShellTool(tempDir)
+            .execute(
+                context(
+                    Map.of(
+                        "command",
+                        "(sleep 0.5; echo LATE-SENTINEL) & echo EARLY-SENTINEL",
+                        "timeout",
+                        5)));
+
+    assertThat(result.code()).isNull();
+    assertThat(result.message()).contains("EARLY-SENTINEL").doesNotContain("LATE-SENTINEL");
+    // 后代还占着管道也不拖着收尾：直接子进程结束后即有界返回
+    assertThat((System.nanoTime() - startedAt) / 1_000_000).isLessThan(5_000);
+  }
+
+  /** 读取线程必须真的结束（不是"被放弃"）：后代命令跑 N 次后，{@code mosire-bash-*} 线程数回到基线。 */
+  @Test
+  @Timeout(90)
+  void readerThreadsAreReclaimedAfterCommandsWithSurvivingDescendants() throws Exception {
+    int baseline = bashReaderCount();
+    ShellTool tool = new ShellTool(tempDir);
+    Map<String, Object> args =
+        Map.of(
+            "command",
+            "sleep 10 & echo THREAD-CENSUS-OUT; echo THREAD-CENSUS-ERR 1>&2",
+            "timeout",
+            5);
+
+    for (int i = 0; i < 8; i++) {
+      assertThat(tool.execute(context(args)).message()).contains("THREAD-CENSUS-OUT");
+    }
+    long deadline = System.nanoTime() + 5_000_000_000L;
+    while (bashReaderCount() > baseline && System.nanoTime() < deadline) {
+      Thread.sleep(50);
+    }
+
+    assertThat(bashReaderCount()).isEqualTo(baseline);
+  }
+
+  /** 进上下文的文本（成功与失败两条路径）都必须尊重字符预算，即使命令本身很长（失败路径曾把原始命令整段塞进消息）。 */
+  @Test
+  @Timeout(30)
+  void injectedTextRespectsTheBudgetOnBothPathsWithALongCommand() {
+    int budget = 200;
+    ShellTool tool =
+        new ShellTool(
+            tempDir, OutputSink.none(), ShellOutputTruncator.Mode.NORMAL, 1 << 20, budget);
+
+    ToolResult success =
+        tool.execute(context(Map.of("command", "echo " + OUT_SENTINEL + " # " + "x".repeat(3000))));
+    ToolResult failure =
+        tool.execute(context(Map.of("command", "sleep 30 # " + "x".repeat(3000), "timeout", 1)));
+
+    assertThat(success.code()).isNull();
+    assertThat(success.message().length()).isLessThanOrEqualTo(budget);
+    assertThat(failure.code()).isEqualTo(ShellTool.TIMEOUT);
+    assertThat(failure.message()).contains("超时");
+    assertThat(failure.message().length()).isLessThanOrEqualTo(budget);
+  }
+
+  /**
+   * 200 MB 级输出 + 1 KiB 采集顶：字节顶必须在<b>采集期</b>生效（超限字节只计数不入内存）——测试 JVM 只有 288m 堆，任何"先收全再裁"的实现都会在这里
+   * OOM（等价于评审在 -Xmx48m 下的实测）。
+   */
+  @Test
+  @Timeout(120)
+  void twoHundredMegabytesOfOutputStaysWithinTheCaptureCap() {
+    ShellTool tool =
+        new ShellTool(tempDir, OutputSink.none(), ShellOutputTruncator.Mode.NORMAL, 1024, 8000);
+
+    ToolResult result = tool.execute(context(Map.of("command", "yes x | head -c 200000000")));
+
+    assertThat(result.code()).isNull();
+    assertThat(result.message())
+        .contains(ShellOutputTruncator.CAPTURE_TAG)
+        .contains("200000000")
+        .contains("1024");
+    assertThat(result.message().length()).isLessThan(2000);
+  }
+
   // ---------- 档 2：进上下文的 head-tail 截断（复用既有截断器） ----------
 
   @Test
@@ -187,18 +313,35 @@ class ShellToolTest {
 
   @Test
   @Timeout(30)
-  void descendantHoldingThePipeDoesNotBlockTheTool() {
-    // 不加 exec：bash 会 fork 出 yes，杀掉直接子进程（bash）后 yes 仍占着管道继续写。
-    // 这就是类 Javadoc 写明的取舍——本工具不回收进程树，故读取线程有界等待、宁可少读也不永久阻塞（朴素 join 会让本用例挂到超时）
+  void descendantHoldingThePipeDoesNotBlockTheTool() throws Exception {
+    // 不加 exec：bash 会 fork 出 yes（不让它变成直接子进程）；后代 PID 写进文件，用例结束自行收殓——
+    // 空转的 yes 会一直烧 CPU，把同门用例（乃至门禁里的其它模块）拖成随机失败。
+    // 这就是类 Javadoc 写明的取舍：本工具不回收进程树，故读取线程有界等待、宁可少读也不永久阻塞（朴素 join 会让本用例挂到超时）
     ShellTool tool = new ShellTool(tempDir);
+    Path strayYes = tempDir.resolve("stray-yes.pid");
+    Path straySleep = tempDir.resolve("stray-sleep.pid");
     long startedAt = System.nanoTime();
 
-    ToolResult result = tool.execute(context(Map.of("command", "yes", "timeout", 1)));
+    try {
+      ToolResult result =
+          tool.execute(
+              context(
+                  Map.of(
+                      "command",
+                      "yes & echo $! > stray-yes.pid; sleep 30 & echo $! > stray-sleep.pid; wait",
+                      "timeout",
+                      1)));
 
-    long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
-    assertThat(result.code()).isEqualTo(ShellTool.TIMEOUT);
-    // 朴素 join 会等到后代进程结束（yes 永不结束）→ 本用例挂到超时失败；有界等待 + 放弃读取才是行为
-    assertThat(elapsedMs).isLessThan(15_000);
+      long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+      assertThat(result.code()).isEqualTo(ShellTool.TIMEOUT);
+      // 失败路径同样自报采集顶：yes 刷满 1 MiB 顶，消息必须说清"看到的是残片"
+      assertThat(result.message()).contains(ShellOutputTruncator.CAPTURE_TAG);
+      // 朴素 join 会等到后代进程结束（yes 永不结束）→ 本用例挂到超时失败；有界等待 + 放弃读取才是行为
+      assertThat(elapsedMs).isLessThan(15_000);
+    } finally {
+      killStray(strayYes);
+      killStray(straySleep);
+    }
   }
 
   @Test
@@ -334,6 +477,7 @@ class ShellToolTest {
 
     Thread worker =
         Thread.ofPlatform()
+            .daemon() // 非守护线程残留会拖住门禁 JVM 退出
             .name("shell-interrupt-test")
             .start(() -> result.set(tool.execute(context(args))));
     long childPid = awaitPidFile(pidFile);
@@ -427,6 +571,29 @@ class ShellToolTest {
 
   private static boolean isAlive(long pid) {
     return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+  }
+
+  /** 收殓命令自己派生的后代（工具按 R1 的取舍不回收进程树）：只按记下的 PID 精确终止，不做全系统按名杀。 */
+  private static void killStray(Path pidFile) {
+    try {
+      String raw = Files.readString(pidFile, UTF_8).trim();
+      if (!raw.isEmpty()) {
+        ProcessHandle.of(Long.parseLong(raw)).ifPresent(ProcessHandle::destroyForcibly);
+      }
+    } catch (IOException | NumberFormatException e) {
+      // 没用例要收殓的进程（PID 文件没写成/已不在）：无需处理
+    }
+  }
+
+  /** 存活的读取线程数（线程结束后即从线程组移除，故这个计数就是"还在跑的"）。 */
+  private static int bashReaderCount() {
+    int live = 0;
+    for (Thread thread : Thread.getAllStackTraces().keySet()) {
+      if (thread.isAlive() && thread.getName().startsWith("mosire-bash-")) {
+        live++;
+      }
+    }
+    return live;
   }
 
   /** 等子进程把 pid 写进文件（子进程启动是异步的；写文件的时机在超时之前）。 */

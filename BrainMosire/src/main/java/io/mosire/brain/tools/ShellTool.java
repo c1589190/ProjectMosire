@@ -17,7 +17,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,6 +45,14 @@ import org.slf4j.LoggerFactory;
  *       不改"什么被保存"——落库口径恒含两路输出。
  * </ol>
  *
+ * <p><strong>输出完整性（不许把"没读到"说成"没有输出"）</strong>：采集是增量发布的（读到一块算一块），读取线程在
+ * "直接子进程已回收且流静音"或"放弃后有界排空"时收手。收手时若没读到可观测范围的尽头，注入文本会带 {@code [输出可能不完整]} 披露行——静默的错误输出比报错更糟（本轮评审的
+ * Critical：后代占着管道时，命令明明打了输出， 却曾回报成"exitCode: 0 + 空输出"）。
+ *
+ * <p><strong>可观测边界（不回收进程树的代价）</strong>：直接子进程被 JDK 回收器回收的瞬间，管道读端就被关闭——回收<b>之前</b>
+ * 已在管道里的字节照常捕获（直接子进程自己写出的输出不会漏），但后代<b>此后</b>写出的字节再也读不到，且与"干净结束"不可区分
+ * （既无法捕获也无从逐条披露）。这正是"不回收进程树"取舍的代价；要治理这种输出得走子 Agent 级的进程树归属。
+ *
  * <p><strong>退出码语义</strong>：非零退出是<b>成功</b>的 {@link ToolResult}（{@code code == null}）——命令确实跑完了，
  * 模型需要看到输出才能推理；把非零退出做成错误码会让管线/审计把正常业务结果当成工具故障。{@code code != null} 表示<b>工具层失败</b>：
  *
@@ -68,6 +75,10 @@ import org.slf4j.LoggerFactory;
  * <p><strong>大输出落库</strong>：输出被裁（档 1 截断或档 2 超预算）时，把<b>采集到的完整文本</b>交给构造注入的 {@link
  * OutputSink}，拿到的引用放进 {@link ToolResult#assetDocIds()}（既有字段）。缺省实现 {@link OutputSink#none()} 不落库； 真实
  * EventStore 接线属 T15。落库是尽力而为：sink 抛异常只降级为"无引用"，不改变命令结果。
+ *
+ * <p><strong>token 预算</strong>：进上下文的文本（成功与失败两条路径）恒受 {@code maxInjectedChars} 约束——失败路径的命令回显
+ * 先收短再随整个消息过同一份预算（超时/中断可逐回合重现，整段照抄命令就是绕过预算的后门）；只有 {@link
+ * io.mosire.agentlib.tool.ToolResultTruncator} 自己的截断提示允许单独超限（否则调用方分不清全量与残片）。
  *
  * <p>线程安全：实例不可变（字段全 final），{@link #execute} 可并发调用（每次调用各起各的直接子进程与两条读取线程）。仅 POSIX （固定 {@code bash
  * -c}）。
@@ -97,8 +108,11 @@ public final class ShellTool implements AgentTool {
   /** 固定用 bash：工具名与语义一致（模型写 bash 语法应可用）；POSIX 之外不支持。 */
   private static final String SHELL_EXECUTABLE = "bash";
 
-  /** 读取线程的收尾宽限：直接子进程退出后，仍持有管道写端的后代最多让它多等这么久（不设宽限＝可能永久阻塞）。 */
-  private static final Duration DRAIN_GRACE = Duration.ofSeconds(2);
+  /** 读取线程的收尾宽限：直接子进程退出后，读取线程自行判定"流已静音"所需的时间上限（含安静窗口）。 */
+  private static final Duration READER_JOIN_GRACE = Duration.ofMillis(400);
+
+  /** 放弃读取后的收尾宽限：置位放弃后有界排空即退出——线程必须真的结束，"被放弃"就是泄漏。 */
+  private static final Duration ABANDON_JOIN_GRACE = Duration.ofMillis(400);
 
   /** 强杀后的收殓宽限（SIGKILL 不可捕获，正常即返回）。 */
   private static final Duration TERMINATE_GRACE = Duration.ofSeconds(5);
@@ -279,29 +293,40 @@ public final class ShellTool implements AgentTool {
       // 红线 5 的边界：只终止本工具创建的直接子进程；后代进程可能存活（类 Javadoc 的取舍）
       terminate(process);
     }
-    joinQuietly(stdoutReader);
-    joinQuietly(stderrReader);
-    ShellOutputTruncator.Captured stdout = stdoutTask.captured();
-    ShellOutputTruncator.Captured stderr = stderrTask.captured();
-    // 宽限已过仍未收尾（后代进程占着管道继续产出）：放弃读取，避免留下一个空转的读取线程
-    stdoutTask.abandonIfAlive(stdoutReader);
-    stderrTask.abandonIfAlive(stderrReader);
+    // 直接子进程已不在：读取线程据此可在"流静音"时收手（JDK 回收进程时关掉管道读端，此前残留字节已搬进内存流）
+    if (!process.isAlive()) {
+      stdoutTask.markChildExited();
+      stderrTask.markChildExited();
+    }
+    boolean readersDone = joinQuietly(stdoutReader, READER_JOIN_GRACE);
+    readersDone &= joinQuietly(stderrReader, READER_JOIN_GRACE);
+    if (!readersDone) {
+      // 宽限已过仍未收尾（后代占着管道持续产出）：放弃并等它们真的退出——"被放弃"的线程就是线程泄漏
+      stdoutTask.abandon();
+      stderrTask.abandon();
+      joinQuietly(stdoutReader, ABANDON_JOIN_GRACE);
+      joinQuietly(stderrReader, ABANDON_JOIN_GRACE);
+    }
+    // 增量发布的快照：读取线程已结束（或已放弃并收尾），此刻即最终可观测结果
+    ShellOutputTruncator.Captured stdout = stdoutTask.snapshot();
+    ShellOutputTruncator.Captured stderr = stderrTask.snapshot();
 
     if (interrupted) {
       Thread.currentThread().interrupt(); // 中断标记归还调用方，不外吞
       return ToolResult.error(
           INTERRUPTED,
-          "命令执行被中断，已终止本工具创建的直接子进程（后代进程可能仍存活）: " + command + "\n" + partialOutput(stdout, stderr));
+          ShellOutputTruncator.renderAborted(
+              "命令执行被中断（已终止本工具创建的直接子进程；后代进程可能仍存活）", command, stdout, stderr, maxInjectedChars));
     }
     if (!exited) {
       return ToolResult.error(
           TIMEOUT,
-          "命令超时（"
-              + timeoutSeconds
-              + " 秒），已终止本工具创建的直接子进程（后代进程可能仍存活）: "
-              + command
-              + "\n"
-              + partialOutput(stdout, stderr));
+          ShellOutputTruncator.renderAborted(
+              "命令超时（" + timeoutSeconds + " 秒），已终止本工具创建的直接子进程（后代进程可能仍存活）",
+              command,
+              stdout,
+              stderr,
+              maxInjectedChars));
     }
     return completed(stdout, stderr, process.exitValue(), mode);
   }
@@ -321,9 +346,12 @@ public final class ShellTool implements AgentTool {
       Optional<String> reference = persist(rendered.full());
       if (reference.isPresent()) {
         assetDocIds = List.of(reference.get());
-        // 引用行追加在截断之后：它只有几十字符，而"模型知道去哪儿拿全量"比死守预算重要（同 ToolResultTruncator
-        // 对截断提示的处理——最小必要信息允许单独超限）
-        message = message + "\n[完整输出已暂存] 资产引用: " + reference.get();
+        // 引用行不可省（模型据此取全量），但也吃预算：先给它留出位置重截一次正文，保证"注入文本不超预算"这条不变量
+        String referenceLine = "\n[完整输出已暂存] 资产引用: " + reference.get();
+        int budget = Math.max(1, maxInjectedChars - referenceLine.length());
+        message =
+            ShellOutputTruncator.render(stdout, stderr, exitCode, mode, budget).injected()
+                + referenceLine;
       }
     }
     return new ToolResult(null, message, assetDocIds);
@@ -339,12 +367,6 @@ public final class ShellTool implements AgentTool {
     }
   }
 
-  /** 超时/中断路径的输出（含档 1 截断自报）：同样过档 2 预算，失败路径不是绕过输出上限的后门。 */
-  private String partialOutput(
-      ShellOutputTruncator.Captured stdout, ShellOutputTruncator.Captured stderr) {
-    return ShellOutputTruncator.renderAborted(stdout, stderr, maxInjectedChars);
-  }
-
   /** 终止本工具持有的直接子进程（不涉进程组/树）；宽限后不再等待，避免收尾自身变成新的阻塞点。 */
   private static void terminate(Process process) {
     process.destroyForcibly();
@@ -355,18 +377,20 @@ public final class ShellTool implements AgentTool {
     }
   }
 
-  /** 有界等待读取线程：直接子进程已退出而某个后代仍持有管道时，宁可少读也不永久阻塞。 */
-  private static void joinQuietly(Thread reader) {
+  /** 有界等待读取线程收尾；返回 true 表示线程已真的结束（不是"被放弃"）。 */
+  private static boolean joinQuietly(Thread reader, Duration grace) {
     try {
-      reader.join(DRAIN_GRACE);
+      reader.join(grace.toMillis());
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
+    return !reader.isAlive();
   }
 
   /**
-   * 启动一条读取线程。<b>平台守护线程而非虚拟线程</b>：被后代占住的管道读取会阻塞很久（本工具不回收进程树），而虚拟线程在阻塞式管道读上会 pin
-   * 住载体线程，长期占用会拖垮整个调度器；平台守护线程最坏只是多一条闲置线程，且不拦 JVM 退出。
+   * 启动一条读取线程。<b>平台守护线程而非虚拟线程</b>：读取走 {@code available()} 轮询（见 {@link
+   * ShellOutputTruncator.Capture}），但底层仍是阻塞式管道 IO，虚拟线程一旦在其上阻塞就会 pin 住载体线程； 平台守护线程最坏是多一条闲置线程，且不拦 JVM
+   * 退出。
    */
   private static Thread startReader(ReaderTask task, String name) {
     return Thread.ofPlatform().daemon().name(name).start(task);
@@ -417,37 +441,40 @@ public final class ShellTool implements AgentTool {
         "required", List.of("command"));
   }
 
-  /** 采集线程：读一条流（采集不抛异常，见 {@link ShellOutputTruncator#drain}——流被回收的 JDK 关掉是正常路径）。 */
+  /**
+   * 一路输出的读取线程载体：{@link ShellOutputTruncator.Capture}（采集 + 增量发布）加上生命周期信号。
+   *
+   * <p>采集<b>不抛异常</b>、也<b>不依赖读到 EOF</b>（见 {@link ShellOutputTruncator.Capture}）：管道读端被后代占着时，
+   * 阻塞式读取会永久卡死——那是线程泄漏，而"读了才发布"会让工具把"没读到"谎报成"没有输出"。
+   */
   private static final class ReaderTask implements Runnable {
 
-    private static final ShellOutputTruncator.Captured EMPTY =
-        new ShellOutputTruncator.Captured("", 0, 0, false);
-
     private final InputStream stream;
-    private final int maxBytes;
-    private final AtomicBoolean abandoned = new AtomicBoolean();
-    private volatile ShellOutputTruncator.Captured captured = EMPTY;
+    private final ShellOutputTruncator.Capture capture;
 
     private ReaderTask(InputStream stream, int maxBytes) {
       this.stream = stream;
-      this.maxBytes = maxBytes;
+      this.capture = new ShellOutputTruncator.Capture(maxBytes);
     }
 
     @Override
     public void run() {
-      captured = ShellOutputTruncator.drain(stream, maxBytes, abandoned::get);
+      capture.pump(stream);
     }
 
-    /** 放弃读取（仅当直接子进程已终止、宽限已过）：让读取线程在下一块数据上收手。 */
-    private void abandonIfAlive(Thread reader) {
-      if (reader.isAlive()) {
-        abandoned.set(true);
-      }
+    /** 直接子进程已退出：读取线程据此可在"流静音"时判定已读到尽头。 */
+    private void markChildExited() {
+      capture.markChildExited();
     }
 
-    /** 已采集内容快照。读取线程未在宽限内结束（后代进程仍持有管道）时仍是空值——本工具不为此阻塞，失败消息会明说"未捕获到输出"。 */
-    private ShellOutputTruncator.Captured captured() {
-      return captured;
+    /** 放弃读取（宽限已过仍未收尾）：读取线程有界排空后即退出，其快照会带上"输出可能不完整"。 */
+    private void abandon() {
+      capture.abandon();
+    }
+
+    /** 随时可取（增量发布）：读取已结束或被放弃后取到的即最终可观测结果。 */
+    private ShellOutputTruncator.Captured snapshot() {
+      return capture.snapshot();
     }
   }
 
