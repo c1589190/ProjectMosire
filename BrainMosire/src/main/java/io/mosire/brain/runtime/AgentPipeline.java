@@ -358,10 +358,10 @@ public final class AgentPipeline {
    *
    * <p><b>档 1/2 只改内存工作集</b>（{@link #replaceWorkingSet}）：档 1 把中段换成披露占位；档 2 把中段摘要写进 {@link
    * CompactSummarySlot}（装配器据此渲染 {@code COMPACT_SUMMARY} 层），工作集只剩尾部。两者都<b>不碰</b>存储——已落库的行照旧
-   * append-only， 重启后 load 回来的是完整历史（档 2 的压缩<b>本就</b>是volatile 的：R1 档 3 的存在意义就是让压缩基线跨重启存活）。
+   * append-only，重启后 {@code load} 回来的是完整历史（档 1/2 的压缩只活在进程内存里，跨不过重启——R1 档 3 的存在意义正是让压缩基线跨重启存活）。
    *
    * <p><b>档 3 落库</b>（{@link #persistSnapshot}）：摘要经显式 {@code compact} 记录进入会话，随后工作集按 {@code load}
-   * 的权威形态重灌， 槽清空（摘要已进入会话本身，层里再留一份就是同一内容出现两遍）。
+   * 的权威形态重灌，槽清空（摘要已进入会话本身，层里再留一份就是同一内容出现两遍）。
    *
    * <p><b>事件（R4/R7/披露）</b>：{@code conversation.compact}（档位/丢弃条数/保留条数/摘要 token）、摘要调用的 {@code
    * llm.call} 记账、以及降级与"无可切点"的 {@code decision}——压缩这件事在事件流里全程可见。
