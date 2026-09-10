@@ -14,6 +14,7 @@ import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
@@ -40,7 +41,11 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>并发约定（R11 未尽项落定）</b>：{@link #history} 非线程安全——调用方必须保证任意时刻只跑一个回合： 每任务一个 runtime
  * 实例，或对外（A2A/AG-UI 等）按提交序串行化调度。选择"每任务一 runtime"= 会话隔离（各任务独立历史）； 选择"串行化"= 一个 Agent 实例的连续对话（A2A
- * 任务续接自然延续上下文）。
+ * 任务续接自然延续上下文）。{@link ConversationStore} 不是并发方案——它只保证"每次调用自身原子"， 上述契约不因持久化而放宽。
+ *
+ * <p><b>会话持久化（T16）</b>：带 {@code (store, conversationId)} 的构造把历史落到 {@link ConversationStore}——构造时
+ * {@code load} 灌入内存工作集（重启续聊），每回合只把<b>新增的尾部</b>追加进去（prompt-cache 不变量：已落库的消息永不改写）。不带 store
+ * 的构造委派到"不落库"实现，行为与持久化接入前逐字节一致。
  */
 public final class AgentPipeline {
 
@@ -56,13 +61,22 @@ public final class AgentPipeline {
   private final EventBus bus;
   private final AccessToken caller;
   private final AgentPermissionSet permissionSet;
+  private final ConversationStore store;
+  private final String conversationId;
 
-  /** 会话历史（不含 system 头，进程内累积，供下一回合原样回灌）；ConversationStore 持久化在 M3 接入。 */
+  /** 会话历史（不含 system 头，进程内累积 + 每回合把新增尾部落库，供下一回合原样回灌）；构造时由 {@link #store} 灌入。 */
   private final List<LlmMessage> history = new ArrayList<>();
 
   /** 取消请求标志（volatile 保证跨线程可见；只在 run() 入口重置——取消只对"正在跑的回合"生效）。 */
   private volatile boolean cancelled;
 
+  /**
+   * 不落库构造（M2 起的既有签名，行为逐字节不变）：委派到 {@link DiscardingConversationStore}。
+   *
+   * <p>生产侧要持久化请用 {@link #AgentPipeline(AgentConfig, LlmClient, ToolRegistry, ToolExecutionGuard,
+   * ContextAssembler, EventStore, EventBus, AccessToken, AgentPermissionSet, ConversationStore,
+   * String)}。
+   */
   public AgentPipeline(
       AgentConfig config,
       LlmClient llm,
@@ -73,6 +87,43 @@ public final class AgentPipeline {
       EventBus bus,
       AccessToken caller,
       AgentPermissionSet permissionSet) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        DiscardingConversationStore.INSTANCE,
+        conversationIdOf(config));
+  }
+
+  /**
+   * 全参装配 + 会话持久化：历史落 {@code conversationId} 名下的 {@link ConversationStore}。
+   *
+   * <p><b>hydrate</b>：构造即 {@code store.load(conversationId)} 灌入内存工作集——同一库文件上新建实例（进程重启）能接着
+   * 上一段对话聊，靠的就是这一步。会话应只被一个 pipeline 实例驱动（并发约定见类 Javadoc）。
+   *
+   * @param store 会话存储（非 null；用 {@link #AgentPipeline(AgentConfig, LlmClient, ToolRegistry,
+   *     ToolExecutionGuard, ContextAssembler, EventStore, EventBus, AccessToken,
+   *     AgentPermissionSet)} 表示不落库）
+   * @param conversationId 会话标识（非 null、显式给定；生产接线由 {@code AgentRuntime} 传 {@code config.id()}）
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId) {
     this.config = Objects.requireNonNull(config, "config");
     this.llm = Objects.requireNonNull(llm, "llm");
     this.registry = Objects.requireNonNull(registry, "registry");
@@ -82,6 +133,15 @@ public final class AgentPipeline {
     this.bus = Objects.requireNonNull(bus, "bus");
     this.caller = Objects.requireNonNull(caller, "caller");
     this.permissionSet = Objects.requireNonNull(permissionSet, "permissionSet");
+    this.store = Objects.requireNonNull(store, "store");
+    this.conversationId = Objects.requireNonNull(conversationId, "conversationId");
+    // hydrate：既有会话（进程重启前落的库）先灌回内存工作集，否则"重启续聊"名存实亡
+    history.addAll(this.store.load(this.conversationId));
+  }
+
+  /** 不落库构造的会话 id 取法：Store 是空实现，id 只用于占位，取配置里的 Agent id（与生产接线同源）。 */
+  private static String conversationIdOf(AgentConfig config) {
+    return Objects.requireNonNull(config, "config").id();
   }
 
   /**
@@ -107,10 +167,14 @@ public final class AgentPipeline {
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
     List<AgentTool> tools = registry.list();
+    // 回合起点：历史长度在组请求前取定——saveHistory 用同一份 messages 列表按下标推出本回合新增的尾部（不靠猜、
+    // 不比对内容）；快照同时让"本回合"与历史后续变化解耦
+    List<LlmMessage> replayedHistory = List.copyOf(history);
+    int replayedSize = replayedHistory.size();
     // 历史回灌：assembler 契约保证 messages[0] 是 system、history 紧随其后、本轮 user 收尾
     List<LlmMessage> messages =
         new ArrayList<>(
-            assembler.buildRequest(config, userMessage, List.copyOf(history), tools).messages());
+            assembler.buildRequest(config, userMessage, replayedHistory, tools).messages());
 
     int turns = 0;
     int totalToolCalls = 0;
@@ -119,17 +183,17 @@ public final class AgentPipeline {
     while (true) {
       if (cancelled) {
         emitDecision("CANCELLED", Map.of());
-        saveHistory(messages);
+        saveHistory(messages, replayedSize);
         return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
       }
       if (turns >= config.maxTurns()) {
         emitDecision("TURN_LIMIT", Map.of("maxTurns", config.maxTurns()));
-        saveHistory(messages);
+        saveHistory(messages, replayedSize);
         return new TurnResult(StopReason.TURN_LIMIT, turns, totalToolCalls, finalText);
       }
       if (Instant.now().isAfter(deadline)) {
         emitDecision("TIME_BUDGET", Map.of("timeBudget", config.timeBudget().toString()));
-        saveHistory(messages);
+        saveHistory(messages, replayedSize);
         return new TurnResult(StopReason.TIME_BUDGET, turns, totalToolCalls, finalText);
       }
 
@@ -140,7 +204,7 @@ public final class AgentPipeline {
       } catch (io.mosire.agentlib.llm.LlmException e) {
         // LlmClient 契约只抛 LlmException；此刻 assistant 消息尚未入列，历史以工具结果干净收尾
         emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(e.getMessage())));
-        saveHistory(messages);
+        saveHistory(messages, replayedSize);
         return new TurnResult(StopReason.LLM_ERROR, turns, totalToolCalls, finalText);
       }
       long latencyMs = Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
@@ -168,7 +232,7 @@ public final class AgentPipeline {
           quota.record(response.inputTokens(), response.outputTokens());
         } catch (io.mosire.agentlib.llm.QuotaExceededException e) {
           emitDecision("QUOTA", Map.of("reason", e.getMessage()));
-          saveHistory(messages);
+          saveHistory(messages, replayedSize);
           return new TurnResult(StopReason.QUOTA, turns, totalToolCalls, finalText);
         }
       }
@@ -194,7 +258,7 @@ public final class AgentPipeline {
               .toList();
 
       if (toolCalls.isEmpty()) {
-        saveHistory(messages);
+        saveHistory(messages, replayedSize);
         return new TurnResult(
             StopReason.FINISHED, turns, totalToolCalls, response.textPart().orElse(""));
       }
@@ -210,7 +274,7 @@ public final class AgentPipeline {
               LlmMessage.tool(
                   new ContentPart.ToolResult(call.id(), call.name(), null, "回合因单次响应工具调用数超限中止")));
         }
-        saveHistory(messages);
+        saveHistory(messages, replayedSize);
         return new TurnResult(
             StopReason.TOOL_CALL_LIMIT, turns, totalToolCalls, response.textPart().orElse(""));
       }
@@ -218,7 +282,7 @@ public final class AgentPipeline {
       for (ContentPart.ToolCall call : toolCalls) {
         if (cancelled) {
           emitDecision("CANCELLED", Map.of());
-          saveHistory(messages);
+          saveHistory(messages, replayedSize);
           return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
         }
         totalToolCalls++;
@@ -228,14 +292,53 @@ public final class AgentPipeline {
   }
 
   /**
-   * 把本回合的消息序列剥离 system 头后存入历史（依赖 assembler 契约"第一条必为 system"）。
+   * 把本回合<b>新增的尾部</b>追加进历史：内存 {@link #history} 与 {@link #store} 都只追加，绝不重写已有前缀。
+   *
+   * <p>为什么不是"清空重写全量"：机制上的 clear+addAll 直译到持久层就变成每回合 DELETE + 全量 INSERT——行标识与插入 时序每回合全变，是
+   * prompt-cache 前缀稳定的隐性敌人。这里改成内容与机制一致的 append-only。
+   *
+   * <p><b>增量怎么算</b>：{@code messages} 的结构恒为 {@code [system] + 回合起点历史 + 本回合新增...}（assembler 契约：第一条必为
+   * system、回合起点历史紧随其后、本轮 user 收尾），故 {@code messages[replayedSize + 1]} 起就是本回合
+   * 新增的部分——用同一份列表按下标推出，不靠猜、不比对内容。{@code replayedSize} 是组请求前取定的历史长度。
    *
    * <p>七条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR/CANCELLED）都必须先经过这里再
    * return——否则下一回合回灌的历史残缺，Agent 就会失忆。
+   *
+   * <p>落库失败（磁盘/DB 异常）不吞：内存历史已追加、异常向上抛，回合以失败告终而不是静默丢持久化。尾部是逐条 append（Store 只保证 单次调用原子，见 {@link
+   * ConversationStore}）——中途失败会留下"已落库的前缀"，重启后正是从那个前缀续起。
    */
-  private void saveHistory(List<LlmMessage> messages) {
-    history.clear();
-    history.addAll(messages.subList(1, messages.size()));
+  private void saveHistory(List<LlmMessage> messages, int replayedSize) {
+    List<LlmMessage> appended = messages.subList(replayedSize + 1, messages.size());
+    history.addAll(appended);
+    for (LlmMessage message : appended) {
+      store.append(conversationId, message);
+    }
+  }
+
+  /**
+   * "不落库"的默认实现：9 参构造（{@code AgentRuntime} 与既有测试）委派到它，行为与持久化接入前逐字节一致。
+   *
+   * <p>{@code load} 返回空 → 构造时不 hydrate；{@code append}/{@code compact} 皆空操作。放在本类内部而非 AgentLib 公开
+   * API：它只是"没有 Store"这一情形的表达，没有独立复用价值。
+   */
+  private static final class DiscardingConversationStore implements ConversationStore {
+
+    static final DiscardingConversationStore INSTANCE = new DiscardingConversationStore();
+
+    @Override
+    public void append(String conversationId, LlmMessage message) {
+      // 有意为空：不落库
+    }
+
+    @Override
+    public List<LlmMessage> load(String conversationId) {
+      return List.of();
+    }
+
+    @Override
+    public void compact(String conversationId, String summary) {
+      // 有意为空：不落库
+    }
   }
 
   private void executeToolCall(List<LlmMessage> messages, ContentPart.ToolCall call) {
@@ -272,9 +375,12 @@ public final class AgentPipeline {
   }
 
   /**
-   * 最近一次回合的会话历史快照（<b>不含 system 头</b>；M2 供 A2A/AG-UI 读会话用；M3 交 ConversationStore）。
+   * 最近一次回合的会话历史快照（<b>不含 system 头</b>；M2 供 A2A/AG-UI 读会话用）。
    *
    * <p>与 {@link #run(String)} 内部消息序列的关系：{@code [system] + lastHistory()} 即完整请求消息。
+   *
+   * <p><b>契约冻结</b>：接 {@link ConversationStore} 之后本方法读的仍是内存工作集（不是库），形状与语义与持久化前一致—— 不含 system
+   * 头、返回不可变快照（后续回合不回改已发出的快照）。compact 之后它是"摘要 + 压缩点之后的消息"。
    */
   public List<LlmMessage> lastHistory() {
     return List.copyOf(history);
