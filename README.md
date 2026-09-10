@@ -24,7 +24,7 @@
 
 ```bash
 # 依赖：JDK 21（Maven 由仓库内 wrapper 提供，./mvnw 锁定 3.9.16）
-./mvnw -N spotless:apply   # 首次：统一格式
+./mvnw spotless:apply      # 首次：统一格式（勿加 -N，会漏掉模块源码）
 ./mvnw verify              # 门禁：Spotless → Checkstyle → SpotBugs → 测试
 ```
 

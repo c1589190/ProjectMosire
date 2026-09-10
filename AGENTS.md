@@ -24,7 +24,7 @@ MainMosire ──→ BrainMosire ──→ AgentLibMosire
 
 - 工具链：JDK 21（`--release 21`）+ Maven Wrapper `./mvnw`（锁定 3.9.16；apt 的 maven 3.8.7 不满足 spotbugs 4.10.4.1 的 Maven ≥3.8.9 要求，勿用系统 `mvn`）。可选安装：`apt-get install openjdk-21-jdk-headless`、`/opt/apache-maven-3.9.16`。
 - `./mvnw verify` = Spotless(google-java-format) → Checkstyle(`config/checkstyle.xml`) → SpotBugs(Max/Low) → Surefire(JUnit 6)，全绿才算完成。
-- 改完代码先 `./mvnw -N spotless:apply` 再 `./mvnw verify`（避免格式门禁来回）。测试全离线（FakeLlmClient/假子进程），禁止依赖外部 LLM/网络的服务。
+- 改完代码先 `./mvnw spotless:apply` 再 `./mvnw verify`（避免格式门禁来回）。**勿加 `-N`**：`-N` 只构建根聚合器，对模块源码是空操作，`spotless:check` 会假绿（2026-09-11 实测：模块内放一个明显违规文件，`./mvnw -N spotless:check` 退出 0，`./mvnw spotless:check` 正确报违规）。测试全离线（FakeLlmClient/假子进程），禁止依赖外部 LLM/网络的服务。
 
 ## 编码与文档
 
