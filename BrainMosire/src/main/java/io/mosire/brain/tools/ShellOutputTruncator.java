@@ -128,7 +128,9 @@ public final class ShellOutputTruncator {
    *
    * @param text 采集到的文本（承接的字节按 UTF-8 解码；顶在字符中间时尾部是一个替换字符）
    * @param keptBytes 实际留下的字节数（≤ 采集上限）
-   * @param totalBytes 子进程写出的总字节数（含被丢弃的部分——它被计数但不曾进入内存）
+   * @param totalBytes <b>已观测到的</b>写出字节数，含被丢弃的部分（它被计数但不曾进入内存）。<b>是下界，不是"子进程写出的总量"</b>：
+   *     正常收尾（读到尽头／子进程已回收且流静音）时等于子进程自己写出的全部字节，但放弃/被中断而提前收手时只是下界——收手之后 子进程及其后代写出的字节既不被计数也不被捕获（见类
+   *     Javadoc 的"可观测边界"与 {@link Capture#abandon()}）
    * @param truncated 是否触到采集上限（{@code totalBytes > keptBytes}）
    * @param endObserved 是否读到了可观测范围的尽头（{@code read} 返回 -1／读端被回收器关闭，或直接子进程已回收且流已静音）； false =
    *     收手时可能还有未捕获的输出，渲染层必须披露（见类 Javadoc 的"可观测边界"）。注意：直接子进程被回收<b>之后</b>
@@ -208,7 +210,13 @@ public final class ShellOutputTruncator {
       childExited = true;
     }
 
-    /** 本次执行放弃收尾（超时/中断后置位）：读完有界排空窗口就收手，不再等数据。 */
+    /**
+     * 本次执行放弃收尾（超时/中断后置位）：读完有界排空窗口就收手，不再等数据。
+     *
+     * <p>收手之后 {@link Captured#totalBytes()} 只是<b>下界</b>：此后子进程及其后代写出的字节既不被计数也不被捕获，且与"命令本来就没再写"
+     * 不可区分——所以它不能被读作"子进程写出的总量"。计数（本方法）与披露（{@code endObserved} 为 false 时的"输出可能不完整"）
+     * 两条路都只保证一件事：不把"没读到"说成"没有输出"；它们都不承诺"数得全"。
+     */
     public void abandon() {
       abandoned = true;
     }
