@@ -22,7 +22,7 @@ import org.slf4j.LoggerFactory;
  * 基础实现：system = 行为提示 + 工具目录（一行一个名字+描述）；历史逐条原样；user 原样；工具定义照传。
  *
  * <p>内部按 {@link ContextLayer} 固定层序组装段落（{@code Segment}），目前 SYSTEM（恒为前缀）、SKILL_INDEX、
- * LOADED_SKILLS、MEMORY 四层有内容源，其余（RULES/COMPACT_SUMMARY）留给后续任务——接入时在 {@code systemSegments}
+ * LOADED_SKILLS、MEMORY、COMPACT_SUMMARY 五层有内容源，其余（RULES）留给后续任务——接入时在 {@code systemSegments}
  * 按声明序插入，既有的段落字节不动（prompt-cache 前缀契约）。{@link ContextPolicy} 作为每层预算的来源随构造注入（当前只记账不 截断，预算是建议值，不改变输出）。
  *
  * <p><b>内容源与身份（P2-4 接线，见 {@link ContextSources}）</b>：技能三档中的前两档与记忆检索结果由 {@link ContextSources}
@@ -61,6 +61,9 @@ public final class BasicContextAssembler implements ContextAssembler {
 
   private static final String MEMORY_HEADER_SUFFIX = " 条）：";
 
+  /** COMPACT_SUMMARY 段标题：说明"这段历史不是丢了，而是被压缩了"——摘要正文见 {@link CompactSummary#render()}。 */
+  private static final String COMPACT_SUMMARY_HEADER = "此前会话的压缩摘要（较早的消息已被压缩，以下为要点）：";
+
   /** 第二档单技能块标题：技能名 + 第三档资源锚点（{@code references/}、{@code scripts/} 相对它按需读取）。 */
   private static final String LOADED_SKILL_TITLE_PREFIX = "## 技能 ";
 
@@ -81,6 +84,7 @@ public final class BasicContextAssembler implements ContextAssembler {
 
   private final ContextPolicy policy;
   private final ContextSources sources;
+  private final CompactSummarySlot compactSummary;
 
   /** 使用默认预算策略（{@link ContextPolicy#defaults()}）与空内容源（只组装 SYSTEM 层）。 */
   public BasicContextAssembler() {
@@ -92,14 +96,28 @@ public final class BasicContextAssembler implements ContextAssembler {
   }
 
   /**
-   * 注入内容源（技能目录 / 记忆检索）。
+   * 注入内容源（技能目录 / 记忆检索）；压缩摘要槽为空（{@code COMPACT_SUMMARY} 层不产出段落）。
    *
    * @param policy 每层预算
    * @param sources 装配期协作者；{@link ContextSources#none()} = 与既有构造同行为
    */
   public BasicContextAssembler(ContextPolicy policy, ContextSources sources) {
+    this(policy, sources, CompactSummarySlot.empty());
+  }
+
+  /**
+   * 注入内容源 + 压缩摘要槽（P2-6 接线）。
+   *
+   * @param policy 每层预算
+   * @param sources 装配期协作者；{@link ContextSources#none()} = 与既有构造同行为
+   * @param compactSummary 当前生效的压缩摘要（{@link Compactor} 的产物，由管线在回合边界写入）；空槽 = {@code COMPACT_SUMMARY}
+   *     层不产出段落（与既有构造逐字节一致）
+   */
+  public BasicContextAssembler(
+      ContextPolicy policy, ContextSources sources, CompactSummarySlot compactSummary) {
     this.policy = Objects.requireNonNull(policy, "policy");
     this.sources = Objects.requireNonNull(sources, "sources");
+    this.compactSummary = Objects.requireNonNull(compactSummary, "compactSummary");
   }
 
   /** 本装配器生效的每层预算策略（诊断与 {@code context} CLI 用）。当前预算只是建议值——接入截断/淘汰前不影响 {@code buildRequest} 输出。 */
@@ -161,14 +179,17 @@ public final class BasicContextAssembler implements ContextAssembler {
 
   /**
    * 按 {@link ContextLayer} 声明顺序产出 system 消息的段落。SYSTEM 恒为第一段且字节与接线前一致；SKILL_INDEX → LOADED_SKILLS →
-   * MEMORY 依次追加（RULES/COMPACT_SUMMARY 仍为空占位，留给后续任务）。空内容的层不产出段落。
+   * MEMORY → COMPACT_SUMMARY 依次追加（RULES 仍为空占位，留给后续任务）。空内容的层不产出段落。
    *
    * <p>需要 {@code userMessage}：MEMORY 层的检索词就是本轮用户输入（与 {@code buildRequest} 同源，composition
    * 因此会执行同一次只读检索——这是"诊断不得失真"的必要代价）。
+   *
+   * <p><b>COMPACT_SUMMARY 段是"追加在最末"的</b>（枚举声明序的末位）：压缩改变了会话本身，但它<b>不</b>改写既有的 system
+   * 前缀（SYSTEM/SKILL_INDEX/LOADED_SKILLS/MEMORY 段落字节一个不动）——prompt-cache 前缀契约由此继续成立。
    */
   private List<Segment> systemSegments(
       AgentConfig config, String userMessage, List<AgentTool> tools) {
-    List<Segment> segments = new ArrayList<>(4);
+    List<Segment> segments = new ArrayList<>(5);
     segments.add(new Segment(ContextLayer.SYSTEM, systemText(config, tools)));
     if (sources.hasSkills()) {
       // 顺序有讲究：先读第二档正文（load 会记下"刚激活"），再渲染第一档目录——listing 在预算吃紧时按激活新近度淘汰，
@@ -180,7 +201,19 @@ public final class BasicContextAssembler implements ContextAssembler {
     if (sources.hasMemory()) {
       addIfPresent(segments, ContextLayer.MEMORY, memoryText(userMessage));
     }
+    addIfPresent(segments, ContextLayer.COMPACT_SUMMARY, compactSummaryText());
     return segments;
+  }
+
+  /**
+   * COMPACT_SUMMARY 段：当前生效摘要的确定性渲染（{@link CompactSummary#render()} 是摘要唯一的文本形态，与档 3 落库的那份逐字节一致）。
+   *
+   * <p>空槽（没有压缩过 / 档 1 的占位式压缩）→ 空串，由 {@link #addIfPresent} 挡下：<b>层内容为空则不产出段落</b>。
+   * 摘要<b>只</b>描述会话发生过什么——持久层（system/技能/记忆）不在其中，也不因它而被改写（R3）。
+   */
+  private String compactSummaryText() {
+    CompactSummary summary = compactSummary.current();
+    return summary == null ? "" : COMPACT_SUMMARY_HEADER + "\n" + summary.render();
   }
 
   /** SYSTEM 段：行为提示 + 工具目录 + 收尾指令（P2-3 起逐字节冻结，新增内容源一律另起段落，不改这里）。 */
