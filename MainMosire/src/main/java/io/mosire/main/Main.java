@@ -114,13 +114,7 @@ public final class Main {
       throw new IllegalArgumentException("--fake 与 --fake-script 不能同时指定");
     }
     // W5：离线 LLM 显式声明面（smoke.sh 断言"断网可测"）；三期 S1-A1：以上开关都不给时一律真模型（缺配置/缺密钥响亮失败，不退化）
-    LlmClient llmOverride =
-        fakeScript != null
-            ? FakeLlmScript.parse(fakeScript)
-            : fake
-                ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY))
-                : config.demo() ? null : realLlm(config.dataDir());
-    App app = App.start(config, llmOverride);
+    App app = App.start(config, selectLlm(config, fake, fakeScript));
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
         "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%n",
@@ -135,6 +129,26 @@ public final class Main {
         config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
     return 0;
+  }
+
+  /**
+   * LLM 覆盖选择（{@code run} 的 LLM 语义唯一入口）：离线脚本 &gt; 显式 {@code --fake} &gt; {@code --demo}（交回 {@code
+   * App.scriptedLlm} 的骨架回复）&gt; 生产真模型。
+   *
+   * <p>抽成包私有静态纯函数的理由：本期唯一的实质行为变更是"<b>什么开关都不给 ⇒ 真模型</b>"（D24：缺配置/缺密钥一律响亮失败，绝不静默退化回 {@link
+   * FakeLlmClient}）。这条不变量必须能在单元层被钉住——只靠进程级用例，覆盖会随 {@code run} 的重构无声消失。
+   *
+   * @param config 启动配置（本函数只读 {@code demo} 与 {@code dataDir}）
+   * @param fake {@code --fake} 是否给出
+   * @param fakeScript {@code --fake-script} 的脚本（非 null 时优先于 {@code fake}）
+   * @return 交给 {@code App.start} 的 LLM 覆盖；{@code null} 表示不覆盖（仅 demo 路径）
+   */
+  static LlmClient selectLlm(BootConfig config, boolean fake, String fakeScript) {
+    return fakeScript != null
+        ? FakeLlmScript.parse(fakeScript)
+        : fake
+            ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY))
+            : config.demo() ? null : realLlm(config.dataDir());
   }
 
   /**
@@ -501,6 +515,9 @@ public final class Main {
              --fake          显式启用离线假 LLM（FakeLlmClient 骨架回复；不触任何网络）
              --fake-script <s> 离线脚本 LLM：分号分隔步骤，text:<回复> 或 tool:<工具>:<args JSON>；
                                args 字符串值 $spawnedId 替换为最近一次 spawn_sub_agent 结果实例 id
+                               （以上离线开关都不给时一律真模型：路由与密钥取自 <data-dir>/config.json
+                               的 llm.baseUrl/llm.model 与 keys.<name>；缺 llm.* 启动即响亮失败，
+                               缺密钥在首次调用响亮失败，都不退回假 LLM。--demo 不读配置）
           health          当前进程健康自检（进程内信息）
           events          查看本地事件库尾部
              --data-dir <p>  数据目录（默认 .work/mosire）

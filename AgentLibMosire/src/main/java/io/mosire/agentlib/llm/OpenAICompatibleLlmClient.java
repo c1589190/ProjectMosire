@@ -167,8 +167,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     this.apiKeySource = Objects.requireNonNull(apiKeySource, "apiKeySource");
     positive(connectTimeout, "connectTimeout");
     this.readTimeout = positive(readTimeout, "readTimeout");
-    this.chatCompletionsUri =
-        URI.create(stripTrailingSlashes(route.baseUrl()) + CHAT_COMPLETIONS_PATH);
+    this.chatCompletionsUri = chatCompletionsUri(route.baseUrl());
     this.http =
         HttpClient.newBuilder()
             .connectTimeout(connectTimeout)
@@ -748,6 +747,27 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       throw new IllegalArgumentException(name + " 必须为正: " + value);
     }
     return value;
+  }
+
+  /**
+   * 拼装补全端点 URI。
+   *
+   * <p><b>{@code baseUrl} 非法时绝不把原串带进异常</b>：{@code baseUrl} 允许内嵌凭据（如 {@code
+   * https://user:token@host/v1}），而构造期异常会经 {@code Main} 直接打到 stderr。原异常<b>既不挂 cause 也不挂
+   * suppressed</b>——{@code IllegalArgumentException#getMessage} 本身就带着整条 URL，挂上去等于换个地方泄漏；只保留 {@code
+   * IllegalArgumentException} 类型与"原因类型"这一层分类。诊断损失可接受：出错的串在调用方自己的配置里，不需要本类回显。
+   *
+   * @throws IllegalArgumentException {@code baseUrl} 拼不出合法 URI（消息不含 baseUrl 原文）
+   */
+  private static URI chatCompletionsUri(String baseUrl) {
+    try {
+      return URI.create(stripTrailingSlashes(baseUrl) + CHAT_COMPLETIONS_PATH);
+    } catch (IllegalArgumentException malformed) {
+      throw new IllegalArgumentException(
+          "模型路由 baseUrl 非法：拼不出合法的补全端点 URI（原因类型 "
+              + malformed.getClass().getSimpleName()
+              + "；原文不外显，以免泄漏 URL 中可能内嵌的凭据或查询串）");
+    }
   }
 
   private static String stripTrailingSlashes(String baseUrl) {
