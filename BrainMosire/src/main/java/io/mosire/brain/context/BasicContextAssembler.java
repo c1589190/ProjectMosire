@@ -1,5 +1,6 @@
 package io.mosire.brain.context;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.ToolDef;
@@ -111,7 +112,8 @@ public final class BasicContextAssembler implements ContextAssembler {
    * @param policy 每层预算
    * @param sources 装配期协作者；{@link ContextSources#none()} = 与既有构造同行为
    * @param compactSummary 当前生效的压缩摘要（{@link Compactor} 的产物，由管线在回合边界写入）；空槽 = {@code COMPACT_SUMMARY}
-   *     层不产出段落（与既有构造逐字节一致）
+   *     层不产出段落（与既有构造逐字节一致）。接线方要把同一个实例交给管线（见 {@link #compactSummarySlot()}）——否则摘要写到一个槽、
+   *     装配器读另一个槽，压缩会"成功"而请求里什么都没有
    */
   public BasicContextAssembler(
       ContextPolicy policy, ContextSources sources, CompactSummarySlot compactSummary) {
@@ -128,6 +130,21 @@ public final class BasicContextAssembler implements ContextAssembler {
   /** 本装配器接线的内容源（诊断用；{@link ContextSources#none()} = 未接线）。 */
   public ContextSources sources() {
     return sources;
+  }
+
+  /**
+   * 本装配器<b>实际读取</b>的压缩摘要槽：把 {@link Compactor} 接到管线时，<b>取槽的唯一正确来源就是本方法</b>。
+   *
+   * <p>为什么要有这个访问器：{@link CompactSummarySlot} 是一条"管线写、装配器每回合读"的可变共享通道，而"两边各拿一个实例"在类型上完全合法 ——管线把摘要写进
+   * A 槽、装配器读的是 B 槽，压缩照常报告成功，但请求里既没有摘要也没有占位，头部与中段<b>静默消失</b>（本项目最坏的失败模式）。 接线必须写 {@code
+   * assembler.compactSummarySlot()}（或构造本实例时注入的那个同一实例），而<b>不是</b>{@code CompactSummarySlot.empty()}
+   * 之类的自建槽。管线侧另有守卫：压缩落地后该层仍为空即响亮失败 （{@code AgentPipeline.requireSummaryVisibleInAssembler}）。
+   *
+   * <p>刻意暴露可变引用（不是复制一份）：复制出来的槽与装配器读的那个必然失配——那是缺陷本身，不是防御。
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP")
+  public CompactSummarySlot compactSummarySlot() {
+    return compactSummary;
   }
 
   @Override
