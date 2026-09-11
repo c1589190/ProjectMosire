@@ -139,13 +139,17 @@ class OpenAICompatibleLlmClientPipelineTest {
   }
 
   /**
-   * R4 pin（管线层）：供应商 429 一律走 {@link StopReason#LLM_ERROR}，<b>不是</b> QUOTA——QUOTA 只由本地账本 （{@link
-   * io.mosire.agentlib.llm.LlmQuota#record}）抛出、只在那一处被捕获。
+   * R4 pin（管线层，<b>只钉管线可观测面</b>）：供应商 429 在管线上表现为 {@link StopReason#LLM_ERROR}，decision 文案带出 HTTP 429
+   * 且不含"配额超限"，且没有任何 {@code llm.call} 记账。
    *
-   * <p>判别性说明：{@code QuotaExceededException} 是 {@code LlmException} 的子类，故"stopReason 不是
-   * QUOTA"这<b>一条</b> 断言并不足以区分（两种实现都落在 LLM_ERROR 分支）；真正区分它们的是 decision 的 reason 文案——本地账本超限说 "token
-   * 配额超限: 已用 N / 上限 M"，而供应商限流必须原样带出 HTTP 429。故这里断言 reason 含 429 且<b>不含</b> "配额超限"，外加"没有任何 llm.call
-   * 记账"（本地账本一分未记）。
+   * <p><b>本用例钉不住什么（如实登记，勿高估）</b>：{@code QuotaExceededException} 是 {@link
+   * io.mosire.agentlib.llm.LlmException} 的子类，若客户端在 429 时误抛它、但<b>消息文案保持不变</b>，本用例三条断言全绿 （评审用变异 M5
+   * 实测：2/2 通过、退出码 0）——本用例只否证"stopReason 一条论断就够"这一半，不做异常<b>类型</b>判别。
+   *
+   * <p>异常类型的判别由 AgentLib 侧承担：{@code
+   * OpenAICompatibleLlmClientTest.mapsProviderRateLimitToLlmExceptionNotQuotaExceeded} 的 {@code
+   * isNotInstanceOf(QuotaExceededException.class)}（同一变异 M5 在那里<b>会红</b>）。此处不发明白盒断言去补类型判别
+   * ——类型归协议层，管线层只负责"客户端抛什么，管线落什么"。
    */
   @Test
   void mapsProviderRateLimitToLlmErrorInsteadOfQuota() {
