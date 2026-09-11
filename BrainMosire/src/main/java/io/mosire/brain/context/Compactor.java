@@ -38,6 +38,12 @@ import java.util.Objects;
  * <p><b>为什么档 3 的摘要覆盖整段历史</b>：{@code compact} 的压缩点 = 调用当时的会话最大行 id，即"摘要必须代表它之前的<b>全部</b>
  * 消息"，否则压缩点之前那些没被摘要覆盖的内容会从重启后的基线里<b>静默消失</b>。因此档 3 不复用"中段摘要"当整段用。
  *
+ * <p><b>不变量与"基准"（F3）</b>：上述不变量要求档 3 的摘要器输入覆盖压缩点将要隐藏的全部内容。档 1 会把中段移出工作集（只剩一行"已丢弃 N 条"
+ * 占位），此后<b>工作集不再是权威视图</b>——它其中有一段内容只被占位代表。因此档 3 的基准由调用方给出（{@link #compact(List, CompactSummary,
+ * List)}）：工作集与存储同源时就是工作集，否则必须是 {@code ConversationStore.load}
+ * 的权威全量视图（管线如此做）。若两个视图都不覆盖（例如传了个不含该内容的基准），本类<b>无法察觉</b>——它不持有存储，
+ * 判据只能由调用方提供；调用方在"工作集曾丢失内容"时必须升级基准，这是接线的契约。
+ *
  * <p><b>成本可观测（R7）</b>：摘要调用是<b>额外</b>的 LLM 调用，它的 {@link LlmResponse} 随结果返回（{@link
  * Result#summarizerCall}），由管线落 {@code llm.call} 事件——P2-3 的 token 汇总因此看得见压缩成本。 调用失败（{@link
  * LlmException}）时没有 response 可记账，此时降级并<b>落 decision 披露</b>（不静默）。本类不进 {@code AgentPipeline}
@@ -50,9 +56,9 @@ import java.util.Objects;
  * <p><b>切除边界必须是"干净"的</b>：工具调用与工具结果必须成对留在同一侧——中段的两个端点都取在 {@code user} 消息上、且前一条不含未被回填的 {@code
  * tool_call}。否则回灌出去的请求里会出现悬空 {@code tool_call}（部分供应商直接拒收）或孤儿 {@code tool_result}。
  *
- * <p><b>本类无状态、不触存储</b>：{@code compact(history, previousSummary)} 是纯决策 + 纯产出（除摘要器这一外部调用）。档 3
- * 的落库由管线用<b>自己持有的那个 store 实例</b>执行——这同时是撕裂读（R11）的结构性回避：管线存活期间不存在第二个 store 实例/第二条连接，{@code load()}
- * 的两条查询间不可能插进一次 {@code compact()}。
+ * <p><b>本类无状态、不触存储</b>：{@code compact(...)} 是纯决策 + 纯产出（除摘要器这一外部调用）。档 3 的落库由管线用<b>自己持有的那个 store
+ * 实例</b>执行——这同时是撕裂读（R11）的结构性回避：管线存活期间不存在第二个 store 实例/第二条连接，{@code load()} 的两条查询间不可能插进一次 {@code
+ * compact()}。
  */
 public final class Compactor {
 
@@ -84,18 +90,24 @@ public final class Compactor {
    *     的形状同源，但档 3 的<b>权威</b>工作集取自 {@code store.load(conversationId)}——管线如此做， 本字段供无存储的单测断言用）；{@link
    *     Tier#NONE} = 原样
    * @param summary 本次产出的结构化摘要；档 {@code NONE}/{@code MICRO} 为 {@code null}（档 1 的披露是占位消息，不是摘要）
-   * @param droppedMessages 被移出工作集（= 本回合请求）的会话消息条数——档 2 也照实计（中段虽被摘要，但确实离开了工作集； 记 0 会让 {@code
+   * @param droppedMessages 本次压缩<b>作用域</b>内不再逐字保留的原消息条数——档 2 也照实计（中段虽被摘要，但确实离开了工作集； 记 0 会让 {@code
    *     conversation.compact} 事件少报），{@code NONE} = 0
+   * @param baselineMessages 本次压缩<b>作用域</b>的原长：档 1/2 = 工作集原长；档 3 = {@code snapshotBaseline}
+   *     的长度（压缩点将要隐藏的 全部内容，通常大于工作集）。恒等式 {@code droppedMessages + 逐字保留条数 == baselineMessages}
+   *     对三档都成立——事件里 {@code keptMessages} 由它推出（占位消息与摘要消息都<b>不</b>算"保留的原消息"，它们不是原消息）
    * @param note 需要披露的偏离（降级原因 / 无安全切点）；{@code null} = 无
    * @param summarizerCall 本次摘要调用；{@code null} = 未发生（档 1 / {@code NONE}）<b>或调用直接失败</b>（没有 response
    *     可记账）。注意它与 {@code summary} 相互独立：摘要在解析失败而降级时，{@code summary} 为 {@code null} 但 {@code
-   *     summarizerCall} <b>非</b>空——那笔 token 是真花掉的，不能因为解析失败就从账上消失（R7）
+   *     summarizerCall} <b>非</b>空——那笔 token 是真花掉的，不能因为解析失败就从账上消失（R7）。同理，<b>只要摘要器返回过
+   *     response</b>，降级路径也必须把它带出来（F1）："没拿到摘要"与"没发生调用"是两回事，只有 {@link LlmException} 那条路径 （连 response
+   *     都没有）才不记账
    */
   public record Result(
       Tier tier,
       List<LlmMessage> workingSet,
       CompactSummary summary,
       int droppedMessages,
+      int baselineMessages,
       String note,
       SummarizerCall summarizerCall) {
 
@@ -110,26 +122,49 @@ public final class Compactor {
     }
 
     static Result untouched(List<LlmMessage> history) {
-      return new Result(Tier.NONE, history, null, 0, null, null);
+      return new Result(Tier.NONE, history, null, 0, history.size(), null, null);
     }
 
     static Result untouched(List<LlmMessage> history, String note) {
-      return new Result(Tier.NONE, history, null, 0, note, null);
+      return new Result(Tier.NONE, history, null, 0, history.size(), note, null);
+    }
+
+    /**
+     * 未压缩但<b>发生过记账</b>：摘要器返回过 response，只是这份 response 没能变成摘要（解析不出八字段）而退回不动。 调用已花掉
+     * token，账必须原样带出（F1）；管线照常落 {@code llm.call} + {@code decision}。
+     */
+    static Result untouched(List<LlmMessage> history, String note, SummarizerCall call) {
+      return new Result(Tier.NONE, history, null, 0, history.size(), note, call);
     }
 
     static Result micro(
-        List<LlmMessage> view, int droppedMessages, String note, SummarizerCall call) {
-      return new Result(Tier.MICRO, view, null, droppedMessages, note, call);
+        List<LlmMessage> view,
+        int droppedMessages,
+        int baselineMessages,
+        String note,
+        SummarizerCall call) {
+      return new Result(Tier.MICRO, view, null, droppedMessages, baselineMessages, note, call);
     }
 
     static Result summary(
-        List<LlmMessage> view, int droppedMessages, CompactSummary summary, SummarizerCall call) {
-      return new Result(Tier.SUMMARY, view, summary, droppedMessages, null, call);
+        List<LlmMessage> view,
+        int droppedMessages,
+        int baselineMessages,
+        CompactSummary summary,
+        SummarizerCall call) {
+      return new Result(Tier.SUMMARY, view, summary, droppedMessages, baselineMessages, null, call);
     }
 
-    static Result snapshot(List<LlmMessage> history, CompactSummary summary, SummarizerCall call) {
+    /** {@code baseline} = 本次摘要<b>作用域</b>（档 3 = 压缩点将要隐藏的全部内容；通常是工作集，见 {@link #compact}）。 */
+    static Result snapshot(List<LlmMessage> baseline, CompactSummary summary, SummarizerCall call) {
       return new Result(
-          Tier.SNAPSHOT, List.of(summaryMessage(summary)), summary, history.size(), null, call);
+          Tier.SNAPSHOT,
+          List.of(summaryMessage(summary)),
+          summary,
+          baseline.size(),
+          baseline.size(),
+          null,
+          call);
     }
   }
 
@@ -183,12 +218,31 @@ public final class Compactor {
    * <p>调用约定：只在<b>回合边界</b>（一轮结束之后、下一轮组请求之前）调用，且必须用管线自己持有的那个 store 完成档 3 的落库（见类 Javadoc）。本方法不修改传入的
    * {@code history}。
    *
+   * <p>等价于 {@code compact(history, previousSummary, history)}：摘要基准 = 工作集（适用于"工作集与存储同源"的常规调用方）。
+   *
    * @param history 当前会话工作集（不含 system 头）
    * @param previousSummary 上一版仍生效的摘要（{@link CompactSummarySlot#current()}；{@code null} = 无）：档 2/3
    *     的摘要器输入会带上 它，使新版摘要<b>并入</b>旧版——否则上一段被压缩的历史会在第二次压缩时从请求里消失
    */
   public Result compact(List<LlmMessage> history, CompactSummary previousSummary) {
+    return compact(history, previousSummary, history);
+  }
+
+  /**
+   * 同 {@link #compact(List, CompactSummary)}，但档 3 的摘要基准可由调用方指定为<b>权威全量视图</b>（{@code
+   * ConversationStore.load} 的结果）。
+   *
+   * <p><b>为什么需要它（F3，不变量见类 Javadoc）</b>：档 1 把中段移出工作集后，工作集里只剩一行"已丢弃 N 条"占位——它<b>不再</b>
+   * 包含压缩点将要隐藏的全部内容。若档 3 仍以工作集为基准去摘 要，那些被占位代表的消息既不进摘要、又会被新压缩点划进"之前"，重启后从基线里静默消失。 因此调用方在
+   * "工作集自上次落库以来曾丢失内容"时必须传权威视图（管线传 {@code store.load(conversationId)}）； 工作集与存储同源时传 {@code history}
+   * 即可（两者等价，白白多读一次库没有意义）。
+   *
+   * @param snapshotBaseline 档 3 的摘要基准 = 压缩点将要隐藏的全部内容（档 1/2 不受影响：它们的切除点只落在工作集上）
+   */
+  public Result compact(
+      List<LlmMessage> history, CompactSummary previousSummary, List<LlmMessage> snapshotBaseline) {
     Objects.requireNonNull(history, "history");
+    Objects.requireNonNull(snapshotBaseline, "snapshotBaseline");
     List<LlmMessage> current = List.copyOf(history);
     int budget = policy.budgetFor(ContextLayer.CONVERSATION);
     if (budget <= 0) {
@@ -210,22 +264,22 @@ public final class Compactor {
     List<LlmMessage> microView = headEnd < 0 ? null : microView(current, headEnd, tail);
     int microDropped = headEnd < 0 ? 0 : tailStart - headEnd;
     if (microView != null && tokensOf(microView) <= budget) {
-      return Result.micro(microView, microDropped, null, null);
+      return Result.micro(microView, microDropped, current.size(), null, null);
     }
 
     // 档 2：仅保留尾部已超预算 → 摘要（只增不减）不可能容纳，档 2 不可达，直接进档 3
     if (tokensOf(tail) <= budget) {
       SummaryAttempt middle = summarize(current.subList(0, tailStart), previousSummary);
       if (middle.summary() != null) {
-        return Result.summary(tail, tailStart, middle.summary(), middle.call());
+        return Result.summary(tail, tailStart, current.size(), middle.summary(), middle.call());
       }
       return degradeToMicro(current, microView, microDropped, middle);
     }
 
-    // 档 3：摘要覆盖整段历史（压缩点=当前末尾，摘要必须代表它之前的全部内容）
-    SummaryAttempt whole = summarize(current, previousSummary);
+    // 档 3：摘要覆盖"压缩点将要隐藏的全部内容"——基准是权威视图而不是工作集（F3）
+    SummaryAttempt whole = summarize(snapshotBaseline, previousSummary);
     if (whole.summary() != null) {
-      return Result.snapshot(current, whole.summary(), whole.call());
+      return Result.snapshot(snapshotBaseline, whole.summary(), whole.call());
     }
     return degradeToMicro(current, microView, microDropped, whole);
   }
@@ -251,7 +305,8 @@ public final class Compactor {
    * 摘要不可用时的降级：退回档 1 的披露式丢弃（仍变小、仍有占位），note 写明原因；无档 1 视图则不动。
    *
    * <p>{@code attempt.call()} 原样带出去：解析失败时摘要没拿到、但调用确实发生过（token 已花），管线据此照常落 {@code
-   * llm.call}（R7）——降级只降级"摘要"，不降级"记账"。
+   * llm.call}（R7）——降级只降级"摘要"，不降级"记账"。<b>两条降级路径都带</b>：连档 1 视图都没有（{@link Result#untouched(List,
+   * String, SummarizerCall)}）时同样带出（F1）——"没拿到摘要"与"没发生调用"是两回事。
    */
   private static Result degradeToMicro(
       List<LlmMessage> history,
@@ -259,8 +314,8 @@ public final class Compactor {
       int droppedMessages,
       SummaryAttempt attempt) {
     return microView == null
-        ? Result.untouched(history, attempt.note())
-        : Result.micro(microView, droppedMessages, attempt.note(), attempt.call());
+        ? Result.untouched(history, attempt.note(), attempt.call())
+        : Result.micro(microView, droppedMessages, history.size(), attempt.note(), attempt.call());
   }
 
   /** 摘要器调用（只读、无工具）：返回摘要或"不可用 + 原因"。 */
@@ -319,8 +374,15 @@ public final class Compactor {
     return -1;
   }
 
+  /**
+   * 不超过 {@code from} 的最靠后的干净边界；返回值恒在契约内（{@code [0, size]}）。
+   *
+   * <p>{@code from < 0}（历史比尾部窗口还短）收敛到 {@code 0}：{@code 0} 本来就是合法切点（{@link
+   * #isCleanBoundary}），负下标则是契约外的取值——调用点用 {@code tailStart <= 0} 判"无切点"，靠的是"要么 0 要么 -1
+   * 要么正数"，一旦这里漏出负数，那个判断就不再是它以为的那个意思（F5）。
+   */
   private static int cleanBoundaryAtOrBefore(List<LlmMessage> history, int from) {
-    for (int index = Math.min(from, history.size()); index >= 0; index--) {
+    for (int index = Math.min(Math.max(from, 0), history.size()); index >= 0; index--) {
       if (isCleanBoundary(history, index)) {
         return index;
       }
