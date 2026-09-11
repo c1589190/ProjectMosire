@@ -1,6 +1,7 @@
 package io.mosire.brain.runtime;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -66,6 +67,9 @@ class AgentPipelineCompactionTest {
   private static final String SYSTEM_CANARY = "SYSTEM-PROMPT-CANARY-7b1e";
 
   private static final String SKILL_CANARY = "SKILL-CANARY-4f2a";
+
+  /** F3 的特征串：位于档 1 会丢掉的<b>中段</b>——用来追踪"这段内容有没有进档 3 的摘要基准"。 */
+  private static final String MIDDLE_CANARY = "MIDDLE-CANARY-9c3f";
 
   private static final String COMPACT_SUMMARY_HEADER = "此前会话的压缩摘要（较早的消息已被压缩，以下为要点）：";
 
@@ -665,6 +669,425 @@ class AgentPipelineCompactionTest {
     }
   }
 
+  // ---------- F1：降级/未压缩路径的记账（评审修复轮） ----------
+
+  /**
+   * F1：<b>无中段可丢 + 尾部装得下 + 回复不可解析</b>——摘要器返回过 response（这笔试错真花了），但没变成摘要，工作集一个字节不动。 这条路（{@code
+   * Result.untouched}）过去把 {@code summarizerCall} 吞掉，管线也就无从落 {@code llm.call}：D18 的账本上看不见它。
+   *
+   * <p>判别性：
+   *
+   * <ul>
+   *   <li>把"退回不动"实现成"整件事当没发生"（{@code untouched(history, note)}）的：{@code phase=compact} 的账与 token
+   *       断言红；
+   *   <li>反过来"记账了顺手把历史也换掉"的：请求逐条相等断言红（本档什么都没压成，历史必须原样）；
+   *   <li>多记一笔的：{@code llm.call} 条数（2）断言红——同一个 response 只能记一次。
+   * </ul>
+   *
+   * <p>同时钉住"没压缩成就不落 {@code conversation.compact}"：事件不得宣称一次没发生的压缩。
+   */
+  @Test
+  void summarizerReplyWithNoMiddleToDropStillLeavesAnAccountOfIt() throws Exception {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyWithNoMiddleToDrop();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      CompactSummarySlot slot = CompactSummarySlot.empty();
+      ScriptedClient llm = ScriptedClient.answering("这一轮的回答");
+      ScriptedSummarizer summarizer = ScriptedSummarizer.returning("模型说了些别的，不是 JSON");
+      AgentPipeline pipeline =
+          pipeline(
+              llm,
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(300), summarizer),
+              slot,
+              assembler(slot));
+
+      assertThat(pipeline.run("新问题").stopReason()).isEqualTo(StopReason.FINISHED);
+      assertThat(summarizer.calls()).isEqualTo(1);
+
+      // 账：主循环一次 + 摘要器一次（尽管这份回复没能变成摘要）
+      List<Event> calls = eventsOf(events, EventTypes.LLM_CALL);
+      assertThat(calls).hasSize(2);
+      JsonNode compactCall =
+          JSON.readTree(
+              calls.stream()
+                  .filter(event -> event.payload().contains("\"phase\":\"compact\""))
+                  .findFirst()
+                  .orElseThrow(() -> new AssertionError("未压缩但发生过的摘要调用没有记账：" + calls))
+                  .payload());
+      assertThat(compactCall.get("inputTokens").asLong()).isEqualTo(321);
+      assertThat(compactCall.get("model").asText()).isEqualTo("fake-summarizer");
+      assertThat(compactCall.has("turns")).isFalse();
+
+      // 工作集原样：请求 = [system, 8 条历史, 本轮 user]，没有占位、没有东西离开请求
+      List<LlmMessage> request = llm.requests.get(0).messages();
+      assertThat(request).hasSize(seeded.size() + 2);
+      assertThat(request.subList(1, request.size() - 1)).containsExactlyElementsOf(seeded);
+      assertThat(slot.current()).isNull();
+      // 没压缩成 → 不落 conversation.compact，但必须落 decision 披露（不静默）
+      assertThat(eventsOf(events, EventTypes.CONVERSATION_COMPACT)).isEmpty();
+      JsonNode decision =
+          JSON.readTree(
+              eventsOf(events, EventTypes.DECISION).stream()
+                  .filter(event -> event.payload().contains("COMPACT_SKIPPED"))
+                  .findFirst()
+                  .orElseThrow(() -> new AssertionError("未压缩且摘要不可用，却没有披露 decision"))
+                  .payload());
+      assertThat(decision.get("detail").get("reason").asText()).contains("无法解析");
+    }
+  }
+
+  /**
+   * F1 的反面：摘要器抛 {@link LlmException}（<b>没有</b> response）→ 仍然不记账。这条与上一条一起把分界线钉在"有没有拿到 response"上，
+   * 而不是"档位是不是 NONE"。
+   *
+   * <p>判别性：把 F1 误做成"凡降级路径一律记账/一律编一个 response"的实现，{@code llm.call} 条数（1）断言必红。
+   */
+  @Test
+  void summarizerFailureWithNoMiddleToDropBooksNothing() throws Exception {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyWithNoMiddleToDrop();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      CompactSummarySlot slot = CompactSummarySlot.empty();
+      ScriptedClient llm = ScriptedClient.answering("这一轮的回答");
+      ScriptedSummarizer summarizer = ScriptedSummarizer.failing("摘要服务不可用");
+      AgentPipeline pipeline =
+          pipeline(
+              llm,
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(300), summarizer),
+              slot,
+              assembler(slot));
+
+      assertThat(pipeline.run("新问题").stopReason()).isEqualTo(StopReason.FINISHED);
+
+      assertThat(summarizer.calls()).isEqualTo(1); // 调用确实发生过
+      assertThat(eventsOf(events, EventTypes.LLM_CALL)).hasSize(1); // 但没有 response：不编造记账
+      assertThat(llm.requests.get(0).messages()).hasSize(seeded.size() + 2);
+      assertThat(eventsOf(events, EventTypes.DECISION))
+          .anyMatch(
+              event ->
+                  event.payload().contains("COMPACT_SKIPPED")
+                      && event.payload().contains("摘要调用失败"));
+    }
+  }
+
+  // ---------- F2：摘要槽的接线失配必须响亮失败 ----------
+
+  /**
+   * F2：管线拿的槽与装配器读的槽<b>不是同一个实例</b>时，档 2 的压缩会"成功"却让请求里既无摘要也无占位（头部与中段静默消失）。 守卫必须在压缩落地当刻响亮失败。
+   *
+   * <p>判别性：没有守卫（或守卫只看"摘要非空"）的实现会让 {@code run} 正常返回——{@code assertThatThrownBy} 红；而"压缩没落地也抛" 的实现会在
+   * {@code lastHistory} 与"工作集未动"两条断言上红（失配时的正确行为是：在替换工作集<i>之前</i>失败，历史一条不少）。
+   */
+  @Test
+  void mismatchedSummarySlotFailsLoudlyInsteadOfDroppingTheCompactedMiddle() {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyForTierTwo();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      // 失配的接线：管线写自己的槽，装配器读它自己那个（两个实例，类型上完全合法）
+      CompactSummarySlot pipelineSlot = CompactSummarySlot.empty();
+      BasicContextAssembler assembler = selfSlottedAssembler();
+      ScriptedClient llm = ScriptedClient.answering("这一轮的回答");
+      AgentPipeline pipeline =
+          pipeline(
+              llm,
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(300), ScriptedSummarizer.returning(SUMMARY_JSON)),
+              pipelineSlot,
+              assembler);
+
+      assertThatThrownBy(() -> pipeline.run("新问题"))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("COMPACT_SUMMARY")
+          .hasMessageContaining("compactSummarySlot");
+
+      // 响亮失败且没有半截状态：工作集一条不少、本轮请求根本没发出去
+      assertThat(pipeline.lastHistory()).hasSize(seeded.size());
+      assertThat(llm.requests).isEmpty();
+      assertThat(eventsOf(events, EventTypes.CONVERSATION_COMPACT)).isEmpty();
+      // 失配的机制也说得清楚：摘要进了管线的槽，装配器渲染不出它
+      assertThat(pipelineSlot.current()).isEqualTo(EXPECTED);
+    }
+  }
+
+  /** F2 的正面对偶：按访问器取槽（唯一正确的接线方式）→ 不抛，且摘要真的进得了请求的 COMPACT_SUMMARY 层。 */
+  @Test
+  void slotTakenFromTheAssemblerAccessorKeepsTheSummaryVisibleInTheRequest() {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyForTierTwo();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      BasicContextAssembler assembler = selfSlottedAssembler();
+      CompactSummarySlot slot = assembler.compactSummarySlot(); // 取槽的唯一正确来源
+      ScriptedClient llm = ScriptedClient.answering("这一轮的回答");
+      AgentPipeline pipeline =
+          pipeline(
+              llm,
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(300), ScriptedSummarizer.returning(SUMMARY_JSON)),
+              slot,
+              assembler);
+
+      assertThat(pipeline.run("新问题").stopReason()).isEqualTo(StopReason.FINISHED);
+
+      List<LlmMessage> request = llm.requests.get(0).messages();
+      assertThat(systemTextOf(request)).contains(COMPACT_SUMMARY_HEADER).contains("目标哨兵");
+      // 中段确实被摘要顶掉了（尾部 + 本轮 user 逐条可查），而摘要层承载了那段内容
+      assertThat(request.subList(1, request.size()))
+          .containsExactlyElementsOf(
+              concat(seeded.subList(12, seeded.size()), List.of(LlmMessage.user("新问题"))));
+      assertThat(slot.current()).isEqualTo(EXPECTED);
+    }
+  }
+
+  /** F2 的取槽契约：访问器返回的就是装配器渲染时读的那个实例（同一个引用，不是复制品）——所以"把它的返回值交给管线"这件事， 按定义就是正确接线。 */
+  @Test
+  void assemblerAccessorReturnsTheVerySlotItRenders() {
+    CompactSummarySlot slot = CompactSummarySlot.empty();
+    BasicContextAssembler assembler = basicAssembler(slot);
+
+    assertThat(assembler.compactSummarySlot()).isSameAs(slot);
+
+    slot.set(EXPECTED);
+    AgentConfig config = AgentConfig.builder("main").systemPrompt(SYSTEM_CANARY).build();
+    assertThat(
+            assembler
+                .composition(config, "问", List.of(), List.of())
+                .estimatedTokens()
+                .get(ContextLayer.COMPACT_SUMMARY))
+        .isPositive();
+    assertThat(textOf(assembler.buildRequest(config, "问", List.of(), List.of()).messages().get(0)))
+        .contains(COMPACT_SUMMARY_HEADER)
+        .contains("目标哨兵");
+  }
+
+  // ---------- F3：档 3 的摘要基准必须覆盖压缩点将要隐藏的全部内容 ----------
+
+  /**
+   * F3：档 1 先把中段（含 {@link #MIDDLE_CANARY}）换成"已丢弃 N 条"占位 → 会话再涨到连尾部都放不下 → 档 3。 <b>档 3
+   * 的摘要基准必须是权威全量视图（存储），不是带占位的工作集</b>——否则那段只被占位代表的内容既不进摘要、又被新压缩点划进 "之前"，重启后从基线里静默消失（{@code
+   * Compactor} 类 Javadoc 的不变量）。
+   *
+   * <p>判别性：
+   *
+   * <ul>
+   *   <li>基准取工作集的实现（结构上最像"正确"的样子——第一回合的档 2 正是这么做的）：摘要器输入里出现的是占位而不是哨兵， {@code
+   *       contains(MIDDLE_CANARY)} 与 {@code doesNotContain("已丢弃")} 双双红；
+   *   <li>把档 3 的摘要只覆盖尾部/中段的：重启后的请求里读不到哨兵，最后一段断言红；
+   *   <li>反过来，"档 1 不丢中段"（没触发任何压缩）的实现会在档 1 的占位断言上红——前提不成立，结论不算数。
+   * </ul>
+   */
+  @Test
+  void tierThreeBaselineCoversWhatTheEarlierMicroDropHid() throws Exception {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyForMicroThenSnapshot();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      CompactSummarySlot slot = CompactSummarySlot.empty();
+      EchoingSummarizer summarizer = new EchoingSummarizer();
+      ScriptedClient llm =
+          ScriptedClient.answering("回合一的回答 " + "答".repeat(5000), "回合二的回答", "回合三的回答");
+      AgentPipeline pipeline =
+          pipeline(
+              llm,
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(1000), summarizer),
+              slot,
+              assembler(slot));
+
+      // 第一回合：档 1（零 LLM 调用）——中段含哨兵，已被占位代表
+      assertThat(pipeline.run("第一轮").stopReason()).isEqualTo(StopReason.FINISHED);
+      assertThat(summarizer.calls()).isZero();
+      // 工作集 = 头 2 条 + 占位 + 尾 6 条（9 条）+ 本回合问答 2 条（回合边界压缩后照常 append）
+      assertThat(pipeline.lastHistory()).hasSize(11);
+      assertThat(textOf(pipeline.lastHistory().get(2))).contains("已丢弃");
+      assertThat(allTextOf(llm.requests.get(0).messages()))
+          .contains("已丢弃")
+          .doesNotContain(MIDDLE_CANARY);
+      assertThat(onlyPayload(events, EventTypes.CONVERSATION_COMPACT).get("tier").asText())
+          .isEqualTo("micro");
+
+      // 第二回合：会话涨到连尾部都放不下 → 档 3，基准必须回到存储（工作集里只剩占位）
+      assertThat(pipeline.run("第二轮").stopReason()).isEqualTo(StopReason.FINISHED);
+      assertThat(summarizer.calls()).isEqualTo(1);
+      String baselineInput = allTextOf(summarizer.requests().get(0).messages());
+      assertThat(baselineInput).contains(MIDDLE_CANARY);
+      assertThat(baselineInput).doesNotContain("已丢弃"); // 基准是权威视图，不是带占位的工作集
+      // 落库的摘要承载了那段内容（不是"被压缩点吃掉"）
+      String persisted = textOf(store.load(CONV).get(0));
+      assertThat(persisted).contains(MIDDLE_CANARY);
+      // 本回合的请求（压缩之后组装的）里已能读到它
+      assertThat(allTextOf(llm.requests.get(1).messages())).contains(MIDDLE_CANARY);
+    }
+
+    // "重启"：同库文件 + 全新管线——基线（摘要 + 压缩点之后的消息）仍能代表那段内容
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      ScriptedClient restartedLlm = ScriptedClient.answering("第三轮的回答");
+      AgentPipeline restarted =
+          pipeline(
+              restartedLlm,
+              events,
+              bus,
+              store,
+              CONV,
+              null,
+              CompactSummarySlot.empty(),
+              new BasicContextAssembler());
+
+      assertThat(restarted.run("第三轮").stopReason()).isEqualTo(StopReason.FINISHED);
+      assertThat(allTextOf(restartedLlm.requests.get(0).messages())).contains(MIDDLE_CANARY);
+    }
+  }
+
+  // ---------- F4：conversation.compact 的条数恒等式（三档同一把尺） ----------
+
+  /** F4 的恒等式：{@code keptMessages + droppedMessages == baselineMessages}（占位与摘要都不是"原消息"）。 */
+  private static void assertCompactionAccountingBalances(
+      JsonNode payload, int dropped, int kept, int baseline) {
+    assertThat(payload.get("droppedMessages").asInt()).isEqualTo(dropped);
+    assertThat(payload.get("keptMessages").asInt()).isEqualTo(kept);
+    assertThat(payload.get("baselineMessages").asInt()).isEqualTo(baseline);
+    assertThat(payload.get("keptMessages").asInt() + payload.get("droppedMessages").asInt())
+        .isEqualTo(payload.get("baselineMessages").asInt());
+  }
+
+  /**
+   * F4 档 1：工作集 = 头 2 条 + 1 条占位 + 尾 6 条（9 条），但"保留的原消息"只有 8 条——占位是压缩产物，不是原消息。
+   *
+   * <p>判别性：{@code keptMessages = history.size()}（旧口径，结构上最省事）在这里报 9，{@code kept == 8} 与恒等式两条都红。
+   */
+  @Test
+  void tierOneCompactEventBalancesKeptDroppedAndBaseline() throws Exception {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyForTierOne();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      CompactSummarySlot slot = CompactSummarySlot.empty();
+      AgentPipeline pipeline =
+          pipeline(
+              ScriptedClient.answering("这一轮的回答"),
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(1000), new ScriptedSummarizer()),
+              slot,
+              assembler(slot));
+
+      pipeline.run("新问题");
+
+      assertCompactionAccountingBalances(
+          onlyPayload(events, EventTypes.CONVERSATION_COMPACT), 10, 8, seeded.size());
+    }
+  }
+
+  /**
+   * F4 档 2：丢弃 12 条、逐字保留 6 条（= 工作集），作用域原长 18。摘要本身不算"保留的原消息"（它不是原消息）。
+   *
+   * <p>判别性：把"保留"理解成"工作集条数 + 摘要 1 条"的实现报 7，两条断言红。
+   */
+  @Test
+  void tierTwoCompactEventBalancesKeptDroppedAndBaseline() throws Exception {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyForTierTwo();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      CompactSummarySlot slot = CompactSummarySlot.empty();
+      AgentPipeline pipeline =
+          pipeline(
+              ScriptedClient.answering("这一轮的回答"),
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(300), ScriptedSummarizer.returning(SUMMARY_JSON)),
+              slot,
+              assembler(slot));
+
+      pipeline.run("新问题");
+
+      assertCompactionAccountingBalances(
+          onlyPayload(events, EventTypes.CONVERSATION_COMPACT), 12, 6, seeded.size());
+    }
+  }
+
+  /**
+   * F4 档 3：整段历史都被摘要（作用域 = 18 条），逐字保留 0 条——工作集里那一条是<b>摘要消息</b>，不是被保留的原消息。
+   *
+   * <p>判别性：拿工作集条数（1）当 kept 的实现两条断言红；把 baseline 记成"压缩后工作集长度"的实现同样红。
+   */
+  @Test
+  void tierThreeCompactEventBalancesKeptDroppedAndBaseline() throws Exception {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      List<LlmMessage> seeded = historyForTierTwo();
+      for (LlmMessage message : seeded) {
+        store.append(CONV, message);
+      }
+      CompactSummarySlot slot = CompactSummarySlot.empty();
+      AgentPipeline pipeline =
+          pipeline(
+              ScriptedClient.answering("这一轮的回答"),
+              events,
+              bus,
+              store,
+              CONV,
+              new Compactor(policy(60), ScriptedSummarizer.returning(SUMMARY_JSON)),
+              slot,
+              assembler(slot));
+
+      pipeline.run("新问题");
+
+      assertCompactionAccountingBalances(
+          onlyPayload(events, EventTypes.CONVERSATION_COMPACT), seeded.size(), 0, seeded.size());
+      // 工作集 = 摘要 + 本回合问答（3 条），但"保留的原消息"仍是 0——口径差别就在这里
+      assertThat(pipeline.lastHistory()).hasSize(3);
+    }
+  }
+
   // ---------- 装配 ----------
 
   private AgentPipeline pipeline(
@@ -699,6 +1122,19 @@ class AgentPipelineCompactionTest {
     catalog.scan(writeSkill());
     return new BasicContextAssembler(
         ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of()), slot);
+  }
+
+  /** 与 {@link #assembler(CompactSummarySlot)} 同形，但保留实现类型——F2 的取槽访问器只在实现类上。 */
+  private BasicContextAssembler basicAssembler(CompactSummarySlot slot) {
+    SkillCatalog catalog = new SkillCatalog();
+    catalog.scan(writeSkill());
+    return new BasicContextAssembler(
+        ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of()), slot);
+  }
+
+  /** 槽由装配器自持（接线方拿不到它）：接线只能经 {@link BasicContextAssembler#compactSummarySlot()} 取——F2 的失配场景。 */
+  private BasicContextAssembler selfSlottedAssembler() {
+    return basicAssembler(CompactSummarySlot.empty());
   }
 
   private static ContextPolicy policy(int conversationBudget) {
@@ -742,6 +1178,51 @@ class AgentPipelineCompactionTest {
     for (int i = 6; i <= 8; i++) {
       seeded.add(LlmMessage.user("HIST#" + (i * 2) + " 尾"));
       seeded.add(LlmMessage.assistant(List.of(new ContentPart.Text("HIST#" + (i * 2 + 1) + " 尾"))));
+    }
+    return seeded;
+  }
+
+  /**
+   * 8 条：头一对各 4000 字符（≈1002/1004 token）、后 6 条各 ~110 字符（≈170 token），全量 ≈ 2176 token。
+   *
+   * <p>{@code size - TAIL_KEEP = 2} 处的干净边界同时是 HEAD_KEEP 之后<b>最靠前</b>的那一个 → {@code headEnd ==
+   * tailStart} → 没有中段可丢（档 1 视图不存在）。预算 300：全量超、尾部放得下 → 走"拿摘要"的分支。F1 的两条用例（有 response / 无 response）
+   * 都建在这个形状上。
+   */
+  private static List<LlmMessage> historyWithNoMiddleToDrop() {
+    List<LlmMessage> seeded = new ArrayList<>();
+    seeded.add(LlmMessage.user("HIST#0 " + "头".repeat(4000)));
+    seeded.add(LlmMessage.assistant(List.of(new ContentPart.Text("HIST#1 " + "头".repeat(4000)))));
+    for (int i = 1; i <= 3; i++) {
+      seeded.add(LlmMessage.user("HIST#" + (i * 2) + " 尾"));
+      seeded.add(LlmMessage.assistant(List.of(new ContentPart.Text("HIST#" + (i * 2 + 1) + " 尾"))));
+    }
+    return seeded;
+  }
+
+  /**
+   * 18 条：头两条极小、中段 10 条各 ~2000 字符（第 5 条带 {@link #MIDDLE_CANARY}）、尾 6 条各 ~600 字符。全量 ≈ 5941 token。
+   *
+   * <p>字符账（预算 1000）：档 1 视图 = 头 ≈6 token + 占位 ≈7 token + 尾 ≈906 token ≈ 919 ≤ 1000 → <b>第一回合档 1
+   * 成立</b>并把中段 （含哨兵）换成占位；第一回合的回答刻意给 5007 字符（≈1254 token），于是第二回合的工作集 ≈ 2178 token，而"最近 6 条"（尾 4 条 +
+   * 本轮问答） ≈ 1863 token > 1000 → <b>尾部放不下 ⇒ 档 3</b>。
+   */
+  private static List<LlmMessage> historyForMicroThenSnapshot() {
+    List<LlmMessage> seeded = new ArrayList<>();
+    seeded.add(LlmMessage.user("HIST#0 头"));
+    seeded.add(LlmMessage.assistant(List.of(new ContentPart.Text("HIST#1 头"))));
+    for (int i = 1; i <= 5; i++) {
+      String marker = i == 3 ? " " + MIDDLE_CANARY : "";
+      seeded.add(LlmMessage.user("HIST#" + (i * 2) + " " + "中".repeat(2000) + marker));
+      seeded.add(
+          LlmMessage.assistant(
+              List.of(new ContentPart.Text("HIST#" + (i * 2 + 1) + " " + "中".repeat(2000)))));
+    }
+    for (int i = 6; i <= 8; i++) {
+      seeded.add(LlmMessage.user("HIST#" + (i * 2) + " " + "尾".repeat(600)));
+      seeded.add(
+          LlmMessage.assistant(
+              List.of(new ContentPart.Text("HIST#" + (i * 2 + 1) + " " + "尾".repeat(600)))));
     }
     return seeded;
   }
@@ -898,6 +1379,35 @@ class AgentPipelineCompactionTest {
         throw new AssertionError("摘要器脚本耗空");
       }
       return response;
+    }
+  }
+
+  /**
+   * 回显式摘要器（F3）：把输入里出现的特征串抄进 {@code objective}——模拟"忠实的摘要"，用来证明某段内容<b>确实进了</b>摘要器的输入，
+   * 因而能被落库摘要承载到重启后的基线里。固定脚本的 {@link ScriptedSummarizer} 做不到这件事（它无法区分输入）。
+   */
+  private static final class EchoingSummarizer implements LlmClient {
+
+    private final List<LlmRequest> requests = new ArrayList<>();
+
+    int calls() {
+      return requests.size();
+    }
+
+    List<LlmRequest> requests() {
+      return requests;
+    }
+
+    @Override
+    public LlmResponse chat(LlmRequest request) {
+      requests.add(request);
+      String input = allTextOf(request.messages());
+      String objective = input.contains(MIDDLE_CANARY) ? "摘要含 " + MIDDLE_CANARY : "摘要不含中段内容";
+      return summarizerResponse(
+          "{\"objective\":\""
+              + objective
+              + "\",\"completed\":[],\"pending\":[],\"decisions\":[],\"changedFiles\":[],"
+              + "\"errors\":[],\"activeSkills\":[],\"unresolved\":[]}");
     }
   }
 

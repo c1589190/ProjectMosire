@@ -385,6 +385,112 @@ class CompactorTest {
     assertThat(summarizer.calls()).isZero();
   }
 
+  /**
+   * F1：<b>无中段可丢（档 1 视图不存在）+ 尾部装得下 + 回复不可解析</b>——摘要器给了 response，工作集一个字节不动，但<b>这笔账必须带出来</b>。
+   *
+   * <p>这条路正是 R7 的漏账口：{@link Result#untouched(List, String)} 把 {@code summarizerCall} 置空，管线也就无从落
+   * {@code llm.call}——token 真花了，D18 的账本上却什么都没有。"没拿到摘要"（解析失败）与"没发生调用"（{@link LlmException}）是两回事。
+   *
+   * <p>判别性：把降级路径统一写成 {@code Result.untouched(history, note)}（结构上最省事、也最像"正确地什么都没做"）的实现， {@code
+   * summarizerCall} 与 token 断言必红；反之，"记账了却把工作集换掉"的实现会在 {@code workingSet} 逐条相等断言上红
+   * （本档什么都没压成，历史必须原样）。{@code calls() == 1} 同时钉住"只调了一次"。
+   */
+  @Test
+  void unparseableReplyWithNoMiddleToDropStillReportsTheCall() {
+    List<LlmMessage> history = noMiddleToDrop();
+    ScriptedSummarizer summarizer = ScriptedSummarizer.returning("模型说了些别的，不是 JSON");
+
+    Result result = new Compactor(policy(300), summarizer).compact(history, null);
+
+    assertThat(result.tier()).isEqualTo(Tier.NONE);
+    assertThat(summarizer.calls()).isEqualTo(1);
+    assertThat(result.note()).contains("无法解析");
+    // F1 的落点：拿到了 response，账就必须带出（哪怕它没能变成摘要、工作集没动）
+    assertThat(result.summarizerCall()).isNotNull();
+    assertThat(result.summarizerCall().response().inputTokens()).isEqualTo(321);
+    // 没压缩 = 工作集原样、零丢弃；恒等式的 NONE 档形态：kept == baseline == 原长
+    assertThat(result.workingSet()).containsExactlyElementsOf(history);
+    assertThat(result.droppedMessages()).isZero();
+    assertThat(result.baselineMessages()).isEqualTo(history.size());
+    assertThat(result.summary()).isNull();
+  }
+
+  /**
+   * F1 的反面（守住"调用失败仍然不记账"这条既有语义）：摘要器抛 {@link LlmException} → <b>没有</b> response 可记账， {@code
+   * summarizerCall} 必须为 {@code null}，由管线落 decision 披露。
+   *
+   * <p>判别性：把 F1 误做成"凡降级就编一个 {@code summarizerCall} / 凡降级就记账"的实现，在这里必红——它与上一条用例共同把分界线钉在 "摘要器有没有返回过
+   * response"上，而不是"档位是不是 NONE"。
+   */
+  @Test
+  void failedCallWithNoMiddleToDropHasNoResponseToBook() {
+    List<LlmMessage> history = noMiddleToDrop();
+
+    Result result =
+        new Compactor(policy(300), ScriptedSummarizer.failing("摘要服务不可用")).compact(history, null);
+
+    assertThat(result.tier()).isEqualTo(Tier.NONE);
+    assertThat(result.workingSet()).containsExactlyElementsOf(history);
+    assertThat(result.note()).contains("摘要调用失败").contains("摘要服务不可用");
+    assertThat(result.summarizerCall()).isNull();
+  }
+
+  /**
+   * F3：档 3 的摘要基准由调用方给出（{@code compact(history, previousSummary, snapshotBaseline)}）——当工作集里只剩"已丢弃 N
+   * 条" 占位时，基准必须是<b>权威全量视图</b>，摘要器要看到那段被占位代表的内容，而不是占位本身。
+   *
+   * <p>判别性：把档 3 的输入恒等于工作集（即 {@code compact(history, previousSummary)} 的两参形态，结构上完全相似的"正确"实现）会让
+   * {@code OLD-SENTINEL} 断言与 {@code containsExactlyElementsOf(baseline)}
+   * 双双红——那段内容既不进摘要、随后又被压缩点划进"之前"， 重启后从基线里静默消失（本类 Javadoc 的不变量）。
+   */
+  @Test
+  void tierThreeSummarizesTheSnapshotBaselineNotJustTheWorkingSet() {
+    List<LlmMessage> workingSet = longHeadShortTail();
+    List<LlmMessage> baseline = new ArrayList<>();
+    baseline.add(LlmMessage.user("最早的一段 " + "旧".repeat(1000) + " OLD-SENTINEL"));
+    baseline.addAll(workingSet);
+    ScriptedSummarizer summarizer = ScriptedSummarizer.returning(SUMMARY_JSON);
+
+    Result result = new Compactor(policy(60), summarizer).compact(workingSet, null, baseline);
+
+    assertThat(result.tier()).isEqualTo(Tier.SNAPSHOT);
+    assertThat(summarizer.calls()).isEqualTo(1);
+    List<LlmMessage> sent = summarizer.requests().get(0).messages();
+    assertThat(sent).hasSize(baseline.size() + 1);
+    assertThat(sent.subList(1, sent.size())).containsExactlyElementsOf(baseline);
+    assertThat(textOf(sent.get(1))).contains("OLD-SENTINEL");
+    // 作用域 = 基准（压缩点将要隐藏的全部内容），不是工作集：丢 19 条、保留 0 条
+    assertThat(result.baselineMessages()).isEqualTo(baseline.size());
+    assertThat(result.droppedMessages()).isEqualTo(baseline.size());
+    assertThat(result.workingSet())
+        .containsExactly(
+            LlmMessage.assistant(List.of(new ContentPart.Text(result.summary().render()))));
+  }
+
+  /**
+   * F5：历史比尾部窗口还短（{@code from = size - TAIL_KEEP < 0}）时，切点收敛到契约内的 {@code 0} → 触门但无切点 → 不动 + 披露。
+   *
+   * <p>判别性：这条 pin 的是"返回值恒在 {@code [0, size]} 契约内"的后果。若有人删掉 {@code cleanBoundaryAtOrBefore}
+   * 里的收敛、并把调用点 的判断改成"只有负下标才算无切点"，切点会漏出负数，随后 {@code subList(负数, size)} 直接抛 {@link
+   * IndexOutOfBoundsException}——本条从"FINISHED 式的不动"变成"炸"，红；而 {@code note}/{@code tier} 两条断言挡住
+   * "干脆当成没触门"的实现（那样就没有任何披露）。
+   */
+  @Test
+  void historyShorterThanTheTailWindowIsLeftUntouched() {
+    List<LlmMessage> history = List.of(LlmMessage.user("U0 " + "长".repeat(4000)));
+    ScriptedSummarizer summarizer = new ScriptedSummarizer();
+
+    Result result = new Compactor(policy(10), summarizer).compact(history, null);
+
+    assertThat(result.tier()).isEqualTo(Tier.NONE);
+    assertThat(result.workingSet()).containsExactlyElementsOf(history);
+    // "触门但无切点"（不是"没触门"——后者 note 为 null，压缩失败就没人在看）
+    assertThat(result.note()).contains("无安全切点");
+    assertThat(result.droppedMessages()).isZero();
+    assertThat(result.baselineMessages()).isEqualTo(history.size());
+    assertThat(summarizer.calls()).isZero();
+  }
+
   // ---------- 夹具 ----------
 
   private static ContextPolicy policy(int conversationBudget) {
@@ -429,6 +535,25 @@ class CompactorTest {
       history.add(LlmMessage.user("U" + i + " " + "尾".repeat(100)));
       history.add(
           LlmMessage.assistant(List.of(new ContentPart.Text("A" + i + " " + "尾".repeat(100)))));
+    }
+    return history;
+  }
+
+  /**
+   * 8 条：头一对各 4000 字符（≈1002/1004 token）、后 6 条各 ~110 字符（≈170 token）——总计 ≈ 2176 token。
+   *
+   * <p>形状要点：{@code size - TAIL_KEEP = 2} 处的干净边界同时是"<b>最靠前的</b>干净边界"（{@link #HEAD_KEEP} 之后第一个）， 于是
+   * {@code headEnd == tailStart} → 没有中段可丢（{@code microView == null}）。预算 300：全量超、尾部 6 条（170）放得下 → 走档
+   * 2/3 的分支去拿摘要。{@link #unparseableReplyWithNoMiddleToDropStillReportsTheCall} 与 {@link
+   * #failedCallWithNoMiddleToDropHasNoResponseToBook} 用它把 F1 的两条路径（有 response / 无 response）摆到同一把尺上。
+   */
+  private static List<LlmMessage> noMiddleToDrop() {
+    List<LlmMessage> history = new ArrayList<>();
+    history.add(LlmMessage.user("U0 " + "头".repeat(4000)));
+    history.add(LlmMessage.assistant(List.of(new ContentPart.Text("A0 " + "头".repeat(4000)))));
+    for (int i = 1; i <= 3; i++) {
+      history.add(LlmMessage.user("U" + i + " 尾"));
+      history.add(LlmMessage.assistant(List.of(new ContentPart.Text("A" + i + " 尾"))));
     }
     return history;
   }
