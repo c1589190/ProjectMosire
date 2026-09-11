@@ -70,6 +70,11 @@ import org.slf4j.LoggerFactory;
  *   <li>多个 tool call 按 {@code index} 分桶（允许不同调用的分片交错到达），结果按 {@code index} 升序交给 {@link LlmResponse}。
  *   <li>{@code usage} 通常在末尾 chunk，落到 {@link LlmResponse} 的 input/output/缓存 token 字段；供应商未上报的字段保持
  *       {@link LlmResponse#UNKNOWN_TOKENS}（-1），不编造 0。
+ *   <li><b>{@code usage} 与配额账本</b>：请求体<b>必须</b>显式带 {@code
+ *       stream_options:{"include_usage":true}}——OpenAI 规范下 {@code stream:true} 时 {@code usage}
+ *       <b>默认不下发</b>；不发该键，四个 token 字段恒为 {@link LlmResponse#UNKNOWN_TOKENS}（-1），而 {@link
+ *       LlmQuota#record} 把负值夹成 0 → <b>本地配额账本静默失效</b> （"配额超限 → {@code StopReason.QUOTA}"这条验收路径在真实
+ *       OpenAI 上不可达）。DeepSeek 等供应商原生默认带 usage， 不发也"看起来正常"——这正是必须显式发的原因。该键对忽略未知字段的供应商无副作用。
  *   <li>{@code data: [DONE]} 为终止符：见到即停止读取并返回（其后内容一概不再解析、不再报错）。
  *   <li>流在 {@code [DONE]} 之前 EOF = 响应被截断 → {@link LlmException}（宁可响亮失败，也不静默交回半截响应）。
  * </ul>
@@ -117,6 +122,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    *
    * <p>约定：返回 {@link Optional#empty()} = 无密钥（匿名调用，本地部署常见）；实现抛异常视为取密钥失败，按调用失败处理。
    * 实现不应记录/回显密钥值（本类也不会）。每次 {@link #chat} 调用都会重新取一次，便于调用方实现轮换/过期感知。
+   *
+   * <p><b>对实现的硬性契约：不得在异常消息或 URL 中内嵌密钥/凭据值。</b> 取密钥失败时本类只会给出固定的非敏感文案并保留异常为
+   * cause——客户端<b>无法</b>净化它根本没拿到的值（例如解析器把 {@code https://user:token@vault/…} 原样写进异常消息，本类 无从得知其中的
+   * token 是凭据）。需要上报失败细节时请把凭据抹成占位符再写进消息。
    */
   public interface ApiKeySource {
 
@@ -222,8 +231,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
   /** 真正的交换（跑在虚拟线程上；本方法内的任何失败都由 {@link #chat} 归类成 {@link LlmException}）。 */
   private LlmResponse exchange(LlmRequest request, AtomicReference<InputStream> bodyRef)
       throws IOException, InterruptedException {
-    String apiKey =
-        apiKeySource.apiKey().map(String::trim).filter(key -> !key.isEmpty()).orElse("");
+    String apiKey = apiKeyOf();
     HttpRequest.Builder builder =
         HttpRequest.newBuilder(chatCompletionsUri)
             .timeout(readTimeout)
@@ -248,6 +256,22 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
           apiKey);
     } finally {
       closeQuietly(body, null);
+    }
+  }
+
+  /**
+   * 取当前密钥（每次调用现取；空串 = 匿名）。
+   *
+   * <p><b>取密钥失败时绝不把 SPI 异常的消息原文拼进本类的消息</b>：本类的消息会经 {@code AgentPipeline} 的 {@code
+   * emitDecision("LLM_ERROR", reason = e.getMessage())} 落进<b>持久事件库并展示给用户</b>（不只是瞬时日志），而密钥解析
+   * 实现抛出的异常消息里可能内嵌凭据值——客户端<b>无法</b>净化它根本没拿到的值（只能靠约定，见 {@link ApiKeySource}）。故这里用固定 的非敏感文案，原始异常经
+   * {@code cause} 保留（诊断力不丢：栈与类型都还在）。
+   */
+  private String apiKeyOf() {
+    try {
+      return apiKeySource.apiKey().map(String::trim).filter(key -> !key.isEmpty()).orElse("");
+    } catch (RuntimeException keyFetchFailure) {
+      throw new LlmException("取密钥失败（详见 cause：宿主侧密钥解析异常，消息不外显，以免泄漏凭据）", keyFetchFailure);
     }
   }
 
@@ -351,11 +375,19 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         : collapsed.substring(0, MAX_EXCERPT_CHARS) + "…";
   }
 
-  /** 请求体：{@code {model, stream:true, messages[], tools[]}}。 */
+  /**
+   * 请求体：{@code {model, stream:true, stream_options:{include_usage:true}, messages[], tools[]}}。
+   *
+   * <p>{@code stream_options.include_usage} <b>不是可选项</b>：OpenAI 规范下 {@code stream:true} 时 usage
+   * 默认不下发，不发该键 则 token 字段恒为 -1 → {@link LlmQuota} 的本地账本永远不超限（理由详见类 Javadoc"usage 与配额账本"）。供应商若忽略未知
+   * 字段，该键无副作用。
+   */
   private byte[] requestBody(LlmRequest request) throws IOException {
     ObjectNode root = JSON.createObjectNode();
     root.put("model", route.model());
     root.put("stream", true);
+    // 显式索要 usage：见方法 Javadoc。放在 stream 之后、messages 之前（无协议要求，只为可读）
+    root.putObject("stream_options").put("include_usage", true);
     ArrayNode messages = root.putArray("messages");
     for (LlmMessage message : request.messages()) {
       appendMessage(messages, message);
@@ -518,7 +550,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       }
     }
 
-    /** usage 通常只在末尾 chunk（部分供应商需 {@code stream_options.include_usage}）；缺字段保持"未知"。 */
+    /**
+     * usage 在末尾 chunk（请求侧已显式带 {@code stream_options.include_usage}，见 {@link
+     * #requestBody}）；缺字段保持"未知"。
+     */
     private void readUsage(JsonNode usage) {
       inputTokens = longOr(usage.get("prompt_tokens"), inputTokens);
       outputTokens = longOr(usage.get("completion_tokens"), outputTokens);
@@ -553,10 +588,21 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       }
     }
 
+    /**
+     * 拼装结果。
+     *
+     * <p><b>只有终止符、没有任何 data 帧</b>（供应商对空补全的退化形态）在这里响亮报"空完成"，与 {@link #notSseStream} 的"不是
+     * SSE"刻意分成两类文案——"供应商什么也没产出"与"接错了端点/不是流式响应"是两种完全不同的 故障，混为一谈会让排查方向跑偏。为什么当失败而不是交回空响应：①按 OpenAI
+     * 协议，正常完成至少会有 {@code finish_reason} 帧（现在还会带 usage），零 data
+     * 帧意味着供应商/网关把内容整个丢了，交回空响应就是静默数据丢失（本项目最坏的失败模式）； ②零 data 帧同时意味着零
+     * usage，静默返回会让配额账本"看起来一切正常"（与请求侧必须显式索要 usage 是同一类静默失效问题）。
+     */
     LlmResponse toResponse(String contentType) {
       if (dataChunks == 0) {
         throw new LlmException(
-            "SSE 响应没有任何 data 帧（不是 OpenAI 兼容的流式响应？Content-Type=" + contentType + "）");
+            "SSE 流是空完成：只见到终止符 data: [DONE]、没有任何内容帧（供应商未产出任何内容与 usage，Content-Type="
+                + contentType
+                + "）——不予采信空响应（见本方法 Javadoc）");
       }
       List<ContentPart> parts = new ArrayList<>();
       if (!text.isEmpty()) {
@@ -577,11 +623,22 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     /** 没等到 {@code [DONE]} 就 EOF：流被截断，响亮失败而不是交回半截响应。 */
     LlmException truncatedStream(String contentType) {
       if (dataChunks == 0) {
-        return new LlmException(
-            "SSE 响应没有任何 data 帧（不是 OpenAI 兼容的流式响应？Content-Type=" + contentType + "）");
+        return notSseStream(contentType);
       }
       return new LlmException(
           "SSE 流在 data: [DONE] 之前结束（响应被截断：已收到 " + dataChunks + " 个 data 帧）——不予采信半截响应");
+    }
+
+    /**
+     * 一个 data 帧都没有、也没等到终止符：更像是"接错了端点/响应根本不是 SSE"（例如网关返回普通 JSON，或空响应体）。
+     *
+     * <p>与"空完成"（{@link #toResponse}：是 SSE、有终止符，但供应商没产出内容）刻意使用不同文案——两类故障的排查方向不同。
+     */
+    private LlmException notSseStream(String contentType) {
+      return new LlmException(
+          "SSE 响应没有任何 data 帧，也没见到终止符 data: [DONE]（不是 OpenAI 兼容的流式响应？Content-Type="
+              + contentType
+              + "）");
     }
 
     /** 误回显的密钥一律抹掉（本类只在此处对供应商文本做净化）。 */
