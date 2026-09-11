@@ -23,6 +23,7 @@ import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.Compactor;
 import io.mosire.brain.context.ContextAssembler;
+import io.mosire.brain.context.ContextLayer;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,6 +55,11 @@ import org.slf4j.LoggerFactory;
  * Compactor}：超预算时按 micro → 局部摘要 → 快照续接三档压缩会话工作集，并落 {@code conversation.compact} 事件（摘要调用另落 {@code
  * llm.call} 记账，R7）。压缩只改<b>内存工作集</b>（档 1/2）或经显式 {@code compact} 记录落库（档 3）——持久层的 append-only
  * 不变量不因压缩而放宽。不接 {@code Compactor} 的构造行为与压缩接线前逐字节一致。
+ *
+ * <p><b>压缩侧的两条硬约束（F1–F4 的落点）</b>：①摘要器只要返回过 response，那笔调用就必须记账（含"解析不出 → 退回不动"这条路径， 见 {@code
+ * compactIfNeeded} 的 {@code llm.call} 分支）；②档 2 的摘要必须真的进得了请求（{@link
+ * #requireSummaryVisibleInAssembler} 守卫），档 3 的摘要必须覆盖压缩点将隐藏的全部内容（{@link #snapshotBaseline} 在档 1
+ * 曾隐藏内容时回退到存储视图）。
  */
 public final class AgentPipeline {
 
@@ -75,11 +81,26 @@ public final class AgentPipeline {
   /** 会话压缩器；{@code null} = 未接线（既有构造的取法，行为与压缩接线前逐字节一致）。 */
   private final Compactor compactor;
 
-  /** 当前生效摘要的槽：<b>必须与装配器共用同一个</b>（否则档 2 的摘要在请求里不可见）——本类只写不读（除回传给 Compactor 做并集）。 */
+  /**
+   * 当前生效摘要的槽：<b>必须与装配器共用同一个</b>（否则档 2 的摘要在请求里不可见）——本类只写不读（除回传给 Compactor 做并集）。
+   *
+   * <p><b>取槽的正确来源是装配器自己</b>（{@code BasicContextAssembler#compactSummarySlot()}）：槽是可变的共享对象，自建一个
+   * {@link CompactSummarySlot#empty()} 在类型上完全合法却会让档 2 静默失效。构造之后无法再核对（{@link ContextAssembler} 接口里
+   * 没有取槽方法），故由 {@link #requireSummaryVisibleInAssembler} 在压缩落地当刻用同源的 {@code composition} 反向验证。
+   */
   private final CompactSummarySlot compactSummary;
 
   /** 会话历史（不含 system 头，进程内累积 + 每回合把新增尾部落库，供下一回合原样回灌）；构造时由 {@link #store} 灌入。 */
   private final List<LlmMessage> history = new ArrayList<>();
+
+  /**
+   * 工作集里是否有"只被占位代表"的内容（档 1 移出工作集、且此后没有落库重新同步过）——{@link #snapshotBaseline} 的判据（F3）。
+   *
+   * <p>只在回合边界读写。{@code volatile} 与 {@link #cancelled} 同口径：本类的并发约定只要求调用方<b>串行</b>（不要求同一线程——见类
+   * Javadoc 的"每任务一 runtime 实例，或对外按提交序串行化调度"），跨回合的线程交接由它保证可见性；这也是 {@code
+   * AT_STALE_THREAD_WRITE_OF_PRIMITIVE} 的正当处理（而不是把一个跨回合必须存活的判据消掉）。
+   */
+  private volatile boolean uncoveredHiddenContent;
 
   /** 取消请求标志（volatile 保证跨线程可见；只在 run() 入口重置——取消只对"正在跑的回合"生效）。 */
   private volatile boolean cancelled;
@@ -164,8 +185,10 @@ public final class AgentPipeline {
    * @param store 会话存储（非 null）
    * @param conversationId 会话标识（非 null）
    * @param compactor 压缩器；{@code null} = 不压缩（与既有构造同行为）
-   * @param compactSummary 摘要槽；<b>必须与 {@code assembler} 共用同一个实例</b>（否则档 2 的摘要进不了 COMPACT_SUMMARY 层；
-   *     未接线压缩时给 {@link CompactSummarySlot#empty()} 即可）
+   * @param compactSummary 摘要槽；<b>必须与 {@code assembler} 共用同一个实例</b>——<b>取槽的正确来源是装配器自己</b> （{@code
+   *     BasicContextAssembler#compactSummarySlot()}），自建槽会让档 2 的摘要进不了 COMPACT_SUMMARY 层；未接线压缩时给
+   *     {@link CompactSummarySlot#empty()} 即可。本构造<b>不去核对</b>这件事（接口里没有取槽方法）， 改由压缩落地当刻的守卫 {@link
+   *     #requireSummaryVisibleInAssembler} 响亮失败兜底
    */
   public AgentPipeline(
       AgentConfig config,
@@ -224,7 +247,7 @@ public final class AgentPipeline {
     cancelled = false;
     // 压缩触发点：回合边界（组请求之前）。此处既没有在途的落库（上一回合早已 return），也没有并发的第二个 store
     // 实例——档 3 的 compact/load 用的是本实例持有的同一个 store，撕裂读在结构上不可达
-    compactIfNeeded();
+    compactIfNeeded(userMessage);
 
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
@@ -363,14 +386,21 @@ public final class AgentPipeline {
    * <p><b>档 3 落库</b>（{@link #persistSnapshot}）：摘要经显式 {@code compact} 记录进入会话，随后工作集按 {@code load}
    * 的权威形态重灌，槽清空（摘要已进入会话本身，层里再留一份就是同一内容出现两遍）。
    *
-   * <p><b>事件（R4/R7/披露）</b>：{@code conversation.compact}（档位/丢弃条数/保留条数/摘要 token）、摘要调用的 {@code
+   * <p><b>档 3 的摘要基准</b>（{@link #snapshotBaseline}，F3）：工作集里只要还有"只被占位代表"的内容，基准就必须回到 {@code
+   * store.load} 的权威全量视图——否则那段内容既不进摘要、又被新压缩点划进"之前"，重启后从基线里静默消失。
+   *
+   * <p><b>事件（R4/R7/披露）</b>：{@code conversation.compact}（档位/丢弃条数/保留条数/作用域原长/摘要 token）、摘要调用的 {@code
    * llm.call} 记账、以及降级与"无可切点"的 {@code decision}——压缩这件事在事件流里全程可见。
+   *
+   * @param userMessage 本轮用户输入：仅用于档 2 落地后的可见性守卫（{@link #requireSummaryVisibleInAssembler}）—— {@code
+   *     composition} 与 {@code buildRequest} 同源，入参必须与本回合组请求时一模一样，否则验的不是同一个东西
    */
-  private void compactIfNeeded() {
+  private void compactIfNeeded(String userMessage) {
     if (compactor == null) {
       return;
     }
-    Compactor.Result result = compactor.compact(history, compactSummary.current());
+    Compactor.Result result =
+        compactor.compact(history, compactSummary.current(), snapshotBaseline());
     if (result.summarizerCall() != null) {
       // R7：摘要是额外 LLM 调用——不记账的话，P2-3 的 token 汇总看不见压缩成本（D18 名不副实）
       Compactor.SummarizerCall call = result.summarizerCall();
@@ -401,15 +431,26 @@ public final class AgentPipeline {
     }
     switch (result.tier()) {
       case NONE -> {
-        // 未压缩：工作集原样
+        // 未压缩：工作集原样（含"摘要器给了 response 但解析不出 → 退回不动"这条路：只记账，不动工作集）
       }
       case MICRO, SUMMARY -> {
-        replaceWorkingSet(result.workingSet());
         if (result.summary() != null) {
           compactSummary.set(result.summary());
+          // 摘要已进槽：此刻必须能在装配器渲染的 COMPACT_SUMMARY 层里看见它（看不见就是接线失配，见守卫）。
+          // 求值在换工作集之前——失败时不留下"工作集已换、上下文却残缺"的半截状态
+          requireSummaryVisibleInAssembler(userMessage);
+        }
+        replaceWorkingSet(result.workingSet());
+        if (result.tier() == Compactor.Tier.MICRO) {
+          // 档 1 把中段换成了占位：工作集自此不再包含全部内容——下次档 3 的摘要基准必须回到存储（F3）
+          uncoveredHiddenContent = true;
         }
       }
-      case SNAPSHOT -> persistSnapshot(result);
+      case SNAPSHOT -> {
+        persistSnapshot(result);
+        // 工作集已按 store.load 的权威形态重灌：内存与存储重新同源，基准可以退回工作集
+        uncoveredHiddenContent = false;
+      }
     }
     if (result.compacted()) {
       emit(
@@ -419,10 +460,62 @@ public final class AgentPipeline {
               result.tier().name().toLowerCase(Locale.ROOT),
               "droppedMessages",
               result.droppedMessages(),
+              // 保留的"原消息"条数 = 作用域原长 - 丢弃条数：占位与摘要都不是原消息，不计入（恒等式对三档都成立）
               "keptMessages",
-              history.size(),
+              result.baselineMessages() - result.droppedMessages(),
+              "baselineMessages",
+              result.baselineMessages(),
               "summaryTokens",
               result.summary() == null ? -1 : result.summary().render().length() / 4));
+    }
+  }
+
+  /**
+   * 档 3 的摘要基准（F3）：压缩点将要隐藏的<b>全部</b>内容。
+   *
+   * <p>工作集与存储同源时它就是工作集（内存里那份就是权威视图，多读一次库没有意义）。但档 1 会把中段换成一行"已丢弃 N 条"占位——此后工作集
+   * <b>不再</b>包含压缩点将要隐藏的全部内容（见 {@link #uncoveredHiddenContent}）。此时基准回退到 {@code store.load} 的权威形态，
+   * 让那段只被占位代表的内容重新进入摘要器输入。
+   *
+   * <p>为什么不用"永远取 store"：工作集与存储同源时两者内容相同，而 {@code load} 是每回合多两条查询的额外成本；且工作集里还带着本回合尚未
+   * 落库的尾部（正常情况下与存储一致，但"以工作集为准"是本来的语义）。只有出现覆盖缺口时才值得升级到存储视图。
+   *
+   * <p>{@code load} 走的是本实例持有的那个 store，仍在 R11 的结构性回避之内（管线存活期间不存在第二个 store 实例，且此处是回合边界—— 上一回合的落库早已
+   * return）。
+   */
+  private List<LlmMessage> snapshotBaseline() {
+    if (!uncoveredHiddenContent) {
+      return history;
+    }
+    List<LlmMessage> stored = store.load(conversationId);
+    // 取不到（空实现/空会话）时退回工作集：不把"读不到"当成"没有内容"——真要是空会话，档 3 的落库守卫会另行响亮失败
+    return stored.isEmpty() ? history : stored;
+  }
+
+  /**
+   * 档 2 的可见性守卫（F2）：摘要<b>已写入槽</b>，但装配器渲染出的 {@code COMPACT_SUMMARY} 层里看不见它 → 接线失配，响亮失败。
+   *
+   * <p>必须失败而不是继续：档 2 落地后工作集只剩尾部，被丢弃的中段既不在工作集里、又没进层——请求里"无摘要、无占位"，头部与中段
+   * <b>静默消失</b>（本项目最坏的失败模式）。失配的成因不是运行期数据问题，而是<b>编程契约违反</b>（管线的槽与装配器读的槽不是同一个实例）， 照 {@code
+   * saveHistory} 守卫与 {@link #persistSnapshot} 空会话守卫的纪律抛 {@link IllegalStateException}。
+   *
+   * <p><b>判据为什么用 {@code composition} 而不是 {@code buildRequest}</b>：接口把 {@code composition} 定为与
+   * {@code buildRequest} <b>同源</b>（同一输入 → 同一组段落），装配器读哪个槽它就反映哪个槽，且不必解析消息文本、不必猜头部/尾部（那条路
+   * 会误伤"摘要内容恰好与尾部重合"的合法情形）。层估算为 {@code 0} 或缺失即"该层没有内容"。
+   *
+   * <p><b>求值时机在写入工作集之前</b>：不满足时不留下"工作集已换、上下文却残缺"的半截状态——失败时工作集一个字节都没动。
+   */
+  private void requireSummaryVisibleInAssembler(String userMessage) {
+    Integer layerTokens =
+        assembler
+            .composition(config, userMessage, List.copyOf(history), List.of())
+            .estimatedTokens()
+            .get(ContextLayer.COMPACT_SUMMARY);
+    if (layerTokens == null || layerTokens <= 0) {
+      throw new IllegalStateException(
+          "压缩摘要已写入槽，但装配器的 COMPACT_SUMMARY 层为空——管线持有的摘要槽与装配器读取的槽不是同一个实例"
+              + "（接线必须用 assembler.compactSummarySlot() 取槽，拒绝静默丢弃被压缩的历史）: "
+              + conversationId);
     }
   }
 

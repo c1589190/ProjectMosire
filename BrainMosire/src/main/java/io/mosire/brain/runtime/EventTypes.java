@@ -25,9 +25,15 @@ public final class EventTypes {
 
   /**
    * 一次会话压缩（{@code Compactor} 的产物；{@code 开发计划.md:101}）。payload: {@code
-   * {"tier":"micro|summary|snapshot","droppedMessages":..,"keptMessages":..,"summaryTokens":..}}——{@code
+   * {"tier":"micro|summary|snapshot","droppedMessages":..,"keptMessages":..,"baselineMessages":..,"summaryTokens":..}}——{@code
    * droppedMessages} 是本次被移出请求的会话消息数（档 1 另有占位消息在会话里披露同一数字），{@code summaryTokens} 为 {@code -1}
    * 表示本次没有摘要（档 1）。
+   *
+   * <p><b>条数口径（恒等式）</b>：{@code keptMessages + droppedMessages == baselineMessages}，三档都成立。{@code
+   * baselineMessages} 是本次压缩的<b>作用域原长</b>——档 1/2 = 压缩前的工作集长度；档 3 = 压缩点将要隐藏的全部内容
+   * （工作集曾丢失内容时为存储的权威全量视图，见 {@code AgentPipeline#snapshotBaseline}）。{@code keptMessages}
+   * 只数<b>逐字保留的原消息</b>：档 1 的占位消息与档 3 的摘要消息都<b>不</b>计入（它们是压缩产物，不是原消息——把它们算进去会让 "保留条数"与工作集长度混为一谈，档 1
+   * 曾因此报 9+10=19 而作用域只有 18 条）。
    *
    * <p>全零成本档（未触门 / 无安全切点）不落本事件；降级（摘要不可用→退回档 1）额外落 {@code decision} 带 {@code COMPACT_DEGRADED}。
    */
