@@ -75,7 +75,8 @@ class AppMcpLinkTest {
                 "--port",
                 "0",
                 "--mcp-link",
-                linksFile.toString()),
+                linksFile.toString(),
+                "--fake"),
             Map.of(),
             Duration.ofSeconds(45),
             Duration.ofSeconds(30));

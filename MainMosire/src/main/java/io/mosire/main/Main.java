@@ -1,12 +1,18 @@
 package io.mosire.main;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
+import io.mosire.agentlib.llm.ConfigApiKeySource;
 import io.mosire.agentlib.llm.FakeLlmClient;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmResponse;
+import io.mosire.agentlib.llm.LlmRouteLoader;
+import io.mosire.agentlib.llm.ModelRoute;
+import io.mosire.agentlib.llm.OpenAICompatibleLlmClient;
+import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.main.agent.SubagentProcessMain;
 import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
@@ -107,11 +113,13 @@ public final class Main {
     if (fake && fakeScript != null) {
       throw new IllegalArgumentException("--fake 与 --fake-script 不能同时指定");
     }
-    // W5：离线 LLM 显式声明面——smoke.sh 断言"断网可测"；非 demo 默认即 FakeLlm（App.scriptedLlm），显式开关是明示
+    // W5：离线 LLM 显式声明面（smoke.sh 断言"断网可测"）；三期 S1-A1：以上开关都不给时一律真模型（缺配置/缺密钥响亮失败，不退化）
     LlmClient llmOverride =
         fakeScript != null
             ? FakeLlmScript.parse(fakeScript)
-            : fake ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY)) : null;
+            : fake
+                ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY))
+                : config.demo() ? null : realLlm(config.dataDir());
     App app = App.start(config, llmOverride);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
@@ -127,6 +135,23 @@ public final class Main {
         config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
     return 0;
+  }
+
+  /**
+   * 生产装配：从 {@code <configRoot>/config.json} 取路由与密钥，构造真实 LLM 客户端（{@code configRoot} 即 {@code
+   * --data-dir}）。
+   *
+   * <p><b>失败一律响亮（D24），绝不退化回 {@link FakeLlmClient}</b>：缺 {@code llm.baseUrl}/{@code llm.model}
+   * 在<b>装配期</b> 抛（{@code E_LLM_CONFIG_MISSING}）；缺密钥在<b>取密钥时</b>抛（{@code E_KEY_MISSING}）——SPI 契约要求每次
+   * {@code chat} 现取一次密钥以 支持轮换/过期感知，故密钥不在构造期固化（详见 {@link ConfigApiKeySource}），取不到时客户端按调用失败响亮抛出。
+   *
+   * <p>包私有：只给 {@code run} 与同包测试用（既有测试入口 {@code App.start(...)} 不经过这里，故离线门禁不受影响）。
+   */
+  static LlmClient realLlm(Path configRoot) {
+    FileConfigStore store = new FileConfigStore(configRoot);
+    ModelRoute route = LlmRouteLoader.load(store);
+    return new OpenAICompatibleLlmClient(
+        route, new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM));
   }
 
   /**
