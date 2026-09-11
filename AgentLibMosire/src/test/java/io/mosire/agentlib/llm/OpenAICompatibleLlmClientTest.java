@@ -2,6 +2,7 @@ package io.mosire.agentlib.llm;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -177,6 +178,31 @@ class OpenAICompatibleLlmClientTest {
   }
 
   /**
+   * F1 pin（R5④ 的对称面）：请求体<b>必须显式索要</b> usage（{@code stream_options:{"include_usage":true}}）。
+   *
+   * <p>为什么这是必判点：OpenAI 规范下 {@code stream:true} 时 usage <b>默认不下发</b>；不发该键 → 四个 token 字段恒 -1 → {@link
+   * LlmQuota#record} 把负值夹成 0 → 本地配额账本<b>永远不超限</b>，"配额超限 → QUOTA"这条验收路径在真实 OpenAI 上不可达 （DeepSeek
+   * 原生默认带 usage，故缺键在默认供应商上"看起来正常"）。
+   *
+   * <p>判别性：假端点<b>刻意不发 usage 帧</b>，断言分两半——①请求体确实含该键（把该键从请求体移除，本用例必红，已实测）； ②缺 usage 时四个 token 字段保持
+   * {@link LlmResponse#UNKNOWN_TOKENS}（<b>不编造 0</b>：若实现改成缺省填 0，前半段仍绿、这里必红）。
+   */
+  @Test
+  void requestsUsageInStreamOptionsAndKeepsTokensUnknownWhenVendorOmitsUsage() {
+    script.add(sseFrame("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"无 usage 的流\"}}]}"));
+    script.add(DONE_FRAME);
+
+    LlmResponse response = client(ApiKeySource.none(), Duration.ofSeconds(5)).chat(oneUserTurn());
+
+    assertThat(requestBodies.get(0)).contains("\"stream_options\":{\"include_usage\":true}");
+    assertThat(response.inputTokens()).isEqualTo(LlmResponse.UNKNOWN_TOKENS);
+    assertThat(response.outputTokens()).isEqualTo(LlmResponse.UNKNOWN_TOKENS);
+    assertThat(response.cacheReadTokens()).isEqualTo(LlmResponse.UNKNOWN_TOKENS);
+    assertThat(response.cacheWriteTokens()).isEqualTo(LlmResponse.UNKNOWN_TOKENS);
+    assertThat(response.textPart()).contains("无 usage 的流");
+  }
+
+  /**
    * R5⑤ {@code [DONE]} 后不再读、不抛：终止符之后跟了非法 JSON 帧——继续读的实现会在这里抛 LlmException， 本用例通过即证明"见到 [DONE] 就收工"。
    */
   @Test
@@ -200,12 +226,35 @@ class OpenAICompatibleLlmClientTest {
         .hasMessageContaining("截断");
   }
 
-  /** 200 但响应体不是 SSE（例如代理返回的普通 JSON）：loud 失败，而不是返回一个空内容的"成功"。 */
+  /**
+   * 200 但响应体不是 SSE（例如代理返回的普通 JSON）：loud 失败，而不是返回一个空内容的"成功"；且文案必须与 {@link
+   * #reportsEmptyCompletionDistinctlyFromNotSse()} 的"空完成"分开（两类故障排查方向不同）。
+   */
   @Test
   void failsLoudlyWhenBodyIsNotSse() {
     assertThatThrownBy(() -> client(ApiKeySource.none(), Duration.ofSeconds(5)).chat(oneUserTurn()))
         .isInstanceOf(LlmException.class)
-        .hasMessageContaining("data 帧");
+        .hasMessageContaining("data 帧")
+        .hasMessageContaining("不是 OpenAI 兼容")
+        .hasMessageNotContaining("空完成");
+  }
+
+  /**
+   * F2 pin（失败必须可辨）：<b>是 SSE 但供应商什么也没产出</b>（有 Content-Type、有终止符 {@code [DONE]}、零内容帧）与 <b>根本不是
+   * SSE</b>（零 data 帧且无终止符）是两类故障——前者是"供应商/网关把内容丢了"，后者是"接错端点/响应不是流式"， 文案混在一起会把排查方向带偏。
+   *
+   * <p>返回语义选择：<b>响亮报"空完成"</b>而不是交回空 {@link LlmResponse}。理由：①按 OpenAI 协议，正常完成至少会有 {@code
+   * finish_reason} 帧（现在还会带 usage），零 data 帧意味着内容整个丢了，交回空响应就是静默数据丢失；②零 data 帧同时意味着零
+   * usage，静默返回会让配额账本"看起来一切正常"（与 F1 同一类静默失效）。选择与理由已写进 {@code Accumulator#toResponse} 的 Javadoc。
+   */
+  @Test
+  void reportsEmptyCompletionDistinctlyFromNotSse() {
+    script.add(DONE_FRAME); // 供应商对空补全的退化形态：只有终止符
+
+    assertThatThrownBy(() -> client(ApiKeySource.none(), Duration.ofSeconds(5)).chat(oneUserTurn()))
+        .isInstanceOf(LlmException.class)
+        .hasMessageContaining("空完成")
+        .hasMessageNotContaining("不是 OpenAI 兼容");
   }
 
   /** 流中携带供应商错误对象（部分供应商如此报错）→ LlmException，带非敏感摘要。 */
@@ -337,6 +386,38 @@ class OpenAICompatibleLlmClientTest {
   }
 
   /**
+   * F3 pin：取密钥 SPI 抛异常时，其异常消息<b>绝不</b>进本类的异常消息——后者会经 {@code AgentPipeline} 的 {@code
+   * emitDecision("LLM_ERROR", reason = e.getMessage())} 落进<b>持久事件库并展示给用户</b>（不只是瞬时日志），而 SPI 的
+   * 消息里可能内嵌凭据值（本类无法净化它根本没拿到的值）。
+   *
+   * <p>判别性：金丝雀串同时以"裸文本"与"URL userinfo"（{@code https://user:CANARY@vault.local/v1}）两种形态出现在 SPI
+   * 的异常消息里——前者钉"整段拼接"（仅靠 URL 正则救不了它），后者钉"只抹 URL"这一半。同时断言 cause 仍保留原异常与其消息 （诊断力不丢，只是不进那条会被持久化的消息）。
+   */
+  @Test
+  void keepsKeySourceFailureMessageOutOfExceptionMessage() {
+    String canary = "credential-canary-8f21";
+    ApiKeySource exploding =
+        () -> {
+          throw new IllegalStateException(
+              "keystore read failed for "
+                  + canary
+                  + " at https://user:"
+                  + canary
+                  + "@vault.local/v1");
+        };
+
+    LlmException failure =
+        catchThrowableOfType(
+            LlmException.class, () -> client(exploding, Duration.ofSeconds(5)).chat(oneUserTurn()));
+
+    assertThat(failure).hasMessageContaining("取密钥失败").hasMessageNotContaining(canary);
+    // 诊断力：原始异常（含其消息）留在 cause 里，只是不进"会被持久化并展示"的那条消息
+    assertThat(failure.getCause())
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining(canary);
+  }
+
+  /**
    * R2：缺省 {@link OpenAICompatibleLlmClient.ApiKeySource#none()} 不带 {@code
    * Authorization}（匿名/本地部署可用）。
    */
@@ -353,7 +434,11 @@ class OpenAICompatibleLlmClientTest {
 
   // ---------- 请求侧形状 ----------
 
-  /** 请求体形状（协议契约的下行方向）：model/stream:true/messages/tools + 工具结果与工具调用回填。 */
+  /**
+   * 请求体形状（协议契约的下行方向）：model/stream:true/stream_options/messages/tools + 工具结果与工具调用回填。 {@code
+   * stream_options.include_usage} 的取舍理由见 {@link
+   * #requestsUsageInStreamOptionsAndKeepsTokensUnknownWhenVendorOmitsUsage()}。
+   */
   @Test
   void sendsOpenAiCompatibleRequestBody() {
     script.add(sseFrame("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}"));
@@ -382,6 +467,7 @@ class OpenAICompatibleLlmClientTest {
     assertThat(body)
         .contains("\"model\":\"" + ROUTE_MODEL + "\"")
         .contains("\"stream\":true")
+        .contains("\"stream_options\":{\"include_usage\":true}")
         .contains("\"role\":\"system\"")
         .contains("\"role\":\"user\"")
         .contains("\"tool_calls\":[{\"id\":\"call_9\",\"type\":\"function\"")
