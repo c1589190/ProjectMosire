@@ -42,6 +42,9 @@ import org.pf4j.PluginClassLoader;
  *
  * <p><b>判别性（R10）</b>：每条"成功"断言都带归属证据——工具类由插件自己的 {@link PluginClassLoader} 装载（不是测试类加载器）；
  * 每条"消失"断言都同时断言<b>其它源一条不少</b>；事件断言要求 state 与顺序可辨（不是"收到过一次回调"）。
+ *
+ * <p>失败路径同样要求事件可辨（评审 F1）：描述符阶段就失败的 JAR（坏 JAR / 缺描述符 / Plugin-Id 重复）在事件流里也各有一条 {@code FAILED}，标识退化为
+ * JAR 文件名；且失败是<b>每次尝试一条</b>，不是"状态恒定只报一次"。
  */
 @Timeout(180)
 class PluginToolSourceTest {
@@ -362,7 +365,10 @@ class PluginToolSourceTest {
         .containsExactly("alpha_one");
     assertThat(registry.find("beta_one")).isEmpty();
     assertThat(source.list()).extracting(PluginStatus::pluginId).containsExactly("same-plugin");
-    assertThat(events).containsExactly("same-plugin|STARTED|1.0.0");
+    // 如实形态：先到者一条 STARTED（标识是真 pluginId），后到者一条 FAILED——它失败在描述符阶段（PF4J 连类加载器都没建），
+    // 此刻没有属于它的 pluginId（"same-plugin" 归先到者），故标识退化为自己的 JAR 文件名（version 空）。
+    // 语义：事件流里"b-beta.jar 试过并失败"与"从未发现有这个文件"可辨，且不与先到者的身份混淆。
+    assertThat(events).containsExactly("same-plugin|STARTED|1.0.0", "b-beta.jar|FAILED|");
   }
 
   @Test
@@ -434,6 +440,33 @@ class PluginToolSourceTest {
         .containsExactly("alpha_one");
     assertThat(registry.find("builtin_alpha")).isPresent();
     assertThat(source.list()).extracting(PluginStatus::pluginId).containsExactly("alpha-plugin");
+    // 失败在事件通道也可见（不止是调用方接到的聚合异常）：两个失败 JAR 各一条 FAILED，标识退化为各自的 JAR 文件名
+    // （描述符阶段还没有可信的 pluginId），顺序与处理顺序一致；失败者绝无 STARTED——判别点：
+    // "只在已识别的插件上回调"（本条会缺两条 FAILED）、"用同一个常量标识"（此处两个文件名不同会红）、
+    // "不区分失败与成功"（多出的 STARTED 会让 containsExactly 红）三种假实现都过不了这条。
+    assertThat(events)
+        .containsExactly(
+            "alpha-plugin|STARTED|1.0.0", "b-garbage.jar|FAILED|", "c-no-descriptor.jar|FAILED|");
+  }
+
+  @Test
+  void everyFailedAttemptEmitsItsOwnFailedEventInOrder() throws IOException {
+    Files.write(pluginsDir.resolve("a-garbage.jar"), new byte[] {1, 2, 3, 4});
+    Files.write(pluginsDir.resolve("b-garbage.jar"), new byte[] {5, 6, 7, 8});
+
+    // 失败的 JAR 不进"已发现"清单 → 每次 loadAll 都会重试，故失败是"每次尝试一条 FAILED"，不是"状态恒定只报一次"
+    assertThatThrownBy(source::loadAll).isInstanceOf(PluginLoadException.class);
+    assertThatThrownBy(source::loadAll).isInstanceOf(PluginLoadException.class);
+
+    // 判别点：两次尝试 × 两个文件 = 四条，且逐条可辨（哪个 JAR / 第几次尝试 / 顺序）；
+    // "只在第一次失败时回调"或"同一 JAR 只报一次"的假实现会在这里红。
+    assertThat(events)
+        .containsExactly(
+            "a-garbage.jar|FAILED|",
+            "b-garbage.jar|FAILED|",
+            "a-garbage.jar|FAILED|",
+            "b-garbage.jar|FAILED|");
+    assertThat(source.list()).isEmpty();
   }
 
   @Test

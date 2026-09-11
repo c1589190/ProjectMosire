@@ -23,15 +23,32 @@ public interface PluginListener {
     STARTED,
     /** 已停止并卸载：工具已从全局工具目录整组摘除；插件可再次 enable。 */
     STOPPED,
-    /** 已装载但未生效（id 冲突 / 工具登记失败 / 无扩展点等）：本类已回滚（停止+卸载），失败同时以异常响亮抛出。 */
+    /**
+     * 未生效：已装载但没登记工具（id 冲突 / 工具登记失败 / 无扩展点等，本类已回滚 = 停止+卸载）， 或<b>描述符阶段就没装载成功</b>（坏 JAR / 缺描述符 /
+     * Plugin-Id 重复，PF4J 连类加载器都没建）。 两种都以异常响亮抛出，且都回调本状态（标识口径见 {@link #onStateChanged}）。
+     */
     FAILED
   }
 
   /**
    * 插件状态变更（每次变更回调一次，见接口注释的时序与异常约定）。
    *
-   * @param pluginId PF4J 插件 id（来自插件 JAR 的描述符，非插件声明的 sourceId）
-   * @param version 插件版本（描述符缺失时不会再回调到此处；正常路径非 null）
+   * <p><b>标识口径（宿主落库时按此判读，勿假定 pluginId 一定是 PF4J 插件 id）</b>：{@link State#STARTED}/{@link
+   * State#STOPPED} 恒为 PF4J 插件 id；{@link State#FAILED} 分两种——
+   *
+   * <ol>
+   *   <li><b>已识别出 pluginId 之后才失败</b>（扩展点缺失/多份、声明的 sourceId 非法或冲突、工具名冲突）：pluginId 与 version
+   *       都是该插件真实值；
+   *   <li><b>描述符阶段就失败</b>（JAR 不可读、缺 {@code Plugin-Id}、{@code Plugin-Id}
+   *       与已装载插件重复）：此时<b>还没有可信的插件身份</b> ——pluginId 要么没读出来、要么已被先到者占用——{@code pluginId} 参数<b>退化为 JAR
+   *       文件名</b>（含 {@code .jar} 后缀）， {@code version} 为空串。宿主据此仍能把它与"从未发现有这个 JAR"区分开，并在事件里定位到具体文件。
+   * </ol>
+   *
+   * <p>一次失败尝试回调一次：失败的 JAR 不进"已发现"清单，故每次 {@code loadAll()} 重试都会再回调一次 {@code FAILED}（同一次 {@code
+   * loadAll} 内按 jar 文件名序，与处理顺序一致）。
+   *
+   * @param pluginId PF4J 插件 id（来自插件 JAR 的描述符，非插件声明的 sourceId）；<b>描述符阶段失败时退化为 JAR 文件名</b>，见上
+   * @param version 插件版本；描述符阶段失败时为空串，其余路径为描述符里的版本
    * @param state 新状态
    */
   void onStateChanged(String pluginId, String version, State state);

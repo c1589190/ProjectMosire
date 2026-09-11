@@ -56,6 +56,14 @@ import org.slf4j.LoggerFactory;
  * #loadAll()}）；<b>不做任何按 Agent 的放行判断</b>——工具进 registry 只等于"全局可用"，某 Agent 能否调用由其 L3 白名单决定，本类
  * <b>不</b>把插件工具加进任何 Agent 的白名单；不改 {@code App}/{@code Brain}/{@code Main}（装配归启动装配任务）。
  *
+ * <p><b>工具集是装载时的快照：不订阅 {@code onChange}、不调用 {@code close()}（本阶段边界，勿误读为"已支持动态工具集"）</b>： 本类只在装载时取一次
+ * {@code ToolSource.listTools()} 快照，<b>不订阅</b>插件提供的 {@code ToolSource.onChange}、也<b>不调用</b>其 {@code
+ * close()}。而 {@code ToolSource} 的接口契约允许工具集在运行中变化、并经 {@code onChange} 通知注册方做增量同步（姊妹实现 {@code
+ * McpSourceBridge} 正是这么做的），故插件侧若自行变更工具集，本类<b>不会</b>跟随：registry 里保留的仍是装载时刻那一份， 直到 {@link
+ * #disable(String)} / {@link #enable(String)}（整组摘除 / 重新装载）才被纠正——中间窗口内工具目录是过期集合。
+ * 这与上面的"不支持原地重载"是<b>两件不同的事</b>：{@code onChange} 指<b>同一插件的工具集变化</b>，reload 指<b>插件被替换</b>；两者本阶段都不做。
+ * 需要工具集跟随插件变化的组合语义，用 {@code disable → enable}（或重启后再 {@link #loadAll()}）。
+ *
  * <p><b>插件 JAR 的形态</b>（本仓库实测 PF4J {@value #PF4J_PROBE_VERSION}，全离线）：JAR 的 {@code
  * META-INF/MANIFEST.MF} 须含 {@code Plugin-Id}/{@code Plugin-Version}（描述符；缺失则 PF4J
  * <b>只记日志并静默跳过</b>，本类据此响亮报错）， 且类路径下须有 {@code META-INF/extensions.idx}——PF4J 3.x 默认装配的 {@code
@@ -120,7 +128,9 @@ public final class PluginToolSource implements AutoCloseable {
    * pluginId。已在本实例清单里的插件（无论启用还是已 disable）原样跳过——<b>disable 是运维意图，不会被本方法悄悄撤销</b>。
    *
    * <p><b>失败语义</b>：单个插件失败（坏 JAR / 缺描述符 / 无扩展点 / id 冲突 / 工具名冲突）不阻断其余插件与其它供给源；本方法在遍历结束后把全部失败
-   * <b>聚合抛</b> {@link PluginLoadException}（每项含 jar 文件名与原因）——响亮失败，绝不静默跳过。
+   * <b>聚合抛</b> {@link PluginLoadException}（每项含 jar 文件名与原因）——响亮失败，绝不静默跳过。每次失败同时经 {@link
+   * PluginListener} 回调一次 {@code FAILED}（事件通道里"试过并失败"因此与"从未发现"可辨；描述符阶段失败的标识退化为 JAR 文件名，见 {@link
+   * PluginListener#onStateChanged}）；失败的 JAR 不写进 {@link #list()}，故下次 {@link #loadAll()} 会重试并再回调一次。
    *
    * @return 本次启用的 pluginId（按 jar 文件名序）
    * @throws PluginLoadException 有任一插件装载失败（消息含全部失败项）
@@ -267,31 +277,36 @@ public final class PluginToolSource implements AutoCloseable {
     } catch (RuntimeException e) {
       // 实测：JAR 不可读/描述符非法 → 返回 null（只记日志）；而 Plugin-Id 与已装载插件重复 → 抛 PluginRuntimeException
       // （抛出点在创建类加载器之前，故不污染已装载的那个插件）。两种都归到响亮失败。
-      throw new PluginLoadException(
+      throw descriptorFailure(
+          jar,
           "插件装载失败（JAR 不可读 / 描述符非法 / Plugin-Id 与已装载插件重复）: "
-              + jar.getFileName()
+              + fileNameOf(jar)
               + " —— "
               + e.getMessage(),
           e);
     }
     if (pluginId == null) {
       // PF4J 对"无 Plugin-Id 描述符/坏 JAR"只记日志并静默跳过——本类必须自己把静默变响亮
-      throw new PluginLoadException(
+      throw descriptorFailure(
+          jar,
           "插件未装载（PF4J 未识别）: "
-              + jar.getFileName()
-              + " —— 检查 META-INF/MANIFEST.MF 是否含 Plugin-Id/Plugin-Version");
+              + fileNameOf(jar)
+              + " —— 检查 META-INF/MANIFEST.MF 是否含 Plugin-Id/Plugin-Version",
+          null);
     }
     Entry prior = entries.get(pluginId);
     if (prior != null && !prior.jar().equals(jar)) {
       // 兜底（正常由 PF4J 在 loadPlugin 处抛错拦住）：不得回滚已合法装载的那个插件
-      throw new PluginLoadException(
+      throw descriptorFailure(
+          jar,
           "插件 id 重复: "
               + pluginId
               + " 已被 "
-              + prior.jar().getFileName()
+              + fileNameOf(prior.jar())
               + " 占用（"
-              + jar.getFileName()
-              + " 被拒）");
+              + fileNameOf(jar)
+              + " 被拒）",
+          null);
     }
     String version = versionOf(pluginId);
     try {
@@ -329,6 +344,24 @@ public final class PluginToolSource implements AutoCloseable {
           ? loadFailure
           : new PluginLoadException("插件启用失败: " + pluginId + " —— " + e.getMessage(), e);
     }
+  }
+
+  /**
+   * 描述符阶段的失败（JAR 不可读 / 缺 {@code Plugin-Id} / {@code Plugin-Id} 与已装载插件重复）：<b>先通知 FAILED，再响亮抛出</b>。
+   *
+   * <p>为什么必须在抛出前通知：否则宿主把 {@code plugin.lifecycle} 落库之后，"从未发现有这个 JAR"与"试过并失败了"在事件流里
+   * <b>不可辨</b>（本项目的"失败形态不可辨"老痛点）——失败不能只体现为调用方接住的异常。
+   *
+   * <p>标识口径：此刻<b>还没有可信的插件身份</b>（pluginId 要么没读出来、要么已被先到者占用），故回调里的标识退化为 <b>JAR 文件名</b>（含 {@code
+   * .jar}），版本传空串——宿主据此仍能定位到具体文件。详见 {@link PluginListener#onStateChanged} 的标识口径。
+   *
+   * <p>不写清单、不回滚：描述符阶段 PF4J 还没建类加载器，也<b>不得</b>动已合法装载的那些插件。
+   */
+  private PluginLoadException descriptorFailure(Path jar, String message, Throwable cause) {
+    notifyListener(fileNameOf(jar), "", PluginListener.State.FAILED);
+    return cause == null
+        ? new PluginLoadException(message)
+        : new PluginLoadException(message, cause);
   }
 
   /** 停用：按本源登记过的 id 整组摘工具 → 停 → 卸载（释放类加载器/JAR 句柄）→ 记状态 → 通知。 */
@@ -406,7 +439,12 @@ public final class PluginToolSource implements AutoCloseable {
     return sourceId;
   }
 
-  /** 以 sourceId 逐个登记：全有或全无——中途失败（名字重复等）回滚本批，绝不留半个插件的工具在册。 */
+  /**
+   * 以 sourceId 逐个登记：全有或全无——中途失败（名字重复等）回滚本批，绝不留半个插件的工具在册。
+   *
+   * <p>{@code listTools()} 在此被调用<b>恰好一次</b>（装载时的快照）；此后本类不订阅 {@code ToolSource.onChange}，也不调其 {@code
+   * close()}——见类注释"工具集是装载时的快照"。
+   */
   private List<String> registerTools(String pluginId, String sourceId, List<AgentTool> tools) {
     List<AgentTool> declared = Objects.requireNonNull(tools, "listTools() 不得返回 null");
     List<String> registered = new ArrayList<>();
