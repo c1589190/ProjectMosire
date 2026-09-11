@@ -204,6 +204,12 @@ class MainRealLlmTest {
    *
    * <p>夹具：{@code keys.local} 有值。正确接线时取密钥成功、失败发生在<b>连接阶段</b>（127.0.0.1:1 拒绝），异常链里没有 {@code
    * E_KEY_MISSING}；密钥源指向别处（如进程默认数据目录）的实现会在这里退化回 {@code E_KEY_MISSING} → 变红。
+   *
+   * <p><b>正向判据（G2）</b>：下面原有的两条都是<b>否定式</b>（"没有 E_KEY_MISSING""没有密钥值"），一个从不取密钥的实现
+   * （永远匿名、直接发请求）也能满足；故追加一条<b>正向</b>断言，要求失败文案属于连接阶段——把"取密钥确实成功、请求确实发出去了" 钉成必需条件，而不是"没观察到坏现象"。
+   *
+   * <p>（残余，如实登记）："永远匿名"的实现同样会走到连接阶段、同样满足本判据——真正闭合它要观察请求上的 {@code Authorization} 头，那需要环回桩服务器（D22
+   * 不进默认门禁，见 S1-A2 简报 §二·五 G2 的裁决）。
    */
   @Test
   void realClientResolvesTheKeyFromTheConfigRootItWasGiven() throws IOException {
@@ -211,6 +217,10 @@ class MainRealLlmTest {
 
     LlmException failure = chatFailure(Main.realLlm(tempDir));
 
+    assertThat(failure.getMessage())
+        .as("正向：失败必须发生在连接阶段（取密钥已成功，不是取密钥阶段失败）")
+        .startsWith("LLM 调用失败（")
+        .contains("ConnectException");
     assertThat(allMessages(failure))
         .as("密钥已从传入的配置根解析成功——失败只能发生在连接阶段")
         .noneMatch(message -> message.contains("E_KEY_MISSING"));
