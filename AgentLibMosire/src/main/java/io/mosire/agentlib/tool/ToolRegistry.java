@@ -2,11 +2,14 @@ package io.mosire.agentlib.tool;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.slf4j.Logger;
@@ -114,6 +117,48 @@ public final class ToolRegistry {
       notifyChanged();
     }
     return count;
+  }
+
+  /**
+   * 当前在册的供给源 id 集合（只读枚举，按字典序；无源注册的哨兵值不参与——它永不参与按源匹配）。 供 {@code source_list} 一类消费方回答"现在有哪些源"。
+   *
+   * <p><b>两层信息分工（消费方须知晓）</b>：本表只知道<b>当前在册</b>的源——某工具源的工具被整组摘除后（插件 disable、MCP 源下线），其 sourceId
+   * 即从这里消失；<b>已发现但当前无工具在册的供给源</b>（如被 disable 的插件）不在本表里，那部分只能由该供给源自己维护的清单回答（见 {@code
+   * PluginToolSource#list()}），{@code source_list} 是两层的合并。
+   */
+  public Set<String> sourceIds() {
+    Set<String> ids = new TreeSet<>();
+    for (String sourceId : toolToSource.values()) {
+      if (!NO_SOURCE.equals(sourceId)) {
+        ids.add(sourceId);
+      }
+    }
+    return Collections.unmodifiableSet(ids);
+  }
+
+  /**
+   * 按供给源枚举当前在册的工具（按名称排序的不可变小抄本，口径同 {@link #list()}）。
+   *
+   * <p>空白 id 显式拒绝：空白会命中无源哨兵（内建/无源注册路径），按源枚举它不是"某个源"，而是"全部无源工具"——与 {@link
+   * #unregisterAllBySource(String)} 同口径，避免把哨兵当普通 sourceId 用。
+   *
+   * @throws IllegalArgumentException sourceId 为空白（null 亦按空白拒绝）
+   */
+  public List<AgentTool> listBySource(String sourceId) {
+    if (sourceId == null || sourceId.isBlank()) {
+      throw new IllegalArgumentException("sourceId 不能为空白");
+    }
+    List<AgentTool> snapshot = new ArrayList<>();
+    for (Map.Entry<String, String> entry : toolToSource.entrySet()) {
+      if (sourceId.equals(entry.getValue())) {
+        AgentTool tool = tools.get(entry.getKey());
+        if (tool != null) {
+          snapshot.add(tool);
+        }
+      }
+    }
+    snapshot.sort(Comparator.comparing(AgentTool::name));
+    return List.copyOf(snapshot);
   }
 
   /** 注册变更监听（同步调用，勿阻塞）；close 句柄撤销监听。 首事件即"当时快照"之外的下一步变更——需要快照请自行调用 {@link #list()}。 */
