@@ -77,6 +77,10 @@ import org.slf4j.LoggerFactory;
  * 内存 cap {@code -Xmx128m}，子 Agent 数据目录隔离在 {@code <dataDir>/subagents/<instanceId>}。{@code
  * templatesDir} 为空 = 本进程不启用子 Agent 编排。
  *
+ * <p>S1-A2（本类新增）：{@code start} 的 4 参重载带 {@code subagentConfigDir}——非 null 时经 {@code
+ * wireSubagents}/{@code subagentCommand} 透传到子进程 argv 的 {@code --config-dir <路径>}（子体据此走真模型）；2/3
+ * 参重载委托 {@code null}（既有测试入口零改动）。<b>只传路径</b>：密钥值不进 argv/env/系统属性/stdio（D23）。
+ *
  * <p>W4（本类新增）：AG-UI 网关——{@code AgUiSessionRegistry}（POST /sessions 建会话 + 运行桥）+ {@link
  * AgUiHttpServer}（GET /sessions/{id}/events SSE）。主 Agent 回合执行器与 A2A 共享<b>同一个单线程执行器</b> （Rul B 串行化 =
  * AgentPipeline.history 非线程安全的不变量，也是 AG-UI 会话 seq 区间隔离的前提——见 AgUiSessionRegistry 说明）。关停顺序：A2A
@@ -127,10 +131,18 @@ public final class App implements AutoCloseable {
   /**
    * 启动（LLM 覆盖入口——测试注入脚本化 {@link FakeLlmClient} 用；{@code llmOverride == null} 时按配置脚本化）。
    *
-   * <p>覆盖仅影响主 AgentRuntime 装配，不改变生命周期行为。
+   * <p>覆盖仅影响主 AgentRuntime 装配，不改变生命周期行为。子 Agent 配置根不注入（= null，R-A2-4）。
    */
   public static App start(BootConfig config, LlmClient llmOverride) {
-    return start(config, llmOverride, List.of());
+    return start(config, llmOverride, List.of(), null);
+  }
+
+  /**
+   * 启动（3 参入口——测试注入额外工具用）：子 Agent 配置根不注入（{@code subagentConfigDir = null}），行为与 S1-A2 之前逐字一致
+   * （R-A2-4）。
+   */
+  public static App start(BootConfig config, LlmClient llmOverride, List<AgentTool> extraTools) {
+    return start(config, llmOverride, extraTools, null);
   }
 
   /**
@@ -138,9 +150,18 @@ public final class App implements AutoCloseable {
    *
    * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装配失败=快速失败契约（端口占用/坏配置等一律 RuntimeException 原样上抛， 由
    * CLI（Main）以非零退出与 stderr 呈现——既有 M0/M1 启动语义）；中间已回收启动期网关/进程资源后重抛，无更窄的异常类型。
+   *
+   * @param subagentConfigDir 子 Agent 的配置根（三期 S1-A2，R-A2-4）：非 null 时经 {@link #wireSubagents} →
+   *     {@link #subagentCommand} 落到子进程 argv 的 {@code --config-dir
+   *     <路径>}（子体据此走真模型）。<b>只传路径</b>——密钥值仍由子进程 自己读该目录下的 {@code config.json}（D23）；null =
+   *     不传（离线/测试形态，子体走模板脚本假 LLM，逐字保持原行为）
    */
   @SuppressFBWarnings("THROWS_METHOD_THROWS_RUNTIMEEXCEPTION")
-  public static App start(BootConfig config, LlmClient llmOverride, List<AgentTool> extraTools) {
+  public static App start(
+      BootConfig config,
+      LlmClient llmOverride,
+      List<AgentTool> extraTools,
+      Path subagentConfigDir) {
     try {
       Files.createDirectories(config.dataDir());
     } catch (IOException e) {
@@ -173,7 +194,9 @@ public final class App implements AutoCloseable {
       AgentSpec agentSpec = AgentSpec.builder(agentConfig).build();
       // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
       if (config.templatesDir() != null) {
-        SubagentRig rig = wireSubagents(config, tools, events, bus, agentConfig, permissionSet);
+        SubagentRig rig =
+            wireSubagents(
+                config, tools, events, bus, agentConfig, permissionSet, subagentConfigDir);
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
       }
@@ -296,13 +319,18 @@ public final class App implements AutoCloseable {
       EventStore events,
       EventBus bus,
       AgentConfig parentConfig,
-      AgentPermissionSet parentPermissions) {
+      AgentPermissionSet parentPermissions,
+      Path subagentConfigDir) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
     templateStore.load();
     SubprocessManager processes = new SubprocessManager();
     SubProcessExecutor executor =
         new SubProcessExecutor(
-            processes, subagentCommand(config), tools, PARENT_SERVER_NAME, Version.VERSION);
+            processes,
+            subagentCommand(config, subagentConfigDir),
+            tools,
+            PARENT_SERVER_NAME,
+            Version.VERSION);
     SubagentManager manager =
         new SubagentManager(
             templateStore, executor, events, bus, parentConfig, parentPermissions, 0);
@@ -314,8 +342,13 @@ public final class App implements AutoCloseable {
     return new SubagentRig(manager, processes);
   }
 
-  /** 子 Agent 启动命令（Rul C：装配层注入，Brain 不做文件系统假设——java 与 classpath 都是"当前进程自带信息"）。 */
-  private static AgentCommand subagentCommand(BootConfig config) {
+  /**
+   * 子 Agent 启动命令（Rul C：装配层注入，Brain 不做文件系统假设——java 与 classpath 都是"当前进程自带信息"）。
+   *
+   * <p>S1-A2：{@code subagentConfigDir} 非 null 时追加 {@code --config-dir <该路径>}（子体据此走真模型）。<b>只把路径交给
+   * Brain</b>：本方法可见的全部信息里没有任何密钥值（密钥由子进程自己读 {@code <configDir>/config.json}，D23）。
+   */
+  private static AgentCommand subagentCommand(BootConfig config, Path subagentConfigDir) {
     String java = ProcessHandle.current().info().command().filter(c -> !c.isBlank()).orElse("java");
     return new AgentCommand(
         java,
@@ -324,7 +357,8 @@ public final class App implements AutoCloseable {
         "--id",
         config.templatesDir().toString(),
         config.dataDir().resolve("subagents").toString(),
-        true);
+        true,
+        subagentConfigDir == null ? null : subagentConfigDir.toString());
   }
 
   /**

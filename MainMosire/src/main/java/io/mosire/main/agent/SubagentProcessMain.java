@@ -1,11 +1,18 @@
 package io.mosire.main.agent;
 
 import io.modelcontextprotocol.json.McpJsonDefaults;
+import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.SqliteEventStore;
+import io.mosire.agentlib.llm.ConfigApiKeySource;
+import io.mosire.agentlib.llm.LlmClient;
+import io.mosire.agentlib.llm.LlmRouteLoader;
+import io.mosire.agentlib.llm.ModelRoute;
+import io.mosire.agentlib.llm.OpenAICompatibleLlmClient;
 import io.mosire.agentlib.mcp.McpSourceBridge;
 import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.mcp.PipeMcpClientTransport;
+import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
@@ -24,7 +31,7 @@ import java.util.function.Predicate;
 
 /**
  * 子 Agent 进程引导（{@code Main agent --id <id> --template <t> --goal <g> [--templates-dir <d>]
- * [--data-dir <d>] [--parent-link]}）——计划 §4.4 的"子体进程即 runtime + MCP client"。
+ * [--data-dir <d>] [--config-dir <d>] [--parent-link]}）——计划 §4.4 的"子体进程即 runtime + MCP client"。
  *
  * <p><strong>进程形态</strong>：
  *
@@ -33,7 +40,11 @@ import java.util.function.Predicate;
  *   <li>模板装载（{@code --templates-dir}，缺省 {@code configs/agents}）→ 模板权限集构造 runtime（子体身份不是继承 父级——红线 R7
  *       的进程面：自身权限即模板三要素，父侧按同一模板权限集为子体服务）→ 事件库落在 {@code --data-dir/events.db}（父装配层经 {@code
  *       --data-dir <root>/<instanceId>} 隔离）；
- *   <li>LLM 固定为模板引导脚本（{@code template.scriptedFakeLlm()}，离线确定性——W3 E2E 的复现支点；M3 换真实模型）。
+ *   <li>LLM 形态由 {@code --config-dir} 二分（R-A2-1）：<b>缺席</b> = 离线/测试形态，逐字不变地走模板引导脚本（{@code
+ *       template.scriptedFakeLlm()}，W3 E2E 与 smoke.sh 的复现支点）；<b>在场</b> = 真模型形态，按 {@code
+ *       <config-dir>/config.json} 的 {@code llm.*} 构造 {@link OpenAICompatibleLlmClient}（见 {@link
+ *       #realLlm}）。 两种形态下模板的 {@code maxTurns}/{@code maxToolCallsPerTurn}/{@code
+ *       timeBudgetSeconds}/{@code quotaMaxTokens} 硬顶一律生效（R-A2-8：硬顶属于运行时，与 LLM 形态无关）。
  * </ul>
  *
  * <p><strong>父链接（{@code --parent-link}）</strong>：stdin/stdout 是父进程建好的 MCP stdio 链路（标准换行帧、 一帧一
@@ -98,9 +109,11 @@ public final class SubagentProcessMain {
         bridge = McpSourceBridge.bind(parentSource, registry, filterFor(permissions));
       }
 
+      // R-A2-1：--config-dir 缺席 ⇒ 逐字不变地走模板脚本假 LLM；在场 ⇒ 真模型（R-A2-2/R-A2-7：路由与密钥一律取自配置）
+      LlmClient llm =
+          options.configDir() == null ? template.scriptedFakeLlm() : realLlm(options.configDir());
       AgentRuntime agent =
-          new AgentRuntime(
-              config, template.scriptedFakeLlm(), registry, eventStore, eventBus, permissions);
+          new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions);
       runtime = agent;
       TurnResult result = agent.chat(options.goal());
       diagnostics.println(
@@ -139,6 +152,34 @@ public final class SubagentProcessMain {
     }
   }
 
+  /**
+   * 真模型装配（R-A2-2/R-A2-7）：<b>只</b>读 {@code <configRoot>/config.json} 的 {@code llm.*}——{@code
+   * baseUrl}/模型名/密钥三者全部来自这条 {@link ModelRoute}，模板里的 {@code model}（{@code AgentConfig} 默认字面量 {@code
+   * "fake"}）不参与。<b>只传路径</b>：父进程给的是配置根，密钥值由本进程自己读出（D23/R-A2-3）。
+   *
+   * <p><b>失败一律响亮（D24），绝不回退 {@code scriptedFakeLlm()}</b>：
+   *
+   * <ul>
+   *   <li>缺 {@code llm.baseUrl}/{@code llm.model} ⇒ {@link LlmRouteLoader#load} 在引导期抛 {@code
+   *       E_LLM_CONFIG_MISSING}；
+   *   <li>缺密钥 / 引用形态不支持 ⇒ 由下面这次"取密钥预检"在引导期抛 {@link ConfigApiKeySource#E_KEY_MISSING}/{@code
+   *       E_REF_FORM_UNSUPPORTED}。<b>为什么预检</b>：不预检的话，取密钥失败要等到首次 {@code chat} 才发生，而 {@code
+   *       AgentPipeline} 会把 {@code LlmException} 收敛成 {@code StopReason.LLM_ERROR} 的<b>正常回合</b>（退出码
+   *       0）——父侧就再也分辨不出"子体压根没跑起来"。预检只多取一次值、不固化任何东西：{@link ConfigApiKeySource} 每次 {@code chat}
+   *       仍现读配置，轮换/过期感知的 SPI 契约不变。
+   * </ul>
+   *
+   * <p>异常消息不含密钥值（引用名也只经 {@link ConfigApiKeySource} 的白名单回显），可直接进子进程 stderr。
+   */
+  private static LlmClient realLlm(Path configRoot) {
+    FileConfigStore store = new FileConfigStore(configRoot);
+    ModelRoute route = LlmRouteLoader.load(store);
+    ConfigApiKeySource keys =
+        new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM);
+    keys.apiKey(); // 预检：结果有意丢弃（只要"取得到"这一事实；密钥值不留在本方法里）
+    return new OpenAICompatibleLlmClient(route, keys);
+  }
+
   /** 模板权限集 → 桥同步过滤器：白名单通配（{@code "*"}）不过滤，否则按名命中。 */
   private static Predicate<String> filterFor(AgentPermissionSet permissions) {
     if (permissions.allowedTools().contains(AgentPermissionSet.ALL_TOOLS)) {
@@ -158,14 +199,20 @@ public final class SubagentProcessMain {
     }
   }
 
-  /** {@code agent} 子命令的进程级参数（Main 解析后的不可变快照）。 */
+  /**
+   * {@code agent} 子命令的进程级参数（Main 解析后的不可变快照）。
+   *
+   * @param configDir 父的配置根（{@code --config-dir}；null = 离线/测试形态 ⇒ 模板脚本假 LLM）。只放路径——密钥值由本进程自己从 {@code
+   *     <configDir>/config.json} 读（D23）
+   */
   public record Options(
       String instanceId,
       String templateId,
       String goal,
       Path templatesDir,
       Path dataDir,
-      boolean parentLink) {
+      boolean parentLink,
+      Path configDir) {
 
     public Options {
       if (instanceId == null || instanceId.isBlank()) {

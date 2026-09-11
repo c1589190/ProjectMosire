@@ -114,7 +114,11 @@ public final class Main {
       throw new IllegalArgumentException("--fake 与 --fake-script 不能同时指定");
     }
     // W5：离线 LLM 显式声明面（smoke.sh 断言"断网可测"）；三期 S1-A1：以上开关都不给时一律真模型（缺配置/缺密钥响亮失败，不退化）
-    App app = App.start(config, selectLlm(config, fake, fakeScript));
+    // 三期 S1-A2（R-A2-6）：只有生产真模型路径才把配置根交给子 Agent（子体的 --data-dir 是隔离目录，底下没有 config.json）；
+    // --demo/--fake/--fake-script 三种离线形态下子体仍是模板脚本假 LLM——离线门禁与 smoke.sh 不受影响
+    Path subagentConfigDir =
+        (fakeScript == null && !fake && !config.demo()) ? config.dataDir() : null;
+    App app = App.start(config, selectLlm(config, fake, fakeScript), List.of(), subagentConfigDir);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
         "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%n",
@@ -171,6 +175,9 @@ public final class Main {
   /**
    * 子 Agent stdio 进程形态（W3b）：运行模板驱动的 runtime；{@code --parent-link} 时以 MCP client 身份接管父侧建好的
    * stdin/stdout 链路，跑完任务后阻塞到父侧关停信号（EOF）。本进程不启动任何 HTTP 网关。
+   *
+   * <p>S1-A2：{@code --config-dir <父的配置根>}（可选）在场 ⇒ 真模型形态（本进程自己从 {@code <config-dir>/config.json}
+   * 读路由与密钥——只传路径，D23）；缺席 ⇒ 保持原样的模板脚本假 LLM。
    */
   private static int agent(String[] args) {
     String instanceId = null;
@@ -179,6 +186,7 @@ public final class Main {
     Path templatesDir = null;
     Path dataDir = null;
     boolean parentLink = false;
+    Path configDir = null;
     for (int i = 1; i < args.length; i++) {
       switch (args[i]) {
         case "--id" -> instanceId = requireValue(args, ++i);
@@ -186,6 +194,7 @@ public final class Main {
         case "--goal" -> goal = requireValue(args, ++i);
         case "--templates-dir" -> templatesDir = Path.of(requireValue(args, ++i));
         case "--data-dir" -> dataDir = Path.of(requireValue(args, ++i));
+        case "--config-dir" -> configDir = Path.of(requireValue(args, ++i));
         case "--parent-link" -> parentLink = true;
         default -> {
           System.err.println("未知参数: " + args[i]);
@@ -200,7 +209,7 @@ public final class Main {
     try {
       return SubagentProcessMain.execute(
           new SubagentProcessMain.Options(
-              instanceId, templateId, goal, templatesDir, dataDir, parentLink));
+              instanceId, templateId, goal, templatesDir, dataDir, parentLink, configDir));
     } catch (IllegalArgumentException e) {
       System.err.println("参数错误: " + e.getMessage());
       return 2;
@@ -530,6 +539,8 @@ public final class Main {
              --goal <g>      目标任务（必填）
              --templates-dir <p> 模板目录（默认 configs/agents）
              --data-dir <p>  数据目录（默认 .work/mosire）
+             --config-dir <p> 父的配置根：在场则按 <p>/config.json 的 llm.* 走真模型（只传路径，
+                              密钥由本进程自己读；缺席 = 模板引导脚本假 LLM）
              --parent-link   以 MCP client 身份接管 stdin/stdout（父侧已建链接）
           doctor          （M3）自检
           config          （M3）配置管理
