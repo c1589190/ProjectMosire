@@ -2,6 +2,7 @@ package io.mosire.brain.runtime;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
@@ -308,6 +309,50 @@ public final class AgentPipeline {
       Compactor compactor,
       CompactSummarySlot compactSummary,
       Map<String, Object> toolConfig) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        null);
+  }
+
+  /**
+   * 全参装配 + <b>审批编排器</b>（S4-B2）：除最后一个参数外与 14 参构造逐字节相同。
+   *
+   * <p>{@code coordinator} 非 null 时，工具自报 {@link io.mosire.agentlib.approval.ToolGate.Ask}
+   * 的调用会真的去问人（tty/HTTP 通道），并只按人的答复继续； <b>null = 无审批面</b>：{@code Ask} 一律 fail-closed 拒（{@link
+   * ToolCallAuthorizer#of(ToolExecutionGuard, ApprovalCoordinator)} 的既定语义）——既有装配（不传）行为因此逐字节不变。
+   *
+   * <p>一份 {@code PendingApprovals} 必须<b>逐层当参数</b>传进来（编排器持有它）；本类<b>不</b>持有任何静态/全局单例——
+   * 同一进程内只能有一份登记表，由装配层（{@code App}）建并往下传，这样"两条通道看到同一 id"才是结构性的（H8 判据）。
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator) {
     this.toolConfig = Map.copyOf(Objects.requireNonNull(toolConfig, "toolConfig"));
     this.compactor = compactor;
     this.compactSummary = Objects.requireNonNull(compactSummary, "compactSummary");
@@ -315,7 +360,8 @@ public final class AgentPipeline {
     this.llm = Objects.requireNonNull(llm, "llm");
     this.registry = Objects.requireNonNull(registry, "registry");
     this.guard = Objects.requireNonNull(guard, "guard");
-    this.authorizer = ToolCallAuthorizer.of(this.guard);
+    // coordinator 为 null 时本装配与 ToolCallAuthorizer.of(guard) 逐字等价（见该工厂 javadoc）：不传协调器的既有路径行为不变
+    this.authorizer = ToolCallAuthorizer.of(this.guard, coordinator);
     this.assembler = Objects.requireNonNull(assembler, "assembler");
     this.events = Objects.requireNonNull(events, "events");
     this.bus = Objects.requireNonNull(bus, "bus");

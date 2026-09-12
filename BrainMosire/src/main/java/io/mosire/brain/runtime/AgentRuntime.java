@@ -3,6 +3,7 @@ package io.mosire.brain.runtime;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
@@ -124,7 +125,8 @@ public final class AgentRuntime implements AutoCloseable {
         permissionSet,
         Objects.requireNonNull(store, "store"),
         Objects.requireNonNull(conversationId, "conversationId"),
-        Map.of());
+        Map.of(),
+        null);
   }
 
   /**
@@ -143,6 +145,28 @@ public final class AgentRuntime implements AutoCloseable {
       ConversationStore store,
       String conversationId,
       Map<String, Object> toolConfig) {
+    this(spec, llm, registry, events, bus, permissionSet, store, conversationId, toolConfig, null);
+  }
+
+  /**
+   * 便捷装配 + 会话持久化 + 工具配置注入 + <b>审批编排器</b>（S4-B2）：除最后一个参数外与上一构造逐字节相同。
+   *
+   * <p>这是 {@code App} 真正走的<b>终态装配路径</b>（非 demo 分叉）——工具自报 {@code ToolGate.Ask} 的调用会经它去问人； 其余重载一律传
+   * {@code null}（= 无审批面，{@code Ask} fail-closed 拒），既有装配行为逐字不变。
+   *
+   * <p>{@code coordinator} 由装配层建好当参数传进来（含进程内唯一的 {@code PendingApprovals}）；本类<b>不</b>持有任何静态单例。
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator) {
     this(
         spec,
         llm,
@@ -154,7 +178,8 @@ public final class AgentRuntime implements AutoCloseable {
         permissionSet,
         Objects.requireNonNull(store, "store"),
         Objects.requireNonNull(conversationId, "conversationId"),
-        toolConfig);
+        toolConfig,
+        coordinator);
   }
 
   /** 便捷装配 + <b>工具配置注入</b>（D30，不落库形态）：除最后一个参数外与 6 参构造逐字节相同。 */
@@ -177,7 +202,8 @@ public final class AgentRuntime implements AutoCloseable {
         permissionSet,
         null,
         null,
-        toolConfig);
+        toolConfig,
+        null);
   }
 
   private AgentRuntime(
@@ -189,12 +215,27 @@ public final class AgentRuntime implements AutoCloseable {
       EventStore events,
       EventBus bus,
       AgentPermissionSet permissionSet) {
-    this(spec, llm, registry, guard, assembler, events, bus, permissionSet, null, null, Map.of());
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        null,
+        null,
+        Map.of(),
+        null);
   }
 
   /**
    * 全参装配（{@code store == null} = 不落库、{@code conversationId} 随之缺省）：两种形态在装配上的<b>唯一</b>差别是 {@link
    * AgentPipeline} 的构造重载——不落库走既有的 9 参构造（行为与持久化接入前逐字节一致），落库走 11 参构造。
+   *
+   * <p>{@code coordinator} 为 {@code null} = 无审批面（{@code ToolGate.Ask} fail-closed 拒）——除 S4-B2
+   * 的终态装配路径外， 所有既有重载都传 {@code null}，行为逐字不变。
    */
   private AgentRuntime(
       AgentSpec spec,
@@ -207,7 +248,8 @@ public final class AgentRuntime implements AutoCloseable {
       AgentPermissionSet permissionSet,
       ConversationStore store,
       String conversationId,
-      Map<String, Object> toolConfig) {
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator) {
     this.spec = Objects.requireNonNull(spec, "spec");
     AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
@@ -218,6 +260,7 @@ public final class AgentRuntime implements AutoCloseable {
     LlmClient client = Objects.requireNonNull(llm, "llm");
     this.pipeline =
         store == null
+            // 不落库分叉不接审批面（与 App 的 demo 分叉同口径）：{@code Ask} 在那里一律 fail-closed 拒——少一条路，不是放行
             ? new AgentPipeline(
                 config,
                 client,
@@ -243,7 +286,8 @@ public final class AgentRuntime implements AutoCloseable {
                 conversationId,
                 null,
                 CompactSummarySlot.empty(),
-                toolConfig);
+                toolConfig,
+                coordinator);
 
     // 起步即记录生命周期（事件词汇表 agent.lifecycle）
     // model 报的是【客户端实际在用的模型】（client.model()），不是装配层标签 config.model()：后者由

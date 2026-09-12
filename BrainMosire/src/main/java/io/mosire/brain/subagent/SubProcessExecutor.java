@@ -6,6 +6,7 @@ import io.mosire.agentlib.proc.ManagedProcess;
 import io.mosire.agentlib.proc.SpawnSpec;
 import io.mosire.agentlib.proc.SubprocessException;
 import io.mosire.agentlib.proc.SubprocessManager;
+import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import java.util.List;
@@ -45,6 +46,9 @@ public final class SubProcessExecutor implements AgentExecutor {
   private final String serverName;
   private final String serverVersion;
 
+  /** 父侧 MCP server 的工具调用入口（S4-B2：装配层注入，缺省 {@link ToolCallAuthorizer#standard()}）。 */
+  private final ToolCallAuthorizer authorizer;
+
   public SubProcessExecutor(SubprocessManager processes, AgentCommand command) {
     this(processes, command, null, null, null);
   }
@@ -57,6 +61,26 @@ public final class SubProcessExecutor implements AgentExecutor {
    *
    * <p>EI_EXPOSE_REP2 抑制：{@code parentTools} 为装配层按实例共享的<b>实时</b>工具注册表（R7 语义——子体调用的父级工具面，
    * 工具随后随时可能注册进来，必须持有引用而非快照）；本类只读使用、不对外暴露——与 {@code AgentRuntime.registry()} 同类设计先例。
+   * 抑制落在<b>真正持有引用</b>的那个构造器（下面这个 6 参终态构造）上——标注挂在只做委托的重载上会被 SpotBugs 判为无用抑制 （{@code
+   * US_USELESS_SUPPRESSION_ON_METHOD}），而真正的暴露点反而漏报。
+   */
+  public SubProcessExecutor(
+      SubprocessManager processes,
+      AgentCommand command,
+      ToolRegistry parentTools,
+      String serverName,
+      String serverVersion) {
+    this(processes, command, parentTools, serverName, serverVersion, ToolCallAuthorizer.standard());
+  }
+
+  /**
+   * W3b 链接形态 + <b>自定义工具调用入口</b>（S4-B2）：除最后一个参数外与上一构造逐字节相同。
+   *
+   * <p>为什么父侧每个子 Agent 的 MCP server 也要接审批入口：子体经 MCP 调<b>父级工具</b>时，判定必须与父级管线走同一条路（S4 的
+   * "判定点统一"）——否则"需人审批"的父级工具在子体这条路上可以绕过审批直接执行。缺省 {@link ToolCallAuthorizer#standard()} （=
+   * 无编排器，{@code Ask} fail-closed 拒）⇒ 既有行为逐字不变。
+   *
+   * <p>{@code authorizer} 由装配层注入（{@code App} 传装了审批编排器的那个）；本类不认识审批/登记表，只透传。
    */
   @SuppressFBWarnings("EI_EXPOSE_REP2")
   public SubProcessExecutor(
@@ -64,9 +88,11 @@ public final class SubProcessExecutor implements AgentExecutor {
       AgentCommand command,
       ToolRegistry parentTools,
       String serverName,
-      String serverVersion) {
+      String serverVersion,
+      ToolCallAuthorizer authorizer) {
     this.processes = Objects.requireNonNull(processes, "processes");
     this.command = Objects.requireNonNull(command, "command");
+    this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
     if (parentTools != null) {
       if (!command.parentLink()) {
         throw new IllegalArgumentException(
@@ -111,6 +137,7 @@ public final class SubProcessExecutor implements AgentExecutor {
                 instance.permissions().grantedToken(),
                 // 红线 R7：父侧调用上下文 = 子体自身权限集（非父级 SYSTEM/unrestricted）
                 instance.permissions()),
+            authorizer,
             managed.stdout().orElseThrow(() -> new SubagentLaunchException("子 Agent stdout 不可用")),
             managed.stdin().orElseThrow(() -> new SubagentLaunchException("子 Agent stdin 不可用")));
     return new LinkedHandle(managed, server);

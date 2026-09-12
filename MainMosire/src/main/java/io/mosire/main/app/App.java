@@ -1,6 +1,11 @@
 package io.mosire.main.app;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.approval.ApprovalConfig;
+import io.mosire.agentlib.approval.ApprovalConfigLoader;
+import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.approval.PendingApprovals;
+import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -13,11 +18,15 @@ import io.mosire.agentlib.mcp.AgentToMcpServer;
 import io.mosire.agentlib.mcp.McpServerLinkConfig;
 import io.mosire.agentlib.mcp.McpSourceBridge;
 import io.mosire.agentlib.mcp.McpToolSource;
+import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
+import io.mosire.agentlib.tool.ToolCallAuthorizer;
+import io.mosire.agentlib.tool.ToolContext;
+import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
@@ -31,6 +40,9 @@ import io.mosire.brain.subagent.SubagentInstance;
 import io.mosire.brain.subagent.SubagentManager;
 import io.mosire.brain.subagent.SubagentOrchestrationTools;
 import io.mosire.main.Version;
+import io.mosire.main.approval.ApprovalHttpServer;
+import io.mosire.main.approval.HttpApprovalChannel;
+import io.mosire.main.approval.TtyApprovalChannel;
 import io.mosire.main.gateway.AdminHttpServer;
 import io.mosire.main.gateway.StatusSnapshot;
 import io.mosire.main.gateway.a2a.A2aAgentRunner;
@@ -149,6 +161,20 @@ public final class App implements AutoCloseable {
   /** 子进程生命周期兜底（同一条件装配：与 subagentManager 同生共死；红线 5：归装配层持有）。 */
   private final SubprocessManager subagentProcesses;
 
+  /**
+   * 审批 HTTP 面（S4-B2）：{@code null} = 未启用（{@code approval.http=false}）。
+   *
+   * <p>它与 {@link #approvalHttpChannel} 是同一个面的两面——server 是"人的入口"，channel 是"编排器的等待口"，两者共享 {@code App}
+   * 里那<b>唯一</b>一份 {@code PendingApprovals}。
+   */
+  private final ApprovalHttpServer approvalServer;
+
+  /** tty 审批通道（S4-B2）：无控制终端时 {@code available()==false}（装配照做，可用性由它自己如实报）。 */
+  private final TtyApprovalChannel approvalTtyChannel;
+
+  /** HTTP 审批面在编排器侧的那条通道（S4-B2；{@code approval.http=false} 时恒不可用）。 */
+  private final HttpApprovalChannel approvalHttpChannel;
+
   private final CountDownLatch terminated = new CountDownLatch(1);
   private volatile boolean closed;
 
@@ -229,6 +255,10 @@ public final class App implements AutoCloseable {
     AgUiSessionRegistry aguiRegistry = null;
     DebugChatService debugChatService = null;
     DebugChatHttpServer debugChatServer = null;
+    // S4-B2：审批面资源声明在 try 之外（同其余网关口径）——装配中途失败时 catch 里要回收已起的那部分
+    ApprovalHttpServer approvalServer = null;
+    TtyApprovalChannel approvalTtyChannel = null;
+    HttpApprovalChannel approvalHttpChannel = null;
     ExecutorService chatExecutor = null;
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
@@ -241,17 +271,67 @@ public final class App implements AutoCloseable {
               .build();
       // D17：主 Agent 以 AgentSpec 装配（组合既有 AgentConfig，二期字段暂取默认值——P2-2 Task 6 仅承载不接线）
       AgentSpec agentSpec = AgentSpec.builder(agentConfig).build();
+      // ★ S4-B2 审批装配：必须排在子 Agent 编排与 MCP 暴露<b>之前</b>——那两处的工具调用入口都要拿同一个编排器。
+      //   同一进程内只能有一个 PendingApprovals（两通道必须看到同一 id，H8 判据）：它由本装配层建、逐层当参数传下去，
+      //   不设任何静态/全局单例。
+      ApprovalConfig approvalConfig =
+          ApprovalConfigLoader.load(new FileConfigStore(config.dataDir()));
+      PendingApprovals pendingApprovals = new PendingApprovals();
+      approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
+      approvalHttpChannel = new HttpApprovalChannel(pendingApprovals);
+      ApprovalCoordinator approvalCoordinator =
+          new ApprovalCoordinator(
+              List.of(),
+              List.of(approvalTtyChannel, approvalHttpChannel),
+              pendingApprovals,
+              approvalConfig.timeout(),
+              bus);
+      ToolCallAuthorizer approvalAuthorizer =
+          ToolCallAuthorizer.of(new ToolExecutionGuard(), approvalCoordinator);
+      if (approvalConfig.http()) {
+        approvalServer =
+            ApprovalHttpServer.start(
+                approvalConfig.httpPort(), pendingApprovals, approvalCoordinator);
+        // HTTP 面真的绑定成功了才算可用通道（"配置说要开"不等于"端口在监听"）
+        approvalHttpChannel.markUp();
+      }
+      LOG.info(
+          "审批面已装配：approvals={} tty通道={} 超时={}s（HTTP 面恒绑 127.0.0.1，无鉴权，与 AdminREST 同基线）",
+          approvalServer == null
+              ? "未启用（approval.http=false）"
+              : "http://127.0.0.1:" + approvalServer.boundPort(),
+          approvalTtyChannel.available() ? "可用" : "不可用（无控制终端）",
+          approvalConfig.timeout().toSeconds());
       // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
       if (config.templatesDir() != null) {
         SubagentRig rig =
             wireSubagents(
-                config, tools, events, bus, agentConfig, permissionSet, subagentConfigDir);
+                config,
+                tools,
+                events,
+                bus,
+                agentConfig,
+                permissionSet,
+                subagentConfigDir,
+                approvalAuthorizer);
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
       }
-      // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）
+      // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）。
+      // S4-B2：改用带 authorizer 的 5 参重载（V8 的结构前提——子体经 MCP 调父级工具时审批同样生效）；
+      // 调用者逐字保持 3 参重载的缺省（GUEST + unrestricted(GUEST)，红线 5：既有行为不变）。
+      // 注意 GUEST 桶 = 全体外部 MCP 客户端（桶粒度分不出实例）⇒ 人在 HTTP 上给 GUEST 批"本会话"会被收窄为一次，
+      // "下次还问"是<b>设计</b>（S5 身份穿透前不许泛化），不是 bug——别为让 session 生效去动 callerKey。
       mcpServer =
-          config.mcpExpose() ? AgentToMcpServer.start(tools, "mosire-main", Version.VERSION) : null;
+          config.mcpExpose()
+              ? AgentToMcpServer.start(
+                  tools,
+                  "mosire-main",
+                  Version.VERSION,
+                  ToolContext.of(
+                      AccessToken.GUEST, AgentPermissionSet.unrestricted(AccessToken.GUEST)),
+                  approvalAuthorizer)
+              : null;
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       LlmClient llm = scriptedLlm(config, llmOverride);
       // D30：工具自身配置经 ToolContext.config 注入（运行时缝，不走构造器全局）——read_agent_context 据此定位
@@ -264,6 +344,8 @@ public final class App implements AutoCloseable {
               config.dataDir().resolve("events.db").toString(),
               AgentContextReader.CONFIG_SELF_AGENT_ID,
               agentConfig.id());
+      // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
+      // （--demo 恒"零行为变化"是本仓既有约定：它只跑一条脚本回合，没有工具调用面可审批）
       AgentRuntime runtime =
           conversations == null
               ? new AgentRuntime(agentSpec, llm, tools, events, bus, permissionSet, toolConfig)
@@ -276,7 +358,8 @@ public final class App implements AutoCloseable {
                   permissionSet,
                   conversations,
                   MAIN_CONVERSATION_ID,
-                  toolConfig);
+                  toolConfig,
+                  approvalCoordinator);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;
@@ -335,7 +418,10 @@ public final class App implements AutoCloseable {
               debugChatService,
               debugChatServer,
               subagentManager,
-              subagentProcesses);
+              subagentProcesses,
+              approvalServer,
+              approvalTtyChannel,
+              approvalHttpChannel);
 
       if (config.demo()) {
         String message = config.demoMessage().isEmpty() ? DEMO_USER_MESSAGE : config.demoMessage();
@@ -345,6 +431,15 @@ public final class App implements AutoCloseable {
       return app;
     } catch (RuntimeException e) {
       // 装配中途失败（如端口占用）：回收已起的网关/MCP 子进程/子 Agent 编排，避免启动失败后残留僵尸进程
+      if (approvalServer != null) {
+        approvalServer.close();
+      }
+      if (approvalTtyChannel != null) {
+        approvalTtyChannel.close();
+      }
+      if (approvalHttpChannel != null) {
+        approvalHttpChannel.close();
+      }
       if (aguiServer != null) {
         aguiServer.close();
       }
@@ -397,7 +492,8 @@ public final class App implements AutoCloseable {
       EventBus bus,
       AgentConfig parentConfig,
       AgentPermissionSet parentPermissions,
-      Path subagentConfigDir) {
+      Path subagentConfigDir,
+      ToolCallAuthorizer authorizer) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
     templateStore.load();
     SubprocessManager processes = new SubprocessManager();
@@ -407,7 +503,8 @@ public final class App implements AutoCloseable {
             subagentCommand(config, subagentConfigDir),
             tools,
             PARENT_SERVER_NAME,
-            Version.VERSION);
+            Version.VERSION,
+            authorizer);
     SubagentManager manager =
         new SubagentManager(
             templateStore, executor, events, bus, parentConfig, parentPermissions, 0);
@@ -521,7 +618,10 @@ public final class App implements AutoCloseable {
       DebugChatService debugChatService,
       DebugChatHttpServer debugChatServer,
       SubagentManager subagentManager,
-      SubprocessManager subagentProcesses) {
+      SubprocessManager subagentProcesses,
+      ApprovalHttpServer approvalServer,
+      TtyApprovalChannel approvalTtyChannel,
+      HttpApprovalChannel approvalHttpChannel) {
     this.events = events;
     this.conversations = conversations;
     this.bus = bus;
@@ -538,6 +638,9 @@ public final class App implements AutoCloseable {
     this.debugChatServer = debugChatServer;
     this.subagentManager = subagentManager;
     this.subagentProcesses = subagentProcesses;
+    this.approvalServer = approvalServer;
+    this.approvalTtyChannel = approvalTtyChannel;
+    this.approvalHttpChannel = approvalHttpChannel;
   }
 
   /** 阻塞直到 close()（由 shutdown 钩子触发）。 */
@@ -578,6 +681,16 @@ public final class App implements AutoCloseable {
     return debugChatServer.port();
   }
 
+  /**
+   * 审批 HTTP 面实际监听端口（S4-B2；恒绑 127.0.0.1，0 = 自动分配场景下由调用方取实际值）。
+   *
+   * <p>返回 {@code 0} 表示本进程<b>没有</b>审批 HTTP 面（{@code approval.http=false}）——0 不是合法端口，故它不会与"真的绑在 0"
+   * 混淆。
+   */
+  public int approvalPort() {
+    return approvalServer == null ? 0 : approvalServer.boundPort();
+  }
+
   /** 子 Agent 实例快照（按实例 id 升序；未装配子 Agent 编排时为空表）。 */
   public List<SubagentInstance> subagents() {
     return subagentManager == null ? List.of() : subagentManager.list();
@@ -606,13 +719,25 @@ public final class App implements AutoCloseable {
     }
     closed = true;
     LOG.info(
-        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 调试对话 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 会话存储/事件存储 checkpoint");
+        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 调试对话 → 审批面 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 会话存储/事件存储 checkpoint");
     closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
     closeQuietly("A2A 网关", () -> a2aServer.close());
     closeQuietly("AG-UI 网关", () -> aguiServer.close());
     closeQuietly("AG-UI 会话注册表", () -> aguiRegistry.close());
     closeQuietly("调试对话服务", debugChatServer::close);
     closeQuietly("调试对话", debugChatService::close);
+    // S4-B2：审批面与既有网关同批关闭（先于 runtime/存储）。理由：它只服务"待人裁决"，关掉后不再接收新决议——
+    // 在途的等待随 runtime 一起结束（最多按超时拒，fail-closed 语义不因关停而变化）；先关它也不会卡住后面的关停链
+    // （HttpServer.stop(0) 立即返回，不等待在途 handler）。
+    closeQuietly(
+        "审批 HTTP 面",
+        () -> {
+          if (approvalServer != null) {
+            approvalServer.close();
+          }
+        });
+    closeQuietly("审批 tty 通道", approvalTtyChannel::close);
+    closeQuietly("审批 HTTP 通道", approvalHttpChannel::close);
     closeQuietly("AdminREST 网关", () -> http.close());
     closeQuietly(
         "MCP 暴露",

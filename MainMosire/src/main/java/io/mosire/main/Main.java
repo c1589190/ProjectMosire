@@ -116,8 +116,11 @@ public final class Main {
     // W5：离线 LLM 显式声明面（smoke.sh 断言"断网可测"）；三期 S1-A1：以上开关都不给时一律真模型（缺配置/缺密钥响亮失败，不退化）
     App app = startApp(config, fake, fakeScript);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
+    // S4-B2：审批面端口（恒 loopback）。approval.http=false 时整段不打印——0 不是合法端口，不拿它冒充"已启用"
+    int approvalPort = app.approvalPort();
+    String approvals = approvalPort == 0 ? "" : " approvals=http://127.0.0.1:" + approvalPort;
     System.err.printf(
-        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%n",
+        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%s%n",
         Version.VERSION,
         app.boundPort(),
         config.a2aHost(),
@@ -125,6 +128,7 @@ public final class Main {
         config.aguiHost(),
         app.aguiPort(),
         app.debugPort(),
+        approvals,
         config.demo() ? "（demo 模式）" : "",
         config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
