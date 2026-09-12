@@ -52,8 +52,10 @@ class AppMcpLinkTest {
     } finally {
       app.close();
     }
-    // close 顺序：bridge 先整组下架工具（registry 恢复原状），再关源子进程
-    assertThat(app.runtime().registry().list()).isEmpty();
+    // close 顺序：bridge 先整组下架工具（registry 恢复到"桥接前"的原状），再关源子进程。
+    // 注意"原状"不是空表：S4-C 起主 Agent 的 builtin 面含 `bash`（ShellTool）。断言写全等而非"包含"——
+    // 桥若没把 echo 摘干净，这里会多出 echo ⇒ 转红。
+    assertThat(app.runtime().registry().list()).extracting(AgentTool::name).containsExactly("bash");
     waitForExit(pidFile);
   }
 
@@ -85,8 +87,11 @@ class AppMcpLinkTest {
             Duration.ofSeconds(30));
     try (McpToolSource client = new McpToolSource(appProcess)) {
       client.connect();
-      // 验收：SDK client listTools 可见主 Agent 工具面（经桥同步进的 echo 工具）
-      assertThat(client.listTools()).extracting(AgentTool::name).containsExactly("echo");
+      // 验收：SDK client listTools 可见主 Agent 工具面 = 经桥同步进的 echo + 主 Agent 的 builtin（S4-C 起含 bash）。
+      // 仍是全等断言：少一个（桥没同步过来）或多一个（不该外发的漏出去了）都转红。
+      assertThat(client.listTools())
+          .extracting(AgentTool::name)
+          .containsExactlyInAnyOrder("echo", "bash");
       // 穿透调用：客户端 → App 的 AgentToMcpServer → registry → 桥 → 外部 MCP server
       AgentTool echo =
           client.listTools().stream()

@@ -1,9 +1,11 @@
 package io.mosire.brain.tools;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.approval.ToolGate;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
+import io.mosire.agentlib.tool.Digest;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
 import java.io.IOException;
@@ -108,6 +110,17 @@ public final class ShellTool implements AgentTool {
 
   /** 固定用 bash：工具名与语义一致（模型写 bash 语法应可用）；POSIX 之外不支持。 */
   private static final String SHELL_EXECUTABLE = "bash";
+
+  /**
+   * {@code tool.call} 里 {@code digest} 的缺省占位：命令文本缺失/空白（参数还没通过校验）时用。
+   *
+   * <p>它不是摘要——真摘要恒以 {@code sha256:} 开头（见 {@link Digest}），两者不会混。写成"空串"或 {@code null} 才是坏的：
+   * 前者看起来像"摘了但摘出个空"，后者会破坏"args 是个对象"这条读取口径。
+   */
+  private static final String DIGEST_ABSENT = "none";
+
+  /** 无命令文本时 {@code class} 的取值：闭词表 {@code allow|ask|block} 之外的第四个值，专门表示"无从分类"。 */
+  private static final String CLASS_ABSENT = "none";
 
   /** 读取线程的收尾宽限：直接子进程退出后，读取线程自行判定"流已静音"所需的时间上限（含安静窗口）。 */
   private static final Duration READER_JOIN_GRACE = Duration.ofMillis(400);
@@ -248,6 +261,87 @@ public final class ShellTool implements AgentTool {
   public ToolSpec spec() {
     // 敏感 + 破坏：默认拒绝，需显式放行（工具自身不做权限判断，见类 Javadoc）
     return ToolSpec.level(AccessToken.DEFAULT, true, true);
+  }
+
+  /**
+   * 三档分流（S4-C）：把命令交给 {@link BashCommandClassifier} 分类（直放 / 问人 / 硬拒）。
+   *
+   * <p><b>闸位只是分流，不是判定</b>：{@code Block} 由 {@code ToolCallAuthorizer} 转成 {@code COMMAND_BLOCKED} 且
+   * <b>不进审批</b>；{@code Ask} 由它去问人。工具<b>不</b>据此自行放行。
+   *
+   * <p>配置（追加条目 / 落账口径）从 {@code ToolContext.config} 读（D30 的运行时缝）：缺省 = 只用内置清单 + {@code digest}。
+   * 命令参数缺失时返回 {@code ALLOW}——没有命令文本就没有可分流的东西，{@link #execute} 会照常报 {@code INVALID_ARGUMENTS}。
+   */
+  @Override
+  public ToolGate gate(ToolContext context) {
+    Objects.requireNonNull(context, "context");
+    String command = strArg(context, "command");
+    if (command == null) {
+      return ToolGate.ALLOW;
+    }
+    BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
+    return BashCommandClassifier.classify(command, config.blockedExtra(), config.askExtra());
+  }
+
+  /**
+   * 落 {@code tool.call} 事件时的参数视图（S4-C 的脱敏点）：{@code digest}（缺省）下只暴露 {@code
+   * {digest,len,class}}，{@code full} 下原样返回。
+   *
+   * <p><b>为什么在这里而不是审批器里</b>：管线在<b>调 authorizer 之前</b>就落了 {@code tool.call}——脱敏落在审批器等于没落。
+   *
+   * <p><b>摘要口径</b>：用 {@link io.mosire.agentlib.tool.Digest}（与审批摘要同一段代码，见其类 javadoc）。这里<b>只</b>摘
+   * {@code command} 一个字段（落账要的是"命令的指纹"），而审批摘要覆盖全部参数——输入面不同是有意的。
+   *
+   * <p><b>{@code env} 在 digest 模式下<b>整个不落</b></b>：它是模型自造的任意字符串、可能承载密钥（D23/D24）， 且它不进命令摘要。{@code
+   * cwd}/{@code timeout}/{@code mode} 不是命令文本，照原样落（取值域有限，不是任意字符串）。
+   *
+   * <p><b>诚实的边界（不许说成"加密"）</b>：{@code digest} 是<b>减少暴露面，不是保密</b>——短命令可被字典攻击还原； 要逐字回放请显式开 {@code
+   * tools.bash.commandLog=full}。
+   */
+  @Override
+  public Map<String, Object> ledgerArgs(ToolContext context) {
+    Objects.requireNonNull(context, "context");
+    BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
+    if (config.commandLog() == BashToolConfig.CommandLog.FULL) {
+      return context.arguments();
+    }
+    Map<String, Object> out = new LinkedHashMap<>();
+    String command = strArg(context, "command");
+    if (command == null) {
+      // 没有命令文本：没有可摘的正文，也不编造分类（class=none 是闭词表外的第四个取值，专门表示"无从分类"）
+      out.put("digest", DIGEST_ABSENT);
+      out.put("len", 0);
+      out.put("class", CLASS_ABSENT);
+    } else {
+      ToolGate gate =
+          BashCommandClassifier.classify(command, config.blockedExtra(), config.askExtra());
+      out.put("digest", Digest.ofCommand(command));
+      out.put("len", command.length());
+      out.put("class", classOf(gate));
+    }
+    copyIfPresent(context, out, "cwd");
+    copyIfPresent(context, out, "timeout");
+    copyIfPresent(context, out, "mode");
+    return Map.copyOf(out);
+  }
+
+  /**
+   * {@code tool.call} 里 {@code class} 的取值（{@code allow|ask|block}；无命令文本时见 {@link #CLASS_ABSENT}）。
+   */
+  private static String classOf(ToolGate gate) {
+    return switch (gate) {
+      case ToolGate.Allow ignored -> "allow";
+      case ToolGate.Ask ignored -> "ask";
+      case ToolGate.Block ignored -> "block";
+    };
+  }
+
+  /** 把非命令文本的标量参数照原样带进事件（{@code cwd}/{@code timeout}/{@code mode}；{@code env} <b>不</b>带）。 */
+  private static void copyIfPresent(ToolContext context, Map<String, Object> out, String name) {
+    Object value = context.arguments().get(name);
+    if (value != null) {
+      out.put(name, value);
+    }
   }
 
   @Override

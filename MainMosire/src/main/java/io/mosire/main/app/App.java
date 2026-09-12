@@ -4,12 +4,15 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ApprovalConfig;
 import io.mosire.agentlib.approval.ApprovalConfigLoader;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.approval.AutoApproveGate;
+import io.mosire.agentlib.approval.ConfirmGate;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.EventStore;
+import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.FakeLlmClient;
 import io.mosire.agentlib.llm.LlmClient;
@@ -39,6 +42,9 @@ import io.mosire.brain.subagent.SubProcessExecutor;
 import io.mosire.brain.subagent.SubagentInstance;
 import io.mosire.brain.subagent.SubagentManager;
 import io.mosire.brain.subagent.SubagentOrchestrationTools;
+import io.mosire.brain.tools.BashToolConfig;
+import io.mosire.brain.tools.BashToolConfigLoader;
+import io.mosire.brain.tools.ShellTool;
 import io.mosire.main.Version;
 import io.mosire.main.approval.ApprovalHttpServer;
 import io.mosire.main.approval.HttpApprovalChannel;
@@ -59,6 +65,7 @@ import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -228,6 +235,14 @@ public final class App implements AutoCloseable {
     SqliteConversationStore conversations =
         config.demo() ? null : SqliteConversationStore.open(config.dataDir().resolve("events.db"));
     EventBus bus = new EventBus();
+    // S4-C：审批事件的<b>落账</b>面。B1 的 ApprovalCoordinator 只把 approval.requested/decided 投到 bus
+    // （B2 收口"用已有的那个总线"），而这条总线目前唯一的订阅者是 AG-UI 的<b>唤醒信号</b>
+    // （AgUiHttpServer:212 只 signal；AG-UI 的数据面是从 events 回读的）⇒ 审批事件在进程里<b>没有任何可回读的面</b>
+    // （实测数据目录 events.db：distinct type 只有
+    // agent.lifecycle/llm.call/conversation.turn/tool.call/tool.result，
+    // 无 approval.*）。V3 判据要求 "approval.decided{scope=once} 落账" ⇒ 在这里把审批事件镜像进事件库。
+    // 只认 approval.* 前缀（管线自己的 emit 已落库，不会双写）；落库失败只告警，不改判定（同 B1 的审计口径）。
+    bus.subscribe(event -> mirrorApprovalEvent(events, event));
     ToolRegistry tools = new ToolRegistry();
     McpLinks links;
     try {
@@ -235,6 +250,11 @@ public final class App implements AutoCloseable {
       // start()，主 catch 够不着——就地回收前面已打开的两条连接（回收口径同主 catch，且用 quiet 关闭保证原异常原样上抛
       // ——失败原因不被"关闭也失败"顶掉）。
       tools.registerAll(extraTools == null ? List.of() : extraTools);
+      // S4-C：bash 给主 Agent（`ShellTool` 二期早已写好、从未注册）。主 Agent 是 system() 权限集 ⇒ spec() 的
+      // sensitive+destructive 位天然放行（用户裁决"全功能"）；子体拿不到它——出厂模板 allowedTools 不含 bash（下放归 S5）。
+      // 它未标 noExport ⇒ 会进 MCP 外发面（有意的：子体的白名单挡着，启动日志会报出实际外发面）。
+      // 基准工作目录 = 进程 CWD（工具的缺省构造语义，见 ShellTool 类 javadoc）；命令的三档分流与落账脱敏在工具内。
+      tools.register(new ShellTool());
       // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
       links = wireMcpLinks(config.mcpLinks(), tools);
     } catch (RuntimeException e) {
@@ -274,14 +294,19 @@ public final class App implements AutoCloseable {
       // ★ S4-B2 审批装配：必须排在子 Agent 编排与 MCP 暴露<b>之前</b>——那两处的工具调用入口都要拿同一个编排器。
       //   同一进程内只能有一个 PendingApprovals（两通道必须看到同一 id，H8 判据）：它由本装配层建、逐层当参数传下去，
       //   不设任何静态/全局单例。
-      ApprovalConfig approvalConfig =
-          ApprovalConfigLoader.load(new FileConfigStore(config.dataDir()));
+      FileConfigStore configStore = new FileConfigStore(config.dataDir());
+      ApprovalConfig approvalConfig = ApprovalConfigLoader.load(configStore);
+      // S4-C：bash 工具配置（追加清单 + 落账口径）同一处读——两者的共同点是"启动期读、项存在但值非法即响亮失败"
+      BashToolConfig bashConfig = BashToolConfigLoader.load(configStore);
       PendingApprovals pendingApprovals = new PendingApprovals();
       approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
       approvalHttpChannel = new HttpApprovalChannel(pendingApprovals);
+      // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
+      // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
+      // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
       ApprovalCoordinator approvalCoordinator =
           new ApprovalCoordinator(
-              List.of(),
+              List.of(new AutoApproveGate(pendingApprovals), new ConfirmGate()),
               List.of(approvalTtyChannel, approvalHttpChannel),
               pendingApprovals,
               approvalConfig.timeout(),
@@ -336,14 +361,17 @@ public final class App implements AutoCloseable {
       LlmClient llm = scriptedLlm(config, llmOverride);
       // D30：工具自身配置经 ToolContext.config 注入（运行时缝，不走构造器全局）——read_agent_context 据此定位
       // 子库根（与 subagentCommand 的 --data-dir 同源）与自身事件库；键名归 Brain（AgentContextReader 常量）
-      Map<String, Object> toolConfig =
-          Map.of(
-              AgentContextReader.CONFIG_SUBAGENTS_ROOT,
-              config.dataDir().resolve("subagents").toString(),
-              AgentContextReader.CONFIG_SELF_EVENTS_DB,
-              config.dataDir().resolve("events.db").toString(),
-              AgentContextReader.CONFIG_SELF_AGENT_ID,
-              agentConfig.id());
+      // S4-C：bash 工具的三项配置也走这条缝（键 = 配置里的完整点分路径，见 BashToolConfig）
+      Map<String, Object> toolConfig = new LinkedHashMap<>();
+      toolConfig.put(
+          AgentContextReader.CONFIG_SUBAGENTS_ROOT,
+          config.dataDir().resolve("subagents").toString());
+      toolConfig.put(
+          AgentContextReader.CONFIG_SELF_EVENTS_DB,
+          config.dataDir().resolve("events.db").toString());
+      toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
+      toolConfig.putAll(bashConfig.toToolConfig());
+      toolConfig = Map.copyOf(toolConfig);
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
       // （--demo 恒"零行为变化"是本仓既有约定：它只跑一条脚本回合，没有工具调用面可审批）
       AgentRuntime runtime =
@@ -773,6 +801,29 @@ public final class App implements AutoCloseable {
     closeQuietly("事件总线", () -> bus.close());
     terminated.countDown();
   }
+
+  /**
+   * 审批事件落库镜像：只收 {@code approval.*}（其余类型由管线自己的 emit 落库，这里再落就是双写），失败只告警。
+   *
+   * <p><b>agent 字段为什么是 {@code main}</b>：审批事件在 B1 里以"基础设施事件"形态投出，不带调用者身份（bus 事件的 agent
+   * 为空串），而审批请求本身也不经过 AgentPipeline。本接线里能触发审批的唯一调用者是主 Agent（子体白名单拿不到 bash， 见 {@code ShellTool}
+   * 注册注释）⇒ 落 {@code main}。若日后子体能触发审批，这里必须换成真身份，否则审计会张冠李戴。
+   */
+  private static void mirrorApprovalEvent(EventStore events, Event event) {
+    if (event.type() == null || !event.type().startsWith(APPROVAL_EVENT_PREFIX)) {
+      return;
+    }
+    try {
+      events.append(
+          EventWrite.of(
+              event.type(), MAIN_CONVERSATION_ID, event.payload(), event.correlationId()));
+    } catch (RuntimeException failure) {
+      LOG.warn("审批事件落库失败（不影响判定） type={} seq={}", event.type(), event.seq(), failure);
+    }
+  }
+
+  /** 审批事件的类型前缀（B1 的 {@code ApprovalEventTypes} 只有两个常量，这里按前缀收口，不复制一份类型表）。 */
+  private static final String APPROVAL_EVENT_PREFIX = "approval.";
 
   /** 单项资源关闭：异常只记日志（继续执行后续关闭——close 链不因单项失败中断）。 */
   private static void closeQuietly(String what, Runnable closer) {

@@ -48,6 +48,24 @@ public interface AgentTool {
   }
 
   /**
+   * 落 {@code tool.call} 事件时用的参数视图。<b>缺省原样返回</b>（既有工具行为逐字不变）。
+   *
+   * <p>需要脱敏的工具（如 bash）覆写它以只暴露摘要——事件库应能"对账"但不默认存明文。
+   *
+   * <p><b>为什么是工具自报而不是管线判断</b>：只有工具自己知道哪几个参数是"模型自造的任意字符串"（能变成任意副作用的只有命令文本， 而 cwd/timeout
+   * 不是），管线按工具名硬编码会造出第二套知识；本 SPI 是这条知识的唯一落点。
+   *
+   * <p><b>调用点与顺序</b>：{@code AgentPipeline.executeToolCall} 在<b>调 authorizer 之前</b>落 {@code
+   * tool.call} 事件——故脱敏必须发生在这个 emit 点，落在审批器里等于没落（事件早就写出去了）。
+   *
+   * <p><b>契约</b>：返回<b>非 null</b> 的 Map（调用点对 null 退回原始 args，见管线注释——那只是防呆，不是允许返回 null）；
+   * 实现<b>不得</b>回传它声称要脱敏的内容。
+   */
+  default Map<String, Object> ledgerArgs(ToolContext context) {
+    return context.arguments();
+  }
+
+  /**
    * 执行一次调用。实现必须把参数、IO 错误映射为 {@link ToolResult}（成功或带 code 的失败）， 不抛异常吞掉边界错误（意外异常可抛，由审计记录后转为工具层错误）。
    */
   ToolResult execute(ToolContext context);

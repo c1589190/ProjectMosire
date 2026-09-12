@@ -4,15 +4,8 @@ import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
 import io.mosire.agentlib.approval.ApprovalRequest;
 import io.mosire.agentlib.approval.ToolGate;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Collection;
-import java.util.HexFormat;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -178,75 +171,20 @@ public final class ToolCallAuthorizer {
   }
 
   /**
-   * 默认脱敏摘要：{@code sha256:<32 hex>}，算的是<b>按参数名排序</b>后的规范化串（同参同摘，便于对账）：逐项 {@code 键长:键 + 值类型 + 值长:值}
-   * 再换行——<b>长度前缀定界</b>，因为值里可能出现任何字符（空格/冒号/换行），拿定界符本身当地界是不可靠的； 类型标记则挡住"渲染成同一串、其实是两回事"的碰撞 （{@code
-   * {"a":"1"}} 与 {@code {"a":1}}，{@code {"x":["a","b"]}} 与 {@code {"x":"[a, b]"}} 都曾同摘）。
+   * 默认脱敏摘要：{@code sha256:<32 hex>}，算的是<b>按参数名排序</b>后的规范化串（同参同摘，便于对账）。
    *
-   * <p><b>为什么是本类的一个静态方法</b>：摘要进 {@code approval.requested} 事件（持久面）与提示面， 只能有一处口径——散在各处就会有人漏掉（派发包
-   * §一：「别把脱敏写死在各处」）。要换实现（C 包的 bash 命令脱敏、 B2 的命令落账）走 {@link #of(ToolExecutionGuard,
-   * ApprovalCoordinator, Function)} 注入，不要就地改这里。
+   * <p><b>实现已上提</b>（C 包接 bash 时）：规范化写法与哈希算法都在 {@link Digest}——命令落账摘要（{@code
+   * ShellTool.ledgerArgs}）与本方法必须共用同一段代码，否则同一条命令会有两个指纹。本方法只剩"喂什么进去"这一件事： <b>全部参数</b>（不是只有命令）。
+   *
+   * <p><b>为什么是这个输入面</b>：摘要进 {@code approval.requested} 事件（持久面）与提示面，人要看的是"这次调用整体是什么"，
+   * 故覆盖全部参数；命令落账要的是"命令文本的指纹"，输入面只有 {@code command} 一项——两者不同是有意的（见 {@link Digest} 的类
+   * javadoc），但哈希写法同源。要换实现走 {@link #of(ToolExecutionGuard, ApprovalCoordinator, Function)} 注入，
+   * 不要就地改这里。
    *
    * <p><b>留一条诚实的边界</b>：sha256 是单向的，但参数里若有<b>低熵</b>密钥（短口令），摘要仍可被字典攻击反推——
-   * 本方法只是"不留明文"的缺省件，不是"密钥可安全入摘要"的证明。接 bash 后由 C 包按命令形状决定到底摘什么。
+   * 本方法只是"不留明文"的缺省件，不是"密钥可安全入摘要"的证明。
    */
   public static String defaultDigest(ToolContext context) {
-    StringBuilder canonical = new StringBuilder();
-    for (Map.Entry<String, Object> argument : new TreeMap<>(context.arguments()).entrySet()) {
-      String key = argument.getKey();
-      Object raw = argument.getValue();
-      String value = String.valueOf(raw);
-      // 长度前缀定界：值里可能出现任何字符（空格/冒号/换行），把定界符本身当地界是不可靠的
-      canonical
-          .append(key.length())
-          .append(':')
-          .append(key)
-          .append(typeTag(raw))
-          .append(value.length())
-          .append(':')
-          .append(value)
-          .append('\n');
-    }
-    byte[] raw = canonical.toString().getBytes(StandardCharsets.UTF_8);
-    MessageDigest sha256;
-    try {
-      sha256 = MessageDigest.getInstance("SHA-256");
-    } catch (NoSuchAlgorithmException absent) {
-      // 任何标准 JVM 都有 SHA-256；真到这一步也不能退回明文，只能给"形状"
-      return "unavailable:len=" + raw.length;
-    }
-    return "sha256:" + HexFormat.of().formatHex(sha256.digest(raw), 0, 16);
-  }
-
-  /**
-   * 值的<b>类别</b>标记（进规范化串，见 {@link #defaultDigest(ToolContext)}）：挡住"渲染成同一串、其实是两回事"的碰撞。
-   *
-   * <p>只按<b>类别</b>分（{@code text}/{@code number}/{@code bool}/...）而不是照 {@code
-   * getClass().getSimpleName()} 记实现类名： 同类别的两种实现（{@code List.of(...)} 与 {@code new
-   * ArrayList<>(...)}）是<b>同一个逻辑参数</b>， 记成两种标记会让"同参同摘"这条对账口径碎掉。类别集合是闭词表，所以定界仍然无歧义
-   * （键有长度前缀，标记里不含冒号、也不以数字开头）。
-   */
-  private static String typeTag(Object value) {
-    if (value == null) {
-      return "null";
-    }
-    if (value instanceof CharSequence) {
-      return "text";
-    }
-    if (value instanceof Number) {
-      return "number";
-    }
-    if (value instanceof Boolean) {
-      return "bool";
-    }
-    if (value instanceof Character) {
-      return "char";
-    }
-    if (value instanceof Map<?, ?>) {
-      return "map";
-    }
-    if (value instanceof Collection<?>) {
-      return "list";
-    }
-    return "other";
+    return Digest.ofArguments(context.arguments());
   }
 }

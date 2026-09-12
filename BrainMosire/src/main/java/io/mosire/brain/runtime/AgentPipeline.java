@@ -827,11 +827,24 @@ public final class AgentPipeline {
   }
 
   private void executeToolCall(List<LlmMessage> messages, ContentPart.ToolCall call) {
-    emit(
-        EventTypes.TOOL_CALL,
-        Map.of("tool", call.name(), "callId", call.id(), "args", call.arguments()));
-
+    // ★ S4-C 脱敏（红线 4：命令明文不进事件库）：tool.call 的 args 取工具自报的参数视图（AgentTool.ledgerArgs）。
+    //   ToolContext 的构造<b>上移</b>到 emit 之前——它是纯的（只做 requireNonNull + Map.copyOf，无副作用），
+    //   于是"先建上下文、再按上下文脱敏、最后写事件"这个顺序成立，且既有工具（不覆写 ledgerArgs）行为逐字不变。
+    //   工具不存在时退回原始 args（未知工具名不该把事件写崩，也不该让这一行成为 NPE 源）。
     ToolContext context = new ToolContext(caller, permissionSet, toolConfig, call.arguments());
+    // 另一次 findBy：authorizer 内部还会各查一次。这是<b>有意</b>的重复查——判定不搬到这个 emit 点来（见 ToolCallAuthorizer 的类注释）。
+    AgentTool tool = registry.find(call.name()).orElse(null);
+    Map<String, Object> ledgerArgs = call.arguments();
+    if (tool != null) {
+      Map<String, Object> reported = tool.ledgerArgs(context);
+      // reported 为 null 只可能是实现违约：退回原始 args（既有行为）而不是让 Map.of 抛 NPE 把事件写崩
+      if (reported != null) {
+        ledgerArgs = reported;
+      }
+    }
+    emit(
+        EventTypes.TOOL_CALL, Map.of("tool", call.name(), "callId", call.id(), "args", ledgerArgs));
+
     ToolResult result;
     try {
       result = authorizer.execute(registry, call.name(), context);
