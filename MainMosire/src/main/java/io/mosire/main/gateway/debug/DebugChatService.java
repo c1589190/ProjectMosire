@@ -8,6 +8,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
@@ -25,6 +26,10 @@ import org.slf4j.LoggerFactory;
  * <p><b>stop 的全局语义</b>：{@link #stop} 转发 {@link AgentRuntime#cancel()}——取消作用于"当前运行中的那一回合"。
  * 因运行被单线程执行器串行化，同一时刻至多一个在途运行，故按 runId 寻址的取消实际是全局的（RUNNING 记录即当前运行）；空闲期 cancel 是空操作。取消不硬中断进行中的
  * LLM/工具调用——管线在下一个检查点以 {@link StopReason#CANCELLED} 就地终止。
+ *
+ * <p><b>会话重置（P3-3 / D26）</b>：{@link #resetSession()} 换新会话 id + 清空主 Agent 的内存工作集（旧会话在库里留档）。切换动作同受
+ * 上述串行化约束——{@code history} 是实例级共享状态，重置与回合必须走同一个串行化点；同一执行器 FIFO ⇒ 排在重置之后的回合必然在重置之后跑。 调用方 {@code
+ * close()} 之后的重置一律失败（不被吞成"看着像成功"）。
  *
  * <p><b>生命周期</b>：实现 {@link AutoCloseable}，但 {@link #close()} 只封提交口（后续 {@code submit} 抛 {@link
  * IllegalStateException}），<b>不关停注入的执行器</b>——它是 App 持有的共享组件（A2A/AG-UI 同用，串行化不变量）， 关停顺序归 App。
@@ -68,6 +73,43 @@ public final class DebugChatService implements AutoCloseable {
       LOG.warn("调试对话运行未调度（执行器已关停）: {}", runId);
     }
     return runId;
+  }
+
+  /**
+   * 重置会话（P3-3 / D26）：换新会话 id + 清空主 Agent 的内存工作集，旧会话在库里原样留档（不删）。
+   *
+   * <p><b>id 在这里生成、切换排在执行器上</b>——两侧各有理由，缺一不可：
+   *
+   * <ul>
+   *   <li>新 id 在<b>调用线程</b>同步生成：HTTP 响应要立刻带上它（调用方拿到就知道"接下来这段聊在哪"），而生成 id 本身不碰任何共享状态；
+   *   <li>切换动作（{@link AgentRuntime#resetSession(String)} 清历史 + 换 id）<b>必须</b>提交到共享单线程 chat 执行器：它改的是
+   *       {@code AgentPipeline.history}（实例级共享、非线程安全，R11）——在 HTTP 线程上直接改，就会与在途回合交错（在途回合的 {@code
+   *       saveHistory} 会把上一个会话的尾部追加进新会话）。同一执行器 FIFO ⇒ 排在本方法之后的对话回合必然在重置之后执行。
+   * </ul>
+   *
+   * <p><b>失败不撒谎</b>：调度被拒（执行器已关停——关停窗，见 {@link #close()}）时抛 {@link IllegalStateException}，绝不回报一个
+   * 没发生的重置。切换动作本身在执行器线程上抛错只记日志：此刻响应早已发出，能做的只有留下痕迹。
+   *
+   * @return 新会话 id + 提交时刻的旧会话 id（见 {@link DebugSessionReset} 对两次连续重置的语义说明）
+   * @throws IllegalStateException 服务已关停，或重置未调度（共享执行器已关停）
+   */
+  public DebugSessionReset resetSession() {
+    requireOpen();
+    String previous = runtime.conversationId();
+    String conversationId = "s-" + UUID.randomUUID();
+    try {
+      chatExecutor.execute(
+          () -> {
+            try {
+              runtime.resetSession(conversationId);
+            } catch (RuntimeException e) {
+              LOG.warn("会话重置执行失败（响应已回报新会话 id）: {}", conversationId, e);
+            }
+          });
+    } catch (RejectedExecutionException e) {
+      throw new IllegalStateException("会话重置未调度（共享 chat 执行器已关停）", e);
+    }
+    return new DebugSessionReset(conversationId, previous);
   }
 
   /** 回合执行（在 chat 执行器线程上）：一回合 → 状态合成 + TurnResult 投影（整体替换记录）。 */

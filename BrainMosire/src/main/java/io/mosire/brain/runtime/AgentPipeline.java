@@ -51,6 +51,9 @@ import org.slf4j.LoggerFactory;
  * {@code load} 灌入内存工作集（重启续聊），每回合只把<b>新增的尾部</b>追加进去（prompt-cache 不变量：已落库的消息永不改写）。不带 store
  * 的构造委派到"不落库"实现，行为与持久化接入前逐字节一致。
  *
+ * <p><b>会话重置（D26）</b>：{@link #resetConversation(String)} 换新会话 id +
+ * 清空内存工作集，旧会话在库里原样留档。重置<b>不是</b>重建管线： 本实例持有的 store/装配器/摘要槽一律沿用，"换会话"只落在会话级状态上。与回合一样受串行调用约定约束（R11）。
+ *
  * <p><b>会话压缩（T17）</b>：带 {@code (compactor, compactSummary)} 的构造在<b>每个回合的边界</b>（组请求之前）跑一次 {@link
  * Compactor}：超预算时按 micro → 局部摘要 → 快照续接三档压缩会话工作集，并落 {@code conversation.compact} 事件（摘要调用另落 {@code
  * llm.call} 记账，R7）。压缩只改<b>内存工作集</b>（档 1/2）或经显式 {@code compact} 记录落库（档 3）——持久层的 append-only
@@ -76,7 +79,17 @@ public final class AgentPipeline {
   private final AccessToken caller;
   private final AgentPermissionSet permissionSet;
   private final ConversationStore store;
-  private final String conversationId;
+
+  /**
+   * 当前会话标识：<b>非 final</b>——{@link #resetConversation(String)}（D26：重置 = 换新会话 id）要在实例存活期间改掉它。
+   * 持久化按它寻址（{@link #saveHistory} 的 {@code append}、{@link #snapshotBaseline} 的 {@code
+   * load}），故切换即"此后一切读写都算新会话"。
+   *
+   * <p>{@code volatile} 与 {@link #uncoveredHiddenContent} 同口径：本类的并发约定只要求调用方<b>串行</b>（不要求同一线程——见类
+   * Javadoc），重绑（重置）与回合可能发生在<b>不同</b>线程上（管线被共享执行器串行驱动），跨线程交接由它保证可见性；这也是 {@code
+   * AT_STALE_THREAD_WRITE_OF_PRIMITIVE} 的正当处理——把一个跨回合必须存活的判据消掉才是错的。
+   */
+  private volatile String conversationId;
 
   /** 会话压缩器；{@code null} = 未接线（既有构造的取法，行为与压缩接线前逐字节一致）。 */
   private final Compactor compactor;
@@ -234,6 +247,48 @@ public final class AgentPipeline {
    */
   public void cancel() {
     cancelled = true;
+  }
+
+  /**
+   * 重置会话（D26：{@code 清空内存工作集 + 切到一个全新 conversationId}）：旧会话在库里<b>原样保留</b>（不删——可追溯），新对话从零开始。
+   *
+   * <p><b>四件事一件都不能少</b>（会话级状态就这四处，漏掉任何一处"重置"都名不副实）：
+   *
+   * <ol>
+   *   <li>{@link #conversationId} ← {@code newConversationId}：此后落库/读库都按新 id 寻址（旧会话的行一条不动）；
+   *   <li>{@link #history} 清空（就地 {@code clear()}——列表是 final，就地改是本类既定口径，见 {@link
+   *       #replaceWorkingSet}）： 否则下一回合会把上一个会话的历史原样回灌给模型；
+   *   <li>{@link #uncoveredHiddenContent} 归 {@code false}：该判据描述的是"<b>本会话</b>工作集有覆盖缺口"，会话换了即失效——
+   *       留着会让下一个会话的档 3 摘要基准回退到 {@code store.load(新 id)}（空）而不是工作集；
+   *   <li>{@link #compactSummary} 清空：槽里挂的是上一个会话的摘要，留着它新会话就会带着一段描述旧对话的记忆开场（槽与装配器共用同一实例， {@code
+   *       COMPACT_SUMMARY} 层随之归空）。
+   * </ol>
+   *
+   * <p><b>不 {@code load} 新会话</b>：重置语义是"从零开始"，不是"续聊某个既有会话"。调用方负责给一个<b>全新</b> id（生产侧由 Main 生成）； 若传入的
+   * id 恰好已有落库内容，本方法<b>不会</b>把它灌进工作集——新会话的工作集恒为空，直到下一回合把新增尾部追加进去（那时的库内容与内存**不同源**，
+   * 是调用方越过了本方法的约定，不是本方法可以静默兜底的场景）。
+   *
+   * <p><b>并发约定</b>：与 {@link #run(String)} 一样只要求调用方<b>串行</b>——重置改的是实例级共享、非线程安全的 {@code history}，
+   * 必须与回合排在同一串行化点上（例如同一个单线程执行器），<b>不得</b>在另一个线程上与在途回合并发调用（见类 Javadoc 的 R11）。
+   *
+   * @param newConversationId 新会话标识（非 null、显式给定——管线不生成 id，也不猜）
+   */
+  public void resetConversation(String newConversationId) {
+    this.conversationId = Objects.requireNonNull(newConversationId, "newConversationId");
+    history.clear();
+    uncoveredHiddenContent = false;
+    // compactSummary 的非空由构造器的 requireNonNull 保证（本类没有第二条赋值路径），故无需空值分支
+    compactSummary.clear();
+  }
+
+  /**
+   * 当前会话标识（重置后即为新 id）——装配层据此向调用方回报"重置前的会话是哪个"。
+   *
+   * <p>读的是 {@code volatile} 字段的即时值：在共享串行执行器上，它反映的是"最后一次已执行的重置/构造"。重置的<b>请求</b>排进执行器到真正执行之间， 本方法仍返回旧
+   * id（切换是一个动作，不是一个声明）。
+   */
+  public String conversationId() {
+    return conversationId;
   }
 
   /**

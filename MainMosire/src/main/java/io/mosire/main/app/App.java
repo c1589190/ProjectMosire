@@ -16,6 +16,7 @@ import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
+import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
@@ -85,6 +86,11 @@ import org.slf4j.LoggerFactory;
  * AgUiHttpServer}（GET /sessions/{id}/events SSE）。主 Agent 回合执行器与 A2A 共享<b>同一个单线程执行器</b> （Rul B 串行化 =
  * AgentPipeline.history 非线程安全的不变量，也是 AG-UI 会话 seq 区间隔离的前提——见 AgUiSessionRegistry 说明）。关停顺序：A2A
  * 任务服务（合成 FAILED + 关停共享执行器）→ A2A 网关 → AG-UI 网关 （stop(1) 给在途流排空）→ AG-UI 注册表（封创建口）→ 既有关停链。
+ *
+ * <p>P3-3（本类新增）：<b>会话历史落盘</b>——非 {@code --demo} 时多开一个 {@link SqliteConversationStore}（与事件库同一文件，计划
+ * §六 一份 DDL），主 Agent 的多轮对话因此跨进程存活，初始会话 id 恒为 {@link #MAIN_CONVERSATION_ID}（稳态 id 是"重启续聊"的前提）；
+ * {@code --demo} 恒不落库（零行为变化）。重置入口不在本类：{@code POST /api/chat/session} → {@link
+ * io.mosire.main.gateway.debug.DebugChatService#resetSession()}（切换动作排在共享 chat 执行器上，R11）。
  */
 public final class App implements AutoCloseable {
 
@@ -92,6 +98,14 @@ public final class App implements AutoCloseable {
 
   /** 子 Agent 链接的父侧 MCP server 自报名（子体按"parent"源名识别——仅日志/审计语义）。 */
   private static final String PARENT_SERVER_NAME = "mosire-parent";
+
+  /**
+   * 主 Agent 的初始会话 id（P3-3）：恒为 {@code "main"}（= 主 Agent 的 {@code AgentConfig} id，同源）。
+   *
+   * <p><b>初始 id 必须稳定</b>——"重启进程后历史仍在"靠的就是每段进程用同一个 id 去库里寻址；若每次启动取随机 id，每次都是全新会话，
+   * 落盘等于白落。代价是：重置后重启会回到 {@code "main"} 这条初始会话（而不是上次重置出的新会话）——"当前会话指针"机制不在 P3-3 范围。
+   */
+  public static final String MAIN_CONVERSATION_ID = "main";
 
   public static final String DEFAULT_SYSTEM_PROMPT =
       "你是 Mosire 主 Agent——一个模块化、可自管理、受权限约束的 Agent。" + "保持诚实：无工具可用时直接说明，不虚构执行过程。";
@@ -101,6 +115,16 @@ public final class App implements AutoCloseable {
   public static final String DEFAULT_LLM_REPLY = "我是 Mosire 主 Agent（M1 骨架 LLM，离线占位回复）。消息已收到。";
 
   private final EventStore events;
+
+  /**
+   * 会话历史存储（P3-3）：{@code null} = 未接线（demo 分叉——不落库，行为与落盘接入前逐字节一致）。
+   *
+   * <p>与 {@link #events} 同口径：归 App 持有、App 关停；两者是<b>同一个 db 文件</b>上的两个连接（各自自建，计划 §六 一份 DDL）。
+   * 字段类型是具体实现而非 {@link io.mosire.agentlib.store.ConversationStore}：装配层持有的是"可关停的那个打开结果"（接口本身没有
+   * close——它只描述存取语义），同 {@link SqliteEventStore} 之于 {@code EventStore}。
+   */
+  private final SqliteConversationStore conversations;
+
   private final EventBus bus;
   private final AgentRuntime runtime;
   private final AdminHttpServer http;
@@ -168,6 +192,10 @@ public final class App implements AutoCloseable {
       throw new IllegalStateException("无法创建数据目录: " + config.dataDir(), e);
     }
     EventStore events = SqliteEventStore.open(config.dataDir().resolve("events.db"));
+    // P3-3 落盘：主 Agent 的会话历史落到 events.db 同一文件（SqliteConversationStore 的既定约定——计划 §六 一份 DDL）。
+    // demo 分叉恒不落库（--demo 行为零变化）：store 为 null 即走 AgentRuntime 的既有 6 参构造（不落库路径逐字节不变）
+    SqliteConversationStore conversations =
+        config.demo() ? null : SqliteConversationStore.open(config.dataDir().resolve("events.db"));
     EventBus bus = new EventBus();
     ToolRegistry tools = new ToolRegistry();
     tools.registerAll(extraTools == null ? List.of() : extraTools);
@@ -203,9 +231,20 @@ public final class App implements AutoCloseable {
       // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）
       mcpServer =
           config.mcpExpose() ? AgentToMcpServer.start(tools, "mosire-main", Version.VERSION) : null;
+      // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
+      LlmClient llm = scriptedLlm(config, llmOverride);
       AgentRuntime runtime =
-          new AgentRuntime(
-              agentSpec, scriptedLlm(config, llmOverride), tools, events, bus, permissionSet);
+          conversations == null
+              ? new AgentRuntime(agentSpec, llm, tools, events, bus, permissionSet)
+              : new AgentRuntime(
+                  agentSpec,
+                  llm,
+                  tools,
+                  events,
+                  bus,
+                  permissionSet,
+                  conversations,
+                  MAIN_CONVERSATION_ID);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;
@@ -250,6 +289,7 @@ public final class App implements AutoCloseable {
       App app =
           new App(
               events,
+              conversations,
               bus,
               runtime,
               http,
@@ -290,6 +330,9 @@ public final class App implements AutoCloseable {
       }
       if (debugChatService != null) {
         debugChatService.close();
+      }
+      if (conversations != null) {
+        conversations.close();
       }
       if (chatExecutor != null) {
         chatExecutor.shutdownNow();
@@ -430,6 +473,7 @@ public final class App implements AutoCloseable {
 
   private App(
       EventStore events,
+      SqliteConversationStore conversations,
       EventBus bus,
       AgentRuntime runtime,
       AdminHttpServer http,
@@ -445,6 +489,7 @@ public final class App implements AutoCloseable {
       SubagentManager subagentManager,
       SubprocessManager subagentProcesses) {
     this.events = events;
+    this.conversations = conversations;
     this.bus = bus;
     this.runtime = runtime;
     this.http = http;
@@ -507,7 +552,7 @@ public final class App implements AutoCloseable {
   /**
    * 优雅关停（计划 §5.1）：A2A 任务服务先行（合成 FAILED 让在订阅的客户端收到终态——必须赶在 HTTP 服务断连之前）→ A2A 网关关闭 （停止接入）→ 网关 drain →
    * MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接 bridge.close（整组下架工具）→ source.close（回收子进程）→ 子
-   * Agent 编排（逐个终止 + launcher 关闭）→ 子进程管理器兜底收割 → 运行时 → 事件存储 checkpoint。
+   * Agent 编排（逐个终止 + launcher 关闭）→ 子进程管理器兜底收割 → 运行时 → 会话存储（P3-3 开的那个）→ 事件存储 checkpoint。
    *
    * <p>（顺序说明）任务要求表述为"A2A server 先行关闭"，但 {@code HttpServer.stop(0)} 会即时掐断在途 SSE 连接——若先关 server，周迟合的
    * FAILED 时序事件早已不可达订阅者（R8 验收不成立）；故先合成终态、后断连接；“A2A 先行于既有关停链” 的本意（网关先于
@@ -527,7 +572,7 @@ public final class App implements AutoCloseable {
     }
     closed = true;
     LOG.info(
-        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 调试对话 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 事件存储 checkpoint");
+        "正在停止：A2A 任务/网关 → AG-UI 网关/注册表 → 调试对话 → 网关 drain → MCP 暴露/链接 → 子 Agent 编排 → 运行时 → 会话存储/事件存储 checkpoint");
     closeQuietly("A2A 任务服务", () -> a2aTaskService.close());
     closeQuietly("A2A 网关", () -> a2aServer.close());
     closeQuietly("AG-UI 网关", () -> aguiServer.close());
@@ -558,6 +603,13 @@ public final class App implements AutoCloseable {
           }
         });
     closeQuietly("Agent 运行时", () -> runtime.close());
+    closeQuietly(
+        "会话存储",
+        () -> {
+          if (conversations != null) {
+            conversations.close();
+          }
+        });
     closeQuietly("事件存储", () -> events.close());
     closeQuietly("事件总线", () -> bus.close());
     terminated.countDown();

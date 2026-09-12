@@ -40,6 +40,8 @@ import org.slf4j.LoggerFactory;
  *       {"runId","status","message","createdAt","result"}}； result 仅终态有值（RUNNING 与硬失败时为 null）。
  *   <li>{@code GET /api/chat/results?page=0&size=10}：{@link DebugChatService#listResults} 倒序分页， 返回
  *       {@code {"results":[...]}}；page/size 非法（非整数/越界）一律 400。
+ *   <li>{@code POST /api/chat/session}：{@link DebugChatService#resetSession()} 重置会话（P3-3 / D26）， 返回
+ *       {@code {"conversationId":"<新>","previousConversationId":"<旧>"}}；服务已关停 503。
  * </ul>
  *
  * <p>方法门禁：各端点只接受声明的方法，其余 405（同 {@code AdminHttpServer.requireGet} 形态）。status 一律小写 （{@code
@@ -54,6 +56,7 @@ public final class DebugChatHttpServer implements AutoCloseable {
 
   private static final String CONTEXT_PATH = "/api/chat";
   private static final String STOP_SUFFIX = "/stop";
+  private static final String SESSION_SUFFIX = "/session";
 
   /** /api/results 默认分页（page=0、size=10）。 */
   private static final int DEFAULT_PAGE = 0;
@@ -103,6 +106,11 @@ public final class DebugChatHttpServer implements AutoCloseable {
         return;
       }
       handleResults(exchange);
+    } else if (rest.equals(SESSION_SUFFIX)) {
+      if (!requireMethod(exchange, "POST")) {
+        return;
+      }
+      handleSessionReset(exchange);
     } else if (rest.endsWith(STOP_SUFFIX)) {
       int cut = rest.length() - STOP_SUFFIX.length();
       Long runId = cut > 1 ? parseRunId(rest.substring(1, cut)) : null;
@@ -157,6 +165,30 @@ public final class DebugChatHttpServer implements AutoCloseable {
       return;
     }
     send(exchange, 200, Map.of("runId", runId, "status", "running"));
+  }
+
+  /**
+   * POST /api/chat/session：重置会话（P3-3 / D26）——返回 {@code
+   * {"conversationId":"<新>","previousConversationId":"<旧>"}}。
+   *
+   * <p>无请求体（重置不需要参数：新 id 由服务生成，调用方不指定）。响应语义是"<b>已受理</b>"而非"已生效"——切换动作排在共享 chat 执行器上
+   * （R11）。这对调用方是够用的：同一执行器 FIFO ⇒ 拿到本响应之后提交的对话回合必然在切换<b>之后</b>执行，不会与在途回合交错。 服务已关停（含关停窗内 执行器已拒）一律
+   * 503：绝不回报一个没发生的重置。
+   */
+  private void handleSessionReset(HttpExchange exchange) throws IOException {
+    DebugSessionReset reset;
+    try {
+      reset = chat.resetSession();
+    } catch (IllegalStateException e) {
+      send(exchange, 503, Map.of("error", "调试对话服务已关停"));
+      return;
+    }
+    send(
+        exchange,
+        200,
+        Map.of(
+            "conversationId", reset.conversationId(),
+            "previousConversationId", reset.previousConversationId()));
   }
 
   /** POST /api/chat/{runId}/stop：未知 runId 404；已知则转发取消（stopped=false = 已终态 no-op）。 */
