@@ -283,12 +283,16 @@ class ToolCallAuthorizerApprovalTest {
     ToolCallAuthorizer authorizer =
         ToolCallAuthorizer.of(
             new ToolExecutionGuard(), coordinator(pending, List.of(tty), Duration.ofSeconds(2)));
-    tool.gate = new ToolGate.Block("bash:blocked:rm-rf", "硬拒：不可回滚且几乎不可能是任务本意");
+    String detail = "命中值-s4c-sentinel-9f3a";
+    tool.gate = new ToolGate.Block("bash:blocked:rm-rf", "硬拒：不可回滚且几乎不可能是任务本意: " + detail);
 
     ToolResult result =
         authorizer.execute(registry, TOOL, ApprovalStubs.context(AccessToken.SYSTEM));
 
     assertThat(result.code()).isEqualTo(ToolCallAuthorizer.COMMAND_BLOCKED);
+    // 消息面（这条会落进事件库）：模型只该看到"这一类被拒 + classKey"；命中的那个值属于日志调试面，
+    // 不得出现在给模型的消息里（参数本就是模型自己写的，回显零信息增益，却会持久化）。
+    assertThat(result.message()).contains("bash:blocked:rm-rf").doesNotContain(detail);
     assertThat(tool.calls()).isZero();
     // ★ 判别性：硬拒连"通道可用吗"都没问过（让 Block 走审批，三个计数立刻转红）
     assertThat(tty.availableCalls()).isZero();

@@ -8,6 +8,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * <b>工具调用的唯一入口</b>：权限判定 → 命令闸（硬拒/需审批）→ 执行。
@@ -37,6 +39,8 @@ import java.util.function.Function;
  * <p><b>不持有的东西</b>：不写事件（审批事件由 {@link ApprovalCoordinator} 发，权限拒绝的审计仍归调用方，与 guard 同口径）；不持有存储。
  */
 public final class ToolCallAuthorizer {
+
+  private static final Logger LOG = LoggerFactory.getLogger(ToolCallAuthorizer.class);
 
   /** 工具自报硬拒（{@link ToolGate.Block}）：终局，不进审批。 */
   public static final String COMMAND_BLOCKED = "COMMAND_BLOCKED";
@@ -115,9 +119,15 @@ public final class ToolCallAuthorizer {
       }
       case ToolGate.Block blocked -> {
         // 硬拒不进审批：不登记、不发 approval.requested、通道里看不到它（防"审批把硬拒洗白"）
-        return ToolResult.error(
-            COMMAND_BLOCKED,
-            "命令被硬拒（不可审批）: class=" + blocked.classKey() + " reason=" + blocked.reason());
+        // 命中细节（规则 + 命中值）只进日志，供人调试"为什么这条被拒"；
+        // 给模型的消息只留"这一类被拒 + classKey"——参数本来就是模型自己写的，回显零信息增益，
+        // 而这条消息会落进事件库（持久面）。
+        LOG.warn(
+            "工具调用被硬拒（不可审批）: tool={} class={} reason={}",
+            tool.name(),
+            blocked.classKey(),
+            blocked.reason());
+        return ToolResult.error(COMMAND_BLOCKED, "命令被硬拒（不可审批）: class=" + blocked.classKey());
       }
       case ToolGate.Ask ask -> {
         Optional<ToolResult> approvalDenied = askForApproval(tool, context, ask);

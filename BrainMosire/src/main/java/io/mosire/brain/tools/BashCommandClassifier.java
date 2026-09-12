@@ -32,7 +32,9 @@ import java.util.Set;
  * 只用"最严那一段的可执行名"（路径前缀 {@code /usr/bin/apt} 归一为 {@code apt}）。
  *
  * <p><b>{@code summary}</b> 可以含命令原文（它只进内存态审批请求与 tty/HTTP 提示面，<b>不进事件库</b>）；事件库里只有 {@code
- * digest}。{@code reason}（Block 用）只带目标路径级别的最小信息，不带命令全文。
+ * digest}。<b>{@code reason}（Block 用）带"命中的那个值"是给日志调试用的</b>——它<b>不进事件面</b>：给模型的消息由 {@code
+ * ToolCallAuthorizer} 组装时裁掉细节，只留 {@code class=bash:block:<首词>}（模型只需要知道"这一类被拒"，
+ * 参数本来就是它自己写的，回显零信息增益，而那条消息会落进事件库）。
  *
  * <p><b>配置只增不删（结构性，不是"我们记得别删"）</b>：内置清单是本类的 {@code private static final} 常量， 外界给进来的只有 {@code
  * blockedExtra}/{@code askExtra} 两个<b>追加</b>入口，本类<b>没有</b>任何"覆盖/清空内置清单"的形参或分支
@@ -250,6 +252,8 @@ public final class BashCommandClassifier {
 
   /** 硬拒清单（附录 A 第一组；判据 = 不可回滚 × 几乎不可能是任务本意）。 */
   private static Verdict blockVerdict(String head, List<String> args, List<String> targets) {
+    // 拒因带"命中的那个值"：这是日志调试面（ToolCallAuthorizer 在硬拒时打 WARN），
+    // 不进事件面——给模型的消息只留 class。
     if (head.startsWith(MKFS_PREFIX)) {
       return block(head, "格式化文件系统（不可回滚）: " + head);
     }

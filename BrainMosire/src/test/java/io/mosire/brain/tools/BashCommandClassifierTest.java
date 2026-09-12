@@ -153,4 +153,37 @@ class BashCommandClassifierTest {
     assertThat(BashCommandClassifier.classify("   ", List.of(), List.of()))
         .isEqualTo(ToolGate.ALLOW);
   }
+
+  // ---------- 拒因口径：细节给日志，消息给模型 ----------
+
+  /**
+   * Block 拒因<b>保留"命中的那个值"</b>——它是<b>日志调试面</b>（{@code ToolCallAuthorizer} 硬拒时打 WARN）， 人靠它查"为什么这条被拒"。
+   *
+   * <p><b>它不进事件面</b>：给模型的消息由 {@code ToolCallAuthorizer} 组装时裁掉细节、只留 {@code class=}——
+   * 那条消息会落进事件库，而参数本就是模型自己写的，回显零信息增益。消息面的判别性用例在 AgentLib 侧 （{@code ToolCallAuthorizerApprovalTest}）。
+   *
+   * <p>判别性：把拒因里的命中值抹掉（"反正模型看不到"），本用例转红——那样日志里就查不出被拒的原因。
+   */
+  @Test
+  void blockReasonsCarryTheMatchedValueForLogs() {
+    String sentinel = "s4c-sentinel-9f3a";
+    List<String> commands =
+        List.of(
+            "rm -rf /var/" + sentinel,
+            "mv /etc/" + sentinel + " /tmp/x",
+            "chmod -R 777 /usr/" + sentinel,
+            "dd if=/dev/zero of=/dev/sd" + sentinel,
+            "echo x > /dev/sd" + sentinel);
+    for (String command : commands) {
+      ToolGate gate = classify(command);
+      assertThat(gate).as("这些形态都该判硬拒，否则本用例失去判别力: %s", command).isInstanceOf(ToolGate.Block.class);
+      assertThat(((ToolGate.Block) gate).reason())
+          .as("日志面要能看出命中了哪个值: %s", command)
+          .contains(sentinel);
+    }
+    // 如实记账：mkfs 的拒因回显的是"程序名"（命中值就是程序名本身），不含设备路径——这不是缺陷，
+    // 设备路径在段内没被单独取出。写清楚以免日后有人以为它"漏了"。
+    ToolGate.Block mkfs = (ToolGate.Block) classify("mkfs.ext4 /dev/sd" + sentinel);
+    assertThat(mkfs.reason()).contains("mkfs").doesNotContain(sentinel);
+  }
 }
