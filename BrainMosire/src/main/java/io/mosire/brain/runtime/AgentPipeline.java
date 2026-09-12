@@ -16,6 +16,7 @@ import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
+import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
@@ -77,6 +78,13 @@ public final class AgentPipeline {
   private final LlmClient llm;
   private final ToolRegistry registry;
   private final ToolExecutionGuard guard;
+
+  /**
+   * 工具调用唯一入口（S4）：判定 →（审批闸）→ 执行。本管线与 MCP 桥（{@code AgentToMcpServer}）共用同一条入口， 避免"新判定只落一条路"（{@code
+   * guard} 字段保留：它是本类既有装配契约的一部分，{@link ToolCallAuthorizer} 由它装配）。
+   */
+  private final ToolCallAuthorizer authorizer;
+
   private final ContextAssembler assembler;
   private final EventStore events;
   private final EventBus bus;
@@ -307,6 +315,7 @@ public final class AgentPipeline {
     this.llm = Objects.requireNonNull(llm, "llm");
     this.registry = Objects.requireNonNull(registry, "registry");
     this.guard = Objects.requireNonNull(guard, "guard");
+    this.authorizer = ToolCallAuthorizer.of(this.guard);
     this.assembler = Objects.requireNonNull(assembler, "assembler");
     this.events = Objects.requireNonNull(events, "events");
     this.bus = Objects.requireNonNull(bus, "bus");
@@ -779,7 +788,7 @@ public final class AgentPipeline {
     ToolContext context = new ToolContext(caller, permissionSet, toolConfig, call.arguments());
     ToolResult result;
     try {
-      result = guard.execute(registry, call.name(), context);
+      result = authorizer.execute(registry, call.name(), context);
     } catch (RuntimeException e) {
       LOG.error("工具执行抛出未捕获异常 tool={}", call.name(), e);
       result = ToolResult.error("TOOL_CRASH", "工具内部异常: " + e.getMessage());

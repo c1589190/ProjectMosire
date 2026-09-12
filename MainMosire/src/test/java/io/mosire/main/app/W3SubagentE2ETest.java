@@ -104,15 +104,16 @@ class W3SubagentE2ETest {
       app.runtime().chat("请派一个提权探测子 Agent");
       SubagentInstance grand = awaitChild(app, "grand");
       Path grandEvents = childEvents(dataDir, grand.instanceId());
-      // grand 子体提权派生 → 父侧编排工具内联 SYSTEM 校验拒绝 → permission.denied 落在子体事件库
-      // reason 钉住拒绝 actor：文本是父侧 systemOnly 的文案（子体侧 guard 因适配器默认身份放行——R7 防线变更会使本断言转红）
+      // grand 子体提权派生 → 父侧工具调用入口按工具 spec 判定（SYSTEM 级）拒绝 → permission.denied 落在子体事件库
+      // reason 钉住拒绝 actor：文本来自父侧 PermissionChecker 的"身份级别不足"（2026-09-12 S4 判定点统一前，
+      // 这条由工具内联的 systemOnly 文案"仅限主 Agent"拒绝——R7 防线变更会使本断言转红，此为第二次变更）
       awaitEventContaining(
           grandEvents,
           EventTypes.PERMISSION_DENIED,
           "tool",
           "spawn_sub_agent",
           "reason",
-          "仅限主 Agent");
+          "要求 SYSTEM");
       // 拒绝后子体继续（echo 仍可服务）：tool.result 成功
       awaitEvent(grandEvents, EventTypes.TOOL_RESULT, "tool", "echo", "ok", true);
 

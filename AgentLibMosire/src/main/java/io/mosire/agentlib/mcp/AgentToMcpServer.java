@@ -12,6 +12,7 @@ import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
+import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
@@ -54,6 +55,12 @@ public final class AgentToMcpServer implements AutoCloseable {
   /** 暴露过滤器：命中才暴露（默认全量）。注册后修改无效——以 server 启动时的实例为准。 */
   private final Predicate<String> include;
 
+  /**
+   * 工具调用唯一入口（S4 判定点统一）：{@code tools/call} 的执行都经它，与 Brain 管线同一条路（理由见 {@link ToolCallAuthorizer}
+   * 类注释）。默认 = {@link ToolCallAuthorizer#standard()}（仅三要素判定）。
+   */
+  private final ToolCallAuthorizer authorizer;
+
   /** 空实现兜底：在 startWith 的赋值前任何 close() 都是安全的（UwF 告警解除）。 */
   private AutoCloseable registrySubscription = () -> {};
 
@@ -85,12 +92,31 @@ public final class AgentToMcpServer implements AutoCloseable {
    */
   public static AgentToMcpServer start(
       ToolRegistry registry, String serverName, String serverVersion, ToolContext caller) {
+    return start(registry, serverName, serverVersion, caller, ToolCallAuthorizer.standard());
+  }
+
+  /**
+   * 启动（自定义<b>工具调用入口</b>）：除 {@code authorizer} 外语义与 4 参重载相同。
+   *
+   * <p>经 MCP 到达的 {@code tools/call} 一律经该 authorizer 执行（{@link #handleCall}）——这是 S4 的"判定点统一"： MCP
+   * 路径过去<b>直接调 {@code tool.execute}、连 guard 都不经</b>，与管线路径各判各的。
+   *
+   * @param authorizer 工具调用唯一入口（审批闸等横切判定都在其中）
+   */
+  public static AgentToMcpServer start(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer) {
     return startWith(
         registry,
         serverName,
         serverVersion,
         caller,
-        new StdioServerTransportProvider(McpJsonDefaults.getMapper()));
+        new StdioServerTransportProvider(McpJsonDefaults.getMapper()),
+        name -> true,
+        authorizer);
   }
 
   /**
@@ -130,12 +156,32 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolContext caller,
       java.io.InputStream in,
       java.io.OutputStream out) {
+    return start(
+        registry, serverName, serverVersion, caller, ToolCallAuthorizer.standard(), in, out);
+  }
+
+  /**
+   * 以给定的流对启动 + 自定义工具调用入口（W3b 父侧桥接的生产形态）。
+   *
+   * @param authorizer 工具调用唯一入口（见 {@link #start(ToolRegistry, String, String, ToolContext,
+   *     ToolCallAuthorizer)}）
+   */
+  public static AgentToMcpServer start(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer,
+      java.io.InputStream in,
+      java.io.OutputStream out) {
     return startWith(
         registry,
         serverName,
         serverVersion,
         caller,
-        new StdioServerTransportProvider(McpJsonDefaults.getMapper(), in, out));
+        new StdioServerTransportProvider(McpJsonDefaults.getMapper(), in, out),
+        name -> true,
+        authorizer);
   }
 
   /** 供测试注入自定义 transport（如管道流）；语义与默认 stdio 相同。 */
@@ -159,7 +205,29 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolContext caller,
       McpServerTransportProvider transport,
       Predicate<String> include) {
+    return startWith(
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        transport,
+        include,
+        ToolCallAuthorizer.standard());
+  }
+
+  /**
+   * 全参形态：注入 transport、暴露过滤器与<b>工具调用入口</b>（前两者见上一重载；{@code authorizer} 决定 {@code tools/call} 的执行语义）。
+   */
+  static AgentToMcpServer startWith(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      McpServerTransportProvider transport,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer) {
     Objects.requireNonNull(include, "include");
+    Objects.requireNonNull(authorizer, "authorizer");
     // sync() 声明返回 Self 型链（serverInfo/toolCall 声明为 SyncSpecification<S>），末端缩窄为 S 实例
     McpServer.SingleSessionSyncSpecification spec =
         (McpServer.SingleSessionSyncSpecification)
@@ -168,10 +236,12 @@ public final class AgentToMcpServer implements AutoCloseable {
       if (!exportable(tool, include)) {
         continue;
       }
-      spec.toolCall(toMcpTool(tool), (exchange, request) -> handleCall(registry, caller, request));
+      spec.toolCall(
+          toMcpTool(tool),
+          (exchange, request) -> handleCall(registry, caller, authorizer, request));
     }
     McpSyncServer server = spec.build();
-    AgentToMcpServer self = new AgentToMcpServer(registry, caller, server, include);
+    AgentToMcpServer self = new AgentToMcpServer(registry, caller, server, include, authorizer);
     // 先建对象再订阅（lambda 捕获 self）；订阅前错过的变化由 sync 的幂等 diff 兜底
     self.registrySubscription = registry.onChange(self::sync);
     // 日志口径 = **实际外发面**（{@code server.listTools()}，与客户端 tools/list 同源），不是 {@code registry.size()}：
@@ -192,11 +262,16 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   private AgentToMcpServer(
-      ToolRegistry registry, ToolContext caller, McpSyncServer server, Predicate<String> include) {
+      ToolRegistry registry,
+      ToolContext caller,
+      McpSyncServer server,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer) {
     this.registry = registry;
     this.caller = caller;
     this.server = server;
     this.include = include;
+    this.authorizer = authorizer;
   }
 
   /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）；可外发且命中的才在暴露面内。 */
@@ -238,13 +313,22 @@ public final class AgentToMcpServer implements AutoCloseable {
 
   private McpSchema.CallToolResult handle(
       McpSyncServerExchange exchange, McpSchema.CallToolRequest request) {
-    return handleCall(registry, caller, request);
+    return handleCall(registry, caller, authorizer, request);
   }
 
+  /**
+   * {@code tools/call} 的执行路径：<b>一切经 {@link ToolCallAuthorizer}</b>（S4 判定点统一）。
+   *
+   * <p>此前这里是裸的 {@code tool.execute(context)}——权限判定完全缺席（工具名级白名单/三要素位在这条路上从不生效）， 各系统级工具只能在自己的 execute
+   * 里补一道"第二道闸"。改为经入口后，{@link ToolSpec} 的四个字段（身份级别 / 敏感 / 破坏 / 禁外发中的前三个）在这条路上<b>第一次真正参与判定</b>，且与
+   * Brain 管线同一套规则。
+   */
   private static McpSchema.CallToolResult handleCall(
-      ToolRegistry registry, ToolContext caller, McpSchema.CallToolRequest request) {
-    AgentTool tool = registry.find(request.name()).orElse(null);
-    if (tool == null) {
+      ToolRegistry registry,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer,
+      McpSchema.CallToolRequest request) {
+    if (registry.find(request.name()).isEmpty()) {
       return error("工具不存在: " + request.name());
     }
     // 参数与上下文拼装：MCP 客户端可传任意参数，ToolContext.arguments 为调用白名单来源（M3 细化）
@@ -254,7 +338,7 @@ public final class AgentToMcpServer implements AutoCloseable {
             caller.permissions(),
             caller.config(),
             request.arguments() == null ? Map.of() : request.arguments());
-    return toCallToolResult(tool.execute(context));
+    return toCallToolResult(authorizer.execute(registry, request.name(), context));
   }
 
   /** AgentTool → MCP Tool（schema 直传；null 值由 SDK 序列化容忍——参考 McpToolAdapter 的反向说明）。 */
