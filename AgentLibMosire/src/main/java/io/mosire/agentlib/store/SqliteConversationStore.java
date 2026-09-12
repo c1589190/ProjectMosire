@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * 会话存储的 SQLite 实现：{@code conversations} + {@code messages} 两表，与事件库<b>同一文件</b>（计划 §六 一份 DDL）、
@@ -104,6 +105,29 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
   private static final String MESSAGES_INDEX =
       "CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id ON messages (conversation_id, id)";
 
+  /**
+   * 会话指针（{@link #currentConversationId}）：key-value 单表单行，与内容同库——"重置跨进程有效"要求指针与消息在同一个原子可见面上，
+   * 独立小文件会多出"两份状态谁先落地"的问题。
+   */
+  private static final String SESSION_STATE_DDL =
+      """
+      CREATE TABLE IF NOT EXISTS session_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+      """;
+
+  /** 指针的 key（单行表；将来若有别的会话级标量，同一张表另起 key）。 */
+  private static final String CURRENT_CONVERSATION_KEY = "current_conversation_id";
+
+  private static final String SELECT_CURRENT_CONVERSATION =
+      "SELECT value FROM session_state WHERE key = '" + CURRENT_CONVERSATION_KEY + "'";
+
+  private static final String UPSERT_CURRENT_CONVERSATION =
+      "INSERT INTO session_state (key, value) VALUES ('"
+          + CURRENT_CONVERSATION_KEY
+          + "', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
   private static final String INSERT_CONVERSATION =
       "INSERT OR IGNORE INTO conversations (id, created_ts, updated_ts) VALUES (?, ?, ?)";
   private static final String TOUCH_CONVERSATION =
@@ -182,6 +206,32 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
       statement.execute(CONVERSATIONS_DDL);
       statement.execute(MESSAGES_DDL);
       statement.execute(MESSAGES_INDEX);
+      statement.execute(SESSION_STATE_DDL);
+    }
+  }
+
+  @Override
+  public Optional<String> currentConversationId() {
+    synchronized (lock) {
+      try (PreparedStatement ps = connection.prepareStatement(SELECT_CURRENT_CONVERSATION);
+          ResultSet rs = ps.executeQuery()) {
+        return rs.next() ? Optional.of(rs.getString(1)) : Optional.empty();
+      } catch (SQLException e) {
+        throw new IllegalStateException("读取会话指针失败: " + dbFile, e);
+      }
+    }
+  }
+
+  @Override
+  public void setCurrentConversationId(String conversationId) {
+    Objects.requireNonNull(conversationId, "conversationId");
+    synchronized (lock) {
+      try (PreparedStatement ps = connection.prepareStatement(UPSERT_CURRENT_CONVERSATION)) {
+        ps.setString(1, conversationId);
+        ps.executeUpdate();
+      } catch (SQLException e) {
+        throw new IllegalStateException("写入会话指针失败: " + conversationId, e);
+      }
     }
   }
 

@@ -76,6 +76,15 @@ public final class DebugChatService implements AutoCloseable {
   }
 
   /**
+   * 当前会话 id（{@code GET /api/chat/session} 的只读口）：反映的是运行时即时值——重置已受理但尚未执行时仍是旧 id（"切换是一个动作，不是一个声明"）。
+   *
+   * <p>无条件可读（不要求服务未关停）：它是只读的，关停后读到的仍是最后一次已执行的值，报 503 反而会让"重置到底生效没有"更难查。
+   */
+  public String conversationId() {
+    return runtime.conversationId();
+  }
+
+  /**
    * 重置会话（P3-3 / D26）：换新会话 id + 清空主 Agent 的内存工作集，旧会话在库里原样留档（不删）。
    *
    * <p><b>id 在这里生成、切换排在执行器上</b>——两侧各有理由，缺一不可：
@@ -86,6 +95,10 @@ public final class DebugChatService implements AutoCloseable {
    *       {@code AgentPipeline.history}（实例级共享、非线程安全，R11）——在 HTTP 线程上直接改，就会与在途回合交错（在途回合的 {@code
    *       saveHistory} 会把上一个会话的尾部追加进新会话）。同一执行器 FIFO ⇒ 排在本方法之后的对话回合必然在重置之后执行。
    * </ul>
+   *
+   * <p><b>重置跨重启有效</b>：切换动作里连同<b>会话指针落库</b>一起发生（{@code AgentPipeline#resetConversation} → {@code
+   * ConversationStore#setCurrentConversationId}）——否则本进程看着已重置，重启后又从旧会话续起（用户已清掉的历史复活）。指针写在内存切换之前，
+   * 写失败则内存不切（宁可不生效，不留下"重启才暴露"的分裂态）。
    *
    * <p><b>响应语义是"已受理"而非"已生效"</b>（口径同 {@code DebugChatHttpServer} 的 POST /api/chat/session）：返回的新 id
    * 是"切换已被受理"的凭据——切换动作只是排进共享执行器队列，此刻可能尚未执行。对调用方仍够用：同一执行器 FIFO ⇒ 拿到本响应之后提交的对话回合

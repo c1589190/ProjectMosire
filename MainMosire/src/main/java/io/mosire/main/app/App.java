@@ -88,8 +88,9 @@ import org.slf4j.LoggerFactory;
  * 任务服务（合成 FAILED + 关停共享执行器）→ A2A 网关 → AG-UI 网关 （stop(1) 给在途流排空）→ AG-UI 注册表（封创建口）→ 既有关停链。
  *
  * <p>P3-3（本类新增）：<b>会话历史落盘</b>——非 {@code --demo} 时多开一个 {@link SqliteConversationStore}（与事件库同一文件，计划
- * §六 一份 DDL），主 Agent 的多轮对话因此跨进程存活，初始会话 id 恒为 {@link #MAIN_CONVERSATION_ID}（稳态 id 是"重启续聊"的前提）；
- * {@code --demo} 恒不落库（零行为变化）。重置入口不在本类：{@code POST /api/chat/session} → {@link
+ * §六 一份 DDL），主 Agent 的多轮对话因此跨进程存活；启动会话 id 由<b>库里的会话指针</b>决定（首次启动才落到 {@link
+ * #MAIN_CONVERSATION_ID}，重置写下的新 id 经指针跨重启有效）。{@code --demo} 恒不落库（零行为变化）。重置入口不在本类：{@code POST
+ * /api/chat/session} → {@link
  * io.mosire.main.gateway.debug.DebugChatService#resetSession()}（切换动作排在共享 chat 执行器上，R11）。
  */
 public final class App implements AutoCloseable {
@@ -102,8 +103,10 @@ public final class App implements AutoCloseable {
   /**
    * 主 Agent 的初始会话 id（P3-3）：恒为 {@code "main"}（= 主 Agent 的 {@code AgentConfig} id，同源）。
    *
-   * <p><b>初始 id 必须稳定</b>——"重启进程后历史仍在"靠的就是每段进程用同一个 id 去库里寻址；若每次启动取随机 id，每次都是全新会话，
-   * 落盘等于白落。代价是：重置后重启会回到 {@code "main"} 这条初始会话（而不是上次重置出的新会话）——"当前会话指针"机制不在 P3-3 范围。
+   * <p><b>初始 id 必须稳定</b>——"重启进程后历史仍在"靠的就是每段进程用同一个 id 去库里寻址；若每次启动取随机 id，每次都是全新会话， 落盘等于白落。
+   *
+   * <p><b>它只是"没有会话指针时的缺省"</b>：{@code conversations} 非空时，管线构造会优先采用库里的会话指针（{@code
+   * ConversationStore#currentConversationId}），重置写下的新 id 因此跨重启有效；本常量只在首次启动（指针尚未写过）时生效。
    */
   public static final String MAIN_CONVERSATION_ID = "main";
 

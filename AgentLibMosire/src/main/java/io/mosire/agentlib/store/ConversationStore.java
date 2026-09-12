@@ -2,6 +2,7 @@ package io.mosire.agentlib.store;
 
 import io.mosire.agentlib.llm.LlmMessage;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 会话持久化（计划 §六 数据模型：{@code conversations}/{@code messages} 两表；Brain 的 {@code AgentPipeline} 是唯一消费方）。
@@ -50,4 +51,30 @@ public interface ConversationStore {
    * @param summary 摘要正文（非 null；空串表示压缩点之前不再有摘要消息）
    */
   void compact(String conversationId, String summary);
+
+  /**
+   * 当前活动会话 id（<b>会话指针</b>）：上次被 {@link #setCurrentConversationId} 记下的那个 id；从未记过 → 空。
+   *
+   * <p><b>为什么需要它</b>：{@link #load} 按 id 寻址，而"重启后该接着哪条会话聊"这件事本身不在任何一条会话里。没有指针时，装配层只能用 <b>固定</b>的初始
+   * id 寻址 ⇒ 重置（D26：换新会话 id）后的重启会退回初始会话，把<b>用户已经清掉的那段历史重新灌回工作集</b> （"重置被重启撤销"）。指针是"重置跨进程有效"的唯一载体。
+   *
+   * <p><b>指针只是续聊的起点，不是内容</b>：它不参与 {@link #load} 的形状，也不因 {@link #append} 而变——只有显式的 {@link
+   * #setCurrentConversationId} 会改它。
+   *
+   * @return 当前活动会话 id；本实现不持久化会话指针时恒为空（如不落库的实现）
+   */
+  default Optional<String> currentConversationId() {
+    return Optional.empty();
+  }
+
+  /**
+   * 记下当前活动会话 id（下次 {@link #currentConversationId} 返回它）。幂等：同 id 重复记写无额外语义。
+   *
+   * <p>{@link #append} 之前调用即可——它<b>不要求</b>该会话已有内容（重置出来的新会话在首条消息落库前就是"当前会话"）。
+   *
+   * @param conversationId 会话标识（非 null）
+   */
+  default void setCurrentConversationId(String conversationId) {
+    // 缺省空实现：不持久化的 store 没有"当前会话"这一说（无状态可续）
+  }
 }

@@ -127,6 +127,46 @@ class MainSessionLifecycleTest {
   }
 
   /**
+   * 验收③的<b>跨进程</b>半边：重置后重启，接的是重置出的新会话，而不是把用户已经清掉的那个会话重新灌回来（D26 拒绝"只清内存"的理由正是后者）。
+   *
+   * <p>判别性：这条用例是 2026-09-12 真模型冒烟暴露的缺陷的回填——当时的实现里"当前会话"没有任何持久载体，重启必退回 {@code
+   * MAIN_CONVERSATION_ID}（断言① {@code conversationId()} 会红），且重启后的首个请求把重置前的问答原样带上（断言② 会红）。
+   */
+  @Test
+  void restartedAppResumesTheResetSessionInsteadOfResurrectingTheClearedHistory() throws Exception {
+    Path dataDir = tempDir.resolve("data");
+
+    RecordingLlmClient firstProcess = new RecordingLlmClient();
+    firstProcess.enqueue(LlmResponse.text("重置前回答"));
+    firstProcess.enqueue(LlmResponse.text("重置后回答"));
+    try (App app = App.start(bootConfig(dataDir), firstProcess)) {
+      assertThat(app.runtime().chat("重置前的提问").stopReason()).isEqualTo(StopReason.FINISHED);
+
+      app.runtime().resetSession("s-after-reset");
+      assertThat(app.runtime().chat("重置后的提问").stopReason()).isEqualTo(StopReason.FINISHED);
+    }
+
+    RecordingLlmClient secondProcess = new RecordingLlmClient();
+    secondProcess.enqueue(LlmResponse.text("重启后的回答"));
+    try (App app = App.start(bootConfig(dataDir), secondProcess)) {
+      assertThat(app.runtime().conversationId())
+          .as("重启接的是重置出的会话，不是固定初始会话")
+          .isEqualTo("s-after-reset");
+
+      assertThat(app.runtime().chat("重启后的提问").stopReason()).isEqualTo(StopReason.FINISHED);
+    }
+
+    assertThat(secondProcess.requests).hasSize(1);
+    List<LlmMessage> firstRequestAfterRestart = secondProcess.requests.get(0).messages();
+    assertThat(firstRequestAfterRestart).doesNotContain(LlmMessage.user("重置前的提问"));
+    assertThat(firstRequestAfterRestart.subList(1, firstRequestAfterRestart.size()))
+        .containsExactly(
+            LlmMessage.user("重置后的提问"),
+            LlmMessage.assistant(List.of(new ContentPart.Text("重置后回答"))),
+            LlmMessage.user("重启后的提问"));
+  }
+
+  /**
    * 反向用例：{@code --demo} 行为零变化——demo 分叉下<b>根本不打开</b>会话存储。
    *
    * <p>判据是"库里连 {@code conversations}/{@code messages} 表都不存在"（DDL 由 {@code

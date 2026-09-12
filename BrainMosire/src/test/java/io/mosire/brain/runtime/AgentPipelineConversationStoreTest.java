@@ -299,6 +299,77 @@ class AgentPipelineConversationStoreTest {
     }
   }
 
+  /**
+   * 重置的<b>跨进程</b>效果：{@link AgentPipeline#resetConversation(String)} 把新 id
+   * 写进会话指针，下一个实例即使被喂了<b>另一个</b> 初始 id，也按指针寻址——它必须接着"重置出的新会话"聊，而不是把用户已经清掉的那段历史重新灌回来（D26
+   * 拒绝"只清内存"的正是这个后果）。
+   *
+   * <p>判别性：把 {@code setCurrentConversationId} 从 {@code resetConversation} 里去掉（或写成"只改内存"），第二个实例就会
+   * hydrate 到 {@code CONV} 名下——{@code conversationId()} 与首个请求内容两处同时红。
+   */
+  @Test
+  void resetPersistsThePointerAndTheNextInstanceResumesTheResetConversation() {
+    RecordingLlmClient firstRun = new RecordingLlmClient();
+    firstRun.enqueue(LlmResponse.text("重置前回答"));
+    firstRun.enqueue(LlmResponse.text("重置后回答"));
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      AgentPipeline pipeline = pipeline(firstRun, events, bus, store);
+      assertThat(pipeline.run("重置前提问").stopReason()).isEqualTo(StopReason.FINISHED);
+
+      pipeline.resetConversation("s-after-reset");
+      assertThat(pipeline.run("重置后提问").stopReason()).isEqualTo(StopReason.FINISHED);
+    }
+
+    // "重启"：同一库文件上全新 Store + 全新管线，构造时仍喂旧 id（CONV）——指针应当把它拽到 s-after-reset
+    RecordingLlmClient secondRun = new RecordingLlmClient();
+    secondRun.enqueue(LlmResponse.text("重启后回答"));
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore store = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      AgentPipeline restarted = pipeline(secondRun, events, bus, store);
+
+      assertThat(restarted.conversationId()).isEqualTo("s-after-reset");
+      assertThat(restarted.lastHistory())
+          .as("hydrate 到重置后的会话：只有重置后那一问一答")
+          .containsExactly(
+              LlmMessage.user("重置后提问"),
+              LlmMessage.assistant(List.of(new ContentPart.Text("重置后回答"))));
+
+      assertThat(restarted.run("重启后提问").stopReason()).isEqualTo(StopReason.FINISHED);
+      List<LlmMessage> request = secondRun.requests.get(0).messages();
+      assertThat(request).doesNotContain(LlmMessage.user("重置前提问"));
+      assertThat(request.subList(1, request.size()))
+          .containsExactly(
+              LlmMessage.user("重置后提问"),
+              LlmMessage.assistant(List.of(new ContentPart.Text("重置后回答"))),
+              LlmMessage.user("重启后提问"));
+    }
+  }
+
+  /** 失败方向：指针写不进库时<b>内存不切</b>——不许留下"运行期看着已重置、重启却复活旧历史"的分裂态（运行期与重启后一致地停在旧会话，用户可重试）。 */
+  @Test
+  void pointerWriteFailureLeavesTheSessionUntouchedInsteadOfSplittingMemoryFromDisk() {
+    try (SqliteEventStore events = SqliteEventStore.open(db);
+        SqliteConversationStore real = SqliteConversationStore.open(db);
+        EventBus bus = new EventBus()) {
+      RecordingLlmClient llm = new RecordingLlmClient();
+      llm.enqueue(LlmResponse.text("回答"));
+      AgentPipeline pipeline =
+          pipeline(llm, events, bus, new PointerFailingConversationStore(real));
+      pipeline.run("提问");
+
+      assertThatThrownBy(() -> pipeline.resetConversation("s-would-be-reset"))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("指针");
+
+      assertThat(pipeline.conversationId()).as("切换未发生：运行期仍是旧会话").isEqualTo(CONV);
+      assertThat(pipeline.lastHistory()).as("工作集也没被清").hasSize(2);
+      assertThat(real.currentConversationId()).as("库里没有半截指针").isEmpty();
+    }
+  }
+
   /** 新增重载：9 参构造之外的 {@code (store, conversationId)}（R2/R3——conversationId 是显式参数）。 */
   private static AgentPipeline pipeline(
       LlmClient llm, EventStore events, EventBus bus, ConversationStore store) {
@@ -412,6 +483,36 @@ class AgentPipelineConversationStoreTest {
   }
 
   /** 落库失败桩：{@code append} 第 2 次调用抛（第 1 条已委托落库），且不吞、不包装——验证异常穿透 {@code run()}。 */
+  /** 指针写入恒失败的桩（其余委托真 store）：用来钉住"写指针失败 ⇒ 不切内存"这条失败方向。 */
+  private static final class PointerFailingConversationStore implements ConversationStore {
+
+    private final ConversationStore delegate;
+
+    PointerFailingConversationStore(ConversationStore delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public void append(String conversationId, LlmMessage message) {
+      delegate.append(conversationId, message);
+    }
+
+    @Override
+    public List<LlmMessage> load(String conversationId) {
+      return delegate.load(conversationId);
+    }
+
+    @Override
+    public void compact(String conversationId, String summary) {
+      delegate.compact(conversationId, summary);
+    }
+
+    @Override
+    public void setCurrentConversationId(String conversationId) {
+      throw new IllegalStateException("注入的指针写入失败: " + conversationId);
+    }
+  }
+
   private static final class FailingOnSecondAppendConversationStore implements ConversationStore {
 
     private final ConversationStore delegate;

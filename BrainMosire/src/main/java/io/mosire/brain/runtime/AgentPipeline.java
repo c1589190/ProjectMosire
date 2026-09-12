@@ -54,6 +54,10 @@ import org.slf4j.LoggerFactory;
  * <p><b>会话重置（D26）</b>：{@link #resetConversation(String)} 换新会话 id +
  * 清空内存工作集，旧会话在库里原样留档。重置<b>不是</b>重建管线： 本实例持有的 store/装配器/摘要槽一律沿用，"换会话"只落在会话级状态上。与回合一样受串行调用约定约束（R11）。
  *
+ * <p><b>重置跨进程有效（会话指针）</b>：重置同时把新 id 写进 {@link
+ * ConversationStore#setCurrentConversationId}，构造时优先按该指针寻址（无指针才用调用方给的
+ * id）——否则"重置后重启"会退回固定初始会话，把用户已清掉的历史重新灌回工作集。
+ *
  * <p><b>会话压缩（T17）</b>：带 {@code (compactor, compactSummary)} 的构造在<b>每个回合的边界</b>（组请求之前）跑一次 {@link
  * Compactor}：超预算时按 micro → 局部摘要 → 快照续接三档压缩会话工作集，并落 {@code conversation.compact} 事件（摘要调用另落 {@code
  * llm.call} 记账，R7）。压缩只改<b>内存工作集</b>（档 1/2）或经显式 {@code compact} 记录落库（档 3）——持久层的 append-only
@@ -229,7 +233,10 @@ public final class AgentPipeline {
     this.caller = Objects.requireNonNull(caller, "caller");
     this.permissionSet = Objects.requireNonNull(permissionSet, "permissionSet");
     this.store = Objects.requireNonNull(store, "store");
-    this.conversationId = Objects.requireNonNull(conversationId, "conversationId");
+    String requestedId = Objects.requireNonNull(conversationId, "conversationId");
+    // 会话指针优先（D26 续）：库上记着"上次活动会话"就用它——重置后重启必须接着<b>重置出的新会话</b>，而不是用固定初始 id
+    // 回到重置前那条（那等于把用户已经清掉的历史重新灌回工作集，正是 D26 拒绝"只清内存"的理由）。无指针（首次启动/不持久化实现）⇒ 用调用方给的 id。
+    this.conversationId = this.store.currentConversationId().orElse(requestedId);
     // hydrate：既有会话（进程重启前落的库）先灌回内存工作集，否则"重启续聊"名存实亡
     history.addAll(this.store.load(this.conversationId));
   }
@@ -252,9 +259,11 @@ public final class AgentPipeline {
   /**
    * 重置会话（D26：{@code 清空内存工作集 + 切到一个全新 conversationId}）：旧会话在库里<b>原样保留</b>（不删——可追溯），新对话从零开始。
    *
-   * <p><b>四件事一件都不能少</b>（会话级状态就这四处，漏掉任何一处"重置"都名不副实）：
+   * <p><b>五件事一件都不能少</b>（会话级状态就这五处，漏掉任何一处"重置"都名不副实）：
    *
    * <ol>
+   *   <li><b>会话指针落库</b>（{@link ConversationStore#setCurrentConversationId}）：这是"重置跨进程有效"的载体——指针不落库，
+   *       重启就回到固定初始 id，把用户已清掉的历史重新灌回来（"重置被重启撤销"）。<b>先落库再切换内存</b>，见下"失败方向"；
    *   <li>{@link #conversationId} ← {@code newConversationId}：此后落库/读库都按新 id 寻址（旧会话的行一条不动）；
    *   <li>{@link #history} 清空（就地 {@code clear()}——列表是 final，就地改是本类既定口径，见 {@link
    *       #replaceWorkingSet}）： 否则下一回合会把上一个会话的历史原样回灌给模型；
@@ -268,13 +277,19 @@ public final class AgentPipeline {
    * id 恰好已有落库内容，本方法<b>不会</b>把它灌进工作集——新会话的工作集恒为空，直到下一回合把新增尾部追加进去（那时的库内容与内存**不同源**，
    * 是调用方越过了本方法的约定，不是本方法可以静默兜底的场景）。
    *
+   * <p><b>失败方向（指针写在前）</b>：指针写入失败 ⇒ 直接抛出、内存<b>不切</b>——运行期与重启后一致地停在旧会话（"重置没生效"，用户可重试）；
+   * 反过来先把内存切了再写指针，一旦写失败就得到最难排查的那种态：重启前看着已经重置，重启后旧历史复活。
+   *
    * <p><b>并发约定</b>：与 {@link #run(String)} 一样只要求调用方<b>串行</b>——重置改的是实例级共享、非线程安全的 {@code history}，
    * 必须与回合排在同一串行化点上（例如同一个单线程执行器），<b>不得</b>在另一个线程上与在途回合并发调用（见类 Javadoc 的 R11）。
    *
    * @param newConversationId 新会话标识（非 null、显式给定——管线不生成 id，也不猜）
    */
   public void resetConversation(String newConversationId) {
-    this.conversationId = Objects.requireNonNull(newConversationId, "newConversationId");
+    Objects.requireNonNull(newConversationId, "newConversationId");
+    // 指针先落库、内存后切换：写失败时宁可不切（"重置未生效"）也不切换（那会留下"运行期看着已重置、重启却复活旧历史"的分裂态）
+    store.setCurrentConversationId(newConversationId);
+    this.conversationId = newConversationId;
     history.clear();
     uncoveredHiddenContent = false;
     // compactSummary 的非空由构造器的 requireNonNull 保证（本类没有第二条赋值路径），故无需空值分支

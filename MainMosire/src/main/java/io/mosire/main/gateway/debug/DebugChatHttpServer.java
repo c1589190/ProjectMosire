@@ -42,12 +42,14 @@ import org.slf4j.LoggerFactory;
  *       {@code {"results":[...]}}；page/size 非法（非整数/越界）一律 400。
  *   <li>{@code POST /api/chat/session}：{@link DebugChatService#resetSession()} 重置会话（P3-3 / D26）， 返回
  *       {@code {"conversationId":"<新>","previousConversationId":"<旧>"}}；服务已关停 503。
+ *   <li>{@code GET /api/chat/session}：读<b>当前</b>会话 id，返回 {@code {"conversationId":"<当前>"}}。
  * </ul>
  *
- * <p>方法门禁：各端点只接受声明的方法，其余 405（同 {@code AdminHttpServer.requireGet} 形态）。status 一律小写 （{@code
- * running}/{@code finished}/{@code cancelled}/{@code failed}），stopReason 用枚举 {@code name()}，
- * createdAt 用 {@code Instant.toString()}（ISO-8601）。JSON 响应全部手工构建 Map 经 {@link ObjectMapper} 序列化
- * （不注册任何 JavaTimeModule——Instant 已显式转字符串）。
+ * <p>方法门禁：各端点只接受声明的方法，其余 405（同 {@code AdminHttpServer.requireGet} 形态；{@code /session} 一径两法， 405 的
+ * {@code Allow} 同时列 {@code GET, POST}）。status 一律小写 （{@code running}/{@code finished}/{@code
+ * cancelled}/{@code failed}），stopReason 用枚举 {@code name()}， createdAt 用 {@code
+ * Instant.toString()}（ISO-8601）。JSON 响应全部手工构建 Map 经 {@link ObjectMapper} 序列化 （不注册任何
+ * JavaTimeModule——Instant 已显式转字符串）。
  */
 public final class DebugChatHttpServer implements AutoCloseable {
 
@@ -107,10 +109,12 @@ public final class DebugChatHttpServer implements AutoCloseable {
       }
       handleResults(exchange);
     } else if (rest.equals(SESSION_SUFFIX)) {
-      if (!requireMethod(exchange, "POST")) {
-        return;
+      // 同一路径两种方法：GET=读当前会话（P3-3 补的只读口）、POST=重置；其余 405（Allow 双列）
+      switch (exchange.getRequestMethod()) {
+        case "GET" -> handleSessionRead(exchange);
+        case "POST" -> handleSessionReset(exchange);
+        default -> sendMethodNotAllowedForSession(exchange);
       }
-      handleSessionReset(exchange);
     } else if (rest.endsWith(STOP_SUFFIX)) {
       int cut = rest.length() - STOP_SUFFIX.length();
       Long runId = cut > 1 ? parseRunId(rest.substring(1, cut)) : null;
@@ -175,6 +179,23 @@ public final class DebugChatHttpServer implements AutoCloseable {
    * （R11）。这对调用方是够用的：同一执行器 FIFO ⇒ 拿到本响应之后提交的对话回合必然在切换<b>之后</b>执行，不会与在途回合交错。 服务已关停（含关停窗内 执行器已拒）一律
    * 503：绝不回报一个没发生的重置。
    */
+  /**
+   * GET /api/chat/session：读<b>当前</b>会话 id——返回 {@code {"conversationId":"<当前>"}}。
+   *
+   * <p>与重置同一路径的只读面：没有它，"重置到底生效没有""现在这段聊在哪个会话里"在 HTTP 面上无从观察（重置响应报的是新 id，不是"当前"）。
+   * 读的是运行时的即时值，故它反映的可执行状态与下一回合实际落库的会话一致。
+   */
+  private void handleSessionRead(HttpExchange exchange) throws IOException {
+    send(exchange, 200, Map.of("conversationId", chat.conversationId()));
+  }
+
+  /** 会话路径的 405（Allow 需同时列出 GET/POST——不能用单值的 {@link #requireMethod}）。 */
+  private static void sendMethodNotAllowedForSession(HttpExchange exchange) throws IOException {
+    exchange.getResponseHeaders().set("Allow", "GET, POST");
+    exchange.sendResponseHeaders(405, -1);
+    exchange.close();
+  }
+
   private void handleSessionReset(HttpExchange exchange) throws IOException {
     DebugSessionReset reset;
     try {

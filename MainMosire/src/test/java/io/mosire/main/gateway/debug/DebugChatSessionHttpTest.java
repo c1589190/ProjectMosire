@@ -195,8 +195,11 @@ class DebugChatSessionHttpTest {
       fixture.submitAndAwaitTerminal("重置前的提问");
       assertThat(fixture.conversations.load(MAIN_CONVERSATION_ID)).hasSize(2);
 
-      // 方法门禁：只有 POST 是可声明的（GET 405，同其余端点口径）
-      assertThat(fixture.get("/api/chat/session").statusCode()).isEqualTo(405);
+      // 只读口（P3-3 补）：重置前一问一答聊在初始会话里，GET 必须这么报
+      HttpResponse<String> before = fixture.get("/api/chat/session");
+      assertThat(before.statusCode()).isEqualTo(200);
+      assertThat(JSON.readTree(before.body()).get("conversationId").asText())
+          .isEqualTo(MAIN_CONVERSATION_ID);
 
       HttpResponse<String> reset = fixture.post("/api/chat/session", "");
       assertThat(reset.statusCode()).isEqualTo(200);
@@ -220,6 +223,43 @@ class DebugChatSessionHttpTest {
           .containsExactly(
               LlmMessage.user("重置后的提问"),
               LlmMessage.assistant(List.of(new ContentPart.Text("回答二"))));
+    }
+  }
+
+  /**
+   * {@code GET /api/chat/session}：读<b>当前</b>会话 id——重置后它报的是<b>新</b> id（与重置响应报的那个一致），而不是仍报初始会话。
+   *
+   * <p>判别性：把该路由接到常量（或"上次 reset 返回的那个 id"）而不是运行时即时值，重置后这一条会红；只读口存在与否本身也被 "未声明方法 405 + Allow 同时列出
+   * GET/POST" 钉住（重置走 POST 的语义不受影响）。
+   */
+  @Test
+  void sessionRouteReadsTheCurrentConversationIdAndRejectsUndeclaredMethods() throws Exception {
+    FakeLlmClient llm = FakeLlmClient.with(LlmResponse.text("回答一"));
+    try (Fixture fixture = new Fixture(llm, tempDir)) {
+      assertThat(
+              JSON.readTree(fixture.get("/api/chat/session").body()).get("conversationId").asText())
+          .isEqualTo(MAIN_CONVERSATION_ID);
+
+      String newId =
+          JSON.readTree(fixture.post("/api/chat/session", "").body())
+              .get("conversationId")
+              .asText();
+      awaitConversationId(fixture, newId);
+
+      assertThat(
+              JSON.readTree(fixture.get("/api/chat/session").body()).get("conversationId").asText())
+          .as("只读口反映的是已生效的当前会话")
+          .isEqualTo(newId);
+
+      // 一径两法：未声明的方法 405，且 Allow 必须把两种合法方法都列出来（否则调用方不知道有条 GET）
+      HttpResponse<String> put =
+          fixture.client.send(
+              HttpRequest.newBuilder(URI.create(fixture.base() + "/api/chat/session"))
+                  .PUT(HttpRequest.BodyPublishers.noBody())
+                  .build(),
+              HttpResponse.BodyHandlers.ofString());
+      assertThat(put.statusCode()).isEqualTo(405);
+      assertThat(put.headers().firstValue("Allow")).contains("GET, POST");
     }
   }
 

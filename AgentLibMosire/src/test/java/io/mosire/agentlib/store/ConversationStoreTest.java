@@ -99,6 +99,62 @@ class ConversationStoreTest {
     }
   }
 
+  // ---------- 会话指针（D26：重置跨进程有效） ----------
+
+  /**
+   * 指针缺省为空、写下即跨 {@code open} 存活、可被覆盖（重置两次 = 指针跟到<b>最后一次</b>）。
+   *
+   * <p>判别性：只断言"指针读回来的值"抓不住"指针只活在内存里"的实现——中间那次重开（全新连接、全新对象）才是判据。
+   */
+  @Test
+  void currentConversationIdIsAbsentThenSurvivesReopenAndIsOverwritten() {
+    Path db = db();
+    try (SqliteConversationStore store = SqliteConversationStore.open(db)) {
+      assertThat(store.currentConversationId()).as("新库没有指针（首次启动才落到缺省会话）").isEmpty();
+
+      store.setCurrentConversationId("s-1");
+      assertThat(store.currentConversationId()).contains("s-1");
+    }
+
+    try (SqliteConversationStore reopened = SqliteConversationStore.open(db)) {
+      assertThat(reopened.currentConversationId()).as("指针跨 open 存活").contains("s-1");
+
+      reopened.setCurrentConversationId("s-2");
+      assertThat(reopened.currentConversationId()).contains("s-2");
+    }
+
+    try (SqliteConversationStore third = SqliteConversationStore.open(db)) {
+      assertThat(third.currentConversationId()).as("重开读到的是最后一次写下的").contains("s-2");
+    }
+  }
+
+  /**
+   * 指针指向的会话<b>不必</b>已有内容（重置出来的新会话在首条消息落库前就是"当前会话"）——且写指针不得顺手产出一条消息。
+   *
+   * <p>判别性：把指针实现成"往会话里塞一条标记消息"（可读、可跨 open，表面上都过）的实现会在这里红：{@code load} 不再是空， {@code messages} 行数也不再是
+   * 0——而那条标记消息会被当成真实历史回灌给模型。
+   */
+  @Test
+  void pointingAtAContentlessConversationAddsNoMessage() throws Exception {
+    Path db = db();
+    try (SqliteConversationStore store = SqliteConversationStore.open(db)) {
+      store.setCurrentConversationId("s-empty");
+
+      assertThat(store.load("s-empty")).as("指针不是内容：空会话读回来仍是空").isEmpty();
+    }
+
+    try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + db);
+        PreparedStatement ps =
+            c.prepareStatement(
+                "SELECT (SELECT COUNT(*) FROM messages),"
+                    + " (SELECT COUNT(*) FROM conversations WHERE id = 's-empty')");
+        ResultSet rs = ps.executeQuery()) {
+      assertThat(rs.next()).isTrue();
+      assertThat(rs.getInt(1)).as("写指针不得产生消息行").isZero();
+      assertThat(rs.getInt(2)).as("写指针不得趁便建会话行").isZero();
+    }
+  }
+
   // ---------- R7：同一 SQLite 文件 + 自建连接（WAL / DDL 幂等） ----------
 
   @Test
