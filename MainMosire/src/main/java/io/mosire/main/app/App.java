@@ -173,7 +173,7 @@ public final class App implements AutoCloseable {
    * 启动（额外工具注入入口——测试注入 echo 等演示工具用；{@code extraTools} 在主 Agent 工具面与 MCP 暴露快照之前注册）。
    *
    * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装配失败=快速失败契约（端口占用/坏配置等一律 RuntimeException 原样上抛， 由
-   * CLI（Main）以非零退出与 stderr 呈现——既有 M0/M1 启动语义）；中间已回收启动期网关/进程资源后重抛，无更窄的异常类型。
+   * CLI（Main）以非零退出与 stderr 呈现——既有 M0/M1 启动语义）；中间已回收启动期网关/进程资源与已打开的存储连接（事件/会话库）后重抛， 无更窄的异常类型。
    *
    * @param subagentConfigDir 子 Agent 的配置根（三期 S1-A2，R-A2-4）：非 null 时经 {@link #wireSubagents} →
    *     {@link #subagentCommand} 落到子进程 argv 的 {@code --config-dir
@@ -198,9 +198,25 @@ public final class App implements AutoCloseable {
         config.demo() ? null : SqliteConversationStore.open(config.dataDir().resolve("events.db"));
     EventBus bus = new EventBus();
     ToolRegistry tools = new ToolRegistry();
-    tools.registerAll(extraTools == null ? List.of() : extraTools);
-    // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
-    McpLinks links = wireMcpLinks(config.mcpLinks(), tools);
+    McpLinks links;
+    try {
+      // 主 try 之前会抛非致命异常的两处调用（工具注册同名/空元素、链接装配）都在本兜底内：抛错时控制流直接逃出
+      // start()，主 catch 够不着——就地回收前面已打开的两条连接（回收口径同主 catch，且用 quiet 关闭保证原异常原样上抛
+      // ——失败原因不被"关闭也失败"顶掉）。
+      tools.registerAll(extraTools == null ? List.of() : extraTools);
+      // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
+      links = wireMcpLinks(config.mcpLinks(), tools);
+    } catch (RuntimeException e) {
+      closeQuietly(
+          "会话存储",
+          () -> {
+            if (conversations != null) {
+              conversations.close();
+            }
+          });
+      closeQuietly("事件存储", events::close);
+      throw e;
+    }
     AgentToMcpServer mcpServer = null;
     A2aHttpServer a2aServer = null;
     A2aTaskService a2aTaskService = null;
@@ -347,6 +363,8 @@ public final class App implements AutoCloseable {
         subagentProcesses.close();
       }
       closeLinks(links);
+      // 事件存储最后关（与 App.close 的口径一致：其余组件仍可能向它写事件时不得先关它）
+      events.close();
       throw e;
     }
   }

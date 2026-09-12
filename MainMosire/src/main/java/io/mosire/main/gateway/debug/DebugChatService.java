@@ -87,8 +87,16 @@ public final class DebugChatService implements AutoCloseable {
    *       saveHistory} 会把上一个会话的尾部追加进新会话）。同一执行器 FIFO ⇒ 排在本方法之后的对话回合必然在重置之后执行。
    * </ul>
    *
-   * <p><b>失败不撒谎</b>：调度被拒（执行器已关停——关停窗，见 {@link #close()}）时抛 {@link IllegalStateException}，绝不回报一个
-   * 没发生的重置。切换动作本身在执行器线程上抛错只记日志：此刻响应早已发出，能做的只有留下痕迹。
+   * <p><b>响应语义是"已受理"而非"已生效"</b>（口径同 {@code DebugChatHttpServer} 的 POST /api/chat/session）：返回的新 id
+   * 是"切换已被受理"的凭据——切换动作只是排进共享执行器队列，此刻可能尚未执行。对调用方仍够用：同一执行器 FIFO ⇒ 拿到本响应之后提交的对话回合
+   * 必然在切换<b>之后</b>执行，不会与在途回合交错（这正是不在 HTTP 线程上直接切的原因）。
+   *
+   * <p><b>"受理了但没生效"的两种已知情形</b>（响应语义不因此改变，如实记录而非掩盖）：① 运行时已关停——任务照常出队执行，但 {@code
+   * AgentRuntime.resetSession} 在 {@code ensureOpen} 处抛错，只留下一条日志（此刻响应早已发出），运行时侧的会话 id 仍是旧值；② 已受理的任务
+   * 在关停窗内被共享执行器的 {@code shutdownNow()} 从队列里丢弃——永不执行（见 {@link #close()}）。
+   *
+   * <p><b>失败不撒谎（仅指调度）</b>：调度被拒（执行器已关停——关停窗，见 {@link #close()}）时抛 {@link
+   * IllegalStateException}，不回报"已受理"。
    *
    * @return 新会话 id + 提交时刻的旧会话 id（见 {@link DebugSessionReset} 对两次连续重置的语义说明）
    * @throws IllegalStateException 服务已关停，或重置未调度（共享执行器已关停）
@@ -181,7 +189,13 @@ public final class DebugChatService implements AutoCloseable {
         .toList();
   }
 
-  /** 关停：只封提交口（后续 submit 抛 IllegalStateException）；不关停共享执行器（归 App——见类 Javadoc）。 */
+  /**
+   * 关停：只封提交口（后续 {@code submit} 抛 IllegalStateException）；不关停共享执行器（归 App——见类 Javadoc）。
+   *
+   * <p><b>关停窗内已受理的重置可能被丢弃</b>：{@code close()} 本身不碰执行器，但 App 的关停链随后会 {@code shutdownNow()} 共享执行器（A2A
+   * 任务服务先关）——此刻仍排在队列里、尚未出队的重置任务会被直接丢弃，永不执行。即：调用方此前拿到的新会话 id 是按"已受理"回报的， 其重置可能不会生效（口径见 {@link
+   * #resetSession()} 的两种已知情形）。
+   */
   @Override
   public void close() {
     closed = true;

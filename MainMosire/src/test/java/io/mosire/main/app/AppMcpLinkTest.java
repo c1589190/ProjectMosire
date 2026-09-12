@@ -2,6 +2,7 @@ package io.mosire.main.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.mcp.McpServerLinkConfig;
@@ -12,11 +13,13 @@ import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -133,6 +136,70 @@ class AppMcpLinkTest {
     assertThatThrownBy(() -> App.start(config))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("mcp-links");
+  }
+
+  /**
+   * 启动失败路径的存储连接回收（P3-3 补丁）：{@code wireMcpLinks} 抛错时控制流<b>在进入 {@code start()} 的主 try 之前</b>就逃出， 主
+   * catch 够不着——此前已打开的 events/conversations 两条 SQLite 连接必须被释放，否则每次启动失败泄漏两条。
+   *
+   * <p>判据 = 本进程还剩几个指向该库的 fd（Linux {@code /proc/self/fd}）：sqlite-jdbc 的连接把库文件（及 WAL 模式的 {@code
+   * -wal}/{@code -shm} 伴生文件）持有为打开的 fd，直到 {@code connection.close()}；计数 &gt;0 即连接仍开。 {@code start()}
+   * 抛错瞬间取样，不经 GC（否则 finalizer 兜底关闭会把泄漏掩盖成"通过"）。
+   */
+  @Test
+  void startupFailureInsideLinkWiringReleasesStoreConnections() throws Exception {
+    assumeTrue(Files.isDirectory(Path.of("/proc/self/fd")), "需要 /proc/self/fd（Linux）观察连接释放");
+    Path dataDir = tempDir.resolve("data");
+    // 必然让 wireMcpLinks 失败的配置：链接文件不存在（McpLinkLoader 在读文件时就抛 IllegalArgumentException）
+    Path missingLinks = tempDir.resolve("no-such-links.json");
+    BootConfig config = new BootConfig(0, dataDir, false, "", missingLinks, false, "127.0.0.1", 0);
+
+    assertThatThrownBy(() -> App.start(config)).isInstanceOf(IllegalArgumentException.class);
+
+    assertThat(openLibraryFds(dataDir.resolve("events.db")))
+        .as("start() 抛错后不得残留指向 events.db 的打开连接")
+        .isZero();
+  }
+
+  /**
+   * 装配中途失败（端口占用）的连接回收：失败发生在 {@code start()} 的主 try 内，主 catch 的回收清单同样必须覆盖已打开的 events 连接 （P3-3
+   * 之前这里只回收 conversations，events 是漏网的一条）。判据同前：抛错后指向 events.db 的 fd 归零。
+   */
+  @Test
+  void startupFailureAfterStoresOpenReleasesEventConnection() throws Exception {
+    assumeTrue(Files.isDirectory(Path.of("/proc/self/fd")), "需要 /proc/self/fd（Linux）观察连接释放");
+    Path dataDir = tempDir.resolve("data");
+    try (java.net.ServerSocket occupied = new java.net.ServerSocket(0)) {
+      BootConfig config =
+          new BootConfig(occupied.getLocalPort(), dataDir, false, "", null, false, "127.0.0.1", 0);
+      assertThatThrownBy(() -> App.start(config)).isInstanceOf(IllegalStateException.class);
+    }
+    assertThat(openLibraryFds(dataDir.resolve("events.db")))
+        .as("start() 抛错后不得残留指向 events.db 的打开连接")
+        .isZero();
+  }
+
+  /**
+   * 本进程打开的、指向 {@code dbFile}（或其 -wal/-shm 伴生文件）的 fd 数。目录也一并比对：每个测试用例有自己的 dataDir， 只看文件名会把同 fork
+   * 里其他测试的库连接一并数进来（判据必须只认本用例那一份）。
+   */
+  private static long openLibraryFds(Path dbFile) throws IOException {
+    Path dir = dbFile.toAbsolutePath().getParent();
+    String name = dbFile.getFileName().toString();
+    try (Stream<Path> fds = Files.list(Path.of("/proc/self/fd"))) {
+      return fds.filter(
+              fd -> {
+                try {
+                  Path target = Files.readSymbolicLink(fd);
+                  return target.startsWith(dir)
+                      && target.getFileName() != null
+                      && target.getFileName().toString().startsWith(name);
+                } catch (IOException e) {
+                  return false; // 列举与读取之间该 fd 已被关闭：与本判据无关
+                }
+              })
+          .count();
+    }
   }
 
   /** 组装 mcp-links.json：array 格式（字段见报告；毫秒为整数，缺省走 McpServerLinkConfig 默认值）。 */
