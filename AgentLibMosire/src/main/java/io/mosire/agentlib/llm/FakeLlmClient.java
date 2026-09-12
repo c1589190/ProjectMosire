@@ -37,6 +37,12 @@ public final class FakeLlmClient implements LlmClient {
     return calls;
   }
 
+  /** 观测名如实报 {@code fake}：本类就是"离线假模型"本身（{@code --demo} 是它唯一的生产正途）。 */
+  @Override
+  public String model() {
+    return "fake";
+  }
+
   @Override
   public LlmResponse chat(LlmRequest request) {
     calls++;

@@ -37,4 +37,10 @@ class FakeLlmClientTest {
     assertThat(call.name()).isEqualTo("echo");
     assertThat(call.arguments()).containsEntry("text", "hi");
   }
+
+  /** 观测名如实报 {@code fake}——与"没声明模型"的 {@code unknown} 分开：两者混同会让假模型探针两个方向同时失效。 */
+  @Test
+  void modelIsReportedAsFake() {
+    assertThat(new FakeLlmClient().model()).isEqualTo("fake");
+  }
 }

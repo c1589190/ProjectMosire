@@ -521,6 +521,15 @@ class OpenAICompatibleLlmClientTest {
     }
   }
 
+  /**
+   * 观测名 = 路由模型名：{@code agent.lifecycle} 与自检据此判"这个进程在跟谁说话"。报错名字会让"以为在用真模型 /
+   * 以为在用假模型"两个方向同时失真——2026-09-12 U6 实跑抓到子体明明在调 deepseek-flash，生命周期事件却报 {@code fake}。
+   */
+  @Test
+  void modelReportsTheRouteModel() {
+    assertThat(client(ApiKeySource.none(), Duration.ofSeconds(1)).model()).isEqualTo(ROUTE_MODEL);
+  }
+
   private OpenAICompatibleLlmClient client(
       OpenAICompatibleLlmClient.ApiKeySource apiKeySource, Duration readTimeout) {
     ModelRoute route = ModelRoute.of("test", baseUrl, ROUTE_MODEL, "keys.fake");

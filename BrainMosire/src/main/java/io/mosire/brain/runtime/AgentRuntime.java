@@ -186,9 +186,12 @@ public final class AgentRuntime implements AutoCloseable {
                 conversationId);
 
     // 起步即记录生命周期（事件词汇表 agent.lifecycle）
+    // model 报的是【客户端实际在用的模型】（client.model()），不是装配层标签 config.model()：后者由
+    // AgentConfig/模板给出，真模型形态下（S1-A2 的 --config-dir）它仍是缺省字面量 "fake"——事件会谎报，
+    // 凡"靠 agent.lifecycle 判这个进程是真模型还是假模型"的检查都会被带偏（2026-09-12 U6 实跑抓到）。
     emit(
         EventTypes.AGENT_LIFECYCLE,
-        Map.of("action", "started", "agent", config.id(), "model", config.model()));
+        Map.of("action", "started", "agent", config.id(), "model", client.model()));
   }
 
   /**

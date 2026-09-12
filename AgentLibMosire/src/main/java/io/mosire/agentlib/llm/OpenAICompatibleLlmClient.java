@@ -181,6 +181,12 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     return route;
   }
 
+  /** 观测名 = 路由里的模型名（与请求体里发出去的 {@code model} 字段同一个值，不是另一个来源的标签）。 */
+  @Override
+  public String model() {
+    return route.model();
+  }
+
   /**
    * 发起一次补全（一次调用 = 一次请求，不重试）。
    *
