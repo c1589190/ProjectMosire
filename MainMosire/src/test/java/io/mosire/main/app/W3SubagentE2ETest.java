@@ -35,8 +35,9 @@ import org.junit.jupiter.api.io.TempDir;
  *
  * <ol>
  *   <li>reader（只读模板 {@code [echo]}）：子体经 MCP 回环调用父级 echo 工具（tool.call/tool.result 落在子体事件库）；
- *   <li>grand（模板 {@code [echo, spawn_sub_agent]}）：子体尝试提权派生——父侧编排工具的内联身份校验拒绝 （{@code
- *       permission.denied} 事件落在子体事件库、父侧零实例落地）；
+ *   <li>grand（模板 {@code [echo, spawn_sub_agent]}）：子体尝试提权派生——<b>父侧工具调用入口</b>（S4-A 判定点统一后的 {@code
+ *       ToolCallAuthorizer}，读工具自己的 {@code spec()}）在工具体之前拒绝（{@code permission.denied}
+ *       事件落在子体事件库、父侧零实例 落地）；（2026-09-12 前该拒绝由工具内联的 {@code systemOnly} 兜住——那时 MCP 路径连 guard 都不经）；
  *   <li>两个子体跑完脚本后阻塞等待父侧关停信号内（{@code whenClosed}），父级 kill → TERMINATING→KILLED 事件链。
  * </ol>
  *
@@ -117,7 +118,7 @@ class W3SubagentE2ETest {
       // 拒绝后子体继续（echo 仍可服务）：tool.result 成功
       awaitEvent(grandEvents, EventTypes.TOOL_RESULT, "tool", "echo", "ok", true);
 
-      // 父侧零实例落地：拒绝没有到达 manager（systemOnly 内联拒绝），管理器只记录两个合法实例
+      // 父侧零实例落地：拒绝发生在工具调用入口（authorizer 读 spec 判 SYSTEM），没到达 manager；管理器只记录两个合法实例
       assertThat(app.subagents()).hasSize(2);
 
       // kill（经主 Agent 的 guard 出口驱动——与主 Agent 管线执行工具相同的路径）→ 三层关停 → 生命周期链

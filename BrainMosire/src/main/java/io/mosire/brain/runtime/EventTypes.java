@@ -51,6 +51,22 @@ public final class EventTypes {
   /** 权限拒绝。payload: {@code {"tool":"...","reason":"..."}}。 */
   public static final String PERMISSION_DENIED = "permission.denied";
 
+  /**
+   * 请求了审批（S4 审批内核；AgentLib 侧常量见 {@code io.mosire.agentlib.approval.ApprovalEventTypes}）。 payload:
+   * {@code {"id","tool","classKey","digest"}}——<b>不含完整命令</b>（D23/D24）。
+   *
+   * <p><b>为什么两层各有一个常量</b>：AgentLib 不依赖 Brain（模块边界），Brain 也不反过来依赖 AgentLib 的
+   * 审批包来写事件名；两层的<b>字符串值必须逐字一致</b>——由 {@code EventTypesApprovalValueTest} 钉住 （改任何一侧的值 ⇒ 该用例转红）。
+   */
+  public static final String APPROVAL_REQUESTED = "approval.requested";
+
+  /**
+   * 审批有了终局决定。payload: {@code {"id","tool","classKey","digest","decision","scope","by","latencyMs"}}
+   * ——{@code scope} ∈ {@code once|session|none}，{@code by} = 决议来源（通道名 / 闸名 / timeout / no-channel /
+   * error）。
+   */
+  public static final String APPROVAL_DECIDED = "approval.decided";
+
   private EventTypes() {
     throw new AssertionError("No instances");
   }

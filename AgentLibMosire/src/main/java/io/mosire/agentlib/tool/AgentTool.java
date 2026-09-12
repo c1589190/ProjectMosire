@@ -35,6 +35,19 @@ public interface AgentTool {
   }
 
   /**
+   * 本工具对这次调用的自报闸位；缺省 {@link ToolGate#ALLOW}（既有工具行为逐字不变）。
+   *
+   * <p>分类器是人的检查点的<b>分流器，不是安全边界</b>（见设计 §2.1）——实现须诚实，不得自称"完备"： 报 {@code ALLOW}
+   * 的含义是"我判断这次调用不需要人看"，不是"我证明了它安全"。
+   *
+   * <p>本 SPI 是 S4 的<b>唯一</b>新增判定入口：工具报"要不要人看"，而"放不放行"仍归 {@link ToolCallAuthorizer}（硬拒 →（审批闸）→
+   * 执行）。工具<b>不得</b>据此自行放行——{@code Block} 由入口转成 {@code COMMAND_BLOCKED} 且不进审批。
+   */
+  default io.mosire.agentlib.approval.ToolGate gate(ToolContext context) {
+    return io.mosire.agentlib.approval.ToolGate.ALLOW;
+  }
+
+  /**
    * 执行一次调用。实现必须把参数、IO 错误映射为 {@link ToolResult}（成功或带 code 的失败）， 不抛异常吞掉边界错误（意外异常可抛，由审计记录后转为工具层错误）。
    */
   ToolResult execute(ToolContext context);

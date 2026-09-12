@@ -27,10 +27,12 @@ import org.slf4j.LoggerFactory;
  * read_agent_context}（D30）按实例 id 直读子体上下文，spec 多一个 {@code noExport=true}（禁外发：桥不转发它， 子体拿不到句柄）+ {@code
  * sensitive=true}（读别家上下文需显式放行）。
  *
- * <p><strong>工具级第二道身份校验</strong>：MCP 路径（W3b 子 Agent 经父侧暴露的工具调用）不经管线 guard——{@link AgentToMcpServer}
- * 直接把调用交给工具。因此本类工具在 execute 入口再做一次 {@code caller == SYSTEM} 校验（红线 R7：子体拿父侧 SYSTEM 工具即提权，结果必须是
- * {@code PERMISSION_DENIED} 而不是执行）。{@code read_agent_context} 的同性质校验收敛在 {@link
- * ContextAccessJudge}（唯一判定点）。
+ * <p><strong>工具级身份校验（纵深防御副本，已非权威判定）</strong>：本类工具在 execute 入口校验 {@code caller == SYSTEM} （红线
+ * R7：子体拿父侧 SYSTEM 工具即提权，结果必须是 {@code PERMISSION_DENIED} 而不是执行）。<b>2026-09-12 S4-A 判定点统一后， 权威判定已上移到
+ * {@link io.mosire.agentlib.tool.ToolCallAuthorizer}</b>——它同时收口管线与 MCP 两条路径（此前 {@link
+ * AgentToMcpServer} 是裸 {@code tool.execute}，本类这道闸正是为补那个洞而写；洞已堵，本闸保留为纵深防御，不再是唯一防线）。 判定读的是工具自己的
+ * {@code spec()}，与 authorizer 同源、不会分叉。{@code read_agent_context} 的同性质校验收敛在 {@link
+ * ContextAccessJudge}（同为其唯一判定点的纵深副本）。
  *
  * <p>错误映射契约：参数缺失/非法 → {@code INVALID_ARGUMENTS}；编排层拒绝（单调性/深度，对应 {@link SubagentRejectedException}）→
  * {@code PERMISSION_DENIED}（可读原因经 message 透出）；未知实例 → {@code UNKNOWN_INSTANCE}；启动失败 → {@code
@@ -228,8 +230,9 @@ public final class SubagentOrchestrationTools {
         ToolSpec.level(AccessToken.SYSTEM, true, false, true),
         context -> {
           String target = strArg(context, "target");
-          // 判定收敛在 ContextAccessJudge（不假设"能进来就一定有权限"——MCP 路径绕过管线 guard，
-          // 本工具虽禁外发，判定仍按独立入口写，不靠调用链上游）
+          // 判定收敛在 ContextAccessJudge（不假设"能进来就一定有权限"——独立入口，不靠调用链上游）。
+          // 2026-09-12 S4-A 后 ToolCallAuthorizer 已成为工具调用唯一入口（管线 + MCP 两条路径都经它），
+          // 本判定是与 spec() 同源的纵深副本，不再是唯一防线（见类注释）。
           ContextAccessJudge.Decision decision = ContextAccessJudge.judge(context, manager, target);
           if (!decision.allowed()) {
             return ToolResult.error(decision.code(), decision.reason());
@@ -304,7 +307,10 @@ public final class SubagentOrchestrationTools {
     return Path.of(String.valueOf(value));
   }
 
-  /** 身份校验（第二道闸——管线 guard 之外的 MCP 路径防线；见类注释）。 */
+  /**
+   * 身份校验（<b>纵深防御副本</b>——2026-09-12 S4-A 判定点统一后权威判定已上移到 {@code ToolCallAuthorizer}， 它同时收口管线与 MCP
+   * 两条路径；本方法保留但不承重，且与 {@code spec()} 的 SYSTEM 级别同源、不会分叉。见类注释）。
+   */
   private static ToolResult systemOnly(ToolContext context) {
     if (context.caller() == AccessToken.SYSTEM) {
       return null;
