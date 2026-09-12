@@ -174,11 +174,20 @@ public final class AgentToMcpServer implements AutoCloseable {
     AgentToMcpServer self = new AgentToMcpServer(registry, caller, server, include);
     // 先建对象再订阅（lambda 捕获 self）；订阅前错过的变化由 sync 的幂等 diff 兜底
     self.registrySubscription = registry.onChange(self::sync);
+    // 日志口径 = **实际外发面**（{@code server.listTools()}，与客户端 tools/list 同源），不是 {@code registry.size()}：
+    // 后者把被 include 挡下与标了 noExport 的工具也算进去，读日志的人会以为它们外发了（2026-09-12 使用模式实测踩到）。
+    List<String> exported = server.listTools().stream().map(McpSchema.Tool::name).toList();
+    List<String> withheld =
+        registry.list().stream().map(AgentTool::name).filter(n -> !exported.contains(n)).toList();
     LOG.info(
-        "MCP stdio server 已启动: name={} version={} 初始工具 {} 个",
+        "MCP stdio server 已启动: name={} version={} 外发工具 {} 个 {}；Registry 共 {} 个，未外发 {} 个 {}",
         serverName,
         serverVersion,
-        registry.size());
+        exported.size(),
+        exported,
+        registry.size(),
+        withheld.size(),
+        withheld);
     return self;
   }
 
