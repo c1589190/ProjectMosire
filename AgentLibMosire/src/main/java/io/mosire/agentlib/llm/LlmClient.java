@@ -17,6 +17,11 @@ public interface LlmClient {
    *
    * <p><b>实现约定：不许谎报</b>。说的必须是本客户端真会用的模型；说不出来就返回 {@code "unknown"}——"没声明模型"与"在用假模型"是两件事，
    * 混同会让"以为在用真模型 / 以为在用假模型"两个方向同时失去判据（D24 口径：宁可响亮地不确定，不可安静地说错）。
+   *
+   * <p><b>与 {@code llm.call} 的 {@code model} 字段口径不同，别把差异当 bug</b>（2026-09-12 使用模式实跑实测）：
+   * 这里报的是<b>客户端侧的声明</b>（配置的路由模型，如 {@code deepseek-chat}），而 {@code llm.call} 的 {@code model}
+   * 取自 {@link LlmResponse#model()}＝<b>服务端自报</b>（同一网关可能自报成版本别名，实测为 {@code deepseek-flash}）。
+   * 两者**都不说谎**，只是回答的问题不同："我们在跟谁说话" vs "对方自称是谁"。
    */
   default String model() {
     return "unknown";
