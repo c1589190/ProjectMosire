@@ -56,7 +56,13 @@ import java.util.function.Predicate;
  * <p><strong>stdout 纪律</strong>：本进程 stdout = MCP 帧通道。所有可见输出只准走 stderr（启动即把 {@code System.out}
  * 与协议流解绑——帧用早期捕获的原始流，日志/错误经 stderr；使用期间任何窗口进程 若把信息写 {@code System.out} 都会污染协议帧，代码评审红线）。
  *
- * <p>并非「关闭语义」：本类失败路径一律 stderr + 非零退出码，<b>不</b>把异常焐成零退出（父侧观测到子体退出即按 FINISHED 收束——退出码用于人工/脚本排障）。
+ * <p><strong>退出码语义（如实二分，勿写成"失败一律非零"）</strong>：<b>引导期</b>装配失败 ⇒ stderr + <b>非零退出</b>，绝不把异常焐成零退出 ——缺
+ * {@code llm.*}（{@code E_LLM_CONFIG_MISSING}）、缺密钥（{@code E_KEY_MISSING}）、密钥引用形态不支持（{@code
+ * E_REF_FORM_UNSUPPORTED}），见 {@link #realLlm} 的取密钥预检。而 <b>chat 期</b>的 LLM 失败（端点不可达 / 401 / 超时）由
+ * {@link io.mosire.brain.runtime.AgentPipeline}（{@code :289-293}）收敛成 {@link
+ * io.mosire.brain.runtime.StopReason#LLM_ERROR} 的<b>正常回合</b>——本类照常打印"回合完成"并 <b>exit
+ * 0</b>，退出码不区分"模型坏了"。 这是<b>既有语义</b>（与主 Agent 一致；脚本假 LLM 排空时同样走这条路），父侧只能从回合停因 {@code stop=LLM_ERROR}
+ * 分辨；改退出码属另一件事。
  */
 public final class SubagentProcessMain {
 

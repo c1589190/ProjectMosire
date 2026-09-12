@@ -114,11 +114,7 @@ public final class Main {
       throw new IllegalArgumentException("--fake 与 --fake-script 不能同时指定");
     }
     // W5：离线 LLM 显式声明面（smoke.sh 断言"断网可测"）；三期 S1-A1：以上开关都不给时一律真模型（缺配置/缺密钥响亮失败，不退化）
-    // 三期 S1-A2（R-A2-6）：只有生产真模型路径才把配置根交给子 Agent（子体的 --data-dir 是隔离目录，底下没有 config.json）；
-    // --demo/--fake/--fake-script 三种离线形态下子体仍是模板脚本假 LLM——离线门禁与 smoke.sh 不受影响
-    Path subagentConfigDir =
-        (fakeScript == null && !fake && !config.demo()) ? config.dataDir() : null;
-    App app = App.start(config, selectLlm(config, fake, fakeScript), List.of(), subagentConfigDir);
+    App app = startApp(config, fake, fakeScript);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     System.err.printf(
         "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%n",
@@ -133,6 +129,34 @@ public final class Main {
         config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
     return 0;
+  }
+
+  /**
+   * 生产装配（{@code run} 的唯一出口）：把解析出的开关折算成交给 {@link App#start} 的四个入参——主 Agent 的 LLM 形态（{@link
+   * #selectLlm}）与子 Agent 的配置根（下方三元）。
+   *
+   * <p><b>为什么把这几行单列出来（评审 MED-1）</b>：下方三元是"子 Agent 走真模型还是模板脚本假 LLM"的<b>唯一生产开关</b>（R-A2-6）； 压成 {@code
+   * null} 会让子体静默退回模板脚本假模型（{@code configDir == null} ⇒ {@code template.scriptedFakeLlm()}——正是 D24
+   * 要防的静默退化，也正是 S1-B"子体跑真模型"的前提）。{@code App.start} 之后的链路已有 进程层用例覆盖（{@code
+   * SubagentConfigDirWiringTest} 从 4 参入口起真子进程、断言子体打到假端点），但"这条开关本身被绕过"只有从
+   * <b>生产装配入口</b>驱动才判得了——故开关与交参合成一条语句：{@code run} 不再持有配置根变量，绕过去只能改这里。
+   *
+   * <p><b>子 Agent 配置根（R-A2-6）</b>：只有生产真模型路径才把父的配置根交给子 Agent（子体的 {@code --data-dir} 是隔离目录，底下没有
+   * {@code config.json}）；{@code --demo}/{@code --fake}/{@code --fake-script} 三种离线形态下子体仍是模板脚本假
+   * LLM——离线门禁与 smoke.sh 不受影响。
+   *
+   * <p><b>可见性（public 而非包私有）</b>：驱动本方法的判据用例必须复用既有回环假端点夹具 {@code OpenAiStubServer}，它位于 {@code
+   * io.mosire.main.agent} 包（包私有），用例因而不能落在本包。行为零变化：只是把 {@code run} 原有的几行原样搬进来。
+   *
+   * @param config 启动配置（{@code --data-dir} 即配置根）
+   * @param fake {@code --fake} 是否给出
+   * @param fakeScript {@code --fake-script} 的脚本（非 null 时优先于 {@code fake}）
+   * @return 装配完成的实例；入参语义与 {@code run} 解析出的开关一一对应
+   */
+  public static App startApp(BootConfig config, boolean fake, String fakeScript) {
+    Path subagentConfigDir =
+        (fakeScript == null && !fake && !config.demo()) ? config.dataDir() : null;
+    return App.start(config, selectLlm(config, fake, fakeScript), List.of(), subagentConfigDir);
   }
 
   /**
