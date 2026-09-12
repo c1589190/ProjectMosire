@@ -145,15 +145,17 @@ public final class Main {
    * {@code config.json}）；{@code --demo}/{@code --fake}/{@code --fake-script} 三种离线形态下子体仍是模板脚本假
    * LLM——离线门禁与 smoke.sh 不受影响。
    *
-   * <p><b>可见性（public 而非包私有）</b>：驱动本方法的判据用例必须复用既有回环假端点夹具 {@code OpenAiStubServer}，它位于 {@code
-   * io.mosire.main.agent} 包（包私有），用例因而不能落在本包。行为零变化：只是把 {@code run} 原有的几行原样搬进来。
+   * <p><b>可见性（包私有）</b>：与 {@link #selectLlm}/{@link #realLlm(Path)} 一致——本方法是生产装配的内部缝，不是公开 API。
+   * 驱动本方法的判据用例必须复用既有回环假端点夹具 {@code OpenAiStubServer}，它位于 {@code io.mosire.main.agent}
+   * 包（包私有），用例因而不能落在本包； 跨包这一档由<b>测试源码树</b>里的 {@code MainStartAppTestSeam} 桥接（{@code
+   * src/test/java}，不进产物）——生产类不为了测试提权。
    *
    * @param config 启动配置（{@code --data-dir} 即配置根）
    * @param fake {@code --fake} 是否给出
    * @param fakeScript {@code --fake-script} 的脚本（非 null 时优先于 {@code fake}）
    * @return 装配完成的实例；入参语义与 {@code run} 解析出的开关一一对应
    */
-  public static App startApp(BootConfig config, boolean fake, String fakeScript) {
+  static App startApp(BootConfig config, boolean fake, String fakeScript) {
     Path subagentConfigDir =
         (fakeScript == null && !fake && !config.demo()) ? config.dataDir() : null;
     return App.start(config, selectLlm(config, fake, fakeScript), List.of(), subagentConfigDir);
