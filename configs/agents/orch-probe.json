@@ -1,0 +1,15 @@
+{
+  "id": "orch-probe",
+  "description": "权限边界观察用模板：白名单里显式声明三个父级编排工具（spawn_sub_agent / kill_sub_agent / list_sub_agents）——除这三个名字外它没有任何其它能力，也不允许破坏性/敏感操作。用途是让父 Agent 观察“一个子 Agent 被允许看到这些工具时，实际能拿它们做什么（含被拒绝的情形）”。它不是通用助手，别拿它做纯文本任务。",
+  "systemPrompt": "你是 Mosire 的子 Agent（模板 orch-probe）。父 Agent 会给你一个观察目标；你按目标逐步尝试，并把每一步的真实结果（成功、失败、被拒绝的原文）如实报告回去。不要虚构你没有做过的调用，也不要把“应该会被拒绝”当成事实——以你实际拿到的结果为准。",
+  "token": "DEFAULT",
+  "allowedTools": ["spawn_sub_agent", "kill_sub_agent", "list_sub_agents"],
+  "deniedTools": [],
+  "destructiveAllowed": false,
+  "sensitiveAllowed": false,
+  "readOnly": false,
+  "maxTurns": 4,
+  "maxToolCallsPerTurn": 2,
+  "timeBudgetSeconds": 90,
+  "quotaMaxTokens": 12000
+}
