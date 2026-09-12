@@ -2,13 +2,19 @@ package io.mosire.agentlib.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -163,6 +169,58 @@ class SqliteEventStoreTest {
           .hasMessageContaining("offset");
       org.junit.jupiter.api.Assertions.assertThrows(
           NullPointerException.class, () -> store.queryLatestByCorrelation(null, 1, 0));
+    }
+  }
+
+  // ---------- 任务 #32：失败路径（initialize 抛错）上已取得连接的回收 ----------
+
+  /**
+   * 任务 #32（AgentLib 既有缺陷）：{@code initialize()} 抛错时必须回收已建立的连接——判据是本进程指向该库文件的 fd 归零。
+   *
+   * <p><b>为何内容非 SQLite 库是判别性输入</b>（2026-09-12 实测，sqlite-jdbc 3.53.4.0）：此时 {@code getConnection}
+   * 仍然成功，失败发生在 {@code initialize()} 的首条语句——即"连接已取得"之后，正是本缺陷的路径。断言 cause 文案是这条前提的守卫：这条 SQLITE_NOTADB
+   * 文案只在语句执行阶段出现；若将来 sqlite-jdbc 提前到 {@code getConnection} 就失败（那条路径没有连接可
+   * 回收），本用例会先在文案断言上转红，提示判别器已失效（对照实测：目标路径为<b>已存在目录</b>时失败在 {@code getConnection}，fd 恒为
+   * 0——那种输入测不到本缺陷）。
+   *
+   * <p>取样必须在抛错瞬间且不触发 GC：泄漏的连接对象此时已不可达，finalizer/Cleaner 类兜底清理会把泄漏掩盖成"通过"。
+   */
+  @Test
+  void initializeFailureReleasesConnection() throws IOException {
+    assumeTrue(Files.isDirectory(Path.of("/proc/self/fd")), "需要 /proc/self/fd（Linux）观察连接释放");
+    Path db = tempDir.resolve("events.db");
+    Files.write(db, "not a sqlite database".getBytes(StandardCharsets.UTF_8));
+
+    assertThatThrownBy(() -> SqliteEventStore.open(db))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("打开 SQLite 事件存储失败: " + db)
+        .hasCauseInstanceOf(SQLException.class)
+        .getCause()
+        .hasMessageContaining("not a database");
+
+    assertThat(openLibraryFds(db)).as("open() 失败后不得残留指向 events.db 的打开连接").isZero();
+  }
+
+  /**
+   * 本进程打开的、指向 {@code dbFile}（或其 {@code -wal}/{@code -shm} 伴生文件）的 fd 数。目录也一并比对：每个用例有自己的
+   * tempDir，只看文件名会把同 fork 里其他用例的库连接一并数进来（判据必须只认本用例那一份）。与 {@code AppMcpLinkTest} 同款。
+   */
+  private static long openLibraryFds(Path dbFile) throws IOException {
+    Path dir = dbFile.toAbsolutePath().getParent();
+    String name = dbFile.getFileName().toString();
+    try (Stream<Path> fds = Files.list(Path.of("/proc/self/fd"))) {
+      return fds.filter(
+              fd -> {
+                try {
+                  Path target = Files.readSymbolicLink(fd);
+                  return target.startsWith(dir)
+                      && target.getFileName() != null
+                      && target.getFileName().toString().startsWith(name);
+                } catch (IOException e) {
+                  return false; // 列举与读取之间该 fd 已被关闭：与本判据无关
+                }
+              })
+          .count();
     }
   }
 }

@@ -135,19 +135,38 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
 
   /** 文件路径：打开（建目录、设 PRAGMA、建表）。同一路径应传给事件存储（计划 §六 同库）。 */
   public static SqliteConversationStore open(Path dbFile) {
+    // 声明在 try 之外：initialize 失败时 catch 里要回收它（任务 #32）。getConnection 自身失败时仍为 null。
+    Connection connection = null;
     try {
       Path parent = dbFile.toAbsolutePath().getParent();
       if (parent != null) {
         Files.createDirectories(parent);
       }
-      Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
+      connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
       SqliteConversationStore store = new SqliteConversationStore(connection, dbFile);
       store.initialize();
       return store;
     } catch (IOException e) {
+      // 建目录失败必然在 getConnection 之前：此路径上没有连接可回收
       throw new UncheckedIOException("无法创建会话存储目录: " + dbFile, e);
     } catch (SQLException e) {
+      // initialize（PRAGMA/DDL）失败时连接已建立且处于半初始化态：直接关 Connection，而不是调本类 close()——
+      // close() 先 wal_checkpoint 再 connection.close()（两者同一个 try），checkpoint 一抛错就跳过 close（泄漏照旧），
+      // 且会用"关闭会话存储失败"顶掉这里的原异常
+      closeSilently(connection);
       throw new IllegalStateException("打开 SQLite 会话存储失败: " + dbFile, e);
+    }
+  }
+
+  /** 失败路径回收：清理自身失败不得顶掉调用方正上抛的异常（原异常原样上抛，类型/文案/cause 链不变）。 */
+  private static void closeSilently(Connection connection) {
+    if (connection == null) {
+      return; // getConnection 自身就失败（如目标路径不可写）：没有连接可回收
+    }
+    try {
+      connection.close();
+    } catch (SQLException ignored) {
+      // 刻意静默：半初始化的连接已无补救手段，此处再抛只会替换掉"打开…失败"这个根因
     }
   }
 

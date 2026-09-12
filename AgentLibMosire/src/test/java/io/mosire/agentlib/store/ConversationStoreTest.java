@@ -2,21 +2,27 @@ package io.mosire.agentlib.store;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmMessage;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -292,6 +298,53 @@ class ConversationStoreTest {
       assertThatThrownBy(() -> store.load(null)).isInstanceOf(NullPointerException.class);
       assertThatThrownBy(() -> store.compact(null, "s")).isInstanceOf(NullPointerException.class);
       assertThatThrownBy(() -> store.compact(CONV, null)).isInstanceOf(NullPointerException.class);
+    }
+  }
+
+  // ---------- 任务 #32：失败路径（initialize 抛错）上已取得连接的回收 ----------
+
+  /**
+   * 任务 #32（AgentLib 既有缺陷，与 {@code SqliteEventStore} 同形）：{@code initialize()} 抛错时必须回收已建立的连接，判据是
+   * 本进程指向该库文件的 fd 归零。判别前提与取样纪律见 {@code
+   * SqliteEventStoreTest#initializeFailureReleasesConnection}（同款输入： 内容非 SQLite 库 ⇒ {@code
+   * getConnection} 成功、首条语句抛 SQLITE_NOTADB，失败点落在 {@code initialize()}）。
+   */
+  @Test
+  void initializeFailureReleasesConnection() throws IOException {
+    assumeTrue(Files.isDirectory(Path.of("/proc/self/fd")), "需要 /proc/self/fd（Linux）观察连接释放");
+    Path db = db();
+    Files.write(db, "not a sqlite database".getBytes(StandardCharsets.UTF_8));
+
+    assertThatThrownBy(() -> SqliteConversationStore.open(db))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("打开 SQLite 会话存储失败: " + db)
+        .hasCauseInstanceOf(SQLException.class)
+        .getCause()
+        .hasMessageContaining("not a database");
+
+    assertThat(openLibraryFds(db)).as("open() 失败后不得残留指向 agent.db 的打开连接").isZero();
+  }
+
+  /**
+   * 本进程打开的、指向 {@code dbFile}（或其 {@code -wal}/{@code -shm} 伴生文件）的 fd 数。目录也一并比对：每个用例有自己的
+   * tempDir，只看文件名会把同 fork 里其他用例的库连接一并数进来（判据必须只认本用例那一份）。跨模块照抄自 {@code AppMcpLinkTest}。
+   */
+  private static long openLibraryFds(Path dbFile) throws IOException {
+    Path dir = dbFile.toAbsolutePath().getParent();
+    String name = dbFile.getFileName().toString();
+    try (Stream<Path> fds = Files.list(Path.of("/proc/self/fd"))) {
+      return fds.filter(
+              fd -> {
+                try {
+                  Path target = Files.readSymbolicLink(fd);
+                  return target.startsWith(dir)
+                      && target.getFileName() != null
+                      && target.getFileName().toString().startsWith(name);
+                } catch (IOException e) {
+                  return false; // 列举与读取之间该 fd 已被关闭：与本判据无关
+                }
+              })
+          .count();
     }
   }
 
