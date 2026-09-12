@@ -93,6 +93,8 @@ save_state() {
     printf 'DB=%q\n' "$DB"
     printf 'JAR=%q\n' "$JAR"
     printf 'CONFIG_SRC=%q\n' "$CONFIG_SRC"
+    printf 'USE_TEMPLATES=%q\n' "${USE_TEMPLATES:-0}"
+    printf 'TEMPLATES=%q\n' "${TEMPLATES:-}"
     printf 'MAIN_PID=%q\n' "$MAIN_PID"
     printf 'ADMIN_PORT=%q\n' "$ADMIN_PORT"
     printf 'DEBUG_PORT=%q\n' "$DEBUG_PORT"
@@ -214,6 +216,9 @@ cmd_start() {
   note "配置来源 $(basename "$CONFIG")（复制为 600；原件不动）"
 
   # 外部硬看门狗：不靠 LLM 守规矩
+  # 必须把它的 stdout/stderr 接进文件：setsid 只脱离终端会话，不换 fd——继承调用方管道会让 `start` 挂着不返回
+  # （管道要等所有写端关闭才 EOF），实测台架第 4 例自伤 bug（2026-09-12 u6c）。顺带它自己的输出也是证据。
+  WATCHDOG_LOG="$PACK_DIR/watchdog.log"
   (
     deadline=$(( $(date +%s) + MAX_SECONDS ))
     while kill -0 "$MAIN_PID" 2>/dev/null; do
@@ -224,7 +229,7 @@ cmd_start() {
       fi
       sleep 2
     done
-  ) &
+  ) >> "$WATCHDOG_LOG" 2>&1 &
   WATCHDOG_PID=$!
   disown "$WATCHDOG_PID" 2>/dev/null || true
 
@@ -437,11 +442,13 @@ cmd_stop() {
     printf '# 使用模式测试证据包\n\n'
     printf -- '- 实验名：`%s`\n- 启动于：%s\n- 数据目录：`%s`\n- jar：`%s`\n- 配置来源：`%s`（复制为 600，原件未动）\n' \
       "$RUN_NAME" "$STARTED_AT" "$DATA_DIR" "$JAR" "$CONFIG_SRC"
-    printf -- '- 端口：admin=%s debug=%s a2a=%s agui=%s\n- 消息回合数：%s\n- 进程残留：%s\n\n' \
+    printf -- '- 端口：admin=%s debug=%s a2a=%s agui=%s\n- 消息回合数：%s\n- 进程残留：%s\n' \
       "$ADMIN_PORT" "$DEBUG_PORT" "$A2A_PORT" "$AGUI_PORT" "$TURN" "${LEFT:-无}"
+    printf -- '- 子 Agent 模板目录：%s\n\n' \
+      "$([ "${USE_TEMPLATES:-0}" -eq 1 ] && printf '`%s`' "$TEMPLATES" || printf '未挂（--no-templates）')"
     printf '## 怎么看\n\n'
     printf '1. `turns/NNNN.request.json` = 我说的原话；`turns/NNNN.snapshot.json` = 程序回的原始快照（含 status/result）。\n'
-    printf '2. `main.log` = 进程 stdout/stderr（启动行、告警、异常栈、看门狗）。\n'
+    printf '2. `main.log` = 进程 stdout/stderr（启动行、告警、异常栈、看门狗）；`watchdog.log` = 看门狗自己的输出。\n'
     printf '3. `db/` = 事件库与会话库快照（`llm.call` 记账、`tool.call/result`、`messages`）。\n'
     printf '4. `session-get.json` / `reset-NN.json` = 会话读写原文；`scan.txt` = 密钥扫描结果。\n\n'
     printf '## 回合索引\n\n```\n'
