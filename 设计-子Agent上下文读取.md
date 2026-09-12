@@ -47,11 +47,31 @@
 
 ---
 
-## 三、权限判定（不新发明，落在 D27 两维上）
+## 三、权限判定（**已查到硬阻塞，降级为"主子句柄"**）
 
-- 判据：`op ∈ capabilities(caller) ∧ target ∈ subtree(caller)`。
-- **读侧同判**（2026-09-12 已裁）：`a2` 看不见 `a1-1`——否则"兄弟互不侵犯"只在写侧成立。
-- 只读面：不引入"父改写子上下文"的写路径（要改写就是另一件事）。
+**先查证，再定案**（2026-09-12 控制者查码，非推测）：
+
+| 想要的东西 | 代码里的实际情况 |
+|---|---|
+| 判"是不是我子树里的" | `SubagentInstance` **只有 `depth`、没有 `parentId`**（`SubagentInstance.java`）⇒ **血缘不可算**：知道层级，不知道谁生的谁 |
+| 判"调用者是谁" | `ToolContext.caller` 是 `AccessToken` 三级枚举（GUEST/DEFAULT/SYSTEM），**主 Agent 与子 Agent 同为 `DEFAULT`**（`AccessToken.java` 类注释明写）⇒ **调用者身份不可辨** |
+| D27 两维落地了吗 | **没有**：全仓 `grep subtree\|capabilities(` 只命中无关的 `ModelCapabilities`（模型能力表） |
+
+⇒ `op ∈ capabilities(caller) ∧ target ∈ subtree(caller)` 这条判据**今天判不了**（第二维无输入、第一维的 caller 也认不出）。
+更糟的是**读工具一旦注册就会被外发**：`AgentToMcpServer.start(tools, …)`（`App.java:252`）把**整个 ToolRegistry** 交给子体当 MCP 桥，
+`--mcp-expose` 一开，子体手里就有 `list_sub_agents` 这类编排工具的副本（U6 实测：`orch-probe` 子体列出了桥接进来的 3 个工具）。
+⇒ 直接注册 `read_agent_context` = **每个子体都能读别家子体的上下文**，正是 D27 读侧明令禁止的事。
+
+**因此本工具的判定降级为「主子句柄」，并把 D27 的缝留在一处**：
+
+1. **不可外发**：工具带"禁外发"标记，MCP 桥不转发它（子体拿不到句柄 = 读权力不外包）。**这一条是新增的小改**（`ToolSpec`/`AgentToMcpServer` 各加一个布尔）。
+2. **能力位**：`AgentPermissionSet.isToolAllowed("read_agent_context")` 判一次（DEFAULT 下模板可只授读、不授读 ⇒ §六.2 的答案是"占"）。
+3. **单一判定点**：`ContextAccessJudge.judge(caller, target)` —— **D27 落地时只改这一处**（补 lineage + 真身份），工具与视图层不动。
+4. **诚实口径**：工具描述里写明"当前仅对**同进程已知子体**开放；跨 Agent 血缘判定待 D27 落地"——不许把"暂不支持"写成"已按权限模型保护"。
+
+> **读侧同判**（用户 2026-09-12 已裁）：`a2` 看不见 `a1-1`——在本降级方案里由第 1 条**结构性地**保证（子体根本没有这个工具），
+> 而不是靠判定；D27 落地后第 3 条会把它升级成真判定。
+> **只读面**：不引入"父改写子上下文"的写路径（要改写就是另一件事）。
 
 ---
 
@@ -62,7 +82,9 @@
 | **A 父直读子库** | 父按 `<dataDir>/subagents/<id>/events.db` **只读**打开（WAL 支持并发读） | 简单；**子体被 kill / 父重启后历史仍可读** | 父要碰文件路径；子体正写时读到的是快照 |
 | **B 经 MCP 问子体** | 父向子体发"取上下文"请求，子体读自己的库返回 | 走协议、无共享文件假设 | 子体必须活着且应答；要扩协议面；子体卡住就没救 |
 
-**建议 A 先行**（读侧无注入面、kill 后仍可追溯），B 留给"实时/在线"需求。**这条请裁**。
+**裁：A 先行**（读侧无注入面、kill 后仍可追溯），B 留给"实时/在线"需求。
+A 的实现纪律：**只读连接**（`jdbc:sqlite:file:<path>?mode=ro`，不建表、不迁移、不写任何东西——子体可能正在写同一文件；
+现有 `SqliteEventStore.open()` 会跑 schema 初始化，故须新增只读工厂或跳过 initialize 的路径）；子库不存在 → 响亮报错，不静默返回空。
 
 ---
 
@@ -76,16 +98,37 @@
 
 ## 六、附带要裁的三小项
 
-1. **子体目录保留策略**：子体被 kill / 父退出后 `<dataDir>/subagents/<id>/` 是否保留（建议保留——读侧才有历史可读；清理策略另议）。
-2. **读是否单独占一个能力位（capability）**：建议**占一个**——读与执行是两种权力，模板可以只授"读"。
-3. **`summary` 的 token 汇总口径**：U6 见 `cacheWriteTokens:-1` 哨兵，需与二期 `usage` 报表口径统一（别各算各的）。
+1. **子体目录保留策略**：**裁：保留**（子体被 kill / 父退出后 `<dataDir>/subagents/<id>/` 不删）——读侧才有历史可读；
+   清理留作独立话题（增长无界，须在 D27/D28 合批时给配额）。
+2. **读是否单独占一个能力位（capability）**：**裁：占一个**（`read_agent_context` 一个工具名，走 `isToolAllowed`）——读与执行是两种权力，模板可只授"读"。
+3. **`summary` 的 token 汇总口径**：U6 见 `cacheWriteTokens:-1` 哨兵，**须与二期 `usage` 报表口径统一**（别各算各的）；
+   `-1` 是"无此缓存档"而非"少写"，`summary` 要么标注口径、要么按同一套换算，**不许直接求和**（求出来是负数）。
+   ⚠ 落地时以二期报表现有实现为准对齐，本稿不新发明口径。
 
 ---
 
-## 七、落地顺序（等 §四/§六 裁决后开工）
+## 七、落地顺序（§四/§六 已按推荐值裁定，用户可否决）
 
-1. **Brain**：`AgentContextReader`（读子库 `events` 表；五视图 + 分页 + 筛选） + 离线单测；
-2. **Brain**：注册为工具 + 接 D27 两维判定（若 D27 未落地，先做"主 Agent 读子树"的最小判定，或与 D27 同批）；
-3. **Main**：装配（子库路径解析）；
-4. **使用模式验收（U6 回归场景）**：父 spawn 子 → 父
-   `read_agent_context(target=<id>, view=results)` → **拿到子体原文**；`view=summary` 能一眼看出"已完成/结果是什么"。
+**已查明的实现接口**（照抄，省得再找）：
+
+| 要用到的东西 | 在哪 |
+|---|---|
+| 子库路径 | `<dataDir>/subagents/<instanceId>/events.db`（`App.java:423` 已按此缀拼给子进程） |
+| 工具注册点 | `App.java:402` `new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager))` |
+| 工具形态 | `AgentTool`：`name()/description()/jsonSchema()/spec()/execute(ToolContext)`（`SubagentOrchestrationTools:176-197`） |
+| 调用者身份/权限 | `ToolContext.caller`（只有三级 `AccessToken`）+ `ToolContext.permissions`（`AgentPermissionSet.isToolAllowed`） |
+| 工具配置注入点 | `ToolContext.config`（**这是运行时给工具注入自身配置的既定缝**，子库根路径走它，别走构造器全局） |
+| 事件读取 | `EventQuery(agent,type,correlationId,beforeSeq,limit)` → 按 seq **倒序**返回；**没有正向游标**（本稿承诺的 `sinceSeq/nextSinceSeq` 需要加法式扩展，或读侧自行过滤+反转） |
+| 外发面 | `AgentToMcpServer.start(tools, …)` 把整个 ToolRegistry 交给子体（`App.java:252`）⇒ 必须加"禁外发"标记 |
+
+**步骤**：
+
+1. **AgentLib**：`SqliteEventStore` 加**只读**打开路径（`mode=ro`，跳过 schema 初始化）；
+   `ToolSpec` 加"禁外发"位；`AgentToMcpServer` 尊重该位（**这一条是安全必需**——不加，子体就能读别家上下文）。
+2. **Brain**：`AgentContextReader`（五视图 + 分页 + 筛选 + 截断）+ `ContextAccessJudge`（唯一判定点）+ 离线单测
+   （判别性：把"禁外发"标记拿掉 → 桥接用例必须转红）；
+3. **Brain**：注册 `read_agent_context` 进 `SubagentOrchestrationTools`；
+4. **Main**：装配（子库根路径经 `ToolContext.config` 注入）；
+5. **使用模式验收（U6 回归场景，用 `scripts/usage-test.sh` 跑）**：父 spawn 子 → 父
+   `read_agent_context(target=<id>, view=results)` → **拿到子体原文**；`view=summary` 能一眼看出"已完成/结果是什么"；
+   **并验一条反向**：子体那侧 `read_agent_context` **不可见**（禁外发生效）。
