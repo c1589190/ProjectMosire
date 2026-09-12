@@ -2,6 +2,8 @@
 # S1-B 驱动脚本：起主 Agent → 送《测试要求书》→ 轮询 → 收结果 → 外部看门狗 → 跑完清理。
 #
 # 六步（本脚本的验收面，逐步可观测）：
+#   · 轮次节奏 要求书 → 「继续」轮 ×N（默认 4，中性文案，不替模型排测试项） → 【出具报告】哨兵
+#              （= 5 个工作轮 + 1 个报告轮；--continue-rounds <n> 可调，--no-continue-rounds 关闭）
 #   1 起进程   java -Xmx<heap> -jar <jar> run --data-dir <dir> --templates-dir <dir> （独立进程组；stdin=/dev/null）
 #   2 送要求书 POST /api/chat {"message":"<要求书全文>"}（debug 面，纯 JSON；无 SDK/无 SSE）
 #   3 轮询     GET /api/chat/{runId} 每秒一次，直至终态（status != running）
@@ -29,10 +31,13 @@ REQUIREMENT="$ROOT/docs/s1b-requirement.md"
 FINAL_PROMPT_DEFAULT='【出具报告】现在请把《发现报告》全文作为本条回复的正文输出。结构：①范围与方法（你测了什么、怎么测的）②每条发现（现象 / 复现步骤 / 期望 vs 实际 / 严重度 / 事件链证据位置）③若无发现就写"空报告"并说明你覆盖了什么 ④你没验成的部分与原因。不要在报告之后继续调用工具。'
 FINAL_PROMPT="$FINAL_PROMPT_DEFAULT"
 NO_FINAL_PROMPT=0
+# 要求书之后、哨兵之前插入的【继续】工作轮条数（默认 4 ⇒ 1 条要求书 + 4 条继续 = 5 个工作轮，+1 报告轮）。
+# 文案中性：只报"第几轮/共几轮"并催它推进【自己规划的】测试项，不替它排任何测试项。
+CONTINUE_ROUNDS="${CONTINUE_ROUNDS:-4}"
 HEAP="${HEAP:-256m}"
 ADMIN_PORT=0
 DEBUG_PORT=0
-MAX_SECONDS="${MAX_SECONDS:-1800}"     # 墙钟上限（=30 分钟，与要求书 §六.6 的对外数字一致：单回合自身预算 10 分钟 × 默认 2 轮 = 最坏 ~20 分钟 + 启动/收尾开销）
+MAX_SECONDS="${MAX_SECONDS:-1800}"     # 墙钟上限（=30 分钟，与要求书 §六.6 的对外数字一致：那是本次会话的【外部上限】，模型已被告知并须在此预算内规划；轮数改变不自动改这个数，两处永远取同一值）
 MAX_CHILDREN="${MAX_CHILDREN:-3}"      # 存活子 JVM 上限（要求书 §六 的"一次最多 1 个"是第一道，这是第二道）
 RSS_LIMIT_MB="${RSS_LIMIT_MB:-1000}"   # 进程组 RSS 上限（**组总量 = 主进程 + 全部后代**；实测主进程 ~100MB、每个子体 ~94MB（-Xmx128m）——本脚本自测里 2 个子体时组总量 223MB ⇒ 3 子体最坏约 400MB；1000MB 是"明显不对"的线，且给 1.6GB 机器留余量）
 LINGER="${LINGER:-0}"                  # 终态后保留进程 N 秒（便于人工 curl 观测）
@@ -50,15 +55,20 @@ usage() {
   --jar <p>            主 jar（默认 MainMosire/target/mosire.jar）
   --templates-dir <p>  子 Agent 模板目录（默认 configs/agents；传 "-" 表示不启用编排）
   --requirement <p>    要求书文件（默认 docs/s1b-requirement.md）
-  --round <p>          追加一轮追问（可重复；按给出的顺序发送）
+  --round <p>          追加一轮追问（可重复；按给出的顺序发送；排在「继续」轮之后、哨兵之前）
+  --continue-rounds <n> 要求书之后、哨兵之前插入的「继续」工作轮条数（默认 4）
+                       ⇒ 默认节奏 = 1 条要求书 + 4 条「继续」 = 5 个工作轮，再加 1 个报告轮
+                       文案中性（只报"第几轮工作轮/共几轮"，不替模型排测试项）
+  --no-continue-rounds 不发「继续」轮（= 旧行为：要求书 → 追问 → 哨兵）
   --final-prompt <t>   结束哨兵消息（默认内建【出具报告】提示；最后一轮=报告正文）
-  --no-final-prompt    不发结束哨兵（只发要求书 + 追问）
+  --no-final-prompt    不发结束哨兵（只发要求书 + 继续轮 + 追问）
   --fake               离线演练：加 --fake（假 LLM；不触网络）
   --fake-script <s>    离线演练：加 --fake-script <s>（脚本 LLM；可驱动 spawn 观察子体路径）
   --heap <x>           主进程堆（默认 256m）
   --port <n>           AdminREST 端口（默认 0=自动分配）
   --debug-port <n>     调试对话端口（默认 0=自动分配；恒绑 127.0.0.1）
-  --max-seconds <n>    看门狗：墙钟上限秒（默认 1800 = 30 分钟，与要求书 §六.6 对外数字一致）
+  --max-seconds <n>    看门狗：墙钟上限秒（默认 1800 = 30 分钟，与要求书 §六.6 对外数字一致；
+                       轮数改多/想让 6 轮都跑满时按需调大——但要求书 §六.6 的数字要同步改，两处必须一致）
   --max-children <n>   看门狗：存活子 JVM 上限（默认 3）
   --rss-limit-mb <n>   看门狗：【进程组 RSS 总量】上限 MB（默认 1000；**是组总量 = 主进程 + 全部后代**，
                        不是单看主进程——实测主进程 ~100MB、子体各 ~94MB，2 子体时组总量 223MB，
@@ -72,9 +82,10 @@ usage() {
 
 注: 真模型模式（不给 --fake/--fake-script）预检 <data-dir>/config.json 是否存在（只判存在性、不读内容）；
     缺则直接失败并提示用 --data-dir <已有的配置根>。缺省数据目录永远是【新】目录——不会默默写别人的数据目录。
-注: 墙钟上限对【整次运行】计量（含 JVM 启动、端口等待、POST 开销），而主 Agent 单回合自身预算是
-    10 分钟 ⇒ 真模型跑"要求书 + 【出具报告】"两轮时最坏约 20 分钟，故默认 1800s 与要求书 §六.6 的
-    "约 30 分钟"对齐（两处必须一致）。真要跑更多轮就把 --max-seconds 相应调大（看门狗仍是硬性的，只是阈值变大）。
+注: 墙钟上限对【整次运行】计量（含 JVM 启动、端口等待、POST 开销）。默认节奏 5 个工作轮 + 1 个报告轮，
+    而主 Agent 单回合自身预算是 10 分钟 —— 6 轮都跑满会远超 30 分钟，所以要求书 §六.6 明确告诉模型
+    "总墙钟约 30 分钟，请在此预算内规划"，看门狗（默认 1800s）就是这条【外部上限】的执行者：两处数字
+    取同一个值。想把 6 轮都跑满就 --max-seconds 调大，并同步把要求书 §六.6 的数字改成同一值。
 EOF
   exit 2
 }
@@ -86,6 +97,8 @@ while [ $# -gt 0 ]; do
     --templates-dir) TEMPLATES_DIR="$2"; shift 2 ;;
     --requirement) REQUIREMENT="$2"; shift 2 ;;
     --round) ROUND_FILES+=("$2"); shift 2 ;;
+    --continue-rounds) CONTINUE_ROUNDS="$2"; shift 2 ;;
+    --no-continue-rounds) CONTINUE_ROUNDS=0; shift ;;
     --final-prompt) FINAL_PROMPT="$2"; shift 2 ;;
     --no-final-prompt) NO_FINAL_PROMPT=1; shift ;;
     --fake) FAKE_ARGS=(--fake); MODE_LABEL="离线演练 --fake"; shift ;;
@@ -362,9 +375,24 @@ run_round() { # $1=轮次号  $2=消息文件
   return 0
 }
 
-# ---- 轮次编排：要求书 → （追问…） → 结束哨兵 ----
+# ---- 轮次编排：要求书 → 「继续」×N → （追问…） → 结束哨兵 ----
+# 第一小段的真模型跑暴露的布置错误：模型把唯一的工作轮用来做规划，第 2 条就是【出具报告】，于是只能交空报告。
+# 修法 = 补中间工作轮（默认 4 条「继续」）；轮次数字只写在这里，要求书本身不写死轮数（两边不会各自漂移）。
 printf '%s' "$FINAL_PROMPT" > "$TMP_DIR/final.txt"
 ROUNDS=("$REQUIREMENT")
+CUSTOM_ROUNDS=0
+for f in "${ROUND_FILES[@]}"; do [ -n "$f" ] && CUSTOM_ROUNDS=$((CUSTOM_ROUNDS + 1)); done
+# 工作轮总数 = 1（要求书）+ N（继续）+ M（自定义追问）；哨兵是【报告轮】，不在此数内
+WORK_TOTAL=$((1 + CONTINUE_ROUNDS + CUSTOM_ROUNDS))
+if [ "$CONTINUE_ROUNDS" -gt 0 ]; then
+  # k 从 2 起：第 1 个工作轮就是要求书本身（模型据此知道"还剩几轮"）
+  for k in $(seq 2 $((1 + CONTINUE_ROUNDS))); do
+    cf="$TMP_DIR/continue-$k.txt"
+    printf '继续（第 %s 轮工作轮，共 %s 轮；之后是报告轮）：推进你规划中尚未执行的测试项，把每项的真实结果（含原始返回文本）记下来。\n' \
+      "$k" "$WORK_TOTAL" > "$cf"
+    ROUNDS+=("$cf")
+  done
+fi
 for f in "${ROUND_FILES[@]}"; do [ -n "$f" ] && ROUNDS+=("$f"); done
 [ "$NO_FINAL_PROMPT" -eq 1 ] || ROUNDS+=("$TMP_DIR/final.txt")
 
@@ -453,6 +481,8 @@ fi
   printf 'templates_dir=%s\n' "$TEMPLATES_DIR"
   printf 'requirement=%s\n' "$REQUIREMENT"
   printf 'final_prompt=%s\n' "$([ "$NO_FINAL_PROMPT" -eq 1 ] && printf '(disabled)' || printf '%s' "$FINAL_PROMPT")"
+  printf 'work_rounds=%s（要求书 1 + 继续 %s + 追问 %s；报告轮 %s）\n' \
+    "$WORK_TOTAL" "$CONTINUE_ROUNDS" "$CUSTOM_ROUNDS" "$([ "$NO_FINAL_PROMPT" -eq 1 ] && printf '0（--no-final-prompt）' || printf '1')"
   printf 'pid=%s\npgid=%s\n' "$MAIN_PID" "$PGID"
   printf 'admin_port=%s\ndebug_port=%s\n' "$ADMIN_PORT_ACTUAL" "$DEBUG_PORT_ACTUAL"
   printf 'seq_base=%s\n' "$SEQ_BASE"
