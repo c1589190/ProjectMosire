@@ -6,12 +6,15 @@
 #   2 送要求书 POST /api/chat {"message":"<要求书全文>"}（debug 面，纯 JSON；无 SDK/无 SSE）
 #   3 轮询     GET /api/chat/{runId} 每秒一次，直至终态（status != running）
 #   4 收结果   result.text = 该轮回复正文 → 落盘 <data-dir>/s1b/round-N.txt（最后一轮 = 《发现报告》正文）
-#   5 看门狗   存活子 JVM 数 > 阈值 / 墙钟 > 阈值 / 主进程 RSS 超阈 → 杀【整个进程组】并如实报告
-#   6 清理     杀进程组 → 确认无残留 java → 打印事件链查询命令（数据目录留档供复现）
+#   5 看门狗   存活子 JVM 数 > 阈值 / 墙钟 > 阈值 / 【主进程 + 全部后代】RSS 之和 > 阈值
+#              → 杀【整个进程组】并如实报告（启动期端口等待段也在看门狗视野内）
+#   6 清理     杀进程组 → 确认无残留 java → 跑后密钥扫描（$OUT_DIR 全部文件 + events.db）
+#              → 打印事件链查询命令（数据目录留档供复现）
 #
 # 红线（脚本自身）：
 #   * 不接触任何密钥：只传 `--data-dir <路径>`，密钥由主 Agent 自己从 <data-dir>/config.json 读（D23）。
 #     argv / env / stdout 里都没有密钥值。
+#   * 跑后密钥扫描只报【命中位置与条数】，绝不回显命中内容（避免把密钥二次写进日志）。
 #   * 任何模式下都不删数据目录、不删 events.db（离线演练请显式给一个临时 --data-dir）。
 #   * 真模型跑由控制者盯着执行；`--fake`/`--fake-script` 是离线演练（假 LLM 不会产出真报告）。
 set -euo pipefail
@@ -29,9 +32,9 @@ NO_FINAL_PROMPT=0
 HEAP="${HEAP:-256m}"
 ADMIN_PORT=0
 DEBUG_PORT=0
-MAX_SECONDS="${MAX_SECONDS:-900}"      # 墙钟上限（要求书 §六 写的是 15 分钟；多轮真跑可能不够，见 --help）
+MAX_SECONDS="${MAX_SECONDS:-1800}"     # 墙钟上限（=30 分钟，与要求书 §六.6 的对外数字一致：单回合自身预算 10 分钟 × 默认 2 轮 = 最坏 ~20 分钟 + 启动/收尾开销）
 MAX_CHILDREN="${MAX_CHILDREN:-3}"      # 存活子 JVM 上限（要求书 §六 的"一次最多 1 个"是第一道，这是第二道）
-RSS_LIMIT_MB="${RSS_LIMIT_MB:-800}"    # 主进程 RSS 上限（实测空跑 ~95MB、堆上限 256m；800MB 是"明显不对"的线，且给 1.6GB 机器留余量）
+RSS_LIMIT_MB="${RSS_LIMIT_MB:-1000}"   # 进程组 RSS 上限（**组总量 = 主进程 + 全部后代**；实测主进程 ~100MB、每个子体 ~94MB（-Xmx128m）——本脚本自测里 2 个子体时组总量 223MB ⇒ 3 子体最坏约 400MB；1000MB 是"明显不对"的线，且给 1.6GB 机器留余量）
 LINGER="${LINGER:-0}"                  # 终态后保留进程 N 秒（便于人工 curl 观测）
 KEEP=0                                 # 数据目录恒保留（CLEAN_DATA 仅在显式 --wipe 时生效）
 WIPE=0
@@ -55,17 +58,23 @@ usage() {
   --heap <x>           主进程堆（默认 256m）
   --port <n>           AdminREST 端口（默认 0=自动分配）
   --debug-port <n>     调试对话端口（默认 0=自动分配；恒绑 127.0.0.1）
-  --max-seconds <n>    看门狗：墙钟上限秒（默认 900）
+  --max-seconds <n>    看门狗：墙钟上限秒（默认 1800 = 30 分钟，与要求书 §六.6 对外数字一致）
   --max-children <n>   看门狗：存活子 JVM 上限（默认 3）
-  --rss-limit-mb <n>   看门狗：主进程 RSS 上限 MB（默认 800）
+  --rss-limit-mb <n>   看门狗：【进程组 RSS 总量】上限 MB（默认 1000；**是组总量 = 主进程 + 全部后代**，
+                       不是单看主进程——实测主进程 ~100MB、子体各 ~94MB，2 子体时组总量 223MB，
+                       只盯主进程会漏掉子孙占的内存）
   --linger <n>         终态后保留进程 n 秒（默认 0）
   --wipe               跑之前清空 <data-dir> 下的 s1b/ 输出目录（仍不删 events.db / config.json）
   -h|--help            本帮助
 
-退出码: 0=全部轮次 finished 且收到报告；1=预检失败；2=参数错误；3=看门狗触发；4=轮次未 finished/HTTP 异常
+退出码: 0=全部轮次 finished 且收到报告；1=预检失败；2=参数错误；3=看门狗触发；
+        4=轮次未 finished/HTTP 异常；5=跑后密钥扫描命中（输出/事件库里出现密钥样式，位置见日志）
 
-注: 墙钟上限对【整次运行】计量，而主 Agent 单回合自身预算是 10 分钟 ⇒ 真模型跑"要求书 + 【出具报告】"
-    两轮时，两轮都跑满就可能先撞看门狗。要跑满两轮就把 --max-seconds 相应调大（看门狗仍是硬性的，只是阈值变大）。
+注: 真模型模式（不给 --fake/--fake-script）预检 <data-dir>/config.json 是否存在（只判存在性、不读内容）；
+    缺则直接失败并提示用 --data-dir <已有的配置根>。缺省数据目录永远是【新】目录——不会默默写别人的数据目录。
+注: 墙钟上限对【整次运行】计量（含 JVM 启动、端口等待、POST 开销），而主 Agent 单回合自身预算是
+    10 分钟 ⇒ 真模型跑"要求书 + 【出具报告】"两轮时最坏约 20 分钟，故默认 1800s 与要求书 §六.6 的
+    "约 30 分钟"对齐（两处必须一致）。真要跑更多轮就把 --max-seconds 相应调大（看门狗仍是硬性的，只是阈值变大）。
 EOF
   exit 2
 }
@@ -120,6 +129,13 @@ if [ "$TEMPLATES_DIR" != "-" ]; then
   [ -d "$TEMPLATES_DIR" ] || die "找不到模板目录: $TEMPLATES_DIR（传 --templates-dir - 可禁用编排）"
   TEMPLATES_ARG=(--templates-dir "$TEMPLATES_DIR")
 fi
+# 真模型模式的硬前置：<data-dir>/config.json（否则主进程"缺 llm.* 响亮失败"，而默认数据目录是刚建的空目录、
+# 必然没有它——预检把这种必然失败提前拦下并给出可照做的下一步）。
+# 纪律（D23）：只判存在性，绝不打开 / 读取 / 把内容打进任何输出。
+if [ "${#FAKE_ARGS[@]}" -eq 0 ] && [ ! -f "$DATA_DIR/config.json" ]; then
+  die "真模型模式需要 <data-dir>/config.json（含 llm.baseUrl/llm.model 与 keys.<name>），当前 $DATA_DIR 下没有。
+     用 --data-dir <已有的配置根> 指定（例如 --data-dir $ROOT/.work/mosire），或加 --fake / --fake-script 走离线演练。"
+fi
 
 # --wipe 只清我们自己的输出目录（$DATA_DIR/s1b）；config.json / events.db 永不动
 [ "$WIPE" -eq 1 ] && rm -rf "$OUT_DIR"
@@ -141,6 +157,11 @@ fi
 say "   事件链基线 seq=$SEQ_BASE；输出目录 $OUT_DIR"
 
 # ---- 1 起进程（独立进程组；stdin=/dev/null 免得 MCP stdio 面抢输入）----
+# main.log 是追加写的：先记住已有行数，端口解析只看【本次运行新增的行】——
+# 否则复用同一数据目录重跑时会解析到上一轮早已关闭的旧端口（现象：POST /api/chat 返回 000）。
+LOG_BASE_LINES="$(wc -l 2>/dev/null < "$MAIN_LOG" || printf '0')"
+LOG_BASE_LINES="${LOG_BASE_LINES// /}"
+[ -n "$LOG_BASE_LINES" ] || LOG_BASE_LINES=0
 setsid java -Xmx"$HEAP" -jar "$JAR" run \
   --port "$ADMIN_PORT" --debug-port "$DEBUG_PORT" \
   --data-dir "$DATA_DIR" "${TEMPLATES_ARG[@]}" \
@@ -157,24 +178,37 @@ say "1) 起进程: pid=$MAIN_PID pgid=$PGID 日志=$MAIN_LOG"
 WATCHDOG_TRIP=""
 WATCHDOG_DETAIL=""
 
-live_child_jvms() {
-  local pid cmd n=0
-  # 后代集合（ps 拿拓扑；/proc/<pid>/cmdline 拿完整命令行——ps 的 args 会被终端宽度截断）
-  for pid in $(ps -eo pid=,ppid= 2>/dev/null | awk -v root="$MAIN_PID" '
+descendant_pids() { # 主进程的【全部后代】pid（ps 拿拓扑；多轮传播以免漏掉孙辈）
+  ps -eo pid=,ppid= 2>/dev/null | awk -v root="$MAIN_PID" '
       { pid[NR]=$1; par[NR]=$2 }
       END {
         desc[root]=1
         for (pass=0; pass<12; pass++)
           for (i in pid) if (par[i] in desc) desc[pid[i]]=1
         for (i in pid) if (pid[i] != root && (pid[i] in desc)) print pid[i]
-      }'); do
-    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+      }'
+}
+
+live_child_jvms() { # 后代里的 [子 Agent JVM] 个数（/proc/<pid>/cmdline 拿完整命令行——ps 的 args 会被终端宽度截断）
+  local pid cmd n=0
+  for pid in $(descendant_pids); do
+    cmd="$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" || true)"
     case "$cmd" in *"io.mosire.main.Main agent"*) n=$((n + 1)) ;; esac
   done
   printf '%s' "$n"
 }
 
-main_rss_mb() { ps -o rss= -p "$MAIN_PID" 2>/dev/null | awk '{printf "%d", $1/1024}'; }
+rss_mb_of() { ps -o rss= -p "$1" 2>/dev/null | awk '{printf "%d", $1/1024}'; }
+
+# 【进程组 RSS 总量】= 主进程 + 全部后代（不只子 Agent JVM——本机 1.6GB 才是真稀缺资源）
+group_rss_mb() {
+  local pid total=0 rss
+  for pid in $(descendant_pids) "$MAIN_PID"; do
+    rss="$(rss_mb_of "$pid")"
+    [ -n "$rss" ] && total=$((total + rss))
+  done
+  printf '%s' "$total"
+}
 
 kill_group() { # $1 = 信号
   kill -"$1" -- "-$PGID" 2>/dev/null || kill -"$1" "$MAIN_PID" 2>/dev/null || true
@@ -193,20 +227,43 @@ watchdog_check() { # 命中则设置 WATCHDOG_TRIP 并返回 0
     WATCHDOG_DETAIL="存活子 JVM ${kids} > 上限 ${MAX_CHILDREN}"
     return 0
   fi
-  rss="$(main_rss_mb)"
+  rss="$(group_rss_mb)"
   if [ -n "$rss" ] && [ "$rss" -gt "$RSS_LIMIT_MB" ]; then
     WATCHDOG_TRIP="rss"
-    WATCHDOG_DETAIL="主进程 RSS ${rss}MB > 上限 ${RSS_LIMIT_MB}MB"
+    WATCHDOG_DETAIL="进程组 RSS ${rss}MB（主进程 $(rss_mb_of "$MAIN_PID")MB + 全部后代）> 组总量上限 ${RSS_LIMIT_MB}MB"
     return 0
   fi
   return 1
 }
 
+# 兜底（看门狗之外的安全网）：脚本因任何原因异常退出时也杀掉整个进程组，绝不留孤儿 JVM。
+# 正常路径的 6) 清理 已先杀过一遍，重复 kill 无害（kill_group 自带 || true）。
+trap 'if [ -n "${MAIN_PID:-}" ]; then kill_group TERM; sleep 1; kill_group KILL; fi' EXIT
+
+watchdog_trip() { # $1=round 标签 $2=runId 标签：杀整个进程组 + 落 watchdog.log（退出码由调用方决定）
+  printf '\n!! 看门狗触发：%s\n' "$WATCHDOG_DETAIL" >&2
+  kill_group TERM
+  for _ in $(seq 1 10); do kill -0 "$MAIN_PID" 2>/dev/null || break; sleep 1; done
+  kill_group KILL
+  {
+    printf 'watchdog=%s\n' "$WATCHDOG_TRIP"
+    printf 'detail=%s\n' "$WATCHDOG_DETAIL"
+    printf 'round=%s runId=%s elapsed=%ss\n' "$1" "$2" "$SECONDS"
+  } >> "$WATCHDOG_LOG"
+}
+
 # ---- 解析实际端口（admin/debug；a2a/agui 本轮不用）----
+# 启动段也在看门狗视野内（此前这里的墙钟是盲区）
+RC=0
 ADMIN_PORT_ACTUAL=""
 DEBUG_PORT_ACTUAL=""
 for _ in $(seq 1 60); do
-  PORTS="$(sed -n 's/.*admin=http:\/\/127\.0\.0\.1:\([0-9]*\) .*debug=http:\/\/127\.0\.0\.1:\([0-9]*\).*/\1 \2/p' "$MAIN_LOG" 2>/dev/null | head -1 || true)"
+  if watchdog_check; then
+    watchdog_trip "启动期" "-"
+    RC=3
+    break
+  fi
+  PORTS="$(tail -n +"$((LOG_BASE_LINES + 1))" "$MAIN_LOG" 2>/dev/null | sed -n 's/.*admin=http:\/\/127\.0\.0\.1:\([0-9]*\) .*debug=http:\/\/127\.0\.0\.1:\([0-9]*\).*/\1 \2/p' | head -1 || true)"
   if [ -n "$PORTS" ]; then
     read -r ADMIN_PORT_ACTUAL DEBUG_PORT_ACTUAL <<< "$PORTS"
     break
@@ -214,7 +271,12 @@ for _ in $(seq 1 60); do
   kill -0 "$MAIN_PID" 2>/dev/null || die "主进程启动失败（日志: $MAIN_LOG）"
   sleep 1
 done
-[ -n "$ADMIN_PORT_ACTUAL" ] || die "60s 内未解析到监听端口（日志: $MAIN_LOG）"
+if [ "$RC" -eq 3 ]; then
+  say "!! 看门狗在【启动期】触发（$WATCHDOG_DETAIL）——进程组已杀；本次不跑任何轮次，直接收尾落档"
+fi
+if [ -z "$ADMIN_PORT_ACTUAL" ] && [ "$RC" -ne 3 ]; then
+  die "60s 内未解析到监听端口（日志: $MAIN_LOG）"
+fi
 say "   端口: admin=$ADMIN_PORT_ACTUAL debug=$DEBUG_PORT_ACTUAL"
 
 CURL_BASE="http://127.0.0.1:$DEBUG_PORT_ACTUAL/api/chat"
@@ -288,7 +350,7 @@ run_round() { # $1=轮次号  $2=消息文件
       break
     fi
     tries=$((tries + 1))
-    [ $((tries % 15)) -eq 0 ] && say "   … 第 $n 轮仍在跑（${SECONDS}s，子 JVM $(live_child_jvms) 个，RSS $(main_rss_mb)MB）"
+    [ $((tries % 15)) -eq 0 ] && say "   … 第 $n 轮仍在跑（${SECONDS}s，子 JVM $(live_child_jvms) 个，RSS 组 $(group_rss_mb)MB（主 $(rss_mb_of "$MAIN_PID")MB））"
     sleep 1
   done
 
@@ -306,9 +368,9 @@ ROUNDS=("$REQUIREMENT")
 for f in "${ROUND_FILES[@]}"; do [ -n "$f" ] && ROUNDS+=("$f"); done
 [ "$NO_FINAL_PROMPT" -eq 1 ] || ROUNDS+=("$TMP_DIR/final.txt")
 
-RC=0
 N=0
 TOTAL=${#ROUNDS[@]}
+if [ "$RC" -eq 0 ]; then # 启动期看门狗触发时 RC=3：跳过全部轮次，直接收尾落档
 for f in "${ROUNDS[@]}"; do
   [ -f "$f" ] || die "找不到轮次消息文件: $f"
   N=$((N + 1))
@@ -329,28 +391,13 @@ for f in "${ROUNDS[@]}"; do
     break
   fi
 done
+fi
 
 # 最后一轮的正文 = 《发现报告》正文
 if [ "$RC" -eq 0 ] && [ "$N" -gt 0 ]; then
   cp "$OUT_DIR/round-$N.txt" "$OUT_DIR/report-final.txt"
   say "5) 报告正文: $OUT_DIR/report-final.txt"
 fi
-
-# ---- 落档 manifest（不含任何密钥；只有路径/端口/阈值/ID）----
-{
-  printf 'mode=%s\n' "$MODE_LABEL"
-  printf 'jar=%s\n' "$JAR"
-  printf 'data_dir=%s\n' "$DATA_DIR"
-  printf 'templates_dir=%s\n' "$TEMPLATES_DIR"
-  printf 'requirement=%s\n' "$REQUIREMENT"
-  printf 'final_prompt=%s\n' "$([ "$NO_FINAL_PROMPT" -eq 1 ] && printf '(disabled)' || printf '%s' "$FINAL_PROMPT")"
-  printf 'pid=%s\npgid=%s\n' "$MAIN_PID" "$PGID"
-  printf 'admin_port=%s\ndebug_port=%s\n' "$ADMIN_PORT_ACTUAL" "$DEBUG_PORT_ACTUAL"
-  printf 'seq_base=%s\n' "$SEQ_BASE"
-  printf 'watchdog: max_seconds=%s max_children=%s rss_limit_mb=%s\n' "$MAX_SECONDS" "$MAX_CHILDREN" "$RSS_LIMIT_MB"
-  printf 'rounds=%s\n' "${ROUND_STATUSES[*]:-}"
-  printf 'main_log=%s\n' "$MAIN_LOG"
-} > "$OUT_DIR/manifest.txt"
 
 # ---- 终态后可选驻留（便于人工 curl 观测）----
 if [ "$LINGER" -gt 0 ] && kill -0 "$MAIN_PID" 2>/dev/null; then
@@ -374,6 +421,47 @@ LEFT_MAIN=0
 kill -0 "$MAIN_PID" 2>/dev/null && LEFT_MAIN=1
 say "6) 清理: 主进程存活=$LEFT_MAIN 残留子 JVM=$LEFT_KIDS（本次运行范围内的）"
 
+# ---- 6b 跑后密钥扫描（验收第 5 条的被测项：它自己有没有把密钥漏进输出/事件库）----
+# 只报【位置 + 条数】，绝不回显命中内容——否则等于把密钥二次写进日志。
+SECRET_HITS=()
+scan_secrets() {
+  local f n
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    n="$(grep -acE 'sk-[A-Za-z0-9_-]{8,}' "$f" 2>/dev/null || true)"
+    [ "${n:-0}" -gt 0 ] && SECRET_HITS+=("$f（$n 行）")
+  done
+  return 0 # 显式归零：末次迭代未命中时函数不得以非零收尾（set -e）
+}
+mapfile -t OUT_FILES < <(find "$OUT_DIR" -type f 2>/dev/null || true)
+[ "${#OUT_FILES[@]}" -gt 0 ] && scan_secrets "${OUT_FILES[@]}"
+scan_secrets "$DATA_DIR/events.db"
+SECRET_LINE="无命中（已扫 $OUT_DIR 全部文件 + $DATA_DIR/events.db）"
+if [ "${#SECRET_HITS[@]}" -gt 0 ]; then
+  SECRET_LINE="命中 ${#SECRET_HITS[@]} 处（只报位置/条数）：${SECRET_HITS[*]}"
+  say "!! 密钥扫描: $SECRET_LINE"
+  [ "$RC" -eq 0 ] && RC=5
+else
+  say "密钥扫描: $SECRET_LINE"
+fi
+
+# ---- 落档 manifest（不含任何密钥；只有路径/端口/阈值/ID/扫描结论）----
+{
+  printf 'mode=%s\n' "$MODE_LABEL"
+  printf 'jar=%s\n' "$JAR"
+  printf 'data_dir=%s\n' "$DATA_DIR"
+  printf 'templates_dir=%s\n' "$TEMPLATES_DIR"
+  printf 'requirement=%s\n' "$REQUIREMENT"
+  printf 'final_prompt=%s\n' "$([ "$NO_FINAL_PROMPT" -eq 1 ] && printf '(disabled)' || printf '%s' "$FINAL_PROMPT")"
+  printf 'pid=%s\npgid=%s\n' "$MAIN_PID" "$PGID"
+  printf 'admin_port=%s\ndebug_port=%s\n' "$ADMIN_PORT_ACTUAL" "$DEBUG_PORT_ACTUAL"
+  printf 'seq_base=%s\n' "$SEQ_BASE"
+  printf 'watchdog: max_seconds=%s max_children=%s rss_limit_mb=%s（组总量=主进程+全部后代）\n' "$MAX_SECONDS" "$MAX_CHILDREN" "$RSS_LIMIT_MB"
+  printf 'rounds=%s\n' "${ROUND_STATUSES[*]:-}"
+  printf 'secret_scan=%s\n' "$SECRET_LINE"
+  printf 'main_log=%s\n' "$MAIN_LOG"
+} > "$OUT_DIR/manifest.txt"
+
 say ""
 say "== 事件链定位（数据目录留档，可直接查库）："
 say "   sqlite3 $DATA_DIR/events.db \"select seq,type,agent,substr(payload,1,300) from events where seq > $SEQ_BASE order by seq\""
@@ -384,8 +472,14 @@ say "   运行期只读面（进程还活着时）: curl 'http://127.0.0.1:$ADMI
 if [ "$RC" -eq 3 ]; then
   say ""
   say "结果: 看门狗触发（$WATCHDOG_DETAIL）——已杀整个进程组并留档，见 $WATCHDOG_LOG"
+elif [ "$RC" -eq 5 ]; then
+  say ""
+  say "结果: 跑后密钥扫描命中（验收第 5 条失败信号）——位置见上，绝不回显内容"
 elif [ "$RC" -ne 0 ]; then
   say ""
   say "结果: 未正常收尾（rc=$RC）——日志见 $MAIN_LOG"
+fi
+if [ "${#SECRET_HITS[@]}" -gt 0 ] && [ "$RC" -ne 5 ]; then
+  say "!! 另注: 跑后密钥扫描也命中 ${#SECRET_HITS[@]} 处（rc=$RC 为先前的失败码，密钥命中的优先级更高，请一并处理）"
 fi
 exit "$RC"
