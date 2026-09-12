@@ -52,6 +52,9 @@ usage() {
   scripts/usage-test.sh db [--query "<SQL>"]
   scripts/usage-test.sh scan | logs [--lines <n>] | status | stop
 
+  非 start 命令默认作用于「**最近一次 start 的数据目录**」（`.work/usage-test/.current` 指针），
+  用 `--data-dir <p>` 可指定别的台架。
+
   start 选项：
     --name <n>           本次实验名（进证据包目录名，便于事后辨认；默认 run）
     --data-dir <p>       数据目录（默认 .work/usage-test/<name>）；**每次 start 不擦除**，
@@ -98,6 +101,7 @@ save_state() {
     printf 'TURN=%q\n' "$TURN"
     printf 'STARTED_AT=%q\n' "$STARTED_AT"
     printf 'MAX_SECONDS=%q\n' "$MAX_SECONDS"
+    printf 'WATCHDOG_PID=%q\n' "${WATCHDOG_PID:-}"
   } > "$PACK_DIR/state.env"
 }
 
@@ -119,11 +123,16 @@ PY
 }
 
 # ---------- HTTP ----------
-http_json() { # $1=方法 $2=url [$3=body] → stdout 原样
-  if [ "$1" = "POST" ] && [ -n "${3:-}" ]; then
-    curl -sS --max-time 30 -X POST "$2" -H 'Content-Type: application/json' -d "$3"
+http_json() { # $1=方法 $2=url [$3=body] → stdout 原样；**POST 一律真 POST**（body 为空也不例外）
+  local method="$1" url="$2" body="${3:-}"
+  if [ "$method" = "POST" ]; then
+    if [ -n "$body" ]; then
+      curl -sS --max-time 30 -X POST "$url" -H 'Content-Type: application/json' -d "$body"
+    else
+      curl -sS --max-time 30 -X POST "$url"
+    fi
   else
-    curl -sS --max-time 30 "$2"
+    curl -sS --max-time 30 "$url"
   fi
 }
 chat_url() { printf 'http://127.0.0.1:%s/api/chat' "$DEBUG_PORT"; }
@@ -155,6 +164,16 @@ cmd_start() {
   command -v python3 >/dev/null || die "缺 python3"
   [ -f "$JAR" ] || die "找不到 jar: $JAR —— 先构建: ./mvnw -pl MainMosire -am package -DskipTests"
   [ -f "$CONFIG" ] || die "找不到真模型配置: $CONFIG"
+  # 陈旧 jar 陷阱（2026-09-12 U7/U9 实跑踩到：jar 早于修复 9 分钟，跑出来的是旧产物，差点把旧症状当现状）
+  local JAR_MTIME SRC_COMMIT
+  JAR_MTIME="$(stat -c %Y "$JAR")"
+  SRC_COMMIT="$(git -C "$ROOT" log -1 --format=%ct -- MainMosire/src AgentLibMosire/src BrainMosire/src 2>/dev/null || echo 0)"
+  if [ "${SRC_COMMIT:-0}" -gt "$JAR_MTIME" ]; then
+    die "jar 比最近一次源码提交旧（jar: $(date -d @"$JAR_MTIME" '+%F %T')，源码提交: $(date -d @"$SRC_COMMIT" '+%F %T')）——跑的是旧产物，先重打: ./mvnw -pl MainMosire -am package -DskipTests"
+  fi
+  if find MainMosire/src/main AgentLibMosire/src/main BrainMosire/src/main -name '*.java' -newer "$JAR" -print -quit 2>/dev/null | grep -q .; then
+    say "⚠ 有未提交的源码比 jar 新 —— 本次跑的不是 HEAD，结论要按此打折"
+  fi
   grep -qF "$SKELETON" "$APP_SRC" 2>/dev/null ||
     die "骨架占位串与 $APP_SRC 里的 DEFAULT_LLM_REPLY 不一致（脚本常量已漂移，先核对再跑）"
   [ -z "$(running_mosire_pids)" ] ||
@@ -171,24 +190,27 @@ cmd_start() {
   fi
   cp "$CONFIG" "$DATA_DIR/config.json"; chmod 600 "$DATA_DIR/config.json"
 
-  local TS PACK
+  local TS
   TS="$(date +%Y%m%d-%H%M%S)"
-  PACK="$DATA_DIR/usage-test/$TS"
-  mkdir -p "$PACK/turns" "$PACK/db" "$DATA_DIR/.usage"
-  printf '%s' "$PACK" > "$DATA_DIR/.usage/current"
+  PACK_DIR="$DATA_DIR/usage-test/$TS"          # 全局：save_state/后续子命令都读它
+  mkdir -p "$PACK_DIR/turns" "$PACK_DIR/db" "$DATA_DIR/.usage"
+  printf '%s' "$PACK_DIR" > "$DATA_DIR/.usage/current"
+  # 「最近一次 start 的数据目录」指针：后续 say/stop 不传 --data-dir 就用它（本机同时只许一个真进程）
+  mkdir -p "$ROOT/.work/usage-test"
+  printf '%s' "$DATA_DIR" > "$ROOT/.work/usage-test/.current"
 
   local ARGS=(run --port "$PORT" --data-dir "$DATA_DIR"
               --no-mcp-expose --a2a-address 127.0.0.1 --a2a-port 0
               --agui-address 127.0.0.1 --agui-port 0)
   [ "$USE_TEMPLATES" -eq 1 ] && ARGS+=(--templates-dir "$TEMPLATES")
 
-  MAIN_LOG="$PACK/main.log"
+  MAIN_LOG="$PACK_DIR/main.log"
 
   setsid java "-Xmx${XMX}m" -jar "$JAR" "${ARGS[@]}" >> "$MAIN_LOG" 2>&1 &
   MAIN_PID=$!
   say "== start name=$NAME pid=$MAIN_PID（进程组 $MAIN_PID）"
   note "数据目录 $DATA_DIR"
-  note "证据包 $PACK"
+  note "证据包 $PACK_DIR"
   note "配置来源 $(basename "$CONFIG")（复制为 600；原件不动）"
 
   # 外部硬看门狗：不靠 LLM 守规矩
@@ -209,7 +231,7 @@ cmd_start() {
   # 解析监听端口（启动行格式与 smoke-live.sh 同源）
   local PORTS="" i
   for i in $(seq 1 60); do
-    PORTS="$(sed -n 's/.*admin=http:\/\/127\.0\.0\.1:\([0-9]*\) a2a=http:\/\/[^:]*:\([0-9]*\) agui=http:\/\/[^:]*:\([0-9]*\) debug=http:\/\/127\.0\.0\.1:\([0-9]*\).*/\1 \2 \3 \4/p' "$MAIN_LOG" | head -1)"
+    PORTS="$(sed -n 's/.*admin=http:\/\/127\.0\.0\.1:\([0-9]*\) a2a=http:\/\/[^:]*:\([0-9]*\) agui=http:\/\/[^:]*:\([0-9]*\) debug=http:\/\/127\.0\.0\.1:\([0-9]*\).*/\1 \2 \3 \4/p' "$MAIN_LOG" | head -1 || true)"
     [ -n "$PORTS" ] && break
     kill -0 "$MAIN_PID" 2>/dev/null || { tail -20 "$MAIN_LOG" >&2; die "主进程启动失败（日志: $MAIN_LOG）"; }
     sleep 1
@@ -218,8 +240,8 @@ cmd_start() {
   read -r ADMIN_PORT A2A_PORT AGUI_PORT DEBUG_PORT <<< "$PORTS"
   say "端口: admin=$ADMIN_PORT debug=$DEBUG_PORT a2a=$A2A_PORT agui=$AGUI_PORT"
 
-  http_json GET "http://127.0.0.1:$ADMIN_PORT/health" > "$PACK/health.json" || true
-  grep -q '"status":"ok"' "$PACK/health.json" || die "health 不 ok: $(cat "$PACK/health.json")"
+  http_json GET "http://127.0.0.1:$ADMIN_PORT/health" > "$PACK_DIR/health.json" || true
+  grep -q '"status":"ok"' "$PACK_DIR/health.json" || die "health 不 ok: $(cat "$PACK_DIR/health.json")"
   say "PASS: health"
 
   RUN_NAME="$NAME"; JAR="$JAR"; CONFIG_SRC="$CONFIG"; DB="$DATA_DIR/events.db"
@@ -248,8 +270,8 @@ cmd_say() {
   N="$(printf '%04d' "$TURN")"
   BODY="$(python3 -c 'import json,sys; print(json.dumps({"message": sys.argv[1]}))' "$MSG")"
   printf '%s' "$BODY" > "$PACK_DIR/turns/$N.request.json"
-  RID="$(http_json POST "$(chat_url)" "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runId"])')"
-  [ -n "$RID" ] || die "提交未返回 runId（$(chat_url)）"
+  RID="$(http_json POST "$(chat_url)" "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runId"])' || true)"
+  [ -n "$RID" ] || die "提交未返回 runId（$(chat_url)）——进程还活着吗？看 $(basename "$MAIN_LOG")"
 
   local deadline=$(( $(date +%s) + TIMEOUT ))
   while :; do
@@ -290,7 +312,9 @@ cmd_session() {
 cmd_reset() {
   load_state "$CUR_DATA_DIR"
   local OUT N; OUT="$(http_json POST "$(chat_url)/session")"
-  N="$(ls "$PACK_DIR"/reset-*.json 2>/dev/null | wc -l)"; N="$(printf '%02d' $((N + 1)))"
+  [ -n "$OUT" ] || die "重置请求无响应（$(chat_url)/session）"
+  # 计数用 find 不用 `ls 通配 | wc`：后者在 set -o pipefail 下无匹配即整脚本静默退出（2026-09-12 当场踩到）
+  N="$(find "$PACK_DIR" -maxdepth 1 -name 'reset-*.json' | wc -l)"; N="$(printf '%02d' $((N + 1)))"
   printf '%s' "$OUT" > "$PACK_DIR/reset-$N.json"
   say "$OUT"
 }
@@ -396,7 +420,11 @@ cmd_stop() {
       kill -KILL -- "-$MAIN_PID" 2>/dev/null || true
     fi
   fi
-  pkill -f "usage-test.sh start" 2>/dev/null || true   # 顺带收掉本台的看门狗子壳
+  # 收掉看门狗子壳：**按记下的 pid 杀**，不用 pkill -f 模式匹配——
+  # 模式会匹配到调用者自己的命令行/别的台架（2026-09-12 当场把自己的 shell 杀了）
+  if [ -n "${WATCHDOG_PID:-}" ] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+  fi
   sleep 1
   MAIN_PID="" ; save_state            # 标记已停（pid 清空）
 
@@ -423,7 +451,7 @@ cmd_stop() {
 
   say "== stop 完成"
   say "证据包: $PACK_DIR（索引 PACK.md）"
-  note "日志 $(wc -l < "$MAIN_LOG" 2>/dev/null || echo 0) 行；$(ls "$PACK_DIR/turns"/*.snapshot.json 2>/dev/null | wc -l) 个回合快照"
+  note "日志 $(wc -l < "$MAIN_LOG" 2>/dev/null || echo 0) 行；$(find "$PACK_DIR/turns" -name '*.snapshot.json' | wc -l) 个回合快照"
 }
 
 # =============================== main ==============================
@@ -434,12 +462,15 @@ case "$CMD" in
   -h|--help|help) usage ;;
   *) die "未知子命令: $CMD（-h 看用法）" ;;
 esac
-# 非 start 命令：允许用 --data-dir 指定台架（默认与 start 同源）
-ARGS=()
+# 非 start 命令：默认跟随「最近一次 start 的数据目录」（.current 指针）；--data-dir 可覆盖
+ARGS=(); DATA_DIR_GIVEN=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --data-dir) CUR_DATA_DIR="$2"; shift 2 ;;
+    --data-dir) CUR_DATA_DIR="$2"; DATA_DIR_GIVEN=1; shift 2 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
+if [ "$DATA_DIR_GIVEN" -eq 0 ] && [ -f "$ROOT/.work/usage-test/.current" ]; then
+  CUR_DATA_DIR="$(cat "$ROOT/.work/usage-test/.current")"
+fi
 "cmd_$CMD" ${ARGS[@]+"${ARGS[@]}"}
