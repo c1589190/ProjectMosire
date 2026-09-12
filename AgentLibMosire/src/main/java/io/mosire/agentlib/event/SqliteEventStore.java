@@ -73,6 +73,24 @@ public final class SqliteEventStore implements EventStore {
   private final Path dbFile;
   private final Object lock = new Object();
 
+  /** 只读打开时实际走通的那条路（审计/测试用；写路径恒为 {@code null}）。 */
+  private final ReadOnlyMode readOnlyMode;
+
+  /**
+   * 只读连接实际使用的只读手段——<b>不是配置项，是事实记录</b>（D30 要求注释/审计写明"实际用的是哪一种"）。
+   *
+   * <ul>
+   *   <li>{@link #URI_RO}：{@code jdbc:sqlite:file:<绝对路径>?mode=ro}——SQLite 自己把库按只读打开， 写入/DDL
+   *       在任何层面都被拒；
+   *   <li>{@link #QUERY_ONLY}：退化路径——普通连接 + {@code PRAGMA query_only = 1}（SQL 层拒写； 但连接本身仍可让 SQLite 做
+   *       WAL 的 -shm/-wal 文件级簿记，见 {@link #openReadOnly}）。
+   * </ul>
+   */
+  public enum ReadOnlyMode {
+    URI_RO,
+    QUERY_ONLY
+  }
+
   /** 文件路径：打开（建目录、设 PRAGMA、建表）。 */
   public static SqliteEventStore open(Path dbFile) {
     // 声明在 try 之外：initialize 失败时 catch 里要回收它（任务 #32）。getConnection 自身失败时仍为 null。
@@ -83,7 +101,7 @@ public final class SqliteEventStore implements EventStore {
         Files.createDirectories(parent);
       }
       connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
-      SqliteEventStore store = new SqliteEventStore(connection, dbFile);
+      SqliteEventStore store = new SqliteEventStore(connection, dbFile, null);
       store.initialize();
       return store;
     } catch (IOException e) {
@@ -110,9 +128,89 @@ public final class SqliteEventStore implements EventStore {
     }
   }
 
-  private SqliteEventStore(Connection connection, Path dbFile) {
+  /**
+   * <b>只读打开</b>（D30 读侧：父进程按 {@code <dataDir>/subagents/<instanceId>/events.db} 读子体的上下文）。
+   *
+   * <p>三条硬约束与各自的手段：
+   *
+   * <ol>
+   *   <li><b>绝不写</b>：不建表、不迁移、不 INSERT/UPDATE——本路径<b>不调用</b> {@link #initialize()}（它含 {@code PRAGMA
+   *       journal_mode = WAL} 与两条 DDL），也不用 {@link #append}；写入会被 SQLite 直接拒绝；
+   *   <li><b>必须能读"正被别的进程写"的库</b>（子 Agent 还活着、WAL 在写）：先用 {@code jdbc:sqlite:file:<绝对路径>?mode=ro}；WAL
+   *       库用只读连接打开时 SQLite 可能需要读写 {@code -shm} 才能建立读快照，若该形态打不开（{@code SQLITE_CANTOPEN} / {@code
+   *       SQLITE_READONLY_CANTINIT} 等）， 退化到普通连接 + {@code PRAGMA query_only = 1}；
+   *   <li><b>库不存在 → 响亮报错</b>：抛 {@link IllegalStateException}，绝不静默返回空结果（"读不到"与"读到空"是
+   *       两件事，混起来会把"库没落成"伪装成"子体没干活"）。
+   * </ol>
+   *
+   * <p><b>实际用的是哪一条</b>：见 {@link #readOnlyMode()}（{@link ReadOnlyMode}）——本方法只负责"能只读就用
+   * 只读"，事实记在实例上供审计与判别性用例读取，不做猜测。
+   *
+   * <p><b>退化路径的诚实口径</b>：{@code PRAGMA query_only = 1} 拦的是 <b>SQL 层</b>的写（INSERT/UPDATE/DDL 直接 抛
+   * {@code SQLITE_READONLY}），但普通连接打开 WAL 库时 SQLite 自身仍可能创建/更新 {@code -shm}、 或在无 WAL
+   * 的库上做恢复性簿记——这是文件级副作用，不改变 {@code events} 表的任何一行。要求"连文件都不碰"就得让 {@code mode=ro} 必然可用（即子体侧保证 -shm
+   * 可读），那是另一件事；本类把差异如实记在 {@link ReadOnlyMode} 上。
+   */
+  public static SqliteEventStore openReadOnly(Path dbFile) {
+    return openReadOnly(dbFile, true);
+  }
+
+  /**
+   * 只读打开（{@code preferUriMode = false} 时跳过 {@code mode=ro} 直接走退化路径）。
+   *
+   * <p>包内可见的<b>测试缝</b>：退化路径的现实触发条件是"WAL 的 {@code -shm} 打不开"，靠文件权限构造不稳定（本仓以 root
+   * 跑测试，权限位对它无效），故用本参数<b>判别性地</b>验证退化路径本身可用且同样只读。
+   */
+  static SqliteEventStore openReadOnly(Path dbFile, boolean preferUriMode) {
+    Objects.requireNonNull(dbFile, "dbFile");
+    if (!Files.isRegularFile(dbFile)) {
+      throw new IllegalStateException("只读打开事件库失败：库文件不存在（只读路径不创建库）: " + dbFile.toAbsolutePath());
+    }
+    if (!preferUriMode) {
+      return queryOnlyStore(dbFile, null);
+    }
+    try {
+      return uriReadOnlyStore(dbFile);
+    } catch (SQLException uriFailure) {
+      return queryOnlyStore(dbFile, uriFailure);
+    }
+  }
+
+  /** 只读手段之一：URI 形态 {@code mode=ro}（库文件由 SQLite 按只读打开）。 */
+  private static SqliteEventStore uriReadOnlyStore(Path dbFile) throws SQLException {
+    // 用原始绝对路径拼接（不能用 Path.toUri()：它会带出 "file:///" 前缀，与 jdbc:sqlite: 的 "file:" 叠加成
+    // "file:file:///…"，SQLite 直接 SQLITE_CANTOPEN——2026-09-12 实测）
+    Connection readOnly =
+        DriverManager.getConnection("jdbc:sqlite:file:" + dbFile.toAbsolutePath() + "?mode=ro");
+    return new SqliteEventStore(readOnly, dbFile, ReadOnlyMode.URI_RO);
+  }
+
+  /**
+   * 只读手段之二（退化）：普通连接 + {@code PRAGMA query_only = 1}。打开或设 PRAGMA 失败则响亮度错——原 {@code uriFailure} 挂在
+   * suppressed 上，两条失败线索都不丢。
+   */
+  private static SqliteEventStore queryOnlyStore(Path dbFile, SQLException uriFailure) {
+    Connection connection = null;
+    try {
+      connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
+      try (Statement statement = connection.createStatement()) {
+        statement.execute("PRAGMA query_only = 1");
+      }
+      return new SqliteEventStore(connection, dbFile, ReadOnlyMode.QUERY_ONLY);
+    } catch (SQLException e) {
+      if (uriFailure != null) {
+        e.addSuppressed(uriFailure);
+      }
+      closeSilently(connection);
+      throw new IllegalStateException(
+          "只读打开 SQLite 事件库失败（mode=ro 与 query_only 两条路均不可用）: " + dbFile, e);
+    }
+  }
+
+  private SqliteEventStore(Connection connection, Path dbFile, ReadOnlyMode readOnlyMode) {
     this.connection = connection;
     this.dbFile = dbFile;
+    this.readOnlyMode = readOnlyMode;
   }
 
   private void initialize() throws SQLException {
@@ -128,6 +226,11 @@ public final class SqliteEventStore implements EventStore {
   @Override
   public Event append(EventWrite write) {
     synchronized (lock) {
+      if (readOnlyMode != null) {
+        // 显式拒绝而非"让 SQLite 报错"：只读 store 被拿去写是调用方接错线（读错对象/拿错句柄），
+        // 消息要指出这一点，别让上层从 SQLITE_READONLY 里猜
+        throw new IllegalStateException("只读事件存储不允许追加事件（" + readOnlyMode + "）: " + write.type());
+      }
       String ts = Instant.now().toString();
       try (var ps = connection.prepareStatement(WAL_INSERT, Statement.RETURN_GENERATED_KEYS)) {
         ps.setString(1, ts);
@@ -267,9 +370,12 @@ public final class SqliteEventStore implements EventStore {
   public void close() {
     synchronized (lock) {
       try {
-        // 收尾 checkpoint：把 WAL 内容刷回主库文件，进程退出后不留 wal 文件
-        try (Statement statement = connection.createStatement()) {
-          statement.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+        if (readOnlyMode == null) {
+          // 收尾 checkpoint：把 WAL 内容刷回主库文件，进程退出后不留 wal 文件
+          // （只读路径绝不做——TRUNCATE checkpoint 会写主库文件，正是"只读"要禁的事）
+          try (Statement statement = connection.createStatement()) {
+            statement.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+          }
         }
         connection.close();
       } catch (SQLException e) {
@@ -280,5 +386,10 @@ public final class SqliteEventStore implements EventStore {
 
   public Path dbFile() {
     return dbFile;
+  }
+
+  /** 本次打开实际使用的只读手段；写路径（{@link #open}）恒为 {@code null}。审计与判别性用例据此断言"走的是哪条路"， 而不是从代码里猜。 */
+  public ReadOnlyMode readOnlyMode() {
+    return readOnlyMode;
   }
 }

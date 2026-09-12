@@ -111,6 +111,12 @@ public final class AgentPipeline {
   private final List<LlmMessage> history = new ArrayList<>();
 
   /**
+   * 工具自身配置（D30）：每次工具调用经 {@link ToolContext#config()} 下发（空 map = 什么都不注入，既有装配不变）。
+   * 装配层（Main）用它把"子库根目录"这类运行时路径交给工具——Brain 不持有全局路径、不做文件系统假设。
+   */
+  private final Map<String, Object> toolConfig;
+
+  /**
    * 工作集里是否有"只被占位代表"的内容（档 1 移出工作集、且此后没有落库重新同步过）——{@link #snapshotBaseline} 的判据（F3）。
    *
    * <p>只在回合边界读写。{@code volatile} 与 {@link #cancelled} 同口径：本类的并发约定只要求调用方<b>串行</b>（不要求同一线程——见类
@@ -151,6 +157,40 @@ public final class AgentPipeline {
         permissionSet,
         DiscardingConversationStore.INSTANCE,
         conversationIdOf(config));
+  }
+
+  /**
+   * 不落库构造 + <b>工具配置注入</b>（D30）：除最后一个参数外与 9 参构造逐字节一致（委派到 {@link #AgentPipeline(AgentConfig,
+   * LlmClient, ToolRegistry, ToolExecutionGuard, ContextAssembler, EventStore, EventBus,
+   * AccessToken, AgentPermissionSet, ConversationStore, String, Compactor, CompactSummarySlot,
+   * Map)}）。
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        DiscardingConversationStore.INSTANCE,
+        conversationIdOf(config),
+        null,
+        CompactSummarySlot.empty(),
+        toolConfig);
   }
 
   /**
@@ -221,6 +261,46 @@ public final class AgentPipeline {
       String conversationId,
       Compactor compactor,
       CompactSummarySlot compactSummary) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        Map.of());
+  }
+
+  /**
+   * 全参装配 + <b>工具配置注入</b>（D30）：除最后一个参数外与 13 参构造逐字节相同。
+   *
+   * <p>{@code toolConfig} 是工具<b>自身</b>的配置（路径等），经 {@link ToolContext#config()} 交给每次工具调用—— 与 LLM 填的
+   * {@code arguments} 严格分开（{@code ToolContext} 的既定缝：工具只能读、不能反向索取调用者数据）。 既有装配不传 = 空
+   * map，行为与注入接线前逐字节一致。
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig) {
+    this.toolConfig = Map.copyOf(Objects.requireNonNull(toolConfig, "toolConfig"));
     this.compactor = compactor;
     this.compactSummary = Objects.requireNonNull(compactSummary, "compactSummary");
     this.config = Objects.requireNonNull(config, "config");
@@ -696,7 +776,7 @@ public final class AgentPipeline {
         EventTypes.TOOL_CALL,
         Map.of("tool", call.name(), "callId", call.id(), "args", call.arguments()));
 
-    ToolContext context = new ToolContext(caller, permissionSet, Map.of(), call.arguments());
+    ToolContext context = new ToolContext(caller, permissionSet, toolConfig, call.arguments());
     ToolResult result;
     try {
       result = guard.execute(registry, call.name(), context);

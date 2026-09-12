@@ -24,6 +24,7 @@ import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
 import io.mosire.brain.runtime.TurnResult;
 import io.mosire.brain.subagent.AgentCommand;
+import io.mosire.brain.subagent.AgentContextReader;
 import io.mosire.brain.subagent.AgentTemplateStore;
 import io.mosire.brain.subagent.SubProcessExecutor;
 import io.mosire.brain.subagent.SubagentInstance;
@@ -47,6 +48,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -252,9 +254,19 @@ public final class App implements AutoCloseable {
           config.mcpExpose() ? AgentToMcpServer.start(tools, "mosire-main", Version.VERSION) : null;
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       LlmClient llm = scriptedLlm(config, llmOverride);
+      // D30：工具自身配置经 ToolContext.config 注入（运行时缝，不走构造器全局）——read_agent_context 据此定位
+      // 子库根（与 subagentCommand 的 --data-dir 同源）与自身事件库；键名归 Brain（AgentContextReader 常量）
+      Map<String, Object> toolConfig =
+          Map.of(
+              AgentContextReader.CONFIG_SUBAGENTS_ROOT,
+              config.dataDir().resolve("subagents").toString(),
+              AgentContextReader.CONFIG_SELF_EVENTS_DB,
+              config.dataDir().resolve("events.db").toString(),
+              AgentContextReader.CONFIG_SELF_AGENT_ID,
+              agentConfig.id());
       AgentRuntime runtime =
           conversations == null
-              ? new AgentRuntime(agentSpec, llm, tools, events, bus, permissionSet)
+              ? new AgentRuntime(agentSpec, llm, tools, events, bus, permissionSet, toolConfig)
               : new AgentRuntime(
                   agentSpec,
                   llm,
@@ -263,7 +275,8 @@ public final class App implements AutoCloseable {
                   bus,
                   permissionSet,
                   conversations,
-                  MAIN_CONVERSATION_ID);
+                  MAIN_CONVERSATION_ID,
+                  toolConfig);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;

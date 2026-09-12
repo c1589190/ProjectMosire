@@ -13,6 +13,7 @@ import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
+import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.ContextAssembler;
 import java.util.Map;
 import java.util.Objects;
@@ -122,7 +123,61 @@ public final class AgentRuntime implements AutoCloseable {
         bus,
         permissionSet,
         Objects.requireNonNull(store, "store"),
-        Objects.requireNonNull(conversationId, "conversationId"));
+        Objects.requireNonNull(conversationId, "conversationId"),
+        Map.of());
+  }
+
+  /**
+   * 便捷装配 + 会话持久化 + <b>工具配置注入</b>（D30）：除最后一个参数外与上一构造逐字节相同。
+   *
+   * <p>{@code toolConfig} 经 {@link AgentPipeline} 落到每次工具调用的 {@code ToolContext.config()}——装配层
+   * （Main）用它把"子库根目录"这类运行时路径交给工具，Brain 因此不必持有全局路径、也不做文件系统假设。
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig) {
+    this(
+        spec,
+        llm,
+        registry,
+        new ToolExecutionGuard(),
+        new BasicContextAssembler(),
+        events,
+        bus,
+        permissionSet,
+        Objects.requireNonNull(store, "store"),
+        Objects.requireNonNull(conversationId, "conversationId"),
+        toolConfig);
+  }
+
+  /** 便捷装配 + <b>工具配置注入</b>（D30，不落库形态）：除最后一个参数外与 6 参构造逐字节相同。 */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig) {
+    this(
+        spec,
+        llm,
+        registry,
+        new ToolExecutionGuard(),
+        new BasicContextAssembler(),
+        events,
+        bus,
+        permissionSet,
+        null,
+        null,
+        toolConfig);
   }
 
   private AgentRuntime(
@@ -134,7 +189,7 @@ public final class AgentRuntime implements AutoCloseable {
       EventStore events,
       EventBus bus,
       AgentPermissionSet permissionSet) {
-    this(spec, llm, registry, guard, assembler, events, bus, permissionSet, null, null);
+    this(spec, llm, registry, guard, assembler, events, bus, permissionSet, null, null, Map.of());
   }
 
   /**
@@ -151,7 +206,8 @@ public final class AgentRuntime implements AutoCloseable {
       EventBus bus,
       AgentPermissionSet permissionSet,
       ConversationStore store,
-      String conversationId) {
+      String conversationId,
+      Map<String, Object> toolConfig) {
     this.spec = Objects.requireNonNull(spec, "spec");
     AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
@@ -171,7 +227,8 @@ public final class AgentRuntime implements AutoCloseable {
                 events,
                 bus,
                 permissionSet.grantedToken(),
-                permissionSet)
+                permissionSet,
+                toolConfig)
             : new AgentPipeline(
                 config,
                 client,
@@ -183,7 +240,10 @@ public final class AgentRuntime implements AutoCloseable {
                 permissionSet.grantedToken(),
                 permissionSet,
                 store,
-                conversationId);
+                conversationId,
+                null,
+                CompactSummarySlot.empty(),
+                toolConfig);
 
     // 起步即记录生命周期（事件词汇表 agent.lifecycle）
     // model 报的是【客户端实际在用的模型】（client.model()），不是装配层标签 config.model()：后者由

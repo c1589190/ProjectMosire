@@ -10,6 +10,7 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpServerTransportProvider;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
@@ -33,6 +34,8 @@ import org.slf4j.LoggerFactory;
  *   <li>启动时枚举 Registry 现有工具（在 transport 启动前注册，避免客户端首二次 {@code listTools} 时缺工具）；
  *   <li>Registry 变更（{@link ToolRegistry#onChange}）增量 addTool/removeTool——SDK 自动通知 {@code
  *       notifications/tools/list_changed}；
+ *   <li>带 {@link ToolSpec#noExport()} 的工具<b>永不进入暴露面</b>（D30：读权力不外包给子体；判定见 {@code
+ *       exportable}，初始注册与增量同步同源）；
  *   <li>工具校验失败（执行中）按 {@code isError} 返回，不抛异常。
  * </ul>
  *
@@ -162,7 +165,7 @@ public final class AgentToMcpServer implements AutoCloseable {
         (McpServer.SingleSessionSyncSpecification)
             McpServer.sync(transport).serverInfo(serverName, serverVersion);
     for (AgentTool tool : registry.list()) {
-      if (!include.test(tool.name())) {
+      if (!exportable(tool, include)) {
         continue;
       }
       spec.toolCall(toMcpTool(tool), (exchange, request) -> handleCall(registry, caller, request));
@@ -187,11 +190,14 @@ public final class AgentToMcpServer implements AutoCloseable {
     this.include = include;
   }
 
-  /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）；过滤器命中的才在暴露面内。 */
+  /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）；可外发且命中的才在暴露面内。 */
   private void sync() {
     List<AgentTool> tools = registry.list();
     Set<String> desired =
-        tools.stream().map(AgentTool::name).filter(include).collect(Collectors.toSet());
+        tools.stream()
+            .filter(tool -> exportable(tool, include))
+            .map(AgentTool::name)
+            .collect(Collectors.toSet());
     List<String> existing = server.listTools().stream().map(McpSchema.Tool::name).toList();
     for (String name : existing) {
       if (!desired.contains(name)) {
@@ -202,11 +208,23 @@ public final class AgentToMcpServer implements AutoCloseable {
     Set<String> stillThere =
         server.listTools().stream().map(McpSchema.Tool::name).collect(Collectors.toSet());
     for (AgentTool tool : tools) {
-      if (include.test(tool.name()) && !stillThere.contains(tool.name())) {
+      if (exportable(tool, include) && !stillThere.contains(tool.name())) {
         server.addTool(new McpServerFeatures.SyncToolSpecification(toMcpTool(tool), this::handle));
         LOG.debug("MCP 工具注册: {}", tool.name());
       }
     }
+  }
+
+  /**
+   * 暴露判定（初始注册与增量同步<b>唯一</b>的取法）= 名过滤器命中 <b>且</b> 工具未标"禁外发"。
+   *
+   * <p>{@link ToolSpec#noExport()} 是 D30 的安全必需：桥接把整个 Registry 交给子体，靠调用点逐个记得传 {@code include}
+   * 过滤器会漏（新增工具时没人提醒），标在工具自己身上则是结构性的——子体拿不到句柄 = 读权力不外包。 判定与 {@link ToolRegistry}
+   * 无关，纯函数，故初始注册与增量同步不会分叉。
+   */
+  private static boolean exportable(AgentTool tool, Predicate<String> include) {
+    ToolSpec spec = tool.spec() == null ? ToolSpec.DEFAULT : tool.spec();
+    return include.test(tool.name()) && !spec.noExport();
   }
 
   private McpSchema.CallToolResult handle(

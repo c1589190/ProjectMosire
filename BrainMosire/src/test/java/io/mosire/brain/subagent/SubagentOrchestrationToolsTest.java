@@ -45,11 +45,17 @@ class SubagentOrchestrationToolsTest {
   void toolsUseSystemLevelSensitiveFalseDestructiveTrue() {
     Fixture f = fixture(systemParent(), null);
     List<AgentTool> tools = SubagentOrchestrationTools.of(f.manager());
+    // D30 起是四个（多 read_agent_context）；注册序 = 名字字典序
     assertThat(tools)
         .extracting(AgentTool::name)
-        .containsExactly("kill_sub_agent", "list_sub_agents", "spawn_sub_agent");
+        .containsExactly(
+            "kill_sub_agent", "list_sub_agents", "read_agent_context", "spawn_sub_agent");
     for (AgentTool tool : tools) {
+      if (tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
+        continue; // 读工具的 spec 另有一维（noExport）+ sensitive=true，判别在 ReadAgentContextToolTest
+      }
       assertThat(tool.spec()).isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
+      assertThat(tool.spec().noExport()).isFalse(); // 既有三工具逐字不变：仍可外发（子体拿得到 spawn/kill/list）
     }
     f.close();
   }
