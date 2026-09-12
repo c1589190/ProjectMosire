@@ -24,7 +24,9 @@ MainMosire ──→ BrainMosire ──→ AgentLibMosire
 
 - 工具链：JDK 21（`--release 21`）+ Maven Wrapper `./mvnw`（锁定 3.9.16；apt 的 maven 3.8.7 不满足 spotbugs 4.10.4.1 的 Maven ≥3.8.9 要求，勿用系统 `mvn`）。可选安装：`apt-get install openjdk-21-jdk-headless`、`/opt/apache-maven-3.9.16`。
 - `./mvnw verify` = Spotless(google-java-format) → Checkstyle(`config/checkstyle.xml`) → SpotBugs(Max/Low) → Surefire(JUnit 6)，全绿才算完成。
-- 改完代码先 `./mvnw spotless:apply` 再 `./mvnw verify`（避免格式门禁来回）。**勿加 `-N`**：`-N` 只构建根聚合器，对模块源码是空操作，`spotless:check` 会假绿（2026-09-11 实测：模块内放一个明显违规文件，`./mvnw -N spotless:check` 退出 0，`./mvnw spotless:check` 正确报违规）。测试全离线（FakeLlmClient/假子进程），禁止依赖外部 LLM/网络的服务。
+- 改完代码先 `./mvnw spotless:apply` 再 `./mvnw verify`（避免格式门禁来回）。**勿加 `-N`**：`-N` 只构建根聚合器，对模块源码是空操作，`spotless:check` 会假绿（2026-09-11 实测：模块内放一个明显违规文件，`./mvnw -N spotless:check` 退出 0，`./mvnw spotless:check` 正确报违规）。默认门禁（`./mvnw verify`）必须离线可跑（FakeLlmClient/假子进程），不得依赖外部 LLM/网络——它要能随时重跑、快、不花钱。
+**但真模型的「使用模式测试」是一等验收手段**（2026-09-12 D29）：起真进程、经 HTTP 对话、以 HTTP 结果 + 日志 + 事件库三方互证判读，见 `开发计划-三期-第二小段.md`。
+离线用例是**回归钉**（改动只跑相关单条用例），不是"功能可用"的证据；"测试禁止真模型"不再是本仓纪律。
 
 ## 编码与文档
 
