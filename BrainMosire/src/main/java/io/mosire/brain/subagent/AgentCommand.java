@@ -24,10 +24,12 @@ import java.util.Objects;
  * @param jvmArgs JVM 级参数（如内存 cap；插在命令之后、子命令前缀之前；null/空 = 不传）
  * @param prefix 子命令前缀参数（如 {@code -jar <jar> agent}）
  * @param idFlag 实例 id 参数名（{@code --id}）
- * @param templatesDir 模板目录（装配层注入；null = 不传，子体按自身默认）
- * @param childDataDir 子 Agent 数据根目录（每实例取其 {@code <root>/<实例id>}；null = 不传）
+ * @param templatesDir 模板目录（装配层注入；<b>相对路径按父进程 CWD 绝对化</b>，见 {@code absoluteOrNull}；null =
+ *     不传，子体按自身默认）
+ * @param childDataDir 子 Agent 数据根目录（每实例取其 {@code <root>/<实例id>}；同上绝对化；null = 不传）
  * @param parentLink 是否带 {@code --parent-link}（父侧已建 stdio 链接，子体走 MCP client 形态）
- * @param configDir 父的配置根目录（装配层注入；null = 不传——离线/测试形态，子体按自身默认）。<b>只放路径</b>：密钥值绝不经参数面 （R-A2-3/D23）
+ * @param configDir 父的配置根目录（装配层注入；同上绝对化；null = 不传——离线/测试形态，子体按自身默认）。<b>只放路径</b>：密钥值绝不经参数面
+ *     （R-A2-3/D23）
  */
 public record AgentCommand(
     String command,
@@ -48,6 +50,26 @@ public record AgentCommand(
     if (idFlag == null || idFlag.isBlank()) {
       throw new IllegalArgumentException("idFlag 不能为空");
     }
+    templatesDir = absoluteOrNull(templatesDir);
+    childDataDir = absoluteOrNull(childDataDir);
+    configDir = absoluteOrNull(configDir);
+  }
+
+  /**
+   * 注入路径一律<b>绝对化</b>（S5-E 实测缺陷）：子体的出生目录是它的 {@code fs} 可达面首根（{@code
+   * SubProcessExecutor.startDirectory}，S5-D 的 L2），<b>与父进程 CWD 可以不同</b>——同一个相对路径在父子两侧会解析到
+   * 两个位置。实测形态（父 Agent 配了 {@code agents.workingDirs} + 相对模板目录）：子体拿到 {@code --templates-dir
+   * .work/…/s5-templates}，在出生目录里解析成 {@code <沙箱根>/.work/…}（不存在）⇒ 子体启动即退，父侧只看到一个 {@code
+   * finished}，日志零行。
+   *
+   * <p>绝对化在<b>构造期</b>做（构造发生在父进程，解析基准 = 父的 CWD，与父装载这些目录时同源）；放在这里而不是各装配点，是
+   * 因为"注入路径必须与父同源"是这个记录的契约，漏一处就复现一次。
+   *
+   * <p>只做 {@code toAbsolutePath().normalize()}：<b>不探测存在性</b>（Rul C——路径由装配层给定），也不做 realpath
+   * （那会改变符号链接语义）。
+   */
+  private static String absoluteOrNull(String path) {
+    return path == null ? null : Path.of(path).toAbsolutePath().normalize().toString();
   }
 
   /** W3a 兼容构造：无 JVM 参数、无目录注入、非链接模式。 */

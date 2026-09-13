@@ -120,6 +120,23 @@ public final class ManagedProcess implements AutoCloseable {
     return overflowed.get();
   }
 
+  /**
+   * 退出码（spawn 模式且进程已退出时）；仍在运行、或 adopt 模式（进程不是本 JVM spawn 的， {@link ProcessHandle} 拿不到退出码）⇒ 空。S5-E
+   * 新增，服务"异常退出要有原因"。
+   *
+   * <p>只读已知状态、不等待：查的瞬间进程若又变了状态（理论上不该发生），返回空而不是抛——这是诊断面，不值得为它崩掉调用方。
+   */
+  public java.util.OptionalInt exitValue() {
+    if (process == null || handle.isAlive()) {
+      return java.util.OptionalInt.empty();
+    }
+    try {
+      return java.util.OptionalInt.of(process.exitValue());
+    } catch (IllegalThreadStateException e) {
+      return java.util.OptionalInt.empty();
+    }
+  }
+
   /** 最近输出（spawn 模式，至多 {@value #MAX_TAIL_LINES} 行，时间正序快照）；adopt 模式恒为空列表。 */
   public List<String> outputTail() {
     synchronized (tailLock) {

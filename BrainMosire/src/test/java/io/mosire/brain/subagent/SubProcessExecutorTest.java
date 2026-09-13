@@ -16,6 +16,7 @@ import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import java.util.List;
+import java.util.OptionalInt;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -150,6 +151,76 @@ class SubProcessExecutorTest {
     handle.close();
     // 三层关停经由 SubprocessManager/ManagedProcess 的标准入口（优雅停+宽限+树级强杀在内）
     verify(managed).stopGracefully(SubprocessManager.DEFAULT_GRACE);
+  }
+
+  /**
+   * S5-E：非零退出必须留下原因（子进程 stderr 尾部），且文本里带退出码。
+   *
+   * <p>判别性：默认实现（{@link LaunchedSubagent#exitDiagnostics()} 返回空）或"只在打印时取、不从尾部缓冲取"的实现都会让本用例变红。
+   */
+  @Test
+  void handleSurfacesNonZeroExitWithChildStderrTail() {
+    SubprocessManager processes = mock(SubprocessManager.class);
+    ManagedProcess managed = mock(ManagedProcess.class);
+    when(processes.spawn(any(SpawnSpec.class))).thenReturn(managed);
+    when(managed.isAlive()).thenReturn(false);
+    when(managed.exitValue()).thenReturn(OptionalInt.of(1));
+    when(managed.outputTail())
+        .thenReturn(List.of("子 Agent 引导/运行失败: 模板目录不存在或不是目录: .work/x", "（第二行）"));
+    SubProcessExecutor executor =
+        new SubProcessExecutor(processes, AgentCommand.javaJar("java", "mosire.jar"));
+
+    LaunchedSubagent handle = executor.launch(instance("a-3", "reader", "g"));
+
+    assertThat(handle.exitDiagnostics())
+        .hasValueSatisfying(
+            text ->
+                assertThat(text).contains("exitCode=1").contains("模板目录不存在或不是目录").contains("（第二行）"));
+  }
+
+  /**
+   * 正常退出（0）与仍在运行 ⇒ 空诊断：诊断面不是"每条退出都刷一行"——那会把日志淹掉，真异常就没人看了。
+   *
+   * <p>adopt 形态（{@link ManagedProcess#exitValue()} 拿不到退出码）同样为空——"拿不到"不是"异常"，不许猜。
+   */
+  @Test
+  void normalExitLiveProcessAndAdoptModeCarryNoDiagnostics() {
+    SubprocessManager processes = mock(SubprocessManager.class);
+    ManagedProcess managed = mock(ManagedProcess.class);
+    when(processes.spawn(any(SpawnSpec.class))).thenReturn(managed);
+    SubProcessExecutor executor =
+        new SubProcessExecutor(processes, AgentCommand.javaJar("java", "mosire.jar"));
+    LaunchedSubagent handle = executor.launch(instance("a-4", "reader", "g"));
+
+    when(managed.isAlive()).thenReturn(true);
+    assertThat(handle.exitDiagnostics()).as("仍在运行").isEmpty();
+
+    when(managed.isAlive()).thenReturn(false);
+    when(managed.exitValue()).thenReturn(OptionalInt.of(0));
+    assertThat(handle.exitDiagnostics()).as("正常完成任务退出 0").isEmpty();
+
+    when(managed.exitValue()).thenReturn(OptionalInt.empty());
+    assertThat(handle.exitDiagnostics()).as("拿不到退出码（adopt）").isEmpty();
+  }
+
+  /** 崩栈可能几十 KB：诊断文本截尾保留（"最后一次说什么"比"从头说"有用），不截尾则本用例红。 */
+  @Test
+  void hugeChildOutputIsTruncatedToTheDiagnosticsBudget() {
+    SubprocessManager processes = mock(SubprocessManager.class);
+    ManagedProcess managed = mock(ManagedProcess.class);
+    when(processes.spawn(any(SpawnSpec.class))).thenReturn(managed);
+    when(managed.isAlive()).thenReturn(false);
+    when(managed.exitValue()).thenReturn(OptionalInt.of(137));
+    when(managed.outputTail()).thenReturn(List.of("X".repeat(5000), "结尾标记YYY"));
+    SubProcessExecutor executor =
+        new SubProcessExecutor(processes, AgentCommand.javaJar("java", "mosire.jar"));
+
+    String text = executor.launch(instance("a-5", "reader", "g")).exitDiagnostics().orElseThrow();
+
+    assertThat(text).contains("exitCode=137").contains("结尾标记YYY").contains("…");
+    assertThat(text.length())
+        .isLessThanOrEqualTo(SubProcessExecutor.EXIT_DIAGNOSTICS_MAX_CHARS + 64)
+        .isGreaterThan(SubProcessExecutor.EXIT_DIAGNOSTICS_MAX_CHARS);
   }
 
   @Test

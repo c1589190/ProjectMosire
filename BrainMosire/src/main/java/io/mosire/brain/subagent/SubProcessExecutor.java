@@ -15,6 +15,8 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -178,6 +180,32 @@ public final class SubProcessExecutor implements AgentExecutor {
   @Override
   public void close() {}
 
+  /** 诊断文本上限（字符）：一条崩栈能到几十 KB，截尾保留——"最后一次说什么"比"从头说"有用。 */
+  static final int EXIT_DIAGNOSTICS_MAX_CHARS = 600;
+
+  /**
+   * 异常退出的诊断文本（S5-E）：<b>正常退出 / 仍在运行 / 拿不到退出码 ⇒ 空</b>。
+   *
+   * <p>两个句柄共用这一段（生产走 {@link LinkedHandle}）：如果只在基础形态的句柄上实现，真进程链接形态就会又一次 "崩了没声音"——那正是本方法要消除的形态。
+   *
+   * <p>非零才是诊断对象：子体完成任务后退出 0 是正常终局，不该刷日志；把它当异常会让"安静"变成噪声，噪声里再出问题就没人看了。
+   */
+  static Optional<String> exitDiagnosticsOf(ManagedProcess managed) {
+    if (managed.isAlive()) {
+      return Optional.empty();
+    }
+    OptionalInt code = managed.exitValue();
+    if (code.isEmpty() || code.getAsInt() == 0) {
+      return Optional.empty();
+    }
+    String tail = String.join(" | ", managed.outputTail()).strip();
+    if (tail.length() > EXIT_DIAGNOSTICS_MAX_CHARS) {
+      tail = "…" + tail.substring(tail.length() - EXIT_DIAGNOSTICS_MAX_CHARS);
+    }
+    return Optional.of(
+        "exitCode=" + code.getAsInt() + (tail.isEmpty() ? "（子进程没有输出）" : "；末段输出: " + tail));
+  }
+
   /** 真进程句柄的窄缝适配：存亡/终止全数委托 {@link ManagedProcess}。 */
   private static final class ManagedHandle implements LaunchedSubagent {
 
@@ -190,6 +218,11 @@ public final class SubProcessExecutor implements AgentExecutor {
     @Override
     public boolean isAlive() {
       return managed.isAlive();
+    }
+
+    @Override
+    public Optional<String> exitDiagnostics() {
+      return exitDiagnosticsOf(managed);
     }
 
     @Override
@@ -214,6 +247,11 @@ public final class SubProcessExecutor implements AgentExecutor {
     @Override
     public boolean isAlive() {
       return managed.isAlive();
+    }
+
+    @Override
+    public Optional<String> exitDiagnostics() {
+      return exitDiagnosticsOf(managed);
     }
 
     @Override

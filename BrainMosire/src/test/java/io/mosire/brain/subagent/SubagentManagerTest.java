@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -582,6 +583,52 @@ class SubagentManagerTest {
         .hasValueSatisfying(i -> assertThat(i.status()).isEqualTo(SubagentStatus.KILLED));
   }
 
+  /**
+   * S5-E：子体在确认存活之后异常退出（非零码）⇒ 状态<b>仍是 FINISHED</b>（生命周期走到终局），原因经诊断面取回。
+   *
+   * <p>判别性：把"非零退出"顺手翻成 {@link SubagentStatus#FAILED}（一种看着更"对"的改法）会让事件链断言变红——状态是生命周期
+   * 事实（确认存活后退出就是终态），退出码是诊断事实，二者混用会让需求/预算/事件账目跟着撒谎。
+   */
+  @Test
+  void abnormalExitStaysFinishedAndTakesReasonFromTheHandle() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    CrashingLauncher launcher = new CrashingLauncher("exitCode=1；末段输出: 模板目录不存在", false);
+    SubagentManager manager =
+        manager(store(), launcher, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+    String id = spawned.instanceId();
+    assertThat(spawned.status()).isEqualTo(SubagentStatus.RUNNING);
+
+    awaitStatus(manager, id, SubagentStatus.FINISHED);
+
+    assertThat(lifecycleActions(id))
+        .containsExactly("configured", "spawning", "running", "finished");
+    assertThat(launcher.diagnosticsCalls()).as("异常退出必须真去取原因（缝加了不用 = 没加）").isPositive();
+  }
+
+  /**
+   * 诊断实现自身抛异常（最恶劣形态）⇒ 观测线程照样收束状态：诊断是日志面，不许把状态机带停。
+   *
+   * <p>判别性：去掉 {@code diagnosticsOf} 的 try/catch，观测线程在投递退出事实时死掉 ⇒ 实例永远停在 RUNNING ⇒ 本用例超时变红。
+   */
+  @Test
+  void throwingDiagnosticsImplementationDoesNotStallTheExitWatch() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    CrashingLauncher launcher = new CrashingLauncher("（不会被取到）", true);
+    SubagentManager manager =
+        manager(store(), launcher, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+
+    awaitStatus(manager, spawned.instanceId(), SubagentStatus.FINISHED);
+    assertThat(launcher.diagnosticsCalls()).as("确认诊断面真被调过（否则本用例是空转）").isPositive();
+  }
+
   @Test
   void killDuringSpawningReturnsFailedSnapshotNotRawIllegalState() throws Exception {
     AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
@@ -1024,6 +1071,53 @@ class SubagentManagerTest {
           closeCalls.incrementAndGet();
           alive.set(false);
         }
+      };
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  /**
+   * 崩退 launcher（S5-E 诊断面）：句柄"启动即死"（观测线程下一轮轮询就投递退出事实），并带（或故意抛）诊断文本。
+   *
+   * <p>为什么句柄要能"抛"：{@link LaunchedSubagent#exitDiagnostics()} 是在退出观测线程里被调的，任何实现都可能在那一瞬抛
+   * （子进程刚死、流已关）——最恶劣形态必须被夹具覆盖，否则"诊断不许带崩状态机"这条约束没有判别性。
+   */
+  private static final class CrashingLauncher implements SubagentLauncher {
+
+    private final String diagnostics;
+    private final boolean throwOnDiagnostics;
+    private final AtomicInteger diagnosticsCalls = new AtomicInteger();
+
+    CrashingLauncher(String diagnostics, boolean throwOnDiagnostics) {
+      this.diagnostics = diagnostics;
+      this.throwOnDiagnostics = throwOnDiagnostics;
+    }
+
+    int diagnosticsCalls() {
+      return diagnosticsCalls.get();
+    }
+
+    @Override
+    public LaunchedSubagent launch(SubagentInstance instance) {
+      return new LaunchedSubagent() {
+        @Override
+        public boolean isAlive() {
+          return false;
+        }
+
+        @Override
+        public Optional<String> exitDiagnostics() {
+          diagnosticsCalls.incrementAndGet();
+          if (throwOnDiagnostics) {
+            throw new IllegalStateException("诊断实现自身崩了");
+          }
+          return Optional.of(diagnostics);
+        }
+
+        @Override
+        public void close() {}
       };
     }
 

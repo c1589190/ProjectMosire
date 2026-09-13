@@ -55,10 +55,10 @@ import org.slf4j.LoggerFactory;
  * KILLED（事件）；kill-before-running 按 {@link SubagentStatus#FAILED} 语义收束。终结后幂等（重复 kill 是空操作）。Manager
  * 不持有 {@link SubprocessManager}——它归装配层（Main） 持有。
  *
- * <p><strong>退出观测</strong>:WIP {@link LaunchedSubagent} 只暴露 {@code isAlive()/close()}（窄缝不泄漏
- * onExit/退出码——决策回溯见其 Javadoc），本类以一个每实例虚拟线程做轮询桥接 ({@value #EXIT_POLL_MILLIS}ms)，自然退出 →
- * FINISHED、关停中退出 → KILLED；W3b 接协议层后（MCP stdio 终止/退出码回报）可换为事件驱动，桥接点收敛在 {@link #onChildExited}
- * 一处。管理核心仍单线程语义： 所有状态转移在同一把私有锁下原子完成，观测线程只投递"已退出"事实。
+ * <p><strong>退出观测</strong>：{@link LaunchedSubagent} 只暴露 {@code isAlive()/close()} 与诊断面 {@code
+ * exitDiagnostics()}（窄缝不泄漏 onExit/退出码——决策回溯见其 Javadoc），本类以一个每实例虚拟线程做轮询桥接 ({@value
+ * #EXIT_POLL_MILLIS}ms)，自然退出 → FINISHED、关停中退出 → KILLED；W3b 接协议层后（MCP stdio 终止/退出码回报）可换为事件驱动，桥接点收敛在
+ * {@link #onChildExited} 一处。管理核心仍单线程语义： 所有状态转移在同一把私有锁下原子完成，观测线程只投递"已退出"事实。
  *
  * <p><strong>事件面</strong>：生命周期事件 {@code agent=childId, correlationId=childId}；拒绝类事件 {@code agent=父级
  * id, correlationId=拟生成的子实例 id}（查询可串起"尝试+转移"全程）。
@@ -909,7 +909,7 @@ public final class SubagentManager implements AutoCloseable {
     try {
       while (!closed) {
         if (!handle.isAlive()) {
-          onChildExited(instanceId);
+          onChildExited(instanceId, handle);
           return;
         }
         Thread.sleep(EXIT_POLL_MILLIS);
@@ -923,31 +923,70 @@ public final class SubagentManager implements AutoCloseable {
     }
   }
 
-  /** 已退出事实投递（观测线程）：RUNNING→FINISHED（自然完成）；TERMINATING→KILLED；余为防御性 FAILED。 */
-  private void onChildExited(String instanceId) {
+  /**
+   * 已退出事实投递（观测线程）：RUNNING→FINISHED（自然完成）；TERMINATING→KILLED；余为防御性 FAILED。
+   *
+   * <p><b>S5-E：异常退出要留一行原因</b>。子体在确认存活之后退出，过去在事件面与日志上同形——"干完活正常退"与"启动即崩"都只有 一个 {@code
+   * finished}（实测：子体拿到解析不到的相对 {@code --templates-dir} 当场退出，父侧零行日志）。现在<b>非零退出</b>会在父侧日志 留一行 WARN，文本取自
+   * {@link LaunchedSubagent#exitDiagnostics()}（子进程 stderr 尾部）。
+   *
+   * <p><b>只记日志，不动状态</b>：状态说的是"这个子体的生命周期走到哪了"（确认存活后退出 = 终态），退出码是<b>诊断面</b>。 把非零一律翻成 FAILED
+   * 反而制造状态谎言（子体可以跑完目标再以非零码退栈），而且需求/预算/事件账目都挂在状态上。对应的口径是既有先例： 模型只见粗类，细节进日志。
+   *
+   * <p>TERMINATING（我们自己要求的关停）<b>不记</b>：那里的非零退出（SIGTERM 惯常 143）是预期形态，记了就是噪声——噪声里再出问题没人看。
+   *
+   * <p>诊断在<b>锁外</b>取：它读子进程输出尾部（自己一把锁），而输出泵在"输出超限"路径上会经 stopGracefully → 移除回调进本类的锁——
+   * 持锁取诊断等于把两条锁序接起来。诊断是尽力而为的面，取不到照样走状态机。
+   */
+  private void onChildExited(String instanceId, LaunchedSubagent handle) {
+    String diagnostics = diagnosticsOf(handle);
+    boolean abnormal;
     synchronized (lock) {
       SubagentInstance current = instances.get(instanceId);
       if (current == null || current.status().isFinal()) {
         return;
       }
       switch (current.status()) {
-        case RUNNING ->
-            transition(
-                instanceId,
-                SubagentStatus.FINISHED,
-                lifecyclePayload("finished", current.templateId(), current.depth(), null, null));
-        case TERMINATING ->
-            transition(
-                instanceId,
-                SubagentStatus.KILLED,
-                lifecyclePayload("killed", current.templateId(), current.depth(), null, null));
-        default ->
-            transition(
-                instanceId,
-                SubagentStatus.FAILED,
-                lifecyclePayload(
-                    "failed", current.templateId(), current.depth(), null, "subagent 退出于确认存活之前"));
+        case RUNNING -> {
+          abnormal = true;
+          transition(
+              instanceId,
+              SubagentStatus.FINISHED,
+              lifecyclePayload("finished", current.templateId(), current.depth(), null, null));
+        }
+        case TERMINATING -> {
+          abnormal = false;
+          transition(
+              instanceId,
+              SubagentStatus.KILLED,
+              lifecyclePayload("killed", current.templateId(), current.depth(), null, null));
+        }
+        default -> {
+          abnormal = true;
+          transition(
+              instanceId,
+              SubagentStatus.FAILED,
+              lifecyclePayload(
+                  "failed", current.templateId(), current.depth(), null, "subagent 退出于确认存活之前"));
+        }
       }
+    }
+    if (abnormal && diagnostics != null) {
+      // 锁外记日志：诊断文本可能很长，别让它占着状态机的锁
+      LOG.warn("子 Agent 异常退出（未留下正常终局）: id={} 原因: {}", instanceId, diagnostics);
+    }
+  }
+
+  /** 退出诊断文本（null = 拿不到）：观测线程专用，本方法与实现都不得抛——诊断不许把状态机观测带崩。 */
+  private static String diagnosticsOf(LaunchedSubagent handle) {
+    if (handle == null) {
+      return null;
+    }
+    try {
+      return handle.exitDiagnostics().filter(text -> !text.isBlank()).orElse(null);
+    } catch (RuntimeException e) {
+      LOG.warn("子 Agent 退出诊断获取失败（忽略，继续收束状态）", e);
+      return null;
     }
   }
 
