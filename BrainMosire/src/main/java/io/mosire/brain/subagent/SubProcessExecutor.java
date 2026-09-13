@@ -10,6 +10,8 @@ import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -109,6 +111,29 @@ public final class SubProcessExecutor implements AgentExecutor {
     }
   }
 
+  /**
+   * <b>L2 起点固定</b>（S5-D）：子 JVM 的出生目录 = 它的 {@code fs} 可达面首根（<b>不改 argv</b>，只改 {@code
+   * SpawnSpec.workingDir}）。
+   *
+   * <p><b>这不是围栏</b>（设计 §2.7 的措辞）：它只让"相对路径"默认落在允许区里，子 JVM 自身的代码不受任何限制。围栏在 L1（参数面硬拒）与 L3（{@link
+   * io.mosire.brain.tools.BashSandbox}）。
+   *
+   * <p>根不存在/不可用 ⇒ 回落到"继承父进程 CWD"并记日志：起点不是安全边界，不许因为一个没建好的目录把子体启动拦死。可达面为"不限"时 没有根列表（{@code dirList()}
+   * 为空）⇒ 同样是继承。
+   */
+  private static Path startDirectory(SubagentInstance instance) {
+    List<Path> roots = instance.permissions().fsScope().dirList();
+    for (Path root : roots) {
+      if (Files.isDirectory(root)) {
+        return root;
+      }
+    }
+    if (!roots.isEmpty()) {
+      LOG.warn("子 Agent({}) 的可达面根都不可用，出生目录回落到父进程 CWD: {}", instance.instanceId(), roots);
+    }
+    return null;
+  }
+
   @Override
   public LaunchedSubagent launch(SubagentInstance instance) {
     List<String> argv = command.argv(instance);
@@ -117,7 +142,7 @@ public final class SubProcessExecutor implements AgentExecutor {
             argv.get(0),
             argv.subList(1, argv.size()),
             Map.of(),
-            null,
+            startDirectory(instance),
             SpawnSpec.DEFAULT_MAX_OUTPUT_BYTES,
             parentTools != null);
     ManagedProcess managed;

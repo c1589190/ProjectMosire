@@ -3,6 +3,7 @@ package io.mosire.brain.tools;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.mosire.agentlib.config.ConfigException;
 import io.mosire.agentlib.config.ConfigStore;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -10,7 +11,8 @@ import java.util.Optional;
 
 /**
  * 把配置里的 {@code tools.bash.*} 读成一份 {@link BashToolConfig}（读法照 {@code LlmRouteLoader} / {@code
- * ApprovalConfigLoader}）：{@code blockedExtra} / {@code askExtra} / {@code commandLog}。
+ * ApprovalConfigLoader}）：{@code blockedExtra} / {@code askExtra} / {@code commandLog} / {@code
+ * sandbox} / {@code sandboxReadOnly}。
  *
  * <p><b>整项缺失 ⇒ 缺省值</b>（不是错误）：没写过任何 {@code tools.bash.*} 的部署照常起来（无追加条目 + {@code digest}）。 JSON
  * {@code null} 与缺失同口径。
@@ -30,6 +32,8 @@ public final class BashToolConfigLoader {
   private static final String KEY_BLOCKED_EXTRA = "blockedExtra";
   private static final String KEY_ASK_EXTRA = "askExtra";
   private static final String KEY_COMMAND_LOG = "commandLog";
+  private static final String KEY_SANDBOX = "sandbox";
+  private static final String KEY_SANDBOX_READ_ONLY = "sandboxReadOnly";
 
   private BashToolConfigLoader() {}
 
@@ -42,7 +46,57 @@ public final class BashToolConfigLoader {
   public static BashToolConfig load(ConfigStore store) {
     Objects.requireNonNull(store, "store");
     return new BashToolConfig(
-        names(store, KEY_BLOCKED_EXTRA), names(store, KEY_ASK_EXTRA), commandLog(store));
+        names(store, KEY_BLOCKED_EXTRA),
+        names(store, KEY_ASK_EXTRA),
+        commandLog(store),
+        sandbox(store),
+        readOnlyDirs(store));
+  }
+
+  /** 沙箱开关：缺失 ⇒ {@code off}；存在但非文本或不在闭词表 ⇒ 响亮。 */
+  private static BashToolConfig.Sandbox sandbox(ConfigStore store) {
+    JsonNode value = valueOf(store, KEY_SANDBOX);
+    if (value == null) {
+      return BashToolConfig.Sandbox.OFF;
+    }
+    if (!value.isTextual()) {
+      throw invalid(KEY_SANDBOX, "必须是文本（off | require）", value.toString());
+    }
+    BashToolConfig.Sandbox parsed = BashToolConfig.Sandbox.parse(value.asText());
+    if (parsed == null) {
+      throw invalid(KEY_SANDBOX, "只接受 off | require", value.asText());
+    }
+    return parsed;
+  }
+
+  /**
+   * 沙箱只读面：缺失 ⇒ 缺省清单；存在但非数组、含非文本/空白元素、空数组，或条目不过 {@link BashToolConfig#readOnlyDir} 的形态关（绝对路径 / 非
+   * {@code /} / 不含 {@code .}、{@code ..}）⇒ 响亮。
+   */
+  private static List<Path> readOnlyDirs(ConfigStore store) {
+    JsonNode value = valueOf(store, KEY_SANDBOX_READ_ONLY);
+    if (value == null) {
+      return BashToolConfig.DEFAULT_SANDBOX_READ_ONLY;
+    }
+    if (!value.isArray()) {
+      throw invalid(KEY_SANDBOX_READ_ONLY, "必须是字符串数组（绝对路径）", value.toString());
+    }
+    if (value.isEmpty()) {
+      // 空数组会退化成"缺省清单"（见记录紧凑构造），静默换掉用户写的值——宁可不接受
+      throw invalid(KEY_SANDBOX_READ_ONLY, "不能是空数组（要缺省清单就别写这一项）", value.toString());
+    }
+    List<Path> out = new ArrayList<>();
+    for (JsonNode item : value) {
+      if (!item.isTextual() || item.asText().isBlank()) {
+        throw invalid(KEY_SANDBOX_READ_ONLY, "数组元素必须是非空白文本（绝对路径）", value.toString());
+      }
+      try {
+        out.add(BashToolConfig.readOnlyDir(item.asText()));
+      } catch (IllegalArgumentException e) {
+        throw invalid(KEY_SANDBOX_READ_ONLY, e.getMessage(), item.asText());
+      }
+    }
+    return List.copyOf(out);
   }
 
   /** 追加条目：缺失 ⇒ 空表；存在但非数组或含非文本元素 ⇒ 响亮。 */

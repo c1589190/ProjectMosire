@@ -3,6 +3,7 @@ package io.mosire.brain.tools;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ToolGate;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.Digest;
@@ -10,6 +11,7 @@ import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
@@ -64,13 +66,31 @@ import org.slf4j.LoggerFactory;
  *       {@code env} 不是对象或值不是标量；{@code cwd} 路径字面非法；
  *   <li>{@link #LAUNCH_FAILED}：进程启动失败（{@code cwd} 不存在/不可进入、可执行文件不可用等 IO 失败）；
  *   <li>{@link #TIMEOUT}：超过 {@code timeout} 秒仍未结束（已终止直接子进程，消息里带已捕获的输出）；
- *   <li>{@link #INTERRUPTED}：执行线程被中断（已终止直接子进程，中断标记归还调用方）。
+ *   <li>{@link #INTERRUPTED}：执行线程被中断（已终止直接子进程，中断标记归还调用方）；
+ *   <li>{@link #DIR_NOT_ALLOWED}：{@code cwd} 越出调用者的 fs 可达面（L1，命令未执行）；
+ *   <li>{@link #SANDBOX_UNAVAILABLE}：需要 L3 沙箱而它不可用（不发命令，不退化）。
  * </ul>
  *
  * <p><strong>工作目录</strong>：构造注入基准目录（缺省 = JVM 当前目录），调用参数 {@code cwd} 可逐次覆盖（相对路径按基准目录解析）。
- * <b>本阶段不做目录围栏/沙箱</b>：{@code cwd} 可指向任意可访问路径——控制手段是权限门禁（{@link #spec()} 声明 sensitive +
- * destructive，默认拒绝、需显式放行，本类自身不做权限判断，那是 {@code ToolExecutionGuard} 的职责）；目录围栏归三期的 {@code
- * Workspace}，此处不假装已有。
+ *
+ * <p><strong>三层围栏（S5-D；分级口径见 {@code 设计-Bash工具与工作目录围栏.md} §2.1，别把这三层混着说）</strong>：
+ *
+ * <ol>
+ *   <li><b>L1 参数面硬拒</b>（{@link #DIR_NOT_ALLOWED}）：调用者带 fs 可达面（{@code
+ *       AgentPermissionSet#fsScope()}）时，{@code cwd} 的缺省值、相对路径基准、绝对路径与 {@code ..} 归一后的落点都必须落在可达面内；
+ *       越界 ⇒ 响亮错误码且<b>命令根本不执行</b>。另加一跳：候选目录<b>已存在</b>时按 realpath 再判一次（根在构造期已
+ *       realpath，链接指向面外会被看到）。<b>L1 不是安全边界</b>——命令文本里的绝对路径它一概不管（那需要 L3）；
+ *   <li><b>L2 起点固定</b>：相对路径与缺省 {@code cwd} 都从可达面首根起算，子进程由此出生在该根里。 <b>同样不是围栏</b>：拦不住 {@code cd
+ *       /}、绝对路径与 {@code bash -c 'cat /etc/shadow'}；
+ *   <li><b>L3 OS 沙箱</b>（{@link BashSandbox}）：受限调用者<b>一律</b>走沙箱（配置 {@code tools.bash.sandbox=off}
+ *       也管不着它）—— 没 bind 的宿主路径在沙箱里<b>不存在</b>，逃逸口（{@code mknod}/{@code mount}/再 {@code
+ *       chroot}/ptrace）关闭。沙箱不可用 ⇒ {@link #SANDBOX_UNAVAILABLE}，<b>绝不</b>静默退回无围栏执行。配置 {@code
+ *       require} 把不限可达面的调用者也一起沙箱化，其围栏面取 <b>工具基准工作目录</b>（它没有声明过可达面）。
+ * </ol>
+ *
+ * <p><b>披露面（诚实说明）</b>：L1/L2 是契约与误操作围栏，只有 L3 是安全意义上的围栏。设计底稿要求"L3 未启用时给受限调用者带一行披露"—— 裁决 ③
+ * 让这条分支<b>不可达</b>（受限调用者永远有沙箱，没沙箱就响亮失败），所以本类不写那句披露，改由沙箱的诚实边界 （{@link BashSandbox} 类注释：同 uid 信号仍可达、无
+ * {@code /proc} 等）与 {@code SANDBOX_UNAVAILABLE} 承担。
  *
  * <p><strong>环境变量</strong>：{@code env} 参数<b>叠加在继承环境之上</b>（同名覆盖，与 {@code
  * ProcessBuilder.environment()} 从父进程继承一致的语义），不是替换整个环境。
@@ -108,6 +128,12 @@ public final class ShellTool implements AgentTool {
   /** 执行线程被中断（已终止直接子进程，中断标记归还调用方）。 */
   public static final String INTERRUPTED = "SHELL_INTERRUPTED";
 
+  /** 工作目录越出调用者的可达面（L1；S5-D 新码）。 */
+  public static final String DIR_NOT_ALLOWED = "DIR_NOT_ALLOWED";
+
+  /** 需要沙箱而沙箱不可用（L3；S5-D 新码）——<b>响亮失败，绝不静默退回无围栏执行</b>。 */
+  public static final String SANDBOX_UNAVAILABLE = "SANDBOX_UNAVAILABLE";
+
   /** 固定用 bash：工具名与语义一致（模型写 bash 语法应可用）；POSIX 之外不支持。 */
   private static final String SHELL_EXECUTABLE = "bash";
 
@@ -139,6 +165,7 @@ public final class ShellTool implements AgentTool {
   private final ShellOutputTruncator.Mode defaultMode;
   private final int maxOutputBytes;
   private final int maxInjectedChars;
+  private final BashSandbox sandbox;
 
   /**
    * 大输出落库 SPI：把被裁掉的完整文本交给宿主（如事件库），返回可引用的 docId。
@@ -218,6 +245,28 @@ public final class ShellTool implements AgentTool {
       ShellOutputTruncator.Mode defaultMode,
       int maxOutputBytes,
       int maxInjectedChars) {
+    this(
+        baseWorkingDirectory,
+        sink,
+        defaultMode,
+        maxOutputBytes,
+        maxInjectedChars,
+        BashSandbox.system());
+  }
+
+  /**
+   * 全量组装 + 指定沙箱（{@link BashSandbox#unavailable} 是"沙箱不可用 ⇒ 响亮失败"这条分支的构造用入口）。
+   *
+   * @param sandbox L3 沙箱（非 null；{@link BashSandbox#system()} = 本机真探针）
+   */
+  public ShellTool(
+      Path baseWorkingDirectory,
+      OutputSink sink,
+      ShellOutputTruncator.Mode defaultMode,
+      int maxOutputBytes,
+      int maxInjectedChars,
+      BashSandbox sandbox) {
+    this.sandbox = Objects.requireNonNull(sandbox, "sandbox");
     this.baseWorkingDirectory =
         Objects.requireNonNull(baseWorkingDirectory, "baseWorkingDirectory");
     this.sink = Objects.requireNonNull(sink, "sink");
@@ -357,12 +406,17 @@ public final class ShellTool implements AgentTool {
       return ToolResult.error(INVALID_ARGUMENTS, "command 为必填参数（非空命令字符串）");
     }
 
+    BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
+    // 围栏面（S5-D）：null = 三层围栏都不参与（不限 scope + sandbox=off）⇒ 行为与 S4-C 逐字相同
+    ResourceScope fence = fenceOf(context, config);
+
     Path workingDirectory;
     Map<String, String> env;
     long timeoutSeconds;
     ShellOutputTruncator.Mode mode;
     try {
-      workingDirectory = resolveWorkingDirectory(strArg(context, "cwd"));
+      workingDirectory =
+          resolveWorkingDirectory(baseWorkingDirectory, strArg(context, "cwd"), fence);
       env = envArg(context, "env");
       timeoutSeconds = longArg(context, "timeout", DEFAULT_TIMEOUT_SECONDS);
       if (timeoutSeconds <= 0) {
@@ -370,13 +424,78 @@ public final class ShellTool implements AgentTool {
       }
       String modeArg = strArg(context, "mode");
       mode = modeArg == null ? defaultMode : ShellOutputTruncator.Mode.parse(modeArg);
+    } catch (DirNotAllowedException e) {
+      LOG.warn("bash 的 cwd 越出调用者可达面（命令未执行）: 可达面={} 拒因={}", fence.summary(), e.getMessage());
+      return ToolResult.error(DIR_NOT_ALLOWED, e.getMessage());
     } catch (IllegalArgumentException e) {
       return ToolResult.error(INVALID_ARGUMENTS, e.getMessage());
     }
 
+    BashSandbox.Wrapped wrapped;
+    try {
+      wrapped = wrapInSandbox(fence, workingDirectory, command);
+    } catch (BashSandbox.SandboxUnavailableException e) {
+      LOG.warn("bash 需要 OS 沙箱但沙箱不可用（命令未执行，不退回无围栏）: 可达面={} 原因={}", fence.summary(), e.getMessage());
+      return ToolResult.error(
+          SANDBOX_UNAVAILABLE, "需要 OS 沙箱而它不可用（受限调用者不退回无围栏执行）: " + e.getMessage());
+    }
+    try {
+      return runCommand(wrapped, workingDirectory, env, command, timeoutSeconds, mode);
+    } finally {
+      if (wrapped != null) {
+        // 清理必须在包装进程结束之后：命名空间内删根会穿透 rw bind 删掉宿主源目录（BashSandbox 类 javadoc 记了这次实测）
+        sandbox.cleanup(wrapped);
+      }
+    }
+  }
+
+  /**
+   * 本次调用要不要沙箱、可写面是哪几个根。
+   *
+   * @return {@code null} = 不沙箱（不限 scope 且 {@code tools.bash.sandbox=off}）
+   */
+  private BashSandbox.Wrapped wrapInSandbox(
+      ResourceScope fence, Path workingDirectory, String command) {
+    if (fence == null) {
+      return null;
+    }
+    return sandbox.wrap(workingDirectory, fence.dirList(), command);
+  }
+
+  /**
+   * 本次调用的围栏面（S5-D）：
+   *
+   * <ul>
+   *   <li>受限调用者 ⇒ 它的 {@code fs} 可达面（三层围栏都上，与 {@code tools.bash.sandbox} 的取值无关——见 {@link
+   *       BashToolConfig.Sandbox}）；
+   *   <li>不限 scope + {@code require} ⇒ <b>工具基准工作目录</b>当围栏面（它没声明过可达面，"整个文件系统"不是一份能绑的清单）；
+   *   <li>不限 scope + {@code off} ⇒ {@code null}（不判 cwd、不沙箱，行为与 S4-C 逐字相同）。
+   * </ul>
+   */
+  private ResourceScope fenceOf(ToolContext context, BashToolConfig config) {
+    ResourceScope fsScope = context.permissions().fsScope();
+    if (!fsScope.unrestricted()) {
+      return fsScope;
+    }
+    if (config.sandbox() == BashToolConfig.Sandbox.REQUIRE) {
+      return ResourceScope.ofDir(baseWorkingDirectory);
+    }
+    return null;
+  }
+
+  /** 真正跑命令：起进程、收输出、渲染结果（沙箱与否只差 {@code wrapped} 的 argv）。 */
+  private ToolResult runCommand(
+      BashSandbox.Wrapped wrapped,
+      Path workingDirectory,
+      Map<String, String> env,
+      String command,
+      long timeoutSeconds,
+      ShellOutputTruncator.Mode mode) {
     Process process;
     try {
-      ProcessBuilder builder = new ProcessBuilder(SHELL_EXECUTABLE, "-c", command);
+      ProcessBuilder builder =
+          new ProcessBuilder(
+              wrapped == null ? List.of(SHELL_EXECUTABLE, "-c", command) : wrapped.command());
       builder.directory(workingDirectory.toFile());
       builder.environment().putAll(env);
       builder.redirectErrorStream(false);
@@ -505,13 +624,70 @@ public final class ShellTool implements AgentTool {
     return Thread.ofPlatform().daemon().name(name).start(task);
   }
 
-  /** 相对 {@code cwd} 按基准目录解析（基准目录就是"进程 CWD 的注入替身"）。 */
-  private Path resolveWorkingDirectory(String rawCwd) {
-    if (rawCwd == null) {
-      return baseWorkingDirectory;
+  /**
+   * 相对 {@code cwd} 按基准目录解析（基准目录就是"进程 CWD 的注入替身"）；带围栏面时走 L1 判定。
+   *
+   * <p><b>包级可见 + 纯函数</b>：L1 的取值语义要能脱开沙箱、确定性地测（沙箱是 L3 的事，L1 不该被"本机能不能建 mount 命名空间"绑架）。执行路径经 {@link
+   * #execute} 调用的是同一段代码，不存在"测的那份与跑的那份不是一个"。
+   *
+   * @param baseWorkingDirectory 基准目录（{@code fence == null} 时的相对路径基准与缺省 cwd）
+   * @param fence 可达面（{@code null} = 不判，见 {@link #fenceOf}）
+   * @throws DirNotAllowedException cwd 越出可达面（<b>命令不会被执行</b>）
+   */
+  static Path resolveWorkingDirectory(
+      Path baseWorkingDirectory, String rawCwd, ResourceScope fence) {
+    if (fence == null) {
+      if (rawCwd == null) {
+        return baseWorkingDirectory;
+      }
+      Path path = Path.of(rawCwd); // 字面非法 → InvalidPathException（IAE 子类）→ INVALID_ARGUMENTS
+      return path.isAbsolute() ? path : baseWorkingDirectory.resolve(path);
     }
-    Path path = Path.of(rawCwd); // 字面非法 → InvalidPathException（IAE 子类）→ INVALID_ARGUMENTS
-    return path.isAbsolute() ? path : baseWorkingDirectory.resolve(path);
+    List<Path> roots = fence.dirList();
+    if (roots.isEmpty()) {
+      // 显式"哪里都不许"：没有可用的起始目录，任何 cwd（含缺省）都无从谈起
+      throw new DirNotAllowedException("调用者的可达面为空（哪里都不许）——bash 没有可用的工作目录: " + fence.summary());
+    }
+    Path base = roots.get(0); // L2：相对路径与缺省 cwd 都从首根起算
+    Path candidate;
+    if (rawCwd == null) {
+      candidate = base;
+    } else {
+      Path path = Path.of(rawCwd); // 字面非法 → INVALID_ARGUMENTS
+      candidate = path.isAbsolute() ? path : base.resolve(path);
+    }
+    Path normalized = candidate.toAbsolutePath().normalize(); // 『..』词法越界在这一跳就被折出来
+    if (!fence.allowsDir(normalized)) {
+      throw new DirNotAllowedException(
+          "cwd 越出调用者的可达面: 请求=" + rawCwd + " 解析=" + normalized + " 可达面=" + fence.summary());
+    }
+    // L1 的加严一跳：候选已存在时按 realpath 再判一次（根在构造期已 realpath，链接指向面外会被这一跳看到）。
+    // 完备的链接防线归 L3；这里只堵"cwd 本身是个指向面外的链接"。
+    Path real = realPathOrNull(normalized);
+    if (real != null && !fence.allowsDir(real)) {
+      throw new DirNotAllowedException(
+          "cwd 经符号链接解析后越出可达面: " + normalized + " → " + real + " 可达面=" + fence.summary());
+    }
+    return normalized;
+  }
+
+  /** 候选的 realpath（不存在/不可解析 ⇒ {@code null} = 这一跳不做判定，只留词法结论）。 */
+  private static Path realPathOrNull(Path path) {
+    try {
+      return Files.exists(path) ? path.toRealPath() : null;
+    } catch (IOException | SecurityException e) {
+      return null;
+    }
+  }
+
+  /** cwd 越出可达面（L1 的硬拒）：在 {@link #execute} 的边界上转成 {@link #DIR_NOT_ALLOWED}，不外泄。 */
+  private static final class DirNotAllowedException extends RuntimeException {
+
+    private static final long serialVersionUID = 1L;
+
+    DirNotAllowedException(String message) {
+      super(message);
+    }
   }
 
   private static Map<String, Object> buildSchema() {
