@@ -100,7 +100,11 @@ public record ResourceScope(boolean unrestricted, Set<String> prefixes) {
   /**
    * 候选资源是否落在本作用域内。
    *
-   * @param candidate 命名空间内的资源路径（{@code fs} 用绝对路径字符串；调用方负责先按命名空间的规则归一）
+   * <p><b>候选先按词法归一</b>（折叠重复分隔符、去尾分隔符、解析 {@code .}/{@code ..} 段，见 {@link #normalizeCandidate}）—— 与
+   * {@link #allowsDir(Path)} 同口径：同一块资源经两个 API 问必须得到同一个答案（S5-C 补：字符串路径过去不解析 {@code ..}， 于是 {@code
+   * /srv/work/../etc/shadow} 会被判成"在 /srv/work 之内"）。
+   *
+   * @param candidate 命名空间内的资源路径（{@code fs} 用绝对路径字符串）
    */
   public boolean allows(String candidate) {
     if (unrestricted) {
@@ -216,8 +220,17 @@ public record ResourceScope(boolean unrestricted, Set<String> prefixes) {
     return collapsed;
   }
 
-  /** 候选归一：与前缀同口径（重复分隔符折叠、去尾分隔符），但**不**做 realpath。 */
-  private static String normalizeCandidate(String raw) {
+  /**
+   * 候选归一：与前缀同口径（重复分隔符折叠、去尾分隔符），<b>再</b>按 {@link Path} 的语义词法解析 {@code .}/{@code ..} 段； 但**不**做
+   * realpath（软链不在承诺范围内）。
+   *
+   * <p><b>包级可见</b>：{@link ResourceId}（S5-C）复用同一段归一口径——资源标识与作用域若各写一套归一，两边对"同一个路径"的 判断会分叉。
+   *
+   * <p><b>为什么候选解析 {@code ..} 而前缀拒绝 {@code ..}</b>：前缀是<b>容器</b>（"我允许哪些地方"，出现相对段说明写的人把两个概念 搞混了 ⇒
+   * 装载期响亮失败）；候选是<b>指向</b>（"我要碰哪个地方"，相对段的含义明确 ⇒ 按 {@code Path.normalize()} 解析， 于是 {@code
+   * /srv/work/../etc} 判成 {@code /srv/etc} 而不是"在 /srv/work 之内"）。
+   */
+  static String normalizeCandidate(String raw) {
     String trimmed = raw == null ? "" : raw.trim();
     if (trimmed.isEmpty()) {
       return "";
@@ -226,7 +239,32 @@ public record ResourceScope(boolean unrestricted, Set<String> prefixes) {
     if (collapsed.length() > 1 && collapsed.endsWith(SEPARATOR)) {
       collapsed = collapsed.substring(0, collapsed.length() - 1);
     }
-    return collapsed;
+    return resolveRelativeSegments(collapsed);
+  }
+
+  /**
+   * 解析 {@code .}/{@code ..} 段（{@link Path#normalize()} 的语义词法，纯字符串实现——候选里含 NUL
+   * 之类的怪字符不该抛异常，只该"不匹配任何前缀"）。
+   */
+  private static String resolveRelativeSegments(String value) {
+    boolean absolute = value.startsWith(SEPARATOR);
+    List<String> stack = new ArrayList<>();
+    for (String segment : value.split(SEPARATOR, -1)) {
+      if (segment.isEmpty() || ".".equals(segment)) {
+        continue;
+      }
+      if ("..".equals(segment)) {
+        if (!stack.isEmpty() && !"..".equals(stack.get(stack.size() - 1))) {
+          stack.remove(stack.size() - 1); // 退一层
+        } else if (!absolute) {
+          stack.add(".."); // 相对路径顶到头的 '..' 留在原处（与 Path.normalize 一致）
+        }
+        // 绝对路径上退到根再退：原地消失（/.. = /）
+        continue;
+      }
+      stack.add(segment);
+    }
+    return (absolute ? SEPARATOR : "") + String.join(SEPARATOR, stack);
   }
 
   private static String collapse(String value) {

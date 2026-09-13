@@ -3,6 +3,7 @@ package io.mosire.agentlib.tool;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.ResourceAuthorizer;
 import java.util.Map;
 import java.util.Objects;
 
@@ -18,13 +19,18 @@ import java.util.Objects;
  * <p><b>兼容口径</b>：{@link #identity} 缺省 = {@link AgentIdentity#UNKNOWN}（{@code FULL} + 中立
  * id）——恰好等于"没有档位这个概念"时的 行为，故<b>既有的 4 参调用点语义逐字不变</b>（4 参构造保留）。真实身份由宿主在装配处显式绑定：主 Agent 在运行时装配、子 Agent
  * 在父侧为它建的 MCP 链接上、外部面用 {@code external-mcp}（模型与 MCP 客户端都给不出、改不了）。
+ *
+ * <p><b>资源判定者（S5-C）</b>：{@link #resources} 是工具在真正读写前调 {@code require} 的那个判定者，由宿主在<b>工具调用唯一入口</b>
+ * （{@code ToolCallAuthorizer}）注入——它拿调用者权限集与工具声明的资源面当场建出来。工具<b>只调不判</b>：自行放行等于跳过唯一入口。 缺省 {@link
+ * ResourceAuthorizer#denying()}（fail-closed）：手工拼的上下文里 {@code require} 一律拒，直到宿主注入。
  */
 public record ToolContext(
     AccessToken caller,
     AgentPermissionSet permissions,
     Map<String, Object> config,
     Map<String, Object> arguments,
-    AgentIdentity identity) {
+    AgentIdentity identity,
+    ResourceAuthorizer resources) {
 
   public ToolContext {
     Objects.requireNonNull(caller, "caller");
@@ -32,6 +38,18 @@ public record ToolContext(
     config = config == null ? Map.of() : Map.copyOf(config);
     arguments = arguments == null ? Map.of() : Map.copyOf(arguments);
     identity = identity == null ? AgentIdentity.UNKNOWN : identity;
+    // 缺省 = 无判定者（fail-closed；不是"缺省放行"）——不用资源 SPI 的工具行为逐字不变（它从不调 require）
+    resources = resources == null ? ResourceAuthorizer.denying() : resources;
+  }
+
+  /** 5 参兼容构造：资源判定者取 {@link ResourceAuthorizer#denying()}（见类 javadoc）。 */
+  public ToolContext(
+      AccessToken caller,
+      AgentPermissionSet permissions,
+      Map<String, Object> config,
+      Map<String, Object> arguments,
+      AgentIdentity identity) {
+    this(caller, permissions, config, arguments, identity, null);
   }
 
   /** 4 参兼容构造：身份取 {@link AgentIdentity#UNKNOWN}（= 本功能引入前的行为，见类 javadoc）。 */
@@ -53,8 +71,16 @@ public record ToolContext(
     return new ToolContext(caller, permissions, Map.of(), Map.of(), identity);
   }
 
-  /** 换身份（保持 caller/permissions/config/arguments 逐字不变）——MCP 面按"链接上绑定的身份"建每次调用的上下文时用。 */
+  /** 换身份（保持 caller/permissions/config/arguments/resources 逐字不变）——MCP 面按"链接上绑定的身份"建每次调用的上下文时用。 */
   public ToolContext withIdentity(AgentIdentity newIdentity) {
-    return new ToolContext(caller, permissions, config, arguments, newIdentity);
+    return new ToolContext(caller, permissions, config, arguments, newIdentity, resources);
+  }
+
+  /**
+   * 换资源判定者（其余分量逐字不变）——<b>宿主侧注入点</b>：唯一入口用"调用者权限集 × 工具声明的资源面"建出判定者后， 在这里换掉缺省的 {@link
+   * ResourceAuthorizer#denying()}。工具不得调它（换 = 自己给自己发许可）。
+   */
+  public ToolContext withResources(ResourceAuthorizer newResources) {
+    return new ToolContext(caller, permissions, config, arguments, identity, newResources);
   }
 }

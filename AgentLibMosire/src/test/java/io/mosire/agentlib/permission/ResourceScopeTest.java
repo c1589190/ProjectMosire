@@ -16,7 +16,9 @@ import org.junit.jupiter.api.io.TempDir;
  * <ul>
  *   <li>{@code /srv/work} 不含 {@code /srv/work-evil}（字符串前缀会含，段边界不会）；
  *   <li>"不限"与"空集"在 {@code allows} 上取相反值（谁退化成对方都会被抓）；
- *   <li>{@code narrowTo} 互不相交 ⇒ 空集，{@code covers} 对"更宽/更窄/不相交"三种关系分别判对。
+ *   <li>{@code narrowTo} 互不相交 ⇒ 空集，{@code covers} 对"更宽/更窄/不相交"三种关系分别判对；
+ *   <li>候选里的 {@code .}/{@code ..} 段被<b>解析</b>而不是原样比对（S5-C 补：不解析则 {@code /work/../etc} 会被判成在 {@code
+ *       /work} 之内）——见 {@link #candidateRelativeSegmentsAreResolvedNotComparedRaw}。
  * </ul>
  */
 class ResourceScopeTest {
@@ -32,6 +34,19 @@ class ResourceScopeTest {
     assertThat(work.allows("/srv/work2")).isFalse();
     assertThat(work.allows("/srv")).isFalse();
     assertThat(work.allows("/srv/workshop")).isFalse();
+  }
+
+  @Test
+  void candidateRelativeSegmentsAreResolvedNotComparedRaw() {
+    // S5-C 补：字符串路径过去不解析 '..'，于是 /srv/work/../etc 被判成"在 /srv/work 之内"（段边界挡不住它——
+    // 它的首段确实叫 /srv/work）。现在与 allowsDir(Path) 同口径：先按 Path 的语义词法解析，再比段边界。
+    ResourceScope work = ResourceScope.of("/srv/work");
+    assertThat(work.allows("/srv/work/../etc/shadow")).isFalse();
+    assertThat(work.allows("/srv/work/a/../../elsewhere")).isFalse();
+    assertThat(work.allows("/srv/work/./a/b")).isTrue(); // 留在面内的相对段照常
+    // 与 Path 那条 API 同答案（两条路对"同一块资源"不许分叉）
+    assertThat(work.allows("/srv/work/../etc"))
+        .isEqualTo(work.allowsDir(Path.of("/srv/work/../etc")));
   }
 
   @Test

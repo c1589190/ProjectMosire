@@ -4,6 +4,8 @@ import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
 import io.mosire.agentlib.approval.ApprovalRequest;
 import io.mosire.agentlib.approval.ToolGate;
+import io.mosire.agentlib.permission.ResourceAuthorizer;
+import io.mosire.agentlib.permission.ResourceDeniedException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -20,17 +22,24 @@ import org.slf4j.LoggerFactory;
  * 都不经</b>（这正是各系统级工具不得不在工具体里 自造 "第二道闸" 的原因）。两条路各判各的，语义必然分叉：任何新判定（审批、资源作用域、未来的额度）只落一条路，另一条就没有它。
  * 本类把"解析工具 → 判定 → 执行"收成一条，两个入口都只调这里。
  *
- * <p><b>四段顺序不可换</b>：
+ * <p><b>五段顺序不可换</b>：
  *
  * <ol>
  *   <li><b>工具不存在</b> ⇒ {@code TOOL_NOT_FOUND}——终局；
  *   <li><b>硬拒</b>（{@link ToolExecutionGuard} 权限判定）⇒ {@code PERMISSION_DENIED}——终局，<b>不进审批</b>。
  *       否则"审批放行"会把一个本就无权执行的调用洗白；
+ *   <li><b>资源判定</b>（S5-C，{@link ResourceAuthorizer}）：①声明式前置闸——工具声明的命名空间调用者一个都够不着 ⇒ {@link
+ *       #RESOURCE_DENIED}（终局，<b>不进审批</b>：人解决不了"够不着"）；②够得着则用"调用者权限集 × 工具声明的资源面"建判定者注入 {@link
+ *       ToolContext#resources()}，工具自己那一次次的 {@code require} 便有了判定者；
  *   <li><b>命令闸</b>（工具自报 {@link ToolGate}）：{@link ToolGate.Block} ⇒ {@link #COMMAND_BLOCKED}
  *       （同样<b>不进审批</b>：硬拒不可审批，防"审批把硬拒洗白"）；{@link ToolGate.Ask} ⇒ 问人（{@link
  *       ApprovalCoordinator}），未放行 ⇒ {@link #APPROVAL_DENIED}；
- *   <li><b>执行</b>。
+ *   <li><b>执行</b>（工具内 {@code require} 判否抛的 {@link ResourceDeniedException} 在这里接住 ⇒ {@link
+ *       #RESOURCE_DENIED}）。
  * </ol>
+ *
+ * <p><b>资源维度只在本类上</b>：{@link ToolExecutionGuard#execute} 是工具名级判定的老入口，不含资源面——给它补上等于造出第二个判定点
+ * （正是本类要消灭的东西）。要判资源就走这里。
  *
  * <p><b>不装配编排器时 {@code Ask} 一律拒（fail-closed）</b>：{@link #of(ToolExecutionGuard)} / {@link
  * #standard()} 不带编排器，此时"需审批"的调用<b>不可能</b>静默放行——它直接得到 {@link #APPROVAL_DENIED}。
@@ -47,6 +56,15 @@ public final class ToolCallAuthorizer {
 
   /** 审批未放行：拒 / 超时 / 无可用通道 / 通道故障 / 未装配编排器，一律 fail-closed 归此码。 */
   public static final String APPROVAL_DENIED = "APPROVAL_DENIED";
+
+  /**
+   * 资源级拒绝（S5-C）：声明式前置闸判否，或工具内 {@code require} 抛 {@link ResourceDeniedException} 被本类接住。
+   *
+   * <p><b>与 {@link ToolExecutionGuard#DENIED} 分码</b>（同 S5-B 的 {@code DIR_NOT_ALLOWED} 理由）：模型看到
+   * {@code PERMISSION_DENIED} 会以为"我没资格用这个工具"（改换工具/收手），看到 {@code RESOURCE_DENIED} 才知道"工具没问题，是我要碰的这块
+   * 资源够不着"——后者它可以改路（换个够得着的资源、换个操作），前者改不了。
+   */
+  public static final String RESOURCE_DENIED = "RESOURCE_DENIED";
 
   private final ToolExecutionGuard guard;
   private final ApprovalCoordinator coordinator;
@@ -107,7 +125,21 @@ public final class ToolCallAuthorizer {
       return denied.get();
     }
     AgentTool tool = registry.find(toolName).orElseThrow();
-    ToolGate gate = tool.gate(context);
+    // 资源判定（S5-C）：先声明式前置闸，再把判定者注入上下文交给工具的命令式断言。
+    // 判定者是"调用者权限集 × 工具声明的资源面"当场建出来的——锚在调用者身份上（S5-A 的锚点纪律），不是构造期常量。
+    ResourceAuthorizer resources = ResourceAuthorizer.of(context.permissions(), tool.resources());
+    Optional<String> resourceDenial = resources.denial();
+    if (resourceDenial.isPresent()) {
+      // 终局：不进审批（"够不着"不是人能裁决的事）。拒因是配置面的数据（命名空间 + 可达面摘要），不含模型自造串。
+      LOG.warn(
+          "工具调用被资源前置闸拒了（不进审批）: tool={} 工具声明={} 调用者可达={}",
+          tool.name(),
+          tool.resources().summary(),
+          context.permissions().resourceScopes().summary());
+      return ToolResult.error(RESOURCE_DENIED, resourceDenial.get());
+    }
+    ToolContext scoped = context.withResources(resources);
+    ToolGate gate = tool.gate(scoped);
     if (gate == null) {
       // 契约是"缺省 ALLOW"，返回 null 是工具实现坏了：按 fail-closed 处理，不猜它的意思
       return ToolResult.error(
@@ -130,13 +162,20 @@ public final class ToolCallAuthorizer {
         return ToolResult.error(COMMAND_BLOCKED, "命令被硬拒（不可审批）: class=" + blocked.classKey());
       }
       case ToolGate.Ask ask -> {
-        Optional<ToolResult> approvalDenied = askForApproval(tool, context, ask);
+        // 审批面看的是同一个上下文（resources 已注入）——同一份判定者贯穿五段，不在半路换掉
+        Optional<ToolResult> approvalDenied = askForApproval(tool, scoped, ask);
         if (approvalDenied.isPresent()) {
           return approvalDenied.get();
         }
       }
     }
-    return tool.execute(context);
+    try {
+      return tool.execute(scoped);
+    } catch (ResourceDeniedException resourceDenied) {
+      // 工具内关键访问点的命令式断言（require）判否，在本类的边界上转成工具错误码——异常不外泄给管线/MCP
+      LOG.warn("工具内资源断言判否: tool={} 拒因={}", tool.name(), resourceDenied.getMessage());
+      return ToolResult.error(RESOURCE_DENIED, resourceDenied.getMessage());
+    }
   }
 
   /**

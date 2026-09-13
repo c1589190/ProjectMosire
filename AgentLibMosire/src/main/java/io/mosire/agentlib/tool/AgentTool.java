@@ -1,5 +1,6 @@
 package io.mosire.agentlib.tool;
 
+import io.mosire.agentlib.permission.ResourceManifest;
 import io.mosire.agentlib.permission.ToolSpec;
 import java.util.Map;
 
@@ -13,7 +14,8 @@ import java.util.Map;
  *   <li>{@link #jsonSchema()} 为 JSON Schema（output 到 LLM 工具定义）；
  *   <li>{@link #spec()} 声明三要素（默认 {@link ToolSpec#DEFAULT}：guest 级、非敏感非破坏）——
  *       不声明不报错，但敏感工具必须显式声明，否则永远不会被放行；
- *   <li>实现自身不做权限判断（那是 {@link ToolExecutionGuard} 的边界职责），只按参数执行。
+ *   <li>实现自身不做<b>工具名级</b>权限判断（那是 {@link ToolExecutionGuard} 的边界职责）；<b>资源级</b>判定经注入的 {@link
+ *       ToolContext#resources()}（唯一入口），工具不得自行放行——详见 {@link #resources()}。
  * </ul>
  */
 public interface AgentTool {
@@ -45,6 +47,23 @@ public interface AgentTool {
    */
   default io.mosire.agentlib.approval.ToolGate gate(ToolContext context) {
     return io.mosire.agentlib.approval.ToolGate.ALLOW;
+  }
+
+  /**
+   * 本工具<b>声明的资源面</b>（S5-C 声明式 SPI）：命名空间 → 缺省策略。缺省 {@link ResourceManifest#NONE} （一个命名空间都不声明）。
+   *
+   * <p><b>声明是必须的</b>：判定点对"未声明的命名空间"一律拒（"没声明"读作"我不知道这类资源怎么判"，而不是"随便用"）。所以 用 {@link
+   * ToolContext#resources()} 的工具必须在这里声明自己的命名空间，用不到的资源 SPI 的工具保持缺省、行为逐字不变。
+   *
+   * <p><b>谁判、谁调</b>：宿主（{@code ToolCallAuthorizer}）在<b>执行前</b>用"调用者权限集 × 本声明"建出判定者注入 {@link
+   * ToolContext#resources()}；工具只在真正读写前<b>调</b> {@code require}——自行放行（不调、或自己判断）等于跳过唯一入口， 本 SPI
+   * 的存在意义就是"工具不得自裁"。
+   *
+   * <p><b>声明的是"我拥有什么"而不是"我要什么"</b>：一次调用的可达面上限仍由调用者权限集决定（见 {@link
+   * io.mosire.agentlib.permission.ResourcePolicy} 的"缺省不是封顶"）。
+   */
+  default ResourceManifest resources() {
+    return ResourceManifest.NONE;
   }
 
   /**

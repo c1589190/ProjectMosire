@@ -122,8 +122,8 @@ public record AgentTemplate(
    * 模板的 {@code fs} 作用域建议（{@code fs} 命名空间）：{@code null} ⇒ 不限；空表 ⇒ 哪里都不许；有值 ⇒ 目录集（绝对化 + 词法归一，已存在的根取
    * realpath——同 {@link ResourceScope#ofDirs}）。
    *
-   * @throws IllegalArgumentException 路径根本不成路径（如含 NUL）的情形（模板装载期响亮失败）；{@code ..} 段属于
-   *     "路径字面"问题，按 {@link Path} 的语义词法解析，不在此拒绝
+   * @throws IllegalArgumentException 路径根本不成路径（如含 NUL）的情形（模板装载期响亮失败）；{@code ..} 段属于 "路径字面"问题，按
+   *     {@link Path} 的语义词法解析，不在此拒绝
    */
   public ResourceScope workingDirScope() {
     if (allowedWorkingDirs == null) {
