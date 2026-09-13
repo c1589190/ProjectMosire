@@ -9,7 +9,9 @@ import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
@@ -229,6 +231,55 @@ class SubagentOrchestrationToolsTest {
       assertThat(denied.code()).isEqualTo(ToolExecutionGuard.DENIED);
       assertThat(denied.message()).contains("身份级别不足");
     }
+    f.close();
+  }
+
+  /**
+   * S6 档位单调性（<b>调用者</b>侧）：{@code mode} 不得超过调用者<b>自己</b>的档位。身份由宿主绑定（本用例显式给 {@link
+   * AgentIdentity#subagent}），模型给不出也改不了。
+   *
+   * <p>判别性构造：本 fixture 的 {@link SubagentManager} 走 7 参构造 ⇒ 父档位缺省 {@code FULL}，所以"请求被拒"
+   * 只可能来自调用者这一维——把这道检查删掉，{@code mode=full} 会一路走到 manager 并被接受（父档位覆盖得动），
+   * 本用例转红。两个维度都必要：父级闸管"本级给不给"，调用者闸管"谁在要"——链上每一跳都受后者约束， 否则一个 LIMITED 的下级能借本级要出 FULL 的下级。
+   *
+   * <p>本用例只断言"拒/放"与实例数，不掺子进程：executor 用 {@link InProcessExecutor} 且任务是空实现。
+   */
+  @Test
+  void spawnModeCannotExceedTheCallerMode() throws Exception {
+    Fixture f = fixture(systemParent(), new InProcessExecutor((instanceId, config) -> {}));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult denied =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            new ToolContext(
+                AccessToken.SYSTEM,
+                AgentPermissionSet.system(),
+                Map.of(),
+                Map.of("templateId", "reader", "goal", "越档尝试", "mode", "full"),
+                AgentIdentity.subagent("limited-child-1", CommandMode.LIMITED, "上级派的任务")));
+
+    assertThat(denied.success()).isFalse();
+    assertThat(denied.code()).isEqualTo(ToolExecutionGuard.DENIED);
+    assertThat(denied.message()).contains("LIMITED").contains("FULL");
+    assertThat(f.manager().list()).as("拒绝必须发生在起实例之前（不留半个实例）").isEmpty();
+
+    // 反向对照：同档要得到——否则本用例退化成"怎么都拒"，判别力为零
+    ToolResult accepted =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            new ToolContext(
+                AccessToken.SYSTEM,
+                AgentPermissionSet.system(),
+                Map.of(),
+                Map.of("templateId", "reader", "goal", "同档尝试", "mode", "limited"),
+                AgentIdentity.subagent("limited-child-2", CommandMode.LIMITED, "上级派的任务")));
+    assertThat(accepted.success()).isTrue();
+    assertThat(f.manager().list()).hasSize(1);
+    assertThat(f.manager().list().get(0).mode()).isEqualTo(CommandMode.LIMITED);
     f.close();
   }
 

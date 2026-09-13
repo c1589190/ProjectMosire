@@ -1,6 +1,8 @@
 package io.mosire.brain.tools;
 
+import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.ToolGate;
+import io.mosire.agentlib.permission.CommandMode;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -176,9 +178,29 @@ public final class BashCommandClassifier {
    */
   public static ToolGate classify(
       String command, List<String> blockedExtra, List<String> askExtra) {
+    return classify(command, blockedExtra, askExtra, CommandMode.FULL);
+  }
+
+  /**
+   * 同上，但带<b>调用者档位</b>（2026-09-13 用户裁决）：
+   *
+   * <ul>
+   *   <li>{@link CommandMode#FULL}：逐字等于三参重载（直放 / 问人 / 硬拒 三档照旧）；
+   *   <li>{@link CommandMode#LIMITED}：<b>所有</b>命令都要审批——"直放"档被<b>提升</b>为 {@link ToolGate.Ask}
+   *       （{@code classKey} 用<b>独立</b>的一段 {@code bash:limited:<首词>}，见 {@link #limitedAsk}），
+   *       硬拒档<b>不变</b>（硬拒不可审批，档位改不了它）。
+   * </ul>
+   *
+   * <p><b>提升只在这里做</b>：审批人怎么定（沿派生链向上找第一个 {@code FULL} 的 Agent、找不到就到人）是审批层的事， 分类器只管"这一档要不要问"。
+   *
+   * @param mode 调用者档位（null 视同 {@link CommandMode#FULL}：缺省等于本功能引入前的行为）
+   */
+  public static ToolGate classify(
+      String command, List<String> blockedExtra, List<String> askExtra, CommandMode mode) {
     if (command == null || command.isBlank()) {
       return ToolGate.ALLOW;
     }
+    CommandMode effective = mode == null ? CommandMode.FULL : mode;
     Set<String> blockedNames = names(blockedExtra);
     Set<String> askNames = names(askExtra);
 
@@ -204,13 +226,17 @@ public final class BashCommandClassifier {
       }
     }
     if (worst == null) {
-      // 命令非空白却切不出任何段（纯赋值等）：没有可执行的命令 ⇒ 直放（执行器自己会跑它/报错）
-      return ToolGate.ALLOW;
+      // 命令非空白却切不出任何段（纯赋值等）：没有可执行的命令 ⇒ 直放（执行器自己会跑它/报错）。
+      // 不完全权限档例外：那一档"所有命令都要审批"，不留例外口（否则 `x=1; $x -rf /` 的赋值段就是绕过面）。
+      return effective == CommandMode.LIMITED ? limitedAsk(command, null) : ToolGate.ALLOW;
+    }
+    if (worst.level() == Level.ALLOW && effective == CommandMode.LIMITED) {
+      return limitedAsk(command, worstHead);
     }
     String classKey = classKey(worst.level(), worstHead);
     return switch (worst.level()) {
       case ALLOW -> ToolGate.ALLOW;
-      case ASK -> new ToolGate.Ask(classKey, summary(command, classKey));
+      case ASK -> new ToolGate.Ask(classKey, summary(command, classKey), AskKind.SENSITIVE);
       case BLOCK -> blockedGate(worstHead, worst.reason());
     };
   }
@@ -931,6 +957,22 @@ public final class BashCommandClassifier {
     return new ToolGate.Block(classKey(Level.BLOCK, head), "命令被硬拒（不可回滚，不可审批）: " + reason);
   }
 
+  /**
+   * 不完全权限档的"提升门"：把本该直放的命令转成需审批。摘要里带命令原文（提示面专用，不进事件库），
+   * 并<b>明写</b>"不完全权限"，让人/上级判定知道这条不是系统敏感区、而是档位使然。
+   *
+   * <p><b>键自成一档</b>（{@code bash:limited:<首词>}，不是 ask 档的 {@code bash:ask:<首词>}）：两个理由——
+   *
+   * <p><b>键自成一档</b>（{@code bash:limited:<首词>}，不是 ask 档的 {@code bash:ask:<首词>}）：两个理由——
+   * 事件面上"这条为什么被问"要一眼可辨（提升问询可以被上级 Agent 代批，敏感问询不能）；会话放行的键也不许跨档串味 （人给敏感区 {@code bash:ask:systemctl}
+   * 批的"本会话"不该顺带放行一条同名的提升问询，反之亦然）。
+   */
+  private static ToolGate limitedAsk(String command, String head) {
+    String classKey = LEVEL_PREFIX + "limited:" + headWord(head);
+    return new ToolGate.Ask(
+        classKey, "不完全权限（所有命令需审批）: " + summary(command, classKey), AskKind.MODE_LIMITED);
+  }
+
   private static Verdict block(String head, String reason) {
     return new Verdict(Level.BLOCK, head, reason);
   }
@@ -941,8 +983,12 @@ public final class BashCommandClassifier {
 
   /** {@code classKey} = {@code bash:<档>:<首词>}；首词不可得时用 {@code unknown}（仍稳定，不拼参数）。 */
   private static String classKey(Level level, String head) {
-    String word = head == null || head.isBlank() ? "unknown" : head;
-    return LEVEL_PREFIX + level.wireName() + ":" + word;
+    return LEVEL_PREFIX + level.wireName() + ":" + headWord(head);
+  }
+
+  /** 键里的首词：不可得时用 {@code unknown}（仍稳定，不拼参数）。 */
+  private static String headWord(String head) {
+    return head == null || head.isBlank() ? "unknown" : head;
   }
 
   /** 给人看的一行（<b>可</b>含命令原文：它只进提示面与内存态审批请求，不进事件库）。 */

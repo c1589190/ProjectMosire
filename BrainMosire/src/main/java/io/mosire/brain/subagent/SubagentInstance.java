@@ -1,6 +1,7 @@
 package io.mosire.brain.subagent;
 
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.brain.runtime.AgentConfig;
 
 /**
@@ -12,6 +13,8 @@ import io.mosire.brain.runtime.AgentConfig;
  * @param goal 任务目标全文（只在实例内存里；事件 payload 只记长度）
  * @param config 收紧后的运行配置（id = instanceId）
  * @param permissions 收紧后的权限集（已过单调性守卫）
+ * @param mode <b>命令档位</b>（S6）：已过派生单调性守卫（父 {@code FULL} 可给子任一档，父 {@code LIMITED} 只能给 {@code
+ *     LIMITED}）。父侧为它建 MCP 链接时绑进调用身份——子体的每条 shell 命令都按这一档判
  * @param depth 层级（父 depth + 1）
  * @param status 当前状态快照（以 Manager 内 map 中的最新记录为准）
  */
@@ -21,12 +24,29 @@ public record SubagentInstance(
     String goal,
     AgentConfig config,
     AgentPermissionSet permissions,
+    CommandMode mode,
     int depth,
     SubagentStatus status) {
+
+  public SubagentInstance {
+    mode = mode == null ? CommandMode.LIMITED : mode;
+  }
+
+  /** 7 参兼容构造（S6 之前）：档位取 {@link CommandMode#LIMITED}——<b>子 Agent 的缺省档</b>（用户裁决"必须是子 Agent 的默认"）。 */
+  public SubagentInstance(
+      String instanceId,
+      String templateId,
+      String goal,
+      AgentConfig config,
+      AgentPermissionSet permissions,
+      int depth,
+      SubagentStatus status) {
+    this(instanceId, templateId, goal, config, permissions, CommandMode.LIMITED, depth, status);
+  }
 
   /** 换状态返回新实例（record 无 wither，收敛到一处避免散落的拷贝构造）。 */
   SubagentInstance withStatus(SubagentStatus newStatus) {
     return new SubagentInstance(
-        instanceId, templateId, goal, config, permissions, depth, newStatus);
+        instanceId, templateId, goal, config, permissions, mode, depth, newStatus);
   }
 }

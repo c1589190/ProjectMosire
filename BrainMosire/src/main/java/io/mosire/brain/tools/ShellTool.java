@@ -280,7 +280,10 @@ public final class ShellTool implements AgentTool {
       return ToolGate.ALLOW;
     }
     BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
-    return BashCommandClassifier.classify(command, config.blockedExtra(), config.askExtra());
+    // 档位来自**宿主绑定的调用者身份**（S6）：不完全权限档下"直放"档会被提升为需审批。
+    // 身份不由模型给（ToolContext.identity 由装配/建链方写），这里只读。
+    return BashCommandClassifier.classify(
+        command, config.blockedExtra(), config.askExtra(), context.identity().mode());
   }
 
   /**
@@ -313,8 +316,10 @@ public final class ShellTool implements AgentTool {
       out.put("len", 0);
       out.put("class", CLASS_ABSENT);
     } else {
+      // 落账的 class 与"实际怎么分流"同源（含档位提升）：不完全权限档下直放命令会落成 ask，别让账本比现实宽
       ToolGate gate =
-          BashCommandClassifier.classify(command, config.blockedExtra(), config.askExtra());
+          BashCommandClassifier.classify(
+              command, config.blockedExtra(), config.askExtra(), context.identity().mode());
       out.put("digest", Digest.ofCommand(command));
       out.put("len", command.length());
       out.put("class", classOf(gate));

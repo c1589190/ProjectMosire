@@ -2,7 +2,9 @@ package io.mosire.brain.tools;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.ToolGate;
+import io.mosire.agentlib.permission.CommandMode;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -185,5 +187,53 @@ class BashCommandClassifierTest {
     // 设备路径在段内没被单独取出。写清楚以免日后有人以为它"漏了"。
     ToolGate.Block mkfs = (ToolGate.Block) classify("mkfs.ext4 /dev/sd" + sentinel);
     assertThat(mkfs.reason()).contains("mkfs").doesNotContain(sentinel);
+  }
+
+  // ---------- S6：不完全权限档的"提升" ----------
+
+  private static ToolGate classifyLimited(String command) {
+    return BashCommandClassifier.classify(command, List.of(), List.of(), CommandMode.LIMITED);
+  }
+
+  /**
+   * 提升档的判别性在两处：①同一条命令在 FULL 下直放、在 LIMITED 下问询（否则"档位真的改变了分流"没被钉住）； ②{@code classKey}
+   * <b>自成一档</b>（{@code bash:limited:<首词>}）且 {@code kind=MODE_LIMITED}——键与 kind
+   * 都要与敏感档分开，否则"这条为什么被问"在事件面分不清，会话放行也会跨档串味。
+   */
+  @Test
+  void limitedModeLiftsAllowLevelToItsOwnAsk() {
+    ToolGate gate = classifyLimited("ls -la");
+    assertThat(gate).isInstanceOf(ToolGate.Ask.class);
+    ToolGate.Ask ask = (ToolGate.Ask) gate;
+    assertThat(ask.classKey()).isEqualTo("bash:limited:ls");
+    assertThat(ask.kind()).isEqualTo(AskKind.MODE_LIMITED);
+    assertThat(classify("ls -la")).isEqualTo(ToolGate.ALLOW);
+  }
+
+  /** 敏感档与硬拒档<b>都不受档位影响</b>：敏感仍是有 kind 的人批，硬拒两档一样。 */
+  @Test
+  void limitedModeLeavesSensitiveAndBlockAlone() {
+    ToolGate.Ask sensitive = (ToolGate.Ask) classifyLimited("systemctl restart nginx");
+    assertThat(sensitive.classKey()).isEqualTo("bash:ask:systemctl");
+    assertThat(sensitive.kind())
+        .as("敏感区不因调用者档位变成可代批的（判据是 kind，不是 classKey 前缀）")
+        .isEqualTo(AskKind.SENSITIVE);
+    assertThat(classifyLimited("rm -rf /")).isInstanceOf(ToolGate.Block.class);
+  }
+
+  /** 空缺/空白命令两档一致（没有命令文本就没有可分流的东西，执行器自己会报参数非法）。 */
+  @Test
+  void limitedModeKeepsMissingCommandAllowed() {
+    assertThat(BashCommandClassifier.classify(null, List.of(), List.of(), CommandMode.LIMITED))
+        .isEqualTo(ToolGate.ALLOW);
+    assertThat(BashCommandClassifier.classify("   ", List.of(), List.of(), CommandMode.LIMITED))
+        .isEqualTo(ToolGate.ALLOW);
+  }
+
+  /** {@code null} 档位视同 {@code FULL}：缺省等于本功能引入前的行为（不经过装配层的调用点逐字不变）。 */
+  @Test
+  void nullModeBehavesLikeFull() {
+    assertThat(BashCommandClassifier.classify("ls -la", List.of(), List.of(), null))
+        .isEqualTo(ToolGate.ALLOW);
   }
 }

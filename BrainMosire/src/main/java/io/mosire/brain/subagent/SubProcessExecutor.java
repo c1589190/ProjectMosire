@@ -2,6 +2,7 @@ package io.mosire.brain.subagent;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.mcp.AgentToMcpServer;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.proc.ManagedProcess;
 import io.mosire.agentlib.proc.SpawnSpec;
 import io.mosire.agentlib.proc.SubprocessException;
@@ -136,7 +137,11 @@ public final class SubProcessExecutor implements AgentExecutor {
             ToolContext.of(
                 instance.permissions().grantedToken(),
                 // 红线 R7：父侧调用上下文 = 子体自身权限集（非父级 SYSTEM/unrestricted）
-                instance.permissions()),
+                instance.permissions(),
+                // S6：子体的<b>实例身份 + 命令档位 + 目标</b>绑在这条链上（绑一次，链上每次调用都取它）。
+                // 这是子体身份的唯一来源：模型给不出、子进程自己报不了——它决定"命令闸工具按哪一档分流"，
+                // 以及审批请求里的 requesterId/goal（上级判定据此回答"谁在问、被派去干什么"）。
+                AgentIdentity.subagent(instance.instanceId(), instance.mode(), instance.goal())),
             authorizer,
             managed.stdout().orElseThrow(() -> new SubagentLaunchException("子 Agent stdout 不可用")),
             managed.stdin().orElseThrow(() -> new SubagentLaunchException("子 Agent stdin 不可用")));

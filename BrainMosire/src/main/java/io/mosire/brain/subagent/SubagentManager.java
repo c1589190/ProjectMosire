@@ -5,6 +5,7 @@ import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.brain.runtime.AgentConfig;
@@ -20,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,6 +71,7 @@ public final class SubagentManager implements AutoCloseable {
   private final EventBus bus;
   private final AgentConfig parentConfig;
   private final AgentPermissionSet parentPermissions;
+  private final Supplier<CommandMode> parentMode;
   private final int parentDepth;
 
   /** 私有锁：状态记录/事件顺序/句柄表全部在锁内原子推进（同 SubprocessManager/USO 理由）。 */
@@ -97,12 +100,39 @@ public final class SubagentManager implements AutoCloseable {
       AgentConfig parentConfig,
       AgentPermissionSet parentPermissions,
       int parentDepth) {
+    this(
+        templateStore,
+        launcher,
+        events,
+        bus,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        () -> CommandMode.FULL);
+  }
+
+  /**
+   * 全参装配 + <b>父级档位取数缝</b>（S6）。
+   *
+   * @param parentMode 父级当前档位的取数缝（现读：主 Agent 的档位经 HTTP 断点可改，派生守卫要按<b>当刻</b>档位判）。 缺省 {@code () ->
+   *     CommandMode.FULL} = "没有档位这个概念"时的行为（子体拿不到比 LIMITED 更宽的档，见 {@link #spawn}）
+   */
+  public SubagentManager(
+      AgentTemplateStore templateStore,
+      SubagentLauncher launcher,
+      EventStore events,
+      EventBus bus,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions,
+      int parentDepth,
+      Supplier<CommandMode> parentMode) {
     this.templateStore = Objects.requireNonNull(templateStore, "templateStore");
     this.launcher = Objects.requireNonNull(launcher, "launcher");
     this.events = Objects.requireNonNull(events, "events");
     this.bus = Objects.requireNonNull(bus, "bus");
     this.parentConfig = Objects.requireNonNull(parentConfig, "parentConfig");
     this.parentPermissions = Objects.requireNonNull(parentPermissions, "parentPermissions");
+    this.parentMode = Objects.requireNonNull(parentMode, "parentMode");
     if (parentDepth < 0) {
       throw new IllegalArgumentException("parentDepth 不能为负: " + parentDepth);
     }
@@ -130,6 +160,7 @@ public final class SubagentManager implements AutoCloseable {
     String instanceId = instanceIdOf(template.id());
     AgentPermissionSet permissions = tightenPermissions(template, request);
     checkMonotonicity(template, instanceId, permissions);
+    CommandMode mode = resolveMode(template, instanceId, request);
     int depth = parentDepth + 1;
     checkDepth(template, instanceId, depth);
     AgentConfig childConfig = deriveConfig(template, request, instanceId, permissions);
@@ -141,6 +172,7 @@ public final class SubagentManager implements AutoCloseable {
             request.goal(),
             childConfig,
             permissions,
+            mode,
             depth,
             SubagentStatus.CONFIGURED);
     SubagentInstance running;
@@ -298,6 +330,30 @@ public final class SubagentManager implements AutoCloseable {
         base.destructiveAllowed(),
         base.sensitiveAllowed(),
         base.readOnly());
+  }
+
+  /**
+   * 子体的<b>命令档位</b>：请求里没给就 {@link CommandMode#LIMITED}（子 Agent 的缺省档，用户裁决"必须是子 Agent 的默认"），
+   * 给了就得过单调性—— 父级档位<b>够不着</b>的一律拒（{@link SubagentRejectedException} + {@code permission.denied}
+   * 事件）， <b>不静默降级</b>：静默降级会让模型以为拿到的是它要的那一档，之后每条命令都"莫名"要审批，而真正的原因在启动那一刻。
+   *
+   * <p>与权限收紧的关系：档位不改变工具<b>可用性</b>（那是权限集的事），它只决定"命令闸工具按哪一档分流"—— 所以这里不做 {@code limit}
+   * 也不回写权限集，只判够不够（{@code CommandMode.covers}）。
+   */
+  private CommandMode resolveMode(
+      AgentTemplate template, String instanceId, SubagentLaunchRequest request) {
+    CommandMode requested = request.mode() == null ? CommandMode.LIMITED : request.mode();
+    CommandMode parent = parentMode.get();
+    if (parent == null || !parent.covers(requested)) {
+      String message = "子 Agent 档位超出父级许可（单调性）: 父级=" + parent + " 子级=" + requested;
+      emit(
+          EventTypes.PERMISSION_DENIED,
+          parentConfig.id(),
+          instanceId,
+          Map.of("template", template.id(), "childId", instanceId, "reason", message));
+      throw new SubagentRejectedException(message);
+    }
+    return requested;
   }
 
   /**

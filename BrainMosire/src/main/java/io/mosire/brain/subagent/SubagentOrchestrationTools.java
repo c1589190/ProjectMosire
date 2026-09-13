@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
@@ -75,7 +76,10 @@ public final class SubagentOrchestrationTools {
                 "extraDenied", Map.of("type", "array", "items", Map.of("type", "string")),
                 "maxTurnsCap", Map.of("type", "integer"),
                 "timeBudgetSecondsCap", Map.of("type", "integer"),
-                "quotaMaxTokensCap", Map.of("type", "integer")),
+                "quotaMaxTokensCap", Map.of("type", "integer"),
+                // S6：命令档位（可选）。不给 = 子 Agent 缺省 LIMITED（所有命令都要审批）；要 FULL 得父级本身是 FULL，
+                // 否则 spawn 直接拒（单调性，见 SubagentManager#resolveMode）——"能要"不等于"能拿到"。
+                "mode", Map.of("type", "string", "enum", List.of("full", "limited"))),
             "required",
             List.of("templateId", "goal")),
         context -> {
@@ -88,6 +92,21 @@ public final class SubagentOrchestrationTools {
           if (templateId == null || goal == null) {
             return ToolResult.error("INVALID_ARGUMENTS", "templateId 与 goal 为必填参数");
           }
+          // 档位：坏值<b>不</b>静默当"没给"（那会把"我要 FULL"读成"缺省"，与 CommandMode.parse 的口径一致）
+          String rawMode = strArg(context, "mode");
+          CommandMode mode = rawMode == null ? null : CommandMode.parse(rawMode);
+          if (rawMode != null && mode == null) {
+            return ToolResult.error("INVALID_ARGUMENTS", "mode 只能是 full 或 limited: " + rawMode);
+          }
+          // S6 单调性（<b>调用者</b>侧）：档位不得超过<b>调用者自己</b>的档位。身份由宿主在建链时绑定
+          // （主 Agent = 运行时缝现读；经 MCP 链接进来的下级 = 父侧为它绑的实例身份），模型改不了。
+          // 与 SubagentManager#resolveMode 的父级闸是两个维度：那条管"本级给不给"，这条管"谁在要"——
+          // 链上每一跳都受约束，否则一个 LIMITED 的下级能借 SYSTEM 模板经本级要出 FULL 的下级。
+          CommandMode callerMode = context.identity().mode();
+          if (mode != null && !callerMode.covers(mode)) {
+            return ToolResult.error(
+                ToolExecutionGuard.DENIED, "档位超出调用者许可（单调性）: 调用者=" + callerMode + " 请求=" + mode);
+          }
           SubagentLaunchRequest request;
           try {
             request =
@@ -97,7 +116,8 @@ public final class SubagentOrchestrationTools {
                     strSetArg(context, "extraDenied"),
                     intArg(context, "maxTurnsCap"),
                     longArg(context, "timeBudgetSecondsCap"),
-                    longArg(context, "quotaMaxTokensCap"));
+                    longArg(context, "quotaMaxTokensCap"),
+                    mode);
           } catch (IllegalArgumentException e) {
             // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
             return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());

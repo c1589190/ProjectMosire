@@ -1,5 +1,6 @@
 package io.mosire.brain.subagent;
 
+import io.mosire.agentlib.permission.CommandMode;
 import java.util.Set;
 
 /**
@@ -14,6 +15,8 @@ import java.util.Set;
  * @param maxTurnsCap 轮次上限收紧；null = 不收紧
  * @param timeBudgetSecondsCap 时间预算（秒）收紧；null = 不收紧
  * @param quotaMaxTokensCap token 配额收紧；null = 不收紧
+ * @param mode 想要的<b>命令档位</b>（S6）；{@code null} = 不给（落到子 Agent 的缺省 {@link CommandMode#LIMITED}）。
+ *     <b>只是"想要"</b>：父级档位不够时 {@link SubagentManager#spawn} 直接拒（单调性，同权限收紧口径），不静默降级
  */
 public record SubagentLaunchRequest(
     String templateId,
@@ -21,7 +24,8 @@ public record SubagentLaunchRequest(
     Set<String> extraDenied,
     Integer maxTurnsCap,
     Long timeBudgetSecondsCap,
-    Long quotaMaxTokensCap) {
+    Long quotaMaxTokensCap,
+    CommandMode mode) {
 
   public SubagentLaunchRequest {
     if (templateId == null || templateId.isBlank()) {
@@ -31,5 +35,16 @@ public record SubagentLaunchRequest(
       throw new IllegalArgumentException("goal 不能为空");
     }
     extraDenied = extraDenied == null ? Set.of() : Set.copyOf(extraDenied);
+  }
+
+  /** 6 参兼容构造（S6 之前）：档位未指定（{@code null} ⇒ 子 Agent 缺省 {@link CommandMode#LIMITED}）。 */
+  public SubagentLaunchRequest(
+      String templateId,
+      String goal,
+      Set<String> extraDenied,
+      Integer maxTurnsCap,
+      Long timeBudgetSecondsCap,
+      Long quotaMaxTokensCap) {
+    this(templateId, goal, extraDenied, maxTurnsCap, timeBudgetSecondsCap, quotaMaxTokensCap, null);
   }
 }

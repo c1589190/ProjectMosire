@@ -14,6 +14,7 @@ import io.mosire.agentlib.llm.LlmQuota;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
@@ -831,7 +832,15 @@ public final class AgentPipeline {
     //   ToolContext 的构造<b>上移</b>到 emit 之前——它是纯的（只做 requireNonNull + Map.copyOf，无副作用），
     //   于是"先建上下文、再按上下文脱敏、最后写事件"这个顺序成立，且既有工具（不覆写 ledgerArgs）行为逐字不变。
     //   工具不存在时退回原始 args（未知工具名不该把事件写崩，也不该让这一行成为 NPE 源）。
-    ToolContext context = new ToolContext(caller, permissionSet, toolConfig, call.arguments());
+    // S6：调用者身份 = 主 Agent（实例 id + <b>现读的档位</b>）——档位从运行时缝取（装配层放进 toolConfig 的
+    // CommandModeHolder），没有该缝时按 FULL = 本功能引入前的行为。身份由宿主在这里装配：模型给不出、改不了。
+    ToolContext context =
+        new ToolContext(
+            caller,
+            permissionSet,
+            toolConfig,
+            call.arguments(),
+            AgentIdentity.mainFrom(toolConfig));
     // 另一次 findBy：authorizer 内部还会各查一次。这是<b>有意</b>的重复查——判定不搬到这个 emit 点来（见 ToolCallAuthorizer 的类注释）。
     AgentTool tool = registry.find(call.name()).orElse(null);
     Map<String, Object> ledgerArgs = call.arguments();
