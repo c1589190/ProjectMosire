@@ -28,6 +28,8 @@ import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandModeHolder;
 import io.mosire.agentlib.permission.CommandModeLoader;
+import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.store.SqliteConversationStore;
@@ -52,6 +54,7 @@ import io.mosire.brain.subagent.SubagentOrchestrationTools;
 import io.mosire.brain.tools.BashToolConfig;
 import io.mosire.brain.tools.BashToolConfigLoader;
 import io.mosire.brain.tools.ShellTool;
+import io.mosire.brain.tools.WorkingDirsLoader;
 import io.mosire.main.Version;
 import io.mosire.main.approval.ApprovalHttpServer;
 import io.mosire.main.approval.HttpApprovalChannel;
@@ -290,7 +293,6 @@ public final class App implements AutoCloseable {
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
     try {
-      AgentPermissionSet permissionSet = AgentPermissionSet.system();
       AgentConfig agentConfig =
           AgentConfig.builder("main")
               .systemPrompt(DEFAULT_SYSTEM_PROMPT)
@@ -324,6 +326,13 @@ public final class App implements AutoCloseable {
           subagentLimits.maxChildDepth(),
           subagentLimits.maxChildrenPerInstance(),
           subagentLimits.maxInstances());
+      // S5-B：主 Agent 的 fs 作用域（工作目录围栏）——配置 agents.workingDirs，<b>缺省不限</b>（裁决 ①，逐跳只减不增）。
+      // 本键只有配置文件/环境层能写：ConfigAuth 的 agents.* 语法是 agents.<id>.<key>（三段），两段的这条写不进去（账本记档）。
+      ResourceScope workingDirs = WorkingDirsLoader.load(configStore);
+      AgentPermissionSet permissionSet =
+          AgentPermissionSet.system()
+              .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, workingDirs));
+      LOG.info("主 Agent 工作目录围栏: {}（配置 agents.workingDirs；* = 不限，子体逐跳只减不增）", workingDirs.summary());
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。

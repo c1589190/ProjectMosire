@@ -7,7 +7,9 @@ import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.brain.runtime.AgentConfig;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -41,6 +43,9 @@ import java.util.regex.Pattern;
  * @param timeBudgetSeconds 时间预算秒数（&gt;0）
  * @param quotaMaxTokens token 配额（&gt;=0；0 = 不限）
  * @param script 引导脚本（null → 空脚本）；每步恰好是工具调用或文本之一
+ * @param allowedWorkingDirs 该模板子体的<b>工作目录建议</b>（S5-B）：null = 不限（不额外收窄，父级说多少就是多少）； 空表 =
+ *     <b>显式"哪里都不许"</b>（与 {@code allowedTools: []} 同形同义）。<b>是建议不是要求</b>—— 最终生效值 = 父级可达面 ∩ 这一份 ∩
+ *     请求那一份；超出父级的条目<b>静默求交</b>（模板是通用配置，被上级收紧是常态）， 与请求面 {@code allowedDirs} 的响亮拒绝口径不同
  */
 public record AgentTemplate(
     String id,
@@ -57,7 +62,8 @@ public record AgentTemplate(
     int maxToolCallsPerTurn,
     long timeBudgetSeconds,
     long quotaMaxTokens,
-    List<ScriptStep> script) {
+    List<ScriptStep> script,
+    List<String> allowedWorkingDirs) {
 
   /** 模板 id 形态约束（小写、短横线、≤64 字符——可直接充当文件名/进程标识）。 */
   private static final Pattern ID_PATTERN = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
@@ -93,6 +99,40 @@ public record AgentTemplate(
     allowedTools = allowedTools == null ? Set.of() : Set.copyOf(allowedTools);
     deniedTools = deniedTools == null ? Set.of() : Set.copyOf(deniedTools);
     script = script == null ? List.of() : List.copyOf(script);
+    // allowedWorkingDirs 刻意<b>不</b>归一成空表：null（不限）与 []（哪里都不许）是两种取值，混成一个会静默放大权限。
+    // 元素形态在这里不判（路径归一归 ResourceScope.ofDirs 管，坏值在装载期由它响亮失败）。
+    if (allowedWorkingDirs != null) {
+      for (String dir : allowedWorkingDirs) {
+        if (dir == null || dir.isBlank()) {
+          throw new IllegalArgumentException(
+              "模板 " + id + " 的 allowedWorkingDirs 元素必须是非空白路径文本: " + allowedWorkingDirs);
+        }
+      }
+    }
+    // 不可变副本（内联 copyOf：让 SpotBugs 看得见来源，同 allowedTools/deniedTools）
+    allowedWorkingDirs = allowedWorkingDirs == null ? null : List.copyOf(allowedWorkingDirs);
+    if (allowedWorkingDirs != null && !allowedWorkingDirs.isEmpty()) {
+      // 装载期就把路径归一跑一遍：坏路径（含 NUL 等无法成路径的形态）在这里响亮失败，不流到 spawn 期才炸。
+      // 归一结果不保留（每次 spawn 现算，根目录的 realpath 可能随环境变化——判定与运行同刻同源）
+      ResourceScope.ofDirs(allowedWorkingDirs.stream().map(Path::of).toList());
+    }
+  }
+
+  /**
+   * 模板的 {@code fs} 作用域建议（{@code fs} 命名空间）：{@code null} ⇒ 不限；空表 ⇒ 哪里都不许；有值 ⇒ 目录集（绝对化 + 词法归一，已存在的根取
+   * realpath——同 {@link ResourceScope#ofDirs}）。
+   *
+   * @throws IllegalArgumentException 路径根本不成路径（如含 NUL）的情形（模板装载期响亮失败）；{@code ..} 段属于
+   *     "路径字面"问题，按 {@link Path} 的语义词法解析，不在此拒绝
+   */
+  public ResourceScope workingDirScope() {
+    if (allowedWorkingDirs == null) {
+      return ResourceScope.unlimited();
+    }
+    if (allowedWorkingDirs.isEmpty()) {
+      return ResourceScope.none();
+    }
+    return ResourceScope.ofDirs(allowedWorkingDirs.stream().map(Path::of).toList());
   }
 
   /**

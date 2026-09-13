@@ -70,7 +70,9 @@ public final class PermissionChecker {
    *   <li>白名单：父级通配（无限制）时子级任意；否则子级不得通配且其白名单 ⊆ 父级白名单 （子级空白名单=拒绝全部=更收缩，允许）；
    *   <li>显式拒绝：父级拒绝集合 ⊆ 子级拒绝集合（子级不得重新放行父级禁止的工具）；
    *   <li>敏感/破坏放行：子级放行 ⇒ 父级也已放行；
-   *   <li>只读：父级只读 ⇒ 子级必须只读（只读是收缩；子级主动更只读总是允许）。
+   *   <li>只读：父级只读 ⇒ 子级必须只读（只读是收缩；子级主动更只读总是允许）；
+   *   <li>资源可达面（S5-B 第 7 维）：父级表态过的每个命名空间，子级都不得更宽（{@link ResourceScopeMap#covers}）。
+   *       父级没表态的命名空间不构成约束（子级主动更窄总是允许）。
    * </ul>
    *
    * @param granted 被授予（较低/子）权限集
@@ -108,6 +110,10 @@ public final class PermissionChecker {
     }
     // 只读：父级只读 ⇒ 子级只读
     if (parent.readOnly() && !granted.readOnly()) {
+      return false;
+    }
+    // 资源可达面（第 7 维）：父级表过态的命名空间，子级一个也不许更宽
+    if (!parent.resourceScopes().covers(granted.resourceScopes())) {
       return false;
     }
     return true;

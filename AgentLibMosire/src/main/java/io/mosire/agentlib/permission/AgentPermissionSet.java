@@ -15,6 +15,10 @@ import java.util.Set;
  *   <li>{@code deniedTools}：显式拒绝（优先于白名单）。
  *   <li>{@code destructiveAllowed}/{@code sensitiveAllowed}：对工具三要素的显式放行。
  *   <li>{@code readOnly}：只读 Agent（不得执行任何写入/敏感工具——M2 起子 Agent 使用）。
+ *   <li>{@code resourceScopes}：第 7 维——<b>资源可达面</b>{@code 命名空间 → ResourceScope}（S5-B）。白名单管"能用哪个
+ *       工具"，这一维管"这个工具能碰哪些资源"（工作目录围栏是 {@code fs} 命名空间的一个实例）。缺省 {@code null} ⇒ 空图 = 本层不表态（=
+ *       本维引入前的行为）；<b>"未声明 ≠ 全拒"</b>，想表达"够不着"要显式写 {@link ResourceScope#none()}（语义全文见 {@link
+ *       ResourceScopeMap}）。
  * </ul>
  *
  * 所有集合均按不可变快照保存。
@@ -25,13 +29,34 @@ public record AgentPermissionSet(
     Set<String> deniedTools,
     boolean destructiveAllowed,
     boolean sensitiveAllowed,
-    boolean readOnly) {
+    boolean readOnly,
+    ResourceScopeMap resourceScopes) {
 
   /** 白名单通配符。 */
   public static final String ALL_TOOLS = "*";
 
+  /** 六参兼容构造（{@code resourceScopes = 不限}）：第 7 维之前写下的调用点逐字不动。 */
+  public AgentPermissionSet(
+      AccessToken grantedToken,
+      Set<String> allowedTools,
+      Set<String> deniedTools,
+      boolean destructiveAllowed,
+      boolean sensitiveAllowed,
+      boolean readOnly) {
+    this(
+        grantedToken,
+        allowedTools,
+        deniedTools,
+        destructiveAllowed,
+        sensitiveAllowed,
+        readOnly,
+        null);
+  }
+
   public AgentPermissionSet {
     Objects.requireNonNull(grantedToken, "grantedToken");
+    // 缺省 = 空图（本层不表态，本维引入前的行为）；"哪里都不许"必须由调用方显式写 none()，不能靠省略字段滑进来
+    resourceScopes = resourceScopes == null ? ResourceScopeMap.empty() : resourceScopes;
     // 不可变快照；内联 Set.copyOf/Set.of（经 helper 间接赋值会让 SpotBugs 看不见不可变性来源而误报 EI_EXPOSE_REP）
     allowedTools =
         allowedTools == null || allowedTools.isEmpty()
@@ -56,6 +81,28 @@ public record AgentPermissionSet(
     return allowedTools.contains(ALL_TOOLS) || allowedTools.contains(toolName);
   }
 
+  /** 只换资源可达面这一维（其余逐字不动）。 */
+  public AgentPermissionSet withResourceScopes(ResourceScopeMap scopes) {
+    return new AgentPermissionSet(
+        grantedToken,
+        allowedTools,
+        deniedTools,
+        destructiveAllowed,
+        sensitiveAllowed,
+        readOnly,
+        scopes);
+  }
+
+  /**
+   * {@code fs} 命名空间的可达面（工作目录围栏的判定入口）。
+   *
+   * <p><b>未表态按"不限"读</b>：本维是限制层，"没写过目录"= 没设限（= 裁决 ① 的缺省不限）；要"哪里都不许"必须显式配 空数组 / {@code
+   * ResourceScope.none()}。子体这一维由 {@code SubagentManager} 逐跳物化（继承父级 ∩ 模板 ∩ 请求），不会留空。
+   */
+  public ResourceScope fsScope() {
+    return resourceScopes.scopeOrUnrestricted(ResourceScopeMap.FS);
+  }
+
   public static Builder builder(AccessToken token) {
     return new Builder(token);
   }
@@ -67,6 +114,7 @@ public record AgentPermissionSet(
     private boolean destructiveAllowed;
     private boolean sensitiveAllowed;
     private boolean readOnly;
+    private ResourceScopeMap resourceScopes;
 
     private Builder(AccessToken token) {
       this.token = Objects.requireNonNull(token, "token");
@@ -106,9 +154,14 @@ public record AgentPermissionSet(
       return this;
     }
 
+    public Builder resourceScopes(ResourceScopeMap scopes) {
+      resourceScopes = scopes;
+      return this;
+    }
+
     public AgentPermissionSet build() {
       return new AgentPermissionSet(
-          token, allowed, denied, destructiveAllowed, sensitiveAllowed, readOnly);
+          token, allowed, denied, destructiveAllowed, sensitiveAllowed, readOnly, resourceScopes);
     }
   }
 }

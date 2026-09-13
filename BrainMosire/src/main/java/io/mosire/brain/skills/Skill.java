@@ -101,7 +101,10 @@ public record Skill(String name, String description, Set<String> allowedTools, P
             callerPermissions.deniedTools(),
             callerPermissions.destructiveAllowed(),
             callerPermissions.sensitiveAllowed(),
-            callerPermissions.readOnly());
+            callerPermissions.readOnly(),
+            // 第 7 维<b>逐字保留</b>（S5-B）：技能只收窄工具白名单，不改资源可达面。这里若省掉（落进"本层不表态"
+            // 的缺省），调用者的工作目录围栏会在这次调用里静默消失——正是"收窄链上丢一环 = 静默放大"的经典错法。
+            callerPermissions.resourceScopes());
     // 身份<b>逐字保留</b>：技能只收窄<b>工具白名单</b>（narrowed），不收窄档位——丢掉 identity 会让这次调用退回
     // "身份未穿透"的缺省（FULL），一个技能就能绕开不完全权限档的命令闸（S6 的红线：身份随收窄只减不增、绝不重置）
     return new ToolContext(

@@ -8,9 +8,13 @@ import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
+import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -35,11 +39,12 @@ import org.slf4j.LoggerFactory;
  * agent.lifecycle} 事件（correlationId = 子 Agent 实例 id）；非法推进直接抛 {@link
  * IllegalStateException}（"非法推进直接抛错而非静默漂移"——SubagentStatus 设计约定）。崩溃恢复 （M3）= 事件重放，本期只落事件、不写恢复逻辑。
  *
- * <p><strong>spawn 检查顺序</strong>（中期计划 W3）：模板存在 → 权限单调性 （{@link PermissionChecker#isSubset}，拒绝即
- * {@link SubagentRejectedException} + {@code permission.denied} 事件）→ 档位单调性（S6，{@code decision}
- * 无事件、拒绝走 {@code permission.denied}）→ 深度（{@code 调用者depth+1 > 子深度上限} 拒绝，{@code decision:DEPTH_LIMIT}
- * 事件）→〔锁内〕繁殖预算（{@code decision:BUDGET_EXHAUSTED} 事件）→ launcher 启动。cap 派生： {@code min(模板, 请求收紧,
- * 父级)}——子级只能更小（D10 硬顶的"单调性第四维度"）。
+ * <p><strong>spawn 检查顺序</strong>（中期计划 W3）：模板存在 → <b>工作目录越界</b>（S5-B，请求面要了调用者够不着的地方 ⇒ {@link
+ * WorkingDirDeniedException} + {@code permission.denied} 事件）→ 权限单调性 （{@link
+ * PermissionChecker#isSubset}，拒绝即 {@link SubagentRejectedException} + {@code permission.denied}
+ * 事件）→ 档位单调性（S6，{@code decision} 无事件、拒绝走 {@code permission.denied}）→ 深度（{@code 调用者depth+1 > 子深度上限}
+ * 拒绝，{@code decision:DEPTH_LIMIT} 事件）→〔锁内〕繁殖预算（{@code decision:BUDGET_EXHAUSTED} 事件）→ launcher
+ * 启动。cap 派生： {@code min(模板, 请求收紧, 父级)}——子级只能更小（D10 硬顶的"单调性第四维度"）。
  *
  * <p><strong>S5-A 起三个守卫的对照物是"调用者"</strong>（{@link #spawn(SubagentLaunchRequest, AgentIdentity,
  * AgentPermissionSet)}）：权限对调用者权限集、深度对调用者深度 + 1、档位对调用者档位。manager 的构造期 {@code
@@ -207,8 +212,13 @@ public final class SubagentManager implements AutoCloseable {
    *
    * <p><b>预算在锁内判</b>：额度数的是在管子实例，"先数后建"若不在同一临界区里，并发两次 spawn 可以双双通过。
    *
+   * <p><b>资源可达面（S5-B）也锚在 {@code callerPermissions} 上</b>：子体的 {@code fs} 面 = 调用者 ∩ 模板建议 ∩ 请求，逐跳物化（见
+   * {@link #effectiveScopes}）。请求要了调用者够不着的地方 ⇒ {@link WorkingDirDeniedException} （{@code
+   * DIR_NOT_ALLOWED}），子体不落地。
+   *
    * @param caller 调用者身份（实例 id + 档位 + 深度；宿主绑定，模型给不出）
-   * @param callerPermissions 调用者自己的权限集（单调性对照真值）
+   * @param callerPermissions 调用者自己的权限集（单调性对照真值 + 资源可达面的来源）
+   * @throws WorkingDirDeniedException 请求面的工作目录超出调用者可达面（{@code DIR_NOT_ALLOWED} 码，见该异常类注释）
    */
   public SubagentInstance spawn(
       SubagentLaunchRequest request, AgentIdentity caller, AgentPermissionSet callerPermissions) {
@@ -221,7 +231,8 @@ public final class SubagentManager implements AutoCloseable {
             .orElseThrow(
                 () -> new SubagentRejectedException("子 Agent 模板不存在: " + request.templateId()));
     String instanceId = instanceIdOf(template.id());
-    AgentPermissionSet permissions = tightenPermissions(template, request);
+    AgentPermissionSet permissions =
+        tightenPermissions(template, request, callerPermissions, instanceId, caller.instanceId());
     checkMonotonicity(template, instanceId, permissions, callerPermissions, caller.instanceId());
     CommandMode mode = resolveMode(template, instanceId, request, caller);
     int depth = caller.depth() + 1;
@@ -379,12 +390,25 @@ public final class SubagentManager implements AutoCloseable {
     return templateId + "-" + Long.toHexString(ThreadLocalRandom.current().nextLong());
   }
 
-  /** 权限收紧：模板权限集 + 请求 extraDenied（只增不减，白名单永不放大——SubagentLaunchRequest 语义）。 */
-  private static AgentPermissionSet tightenPermissions(
-      AgentTemplate template, SubagentLaunchRequest request) {
+  /**
+   * 权限收紧：模板权限集 + 请求 extraDenied（只增不减，白名单永不放大——SubagentLaunchRequest 语义）+ <b>资源可达面物化</b> （S5-B：调用者 ∩
+   * 模板建议 ∩ 请求，逐命名空间落成子体的具体取值）。
+   *
+   * <p><b>为什么继承要物化而不是"运行时往上问父级"</b>：{@link PermissionChecker#isSubset} 比的是两份<b>权限集数据</b>。
+   * 如果子体这一维留空（"我照父级的办"）， covers 只能看到"子级没表态"，无从证明它不比父级宽——判定会静默放行一个运行期真正生效的面比父级宽的子体（锚错对象的同族缺陷， 见 S5-A
+   * 的构造期常量教训）。
+   */
+  private AgentPermissionSet tightenPermissions(
+      AgentTemplate template,
+      SubagentLaunchRequest request,
+      AgentPermissionSet callerPermissions,
+      String instanceId,
+      String callerId) {
+    ResourceScopeMap scopes =
+        effectiveScopes(template, request, callerPermissions, instanceId, callerId);
     AgentPermissionSet base = template.toPermissionSet();
     if (request.extraDenied().isEmpty()) {
-      return base;
+      return base.withResourceScopes(scopes);
     }
     Set<String> denied = new HashSet<>(base.deniedTools());
     denied.addAll(request.extraDenied());
@@ -394,7 +418,115 @@ public final class SubagentManager implements AutoCloseable {
         Set.copyOf(denied),
         base.destructiveAllowed(),
         base.sensitiveAllowed(),
-        base.readOnly());
+        base.readOnly(),
+        scopes);
+  }
+
+  /**
+   * 子体资源可达面的生效值（设计 §2.4）：{@code 调用者 ∩ 模板建议 ∩ 请求}，逐命名空间求交后<b>物化</b>。
+   *
+   * <p>三个来源的分工（口径不同，别互相套用）：
+   *
+   * <ul>
+   *   <li><b>调用者</b>：真值来源。它表过态的命名空间，子体一律接着（只减不增）；
+   *   <li><b>模板</b>（{@code allowedWorkingDirs}）：<b>建议</b>——超出调用者可达面就求交（通用配置被上级收紧是常态）， 不静默放大也不报错；
+   *   <li><b>请求</b>（{@code allowedDirs}）：<b>要求</b>——超出调用者可达面 ⇒ {@link
+   *       WorkingDirDeniedException}（+{@code permission.denied} 事件），父子都不静默截断。
+   * </ul>
+   *
+   * <p>其余命名空间（{@code fs} 以外的）逐条照抄调用者的取值——本段只给 {@code fs} 定义了"模板/请求怎么参与"， 别的命名空间没有对应字段，照抄即"继承父级"（裁决
+   * ②）。
+   */
+  private ResourceScopeMap effectiveScopes(
+      AgentTemplate template,
+      SubagentLaunchRequest request,
+      AgentPermissionSet callerPermissions,
+      String instanceId,
+      String callerId) {
+    ResourceScope callerFs = callerPermissions.fsScope();
+    ResourceScope requested = requestedDirScope(template, request, instanceId, callerId, callerFs);
+    if (requested != null && !callerFs.covers(requested)) {
+      throw dirDenied(template, instanceId, callerId, request, callerFs);
+    }
+    ResourceScope effectiveFs =
+        callerFs.narrowTo(template.workingDirScope()).narrowTo(effective(requested));
+    return callerPermissions.resourceScopes().withNamespace(ResourceScopeMap.FS, effectiveFs);
+  }
+
+  /**
+   * 请求面的目录集（{@code null} = 没提这一嘴 ⇒ 不参与求交；空表 = 显式"哪里都不许"）。
+   *
+   * <p>路径归一失败（含 {@code ..} 段）也走 {@link WorkingDirDeniedException}：那是模型送来的坏参数，
+   * 与"越界"同属"这次要的东西不成立"，工具层落同一个码回灌即可（坏路径重试一次也会被同样拒掉，不会变成无限重试的哑谜）。
+   */
+  private ResourceScope requestedDirScope(
+      AgentTemplate template,
+      SubagentLaunchRequest request,
+      String instanceId,
+      String callerId,
+      ResourceScope callerFs) {
+    if (request.allowedDirs() == null) {
+      return null;
+    }
+    if (request.allowedDirs().isEmpty()) {
+      return ResourceScope.none();
+    }
+    try {
+      return ResourceScope.ofDirs(request.allowedDirs().stream().map(Path::of).toList());
+    } catch (IllegalArgumentException | UncheckedIOException e) {
+      String message =
+          "子 Agent 工作目录参数无法归一（DIR_NOT_ALLOWED）: 请求="
+              + request.allowedDirs()
+              + " 原因="
+              + e.getMessage();
+      emit(
+          EventTypes.PERMISSION_DENIED,
+          callerId,
+          instanceId,
+          Map.of(
+              "template", template.id(),
+              "childId", instanceId,
+              "reason", message,
+              "requestedDirs", request.allowedDirs(),
+              "callerScope", callerFs.summary()));
+      throw new WorkingDirDeniedException(message);
+    }
+  }
+
+  /** 越界拒绝：{@code permission.denied} 事件（agent = <b>被拒的调用者</b>）+ 带需求与可达面的异常。 */
+  private WorkingDirDeniedException dirDenied(
+      AgentTemplate template,
+      String instanceId,
+      String callerId,
+      SubagentLaunchRequest request,
+      ResourceScope callerFs) {
+    String message =
+        "子 Agent 工作目录越界（DIR_NOT_ALLOWED）: 请求="
+            + request.allowedDirs()
+            + " 调用者可达="
+            + callerFs.summary()
+            + "（请求面是'要求'不是'建议'：超出上级可达面一律拒，任一方都不静默截断）";
+    emit(
+        EventTypes.PERMISSION_DENIED,
+        callerId,
+        instanceId,
+        Map.of(
+            "template",
+            template.id(),
+            "childId",
+            instanceId,
+            "reason",
+            message,
+            "requestedDirs",
+            request.allowedDirs(),
+            "callerScope",
+            callerFs.summary()));
+    return new WorkingDirDeniedException(message);
+  }
+
+  /** {@code null}（不表态）在求交里等价于"不限"——它本来就不限制任何东西。 */
+  private static ResourceScope effective(ResourceScope scope) {
+    return scope == null ? ResourceScope.unlimited() : scope;
   }
 
   /**
@@ -531,6 +663,21 @@ public final class SubagentManager implements AutoCloseable {
     }
     if (parent.readOnly() && !granted.readOnly()) {
       return "父级只读而子级未只读";
+    }
+    for (String namespace : parent.resourceScopes().namespaces()) {
+      ResourceScope parentScope = parent.resourceScopes().declaredScope(namespace);
+      ResourceScope child = granted.resourceScopes().declaredScope(namespace);
+      if (child == null) {
+        return "子级未表态资源命名空间 " + namespace + "（父级已表态=" + parentScope.summary() + "）";
+      }
+      if (!parentScope.covers(child)) {
+        return "资源命名空间 "
+            + namespace
+            + " 子级更宽: 父级="
+            + parentScope.summary()
+            + " 子级="
+            + child.summary();
+      }
     }
     return "权限集不在父级范围内";
   }

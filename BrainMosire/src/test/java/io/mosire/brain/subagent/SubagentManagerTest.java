@@ -13,6 +13,9 @@ import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
+import io.mosire.agentlib.permission.PermissionChecker;
+import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
 import java.nio.file.Files;
@@ -349,6 +352,208 @@ class SubagentManagerTest {
     release.countDown();
   }
 
+  // ---- S5-B：资源作用域（fs = 工作目录围栏） ----
+
+  /**
+   * S5-B 锚点 + 物化：子体的 {@code fs} 面取自<b>调用者</b>的权限集，并在派生那一刻落成具体取值。
+   *
+   * <p><b>判别性</b>：本 manager 的构造期权限是 {@code system()}（不限工作目录）。若实现锚在它身上（S5-A 修掉的那类"对照物错对象"），
+   * 子体会拿到"不限" ⇒ 第一条断言转红。若实现只把"继承"留给运行期去问父级（子体这一维留空），第三条断言转红——留空会让 {@code
+   * PermissionChecker.isSubset} 拿到"没有对象的比较"，静默放行一个真正生效的面更宽的子体。
+   */
+  @Test
+  void childFsScopeIsAnchoredToTheCallerAndMaterialized() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path outside = Files.createDirectories(tempDir.resolve("outside"));
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+    AgentPermissionSet callerPermissions = withFs(ResourceScope.ofDir(allowed));
+
+    SubagentInstance spawned =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "调查", null, null, null, null),
+            AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1),
+            callerPermissions);
+
+    ResourceScope childFs = spawned.permissions().fsScope();
+    assertThat(childFs.unrestricted()).as("子体必须继承调用者的围栏，而不是 manager 的构造期权限").isFalse();
+    assertThat(childFs.allowsDir(allowed.resolve("a/b"))).isTrue();
+    assertThat(childFs.allowsDir(outside.resolve("a"))).isFalse();
+    assertThat(spawned.permissions().resourceScopes().declaredScope(ResourceScopeMap.FS))
+        .as("继承要物化：子体自己表了态，不留空")
+        .isNotNull();
+    assertThat(PermissionChecker.isSubset(spawned.permissions(), callerPermissions)).isTrue();
+  }
+
+  /** 模板的 {@code allowedWorkingDirs} 是<b>建议</b>：与调用者求交，这里更窄 ⇒ 取更窄的。 */
+  @Test
+  void templateWorkingDirSuggestionNarrowsTheChild() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path narrow = Files.createDirectories(allowed.resolve("narrow"));
+    write(templateWithDirs(List.of(narrow.toString())));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "调查", null, null, null, null),
+            AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1),
+            withFs(ResourceScope.ofDir(allowed)));
+
+    ResourceScope childFs = spawned.permissions().fsScope();
+    assertThat(childFs.allowsDir(narrow.resolve("x"))).isTrue();
+    assertThat(childFs.allowsDir(allowed.resolve("sibling"))).as("模板更窄 ⇒ 按更窄的来（求交，不是取并）").isFalse();
+  }
+
+  /**
+   * 模板建议<b>超出</b>调用者可达面 ⇒ <b>静默求交</b>（不报错、也不放大）：通用模板配置了上级之外的目录是常态。
+   *
+   * <p><b>判别性</b>：把求交写成"模板优先/取并"，第二条断言（子体拿不到别处）转红；写成"模板越界就抛"，这次 spawn 直接失败 ⇒ 也红。 反向对照见 {@link
+   * #requestedDirsBeyondTheCallerAreRejectedLoudly}：同一份越界，<b>请求</b>那一面必须响亮。
+   */
+  @Test
+  void templateSuggestionBeyondTheCallerIsIntersectedSilently() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path elsewhere = Files.createDirectories(tempDir.resolve("elsewhere"));
+    write(templateWithDirs(List.of(elsewhere.toString())));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "调查", null, null, null, null),
+            AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1),
+            withFs(ResourceScope.ofDir(allowed)));
+
+    ResourceScope childFs = spawned.permissions().fsScope();
+    assertThat(childFs.unrestricted()).isFalse();
+    assertThat(childFs.prefixList()).as("互不相交 ⇒ 显式空集（不是退化成'不限'）").isEmpty();
+    assertThat(childFs.allowsDir(elsewhere.resolve("x"))).isFalse();
+    assertThat(childFs.allowsDir(allowed.resolve("x"))).isFalse();
+    assertThat(query(EventTypes.PERMISSION_DENIED)).as("建议面越界不是错误——只有请求面才响亮").isEmpty();
+  }
+
+  /**
+   * 请求面是<b>要求</b>：超出调用者可达面 ⇒ {@code DIR_NOT_ALLOWED} + {@code permission.denied}，子体不落地。
+   *
+   * <p><b>判别性</b>：静默截断（把请求削到调用者可达面然后照常起实例）会让 {@code manager.list()} 非空、生命周期事件出现 ⇒ 两条断言转红。 拒绝事件里的
+   * {@code agent} 必须是<b>被拒的调用者</b>（与 S5-A 同一口径）。
+   */
+  @Test
+  void requestedDirsBeyondTheCallerAreRejectedLoudly() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path elsewhere = Files.createDirectories(tempDir.resolve("elsewhere"));
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest(
+                        "reader",
+                        "越界调查",
+                        null,
+                        null,
+                        null,
+                        null,
+                        CommandMode.FULL,
+                        List.of(elsewhere.toString())),
+                    AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1),
+                    withFs(ResourceScope.ofDir(allowed))))
+        .isInstanceOf(WorkingDirDeniedException.class)
+        .hasMessageContaining("DIR_NOT_ALLOWED");
+
+    assertThat(manager.list()).as("拒绝发生在起实例之前").isEmpty();
+    assertThat(query(EventTypes.AGENT_LIFECYCLE)).as("一个生命周期事件都不该有").isEmpty();
+
+    List<Event> denied = query(EventTypes.PERMISSION_DENIED);
+    assertThat(denied).hasSize(1);
+    assertThat(denied.get(0).agent()).isEqualTo("parent-1");
+    assertThat(payloadOf(denied.get(0)))
+        .containsEntry("template", "reader")
+        .containsEntry("requestedDirs", List.of(elsewhere.toString()))
+        .containsEntry("callerScope", ResourceScope.ofDir(allowed).summary())
+        .satisfies(p -> assertThat(p.get("reason").toString()).contains("DIR_NOT_ALLOWED"));
+  }
+
+  /** 请求面落在调用者之内 ⇒ 逐跳再收窄（这里窄一层）。 */
+  @Test
+  void requestedDirsWithinTheCallerNarrowTheChildFurther() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path narrow = Files.createDirectories(allowed.resolve("narrow"));
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "reader", "窄调查", null, null, null, null, null, List.of(narrow.toString())),
+            AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1),
+            withFs(ResourceScope.ofDir(allowed)));
+
+    ResourceScope childFs = spawned.permissions().fsScope();
+    assertThat(childFs.allowsDir(narrow.resolve("x"))).isTrue();
+    assertThat(childFs.allowsDir(allowed.resolve("sibling"))).isFalse();
+  }
+
+  /**
+   * 请求给<b>空表</b> = 显式"哪里都不许"：子体照常落地，但 {@code fs} 面是空集。
+   *
+   * <p><b>判别性</b>：把"显式空集"当成"没提这一嘴"（退化成继承调用者）⇒ 后两条断言转红。 与 {@code allowedTools: []}
+   * 同形同义——显式写的空集是"不给"，不是"没写"。
+   */
+  @Test
+  void requestedEmptyDirsGiveTheChildNothing() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "无目录任务", null, null, null, null, null, List.of()),
+            AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1),
+            withFs(ResourceScope.ofDir(allowed)));
+
+    ResourceScope childFs = spawned.permissions().fsScope();
+    assertThat(childFs.unrestricted()).as("空集不是'不限'").isFalse();
+    assertThat(childFs.prefixList()).isEmpty();
+    assertThat(childFs.allowsDir(allowed.resolve("x"))).isFalse();
+  }
+
+  /** 坏路径（含 NUL，{@code Path.of} 抛 {@code InvalidPathException}）与"越界"同码同事件：模型送来的参数不成立，不是崩溃。 */
+  @Test
+  void unparsableRequestedDirIsDeniedWithTheSameCode() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+    AgentIdentity caller = AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1);
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest(
+                        "reader",
+                        "坏路径",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        List.of("bad" + (char) 0 + "path")),
+                    caller,
+                    withFs(ResourceScope.ofDir(allowed))))
+        .isInstanceOf(WorkingDirDeniedException.class)
+        .hasMessageContaining("DIR_NOT_ALLOWED");
+
+    assertThat(manager.list()).isEmpty();
+    assertThat(query(EventTypes.PERMISSION_DENIED)).hasSize(1);
+  }
+
   @Test
   void killOrchestratesLauncherShutdownAndEmitsKilled() throws Exception {
     AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
@@ -664,6 +869,33 @@ class SubagentManagerTest {
       int maxToolCallsPerTurn,
       long timeBudgetSeconds,
       long quotaMaxTokens) {
+    return template(
+        id,
+        allowedTools,
+        deniedTools,
+        destructiveAllowed,
+        sensitiveAllowed,
+        readOnly,
+        maxTurns,
+        maxToolCallsPerTurn,
+        timeBudgetSeconds,
+        quotaMaxTokens,
+        null);
+  }
+
+  /** 带 {@code allowedWorkingDirs}（S5-B）的重载：null = 不限，空表 = 哪里都不许。 */
+  private static AgentTemplate template(
+      String id,
+      Set<String> allowedTools,
+      Set<String> deniedTools,
+      boolean destructiveAllowed,
+      boolean sensitiveAllowed,
+      boolean readOnly,
+      int maxTurns,
+      int maxToolCallsPerTurn,
+      long timeBudgetSeconds,
+      long quotaMaxTokens,
+      List<String> allowedWorkingDirs) {
     return new AgentTemplate(
         id,
         "测试模板 " + id,
@@ -679,7 +911,30 @@ class SubagentManagerTest {
         maxToolCallsPerTurn,
         timeBudgetSeconds,
         quotaMaxTokens,
-        List.of());
+        List.of(),
+        allowedWorkingDirs);
+  }
+
+  /** S5-B 用的模板：只差一组 {@code allowedWorkingDirs}（null = 不限，空表 = 哪里都不许），其余取缺省。 */
+  private static AgentTemplate templateWithDirs(List<String> allowedWorkingDirs) {
+    return template(
+        "reader",
+        Set.of("read"),
+        Set.of(),
+        true,
+        false,
+        false,
+        2000,
+        30,
+        600,
+        0,
+        allowedWorkingDirs);
+  }
+
+  /** 一份"只把 {@code fs} 面收紧到给定目录"的权限集（其余维照 {@code system()}）。 */
+  private static AgentPermissionSet withFs(ResourceScope fs) {
+    return AgentPermissionSet.system()
+        .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, fs));
   }
 
   private void awaitStatus(SubagentManager manager, String id, SubagentStatus status)

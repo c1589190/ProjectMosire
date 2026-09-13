@@ -40,7 +40,8 @@ import org.slf4j.LoggerFactory;
  * ContextAccessJudge}（同为其唯一判定点的纵深副本）。
  *
  * <p>错误映射契约：参数缺失/非法 → {@code INVALID_ARGUMENTS}；编排层拒绝（单调性/深度，对应 {@link SubagentRejectedException}）→
- * {@code PERMISSION_DENIED}（可读原因经 message 透出）；<b>繁殖预算耗尽</b>（{@link
+ * {@code PERMISSION_DENIED}（可读原因经 message 透出）；<b>工作目录越界</b>（{@link WorkingDirDeniedException}）→
+ * {@code DIR_NOT_ALLOWED}（S5-B：与"你不该用这个工具"分码——它要说的是"你要的目录不在上级可达面里"）；<b>繁殖预算耗尽</b>（{@link
  * SubagentBudgetExceededException}）→ {@code
  * BUDGET_EXHAUSTED}（与越权分码：前者"现在不行"、后者"你不该要"，见该异常的类注释）；未知实例 → {@code UNKNOWN_INSTANCE}；启动失败 → {@code
  * LAUNCH_FAILED}；读上下文失败（库不存在/配置未注入）→ {@code CONTEXT_UNAVAILABLE}（响亮，绝不返回空结果冒充成功）。
@@ -78,7 +79,7 @@ public final class SubagentOrchestrationTools {
   static AgentTool spawn(SubagentManager manager) {
     return tool(
         SPAWN_SUB_AGENT,
-        "派生一个子 Agent（由模板驱动；深度/权限/档位/cap 均经<b>调用者</b>收紧）。",
+        "派生一个子 Agent（由模板驱动；深度/权限/档位/工作目录/cap 均经<b>调用者</b>收紧）。",
         Map.of(
             "type",
             "object",
@@ -87,6 +88,9 @@ public final class SubagentOrchestrationTools {
                 "templateId", Map.of("type", "string"),
                 "goal", Map.of("type", "string"),
                 "extraDenied", Map.of("type", "array", "items", Map.of("type", "string")),
+                // S5-B：子体的工作目录（可选）。给 = 明确要求（超出调用者可达面直接拒，码 DIR_NOT_ALLOWED）；
+                // 空数组 = 要求"哪里都不许"；不给 = 不额外收窄（调用者 ∩ 模板说了算）。
+                "allowedDirs", Map.of("type", "array", "items", Map.of("type", "string")),
                 "maxTurnsCap", Map.of("type", "integer"),
                 "timeBudgetSecondsCap", Map.of("type", "integer"),
                 "quotaMaxTokensCap", Map.of("type", "integer"),
@@ -128,7 +132,8 @@ public final class SubagentOrchestrationTools {
                     intArg(context, "maxTurnsCap"),
                     longArg(context, "timeBudgetSecondsCap"),
                     longArg(context, "quotaMaxTokensCap"),
-                    mode);
+                    mode,
+                    strListArg(context, "allowedDirs"));
           } catch (IllegalArgumentException e) {
             // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
             return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());
@@ -137,6 +142,10 @@ public final class SubagentOrchestrationTools {
           try {
             // S5-A：以**调用者自己的**身份与权限集派生——三个守卫都对照它（不是 manager 的构造期常量）
             instance = manager.spawn(request, context.identity(), context.permissions());
+          } catch (WorkingDirDeniedException e) {
+            // S5-B：目录越界单独一码（DIR_NOT_ALLOWED）——模型据此改成"要一个够得着的目录"，
+            // 而不是像看到 PERMISSION_DENIED 那样去换模板/换身份接着撞
+            return ToolResult.error("DIR_NOT_ALLOWED", e.getMessage());
           } catch (SubagentBudgetExceededException e) {
             // 预算与越权分码：越权 = "你不该要"，预算 = "现在不行"（模型据此才会等/收敛，而不是换条路接着撞）
             return ToolResult.error("BUDGET_EXHAUSTED", e.getMessage());
@@ -406,6 +415,35 @@ public final class SubagentOrchestrationTools {
       return s.isBlank() ? null : s;
     }
     return String.valueOf(value);
+  }
+
+  /**
+   * 字符串数组参数（S5-B 的 {@code allowedDirs}）：字段缺失 → {@code null}（"没提这一嘴"，与"给了空数组 = 哪里都不许"不同口径）； 给了集合 →
+   * 逐元素取字符串（元素为空/空白 ⇒ 抛 {@link IllegalArgumentException}，调用方落 {@code INVALID_ARGUMENTS}）； 给了单个标量 →
+   * 当成单元素表（与 {@code strSetArg} 同惯例）。
+   */
+  private static java.util.List<String> strListArg(ToolContext context, String name) {
+    Object value = context.arguments().get(name);
+    if (value == null) {
+      return null;
+    }
+    java.util.List<String> out = new java.util.ArrayList<>();
+    if (value instanceof java.util.Collection<?> collection) {
+      for (Object item : collection) {
+        out.add(dirText(name, item));
+      }
+    } else {
+      out.add(dirText(name, value));
+    }
+    return java.util.List.copyOf(out);
+  }
+
+  private static String dirText(String name, Object raw) {
+    String text = raw == null ? "" : String.valueOf(raw).strip();
+    if (text.isEmpty()) {
+      throw new IllegalArgumentException("参数 " + name + " 的元素必须是非空白路径文本");
+    }
+    return text;
   }
 
   private static java.util.Set<String> strSetArg(ToolContext context, String name) {

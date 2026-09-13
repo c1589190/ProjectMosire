@@ -112,7 +112,8 @@ class AgentTemplateScriptTest {
         0,
         List.of(
             new AgentTemplate.ScriptStep("echo", Map.of("text", "问好"), null),
-            new AgentTemplate.ScriptStep(null, Map.of(), "子 Agent 完成")));
+            new AgentTemplate.ScriptStep(null, Map.of(), "子 Agent 完成")),
+        null);
   }
 
   private static AgentTemplate sampleNoScript(String id) {
@@ -131,6 +132,7 @@ class AgentTemplateScriptTest {
         2,
         60,
         0,
-        List.of());
+        List.of(),
+        null);
   }
 }

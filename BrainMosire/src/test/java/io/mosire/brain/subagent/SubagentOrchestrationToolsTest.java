@@ -12,6 +12,8 @@ import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
+import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
@@ -432,6 +434,161 @@ class SubagentOrchestrationToolsTest {
     f.close();
   }
 
+  // ---- S5-B：allowedDirs 参数面 ----
+
+  /**
+   * {@code allowedDirs} 一路落到子体的 {@code fs} 面（父级之内再收窄），且子体这一维是<b>物化</b>的。
+   *
+   * <p><b>判别性</b>：参数面若不透传（漏传/吞掉），子体会拿到调用者的整面 ⇒ 第二条断言转红。这里刻意让请求比调用者窄一层， 好把"透传了"和"透传后被忽略"分开。
+   */
+  @Test
+  void allowedDirsArgumentReachesTheChildsFsScope() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path narrow = Files.createDirectories(allowed.resolve("narrow"));
+    Fixture f = fixture(systemParent(), null);
+    ToolRegistry registry = registryOf(f.manager());
+
+    ToolResult result =
+        new ToolExecutionGuard()
+            .execute(
+                registry,
+                "spawn_sub_agent",
+                contextWith(
+                    withFs(ResourceScope.ofDir(allowed)),
+                    Map.of(
+                        "templateId",
+                        "reader",
+                        "goal",
+                        "窄调查",
+                        "allowedDirs",
+                        List.of(narrow.toString()))));
+    assertThat(result.success()).as(result.message()).isTrue();
+    String childId = (String) JSON.<Map>readValue(result.message(), Map.class).get("instanceId");
+
+    ResourceScope childFs = f.manager().get(childId).orElseThrow().permissions().fsScope();
+    assertThat(childFs.allowsDir(narrow.resolve("x"))).isTrue();
+    assertThat(childFs.allowsDir(allowed.resolve("sibling"))).as("收窄真的生效过").isFalse();
+    assertThat(
+            f.manager()
+                .get(childId)
+                .orElseThrow()
+                .permissions()
+                .resourceScopes()
+                .declaredScope("fs"))
+        .isNotNull();
+    f.close();
+  }
+
+  /**
+   * 请求面越界 ⇒ <b>工具码 {@code DIR_NOT_ALLOWED}</b>（不是笼统的 DENIED），子体不落地。
+   *
+   * <p><b>判别性</b>：把异常映射退回 {@code SubagentRejectedException} 那一条（去掉独立 catch），码会变成 DENIED ⇒ 第一条断言转红——
+   * 而这两个码对模型说的是两件事（"要个够得着的目录" vs "你不该用这个工具"）。
+   */
+  @Test
+  void allowedDirsBeyondTheCallerYieldDirNotAllowed() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Path elsewhere = Files.createDirectories(tempDir.resolve("elsewhere"));
+    Fixture f = fixture(systemParent(), null);
+    ToolRegistry registry = registryOf(f.manager());
+
+    ToolResult result =
+        new ToolExecutionGuard()
+            .execute(
+                registry,
+                "spawn_sub_agent",
+                contextWith(
+                    withFs(ResourceScope.ofDir(allowed)),
+                    Map.of(
+                        "templateId",
+                        "reader",
+                        "goal",
+                        "越界调查",
+                        "allowedDirs",
+                        List.of(elsewhere.toString()))));
+
+    assertThat(result.success()).isFalse();
+    assertThat(result.code()).isEqualTo("DIR_NOT_ALLOWED");
+    assertThat(result.message()).contains("DIR_NOT_ALLOWED");
+    assertThat(f.manager().list()).as("拒绝发生在起实例之前").isEmpty();
+    assertThat(f.events().query(new EventQuery("", EventTypes.AGENT_LIFECYCLE, "", -1, 100)))
+        .as("一个生命周期事件都不该有")
+        .isEmpty();
+    f.close();
+  }
+
+  /**
+   * {@code allowedDirs} 的元素是空白（或 JSON {@code null}）⇒ {@code INVALID_ARGUMENTS}（模型参数问题），
+   * 与"越界"（{@code DIR_NOT_ALLOWED}）分码；两者都不得静默当成"没提这一嘴"。
+   *
+   * <p>非字符串元素（如 {@code 42}）<b>不</b>在这里拒绝：本工具的文本参数一律走 {@code String.valueOf} 强转（{@code
+   * strArg}/{@code strSetArg} 同惯例），"42" 会当成相对路径按进程 cwd 解析——它是"一个真的目录要求"，成不成立交给可达面判。
+   */
+  @Test
+  void blankAllowedDirsElementsYieldInvalidArguments() throws Exception {
+    Path allowed = Files.createDirectories(tempDir.resolve("allowed"));
+    Fixture f = fixture(systemParent(), null);
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    List<Object> withNull = new ArrayList<>();
+    withNull.add(null);
+    List<Object> cases = new ArrayList<>();
+    cases.add("");
+    cases.add("   ");
+    cases.add(withNull);
+
+    for (Object bad : cases) {
+      ToolResult result =
+          guard.execute(
+              registry,
+              "spawn_sub_agent",
+              contextWith(
+                  withFs(ResourceScope.ofDir(allowed)),
+                  Map.of("templateId", "reader", "goal", "g", "allowedDirs", bad)));
+      assertThat(result.success()).as("allowedDirs=%s", bad).isFalse();
+      assertThat(result.code()).as("allowedDirs=%s", bad).isEqualTo("INVALID_ARGUMENTS");
+      assertThat(result.message()).as("allowedDirs=%s", bad).contains("allowedDirs");
+    }
+    assertThat(f.manager().list()).as("一个实例都不该落地").isEmpty();
+    f.close();
+  }
+
+  /**
+   * 调用者<b>不限</b>时 {@code allowedDirs} 照常是"要求"（收窄生效），不是"没接上"：给面接上了，只是没人收窄过。
+   *
+   * <p>判别性：把"调用者不限"实现成"跳过请求面"（例如 {@code if (callerFs.unrestricted()) return callerFs;}），
+   * 第二条断言转红——不限不等于"请求面可以随便被忽略"。
+   */
+  @Test
+  void allowedDirsStillBindsWhenTheCallerIsUnrestricted() throws Exception {
+    Path narrow = Files.createDirectories(tempDir.resolve("narrow"));
+    Fixture f = fixture(systemParent(), null);
+    ToolRegistry registry = registryOf(f.manager());
+
+    ToolResult result =
+        new ToolExecutionGuard()
+            .execute(
+                registry,
+                "spawn_sub_agent",
+                context(
+                    Map.of(
+                        "templateId",
+                        "reader",
+                        "goal",
+                        "g",
+                        "allowedDirs",
+                        List.of(narrow.toString()))));
+    assertThat(result.success()).as(result.message()).isTrue();
+    String childId = (String) JSON.<Map>readValue(result.message(), Map.class).get("instanceId");
+
+    ResourceScope childFs = f.manager().get(childId).orElseThrow().permissions().fsScope();
+    assertThat(childFs.unrestricted()).isFalse();
+    assertThat(childFs.allowsDir(narrow.resolve("x"))).isTrue();
+    assertThat(childFs.allowsDir(tempDir.resolve("outside"))).isFalse();
+    f.close();
+  }
+
   // ---- fixtures ----
 
   /** 管理器 + 事件库 + 总线（测试自建并注入，便于直接查事件）。 */
@@ -554,6 +711,17 @@ class SubagentOrchestrationToolsTest {
 
   private static ToolContext context(Map<String, Object> args) {
     return new ToolContext(AccessToken.SYSTEM, AgentPermissionSet.system(), Map.of(), args);
+  }
+
+  /** 换一份<b>调用者权限集</b>的上下文（S5-B：fs 面受限的调用者）。 */
+  private static ToolContext contextWith(AgentPermissionSet permissions, Map<String, Object> args) {
+    return new ToolContext(AccessToken.SYSTEM, permissions, Map.of(), args);
+  }
+
+  /** 一份"只把 {@code fs} 面收紧到给定目录"的权限集（其余维照 {@code system()}）。 */
+  private static AgentPermissionSet withFs(ResourceScope fs) {
+    return AgentPermissionSet.system()
+        .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, fs));
   }
 
   private static AgentPermissionSet systemParent() {
