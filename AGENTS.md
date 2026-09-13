@@ -1,13 +1,16 @@
 # 仓库约定（AGENTS.md）
 
 > 本项目 = Java 21 + Maven 多模块的 Agent 软件：主 Agent（Brain）为核心，可自由创建/销毁多个权限各异的子 Agent；对外 MCP/A2A/AG-UI；对内统一事件存储 + 权限 + 配置；且运行时自身（配置、模块、skills、子 Agent）可被 Agent 管理。
-> 开发依据见 `开发计划.md`（P0 计划）与 `Research/调查报告.md`（调查结论，2026-09-08）。
+> 开发依据见 `开发计划.md`（**2026-09-14 重写版**；权威实时状态在 `.superpowers/sdd/2026-09-12-三期/` 的账本）
+> 与 `Research/调查报告.md`（调查结论，2026-09-08）。
 
 ## 模块边界（不可违反）
 
 ```
 MainMosire ──→ BrainMosire ──→ AgentLibMosire
 （入口/网关）   （Agent 运行时）   （通用工具包）
+                                     ▲
+BashPluginMosire ────────────────────┘   （PF4J 插件：只依赖 AgentLib；宿主不依赖它）
 ```
 
 - **AgentLibMosire**：通用 LLM 工具包/接口/协议（llm client、AgentTool 接口、MCP 适配、权限模型、事件存储、配置、进程管理）。**无 Agent 假设**：不得 import `io.mosire.brain.*` / `io.mosire.main.*`；可被其他程序单独依赖复用。
@@ -18,7 +21,11 @@ MainMosire ──→ BrainMosire ──→ AgentLibMosire
   grep -rlE "io\.mosire\.(brain|main)" AgentLibMosire/src || echo "OK: AgentLib 无下游依赖"
   grep -rl "io\.mosire\.main" BrainMosire/src || echo "OK: Brain 无 Main 依赖"
   ```
-- 包前缀：`io.mosire.agentlib.*` / `io.mosire.brain.*` / `io.mosire.main.*`；groupId `io.mosire`。
+- 包前缀：`io.mosire.agentlib.*` / `io.mosire.brain.*` / `io.mosire.main.*`（插件模块用 `io.mosire.bash.*` 一类**独立命名空间**）；
+  groupId `io.mosire`。
+- **插件模块（`BashPluginMosire`）**：只依赖 `AgentLibMosire`；**宿主（Brain/Main）不得依赖它**——插件 JAR 由
+  PF4J 从 `plugins/` 装载（**唯一装载路径**，不 shade 进 fat jar），宿主通过 `ToolSource` 接口与它对话。
+  设计见 `设计-插件系统与bash插件化.md`。
 
 ## 构建与门禁
 
@@ -42,7 +49,7 @@ MainMosire ──→ BrainMosire ──→ AgentLibMosire
 4. **信任边界 = 进程边界**：子 Agent = 同 jar stdio 子进程；进程内"逻辑隔离"只放自己审过的插件。
 5. 任何工具不能关进程（进程生命周期归 SubprocessManager/Main 管理）。
 
-## 外部跟踪项（列入 开发计划.md §九，改代码前先查）
+## 外部跟踪项（改代码前先查；原列于 P0 计划 §九，P0 已归档 ⇒ **以本节为准**）
 
 - MCP Java SDK 3.0（2026-07-28 规范）发布即评估升级（当前锁 2.0.1；2.0.1 无 server/discover/header 路由）。
 - AG-UI 1.0 仍 Draft（事件模型可能再变）；A2A server 用官方 spec+jsonrpc-common 纯模块自写绑定（不用 server-common/CDI）。
