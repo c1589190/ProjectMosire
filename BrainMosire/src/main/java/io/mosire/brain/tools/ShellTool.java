@@ -501,7 +501,9 @@ public final class ShellTool implements AgentTool {
       builder.redirectErrorStream(false);
       process = builder.start();
     } catch (IOException e) {
-      LOG.warn("bash 启动失败: {}", command, e);
+      // 命令明文不进持久面（D24 的同一条红线）：日志会被台架/部署落盘，这条线上只落"命令摘要"——与 tool.call
+      // 的落账摘要（ledgerArgs）同一段代码、同一个输入面，可由摘要反查那次调用；命令原文属于提示面（tty/HTTP）不属于日志面。
+      LOG.warn("bash 启动失败（命令摘要 {}）", Digest.ofCommand(command), e);
       return ToolResult.error(LAUNCH_FAILED, "启动命令失败（工作目录或可执行文件不可用）: " + e.getMessage());
     }
 
