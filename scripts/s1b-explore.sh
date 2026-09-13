@@ -27,7 +27,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JAR="${JAR:-$ROOT/MainMosire/target/mosire.jar}"
 DATA_DIR=""
 TEMPLATES_DIR="$ROOT/configs/agents"
-REQUIREMENT="$ROOT/docs/s1b-requirement.md"
+REQUIREMENT="$ROOT/docs/archive/2026-09-14-旧计划/s1b-requirement.md"
 FINAL_PROMPT_DEFAULT='【出具报告】现在请把《发现报告》全文作为本条回复的正文输出。结构：①范围与方法（你测了什么、怎么测的）②每条发现（现象 / 复现步骤 / 期望 vs 实际 / 严重度 / 事件链证据位置）③若无发现就写"空报告"并说明你覆盖了什么 ④你没验成的部分与原因。不要在报告之后继续调用工具。'
 FINAL_PROMPT="$FINAL_PROMPT_DEFAULT"
 NO_FINAL_PROMPT=0
@@ -54,7 +54,7 @@ usage() {
   --data-dir <p>       数据目录（= 配置根；默认 .work/s1b-<时间戳>；离线演练建议用临时目录）
   --jar <p>            主 jar（默认 MainMosire/target/mosire.jar）
   --templates-dir <p>  子 Agent 模板目录（默认 configs/agents；传 "-" 表示不启用编排）
-  --requirement <p>    要求书文件（默认 docs/s1b-requirement.md）
+  --requirement <p>    要求书文件（默认 docs/archive/2026-09-14-旧计划/s1b-requirement.md）
   --round <p>          追加一轮追问（可重复；按给出的顺序发送；排在「继续」轮之后、哨兵之前）
   --continue-rounds <n> 要求书之后、哨兵之前插入的「继续」工作轮条数（默认 4）
                        ⇒ 默认节奏 = 1 条要求书 + 4 条「继续」 = 5 个工作轮，再加 1 个报告轮

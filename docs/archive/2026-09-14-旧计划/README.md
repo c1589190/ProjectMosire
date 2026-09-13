@@ -2,6 +2,7 @@
 
 > **归档裁决**：用户 2026-09-14 ——「先把之前的开发计划归档弃用一下，我觉得可以重新制定新的调试和开发计划了」。
 > 本目录是**冻结快照**：文件原样保留、不再更新、**不再是任何工作的依据**。新计划见仓库根 `开发计划.md`（重写版）。
+> （**例外**：本 README 是索引，随接续项的交接与回填更新——2026-09-14 已做一轮回填，见下"接续项"。）
 
 ## 为什么归档
 
@@ -25,6 +26,9 @@
 | `开发计划-三期-第三小段.md` | S3：血缘/身份判定（D27）+ 终局语义（D28） | A 块关账；**B/C 已实现待修复轮；D 块验收未做** |
 | `开发计划-三期-第四小段.md` | S4：判定点统一 + 审批内核 + bash 给主 Agent | 已关账 |
 | `开发计划-三期-第五小段.md` | S5：资源作用域判定（目录围栏 + 工具内细粒度权限） | **全部关账**（A/B/C/D/E + F3），文件本身未同步 |
+| `2026-09-09-二期-p2.md` | 二期的 SDD 任务级拆解（原 `docs/superpowers/plans/`） | 已完结（P2-7 欠账见"接续项 3"） |
+| `2026-09-09-m2-w2-w5.md` | M2 收官波次（W2/W5）的 SDD 任务级拆解（原 `docs/superpowers/plans/`） | 已完结 |
+| `s1b-requirement.md` | S1-B 真模型接线要求书（原 `docs/`） | 已用毕 |
 
 > 引用这些文件名的注释/文档（全仓 83 处，如 `Compactor.java:14` 引 `开发计划.md:101`）**未逐处改写**：
 > 它们引用的是**历史设计决定的出处**，归档后按文件名仍可检索到（`git log --follow` 亦保留历史）。新工作**不得**再引本目录作为依据。
@@ -34,26 +38,35 @@
 以下是从这些文件与 SDD 账本里**仍然有效**的未结项，已交接给新计划与账本。**权威状态以
 `.superpowers/sdd/2026-09-12-三期/README.md`（任务表）与 `progress.md`（账本）为准**，本表只是索引。
 
-1. **三期 S3 / D 块验收未做**：V1~V10 真模型使用模式实跑（父侧全链未上真模型）。
-   夹具前提：`.work/usage-test/probe-templates/orch-probe.json` 需补 `read_agent_context`/`wait_sub_agent`
-   进白名单 + `destructiveAllowed: true`，否则判定根本没被触达。
-2. **三期 S3 / B/C 修复轮**：独立评审"有条件通过"，**2 条必改 + 6 条顺手**未修：
-   ①`killSummary` 的 `case TERMINATING`（"尚未确认"）零用例；②`wait_sub_agent` 的 `timeoutMs` 无上限
-   （子体经 MCP 桥调用会撞 `McpToolSource.DEFAULT_REQUEST_TIMEOUT = 60s`，把"超时不报错"变成传输错误）；
-   ③`readChildTerminalRecord` 缺越根防护；④`close()` 顺序用例是概率性判别；⑤`PipeMcpClientTransport`
-   类注释旧段落与 §2.2 自相矛盾；⑥`default ->` 死分支零用例；⑦微分支无用例；⑧父侧全链未上真模型。
+1. ~~**三期 S3 / D 块验收未做**~~ **✅ 2026-09-14 已关账**：V1~V10 真模型（`glm-5.3-flash`）使用模式实跑**全过**
+   （父侧全链 + HTTP + 日志/事件库三方互证；跑单修订见 `.work/usage-test/D-run-sheet.md`，结果见账本 `progress.md` §⑭）。
+2. ~~**三期 S3 / B/C 修复轮**~~ **✅ 2026-09-14 已关账**（提交 `1871ea5`）：2 条必改（TERMINATING 用例、
+   `wait_sub_agent` 单次上限 `MAX_WAIT_MILLIS=30s`）+ 6 条顺手（越根防护收敛 `childDbPath`、close 顺序判据、
+   `PipeMcpClientTransport` 注释、SPAWNING 死分支注明不可达、微分支用例）全落地；父侧全链由 D 块验收覆盖。
 3. **二期 P2-7 欠账**（`开发进度.md` 语："已建成但尚未接线"）——**核过全仓，以下仍是零命中**：
    `config_get`/`config_put`（T21a）、`read_memory`/`remember`/`skill_load`/`skill_learn`（T21b）、
    `event_query`/`audit_query`/`probe_status`/`list_agents`/`send_user_message`（T21c）、`usage` 报表（T22a）、
    `Skill.constrain`（T24）；`doctor` 仍是 `Main.java:72` 的"在 M3 实现"占位（T22b）。
    **装配面**：`Main` 侧 `SkillCatalog`/`MemoryRetriever`/`MemoryStore`/`Compactor` 命中**仍为 0**
    （只有 `ConversationStore` 接上了）⇒ 技能/记忆/压缩三件套**已交付但零生产构造点**。
-4. **登记项（未逐条复核，以账本为准）**：`SubagentOrchestrationTools.systemOnly` 冗余闸注释待更正
-   （S4-A 登记①）；审批 `callerKey` 粒度是否已随 S5-A 身份穿透换成实例级（S4-B1 登记）；
-   `SqliteEventStore.open()` 在 `initialize()` 抛异常时不关连接（S1-A2 登记）；
-   S2/UX 四条诚实缺口（`childDbPath` 穿越纵深防御未触达、零命中 search、空消息产品侧、子体真派生链路未复跑）；
-   `设计-审批与工具内权限.md` 开口项 5 条（主 Agent 沙箱 off / 命令脱敏 digest / 硬拒清单不可删 /
-   HTTP 审批面默认开 / 超时 300 s）——**该设计文档仍在仓库根，未归档**。
-5. **不在本目录但同期归档的候选**：`docs/superpowers/plans/2026-09-09-二期-p2.md`、`docs/superpowers/plans/2026-09-09-m2-w2-w5.md`
-   （SDD 任务级拆解，同属旧计划体系）；`docs/s1b-requirement.md`（S1-B 要求书，已用毕）。
-   **本次未动**——它们被账本与 Java 注释引用得更多，待新计划定型后一并处置。
+4. **登记项（2026-09-14 逐条复核完毕，结果逐条见下）**：
+   - `SubagentOrchestrationTools.systemOnly` 冗余闸注释"待更正" → **代码已全仓绝迹**（生产源集 0 命中），
+     只剩两处历史性注释且措辞准确 ⇒ 无需再改（`开发计划.md` §3.1）。
+   - `SqliteEventStore.open()` 在 `initialize()` 抛异常时不关连接（S1-A2 登记）→ **已修**
+     （`SqliteEventStore.java:96` 注释标"任务 #32"、`:111-125` 显式关连接）⇒ 无需再改（`开发计划.md` §3.1）。
+   - **审批 `callerKey` 粒度**（S4-B1 登记"S5 身份穿透时必须换实例级"）→ **复核：仍未换**。
+     `ToolCallAuthorizer.java:212` 的会话键左半仍取 `context.caller().name()`（桶名），实例级身份
+     `context.identity().instanceId()` 已采集但只进 `requesterId`（`:213`）不参与归类；装配点 `App.java:343`
+     用缺省 `sessionGrantable`（只认 `SYSTEM`）⇒ 红线"子↔子不继承会话放行"目前靠**收窄**（非唯一身份的
+     "本会话"降级为 once）维持，**不是**靠键本身。⇒ 转 `开发计划.md` §3.2.3 跟踪（前置已满足：身份穿透已落地）。
+   - **超时出口"人已答过也摘掉"的窄窗口**（S4-B1 登记 LOW-1）→ **复核：现状与登记一致，已按"口径定死 + 如实记账"
+     处置，无新缺陷**：`ApprovalCoordinator.decide` 的超时路径（`:162-165`）仍无条件 `dropQuietly`；对外口径 =
+     一律 `404`（不是 409）且判定顺序已实现（`ApprovalHttpServer.java:248-264`），窄窗口本身已如实写进该类
+     javadoc（`:64-66`，"记账，不是已解决"）。
+   - S2/UX 四条诚实缺口（`childDbPath` 穿越纵深防御未触达、零命中 search、空消息产品侧、子体真派生链路未复跑）
+     → **未复核**，以账本为准。
+   - `设计-审批与工具内权限.md` 开口项 5 条（主 Agent 沙箱 off / 命令脱敏 digest / 硬拒清单不可删 /
+     HTTP 审批面默认开 / 超时 300 s）——**该设计文档仍在仓库根，未归档；待用户裁决**（`开发计划.md` §四.2）。
+5. ~~**不在本目录但同期归档的候选**~~ **✅ 2026-09-14 已处置**：`docs/superpowers/plans/2026-09-09-二期-p2.md`、
+   `docs/superpowers/plans/2026-09-09-m2-w2-w5.md`、`docs/s1b-requirement.md` 三份已移入本目录
+   （见上表；**文件名逐字保留**，按名仍可检索，`git log --follow` 亦保留历史）。
