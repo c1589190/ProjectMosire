@@ -25,6 +25,31 @@ import org.pf4j.ExtensionPoint;
  */
 public interface ToolSource extends ExtensionPoint {
 
+  /**
+   * 装载时注入宿主服务（{@link HostServices}）：<b>一次</b>，早于 {@link #listTools()}，由装载方（{@link
+   * PluginToolSource}）在把本源的 {@code id()} 与工具登记进全局目录<b>之前</b>调用。
+   *
+   * <p><b>为什么在这里校验配置</b>：这是唯一的"装载期"钩子。配置项存在但值非法 ⇒ 在<b>本方法里抛</b>，装载随之失败（回滚 + {@code FAILED} +
+   * 启动响亮失败，见 {@link PluginToolSource} 的失败语义）——若拖到第一次工具调用才解析，坏配置就变成"跑到那一步才炸"的静默降级。
+   *
+   * <p><b>实现约束</b>：
+   *
+   * <ul>
+   *   <li><b>不得</b>在此（或任何别的地方）向全局状态注册工具——工具进入全局目录的唯一路径是 {@link #listTools()} 返回的快照；
+   *   <li>本方法在<b>每次装载</b>时被调一次；{@code disable → enable} 是<b>重新装载</b>（新建类加载器、重新取扩展实例），
+   *       因此实现不必把本方法当成"进程内只调一次"，但也不该在装载之外被调；
+   *   <li>{@link HostServices#config()} <b>可能为 null</b>（未装配的宿主，如 3 参构造的 {@link
+   *       PluginToolSource}）——实现要么响亮失败， 要么退化到缺省并记日志，不得假设非空。
+   * </ul>
+   *
+   * <p>缺省实现为 no-op：不需要宿主服务的插件（纯静态工具集）什么都不用做，且<b>旧宿主</b>（不认识本方法的宿主 API 版本）与本接口的 缺省实现天然二进制兼容——这正是把它做成
+   * default 方法的原因。
+   *
+   * @param services 宿主服务面（非 null；未装配时是 {@link HostServices#none()}，其 {@code config()} 为 null）
+   * @throws RuntimeException 装载期校验失败（该插件装载失败并回滚，绝不静默跳过）
+   */
+  default void init(HostServices services) {}
+
   /** 供给源唯一标识（审计/按源卸载用）；同一运行时内不可重复，生命周期内不应变化。 */
   String id();
 

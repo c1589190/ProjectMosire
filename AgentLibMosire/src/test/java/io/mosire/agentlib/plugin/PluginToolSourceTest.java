@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
+import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.plugin.PluginToolSource.PluginLoadException;
 import io.mosire.agentlib.plugin.PluginToolSource.PluginStatus;
 import io.mosire.agentlib.tool.AgentTool;
@@ -14,6 +15,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.lang.reflect.Field;
 import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -571,6 +573,182 @@ class PluginToolSourceTest {
         .isEqualTo(pluginsDir);
   }
 
+  // ---------- 装载期服务面（init）与卸载期回收（close） ----------
+
+  @Test
+  void initReceivesTheHostServicesAndRunsBeforeListTools() throws IOException {
+    Path marker = tempDir.resolve("init-order.txt");
+    FileConfigStore store = new FileConfigStore(tempDir.resolve("cfg"));
+    writeJar(
+        pluginsDir.resolve("a-init.jar"),
+        compilePlugin(
+            List.of(
+                new PluginSource(
+                    "plug.init.InitSource",
+                    lifecycleTemplate("plug.init", "InitSource", "init_source", marker)))),
+        "init-plugin",
+        "1.0.0");
+    PluginToolSource withHost =
+        new PluginToolSource(pluginsDir, registry, PluginListener.none(), new HostServices(store));
+
+    withHost.loadAll();
+
+    // 判别点有三：① init 被调了（不调 ⇒ 只有 listTools 一行）；
+    // ② 拿到的是宿主传的那个 ConfigStore 实例（传 null/空 HostServices ⇒ 行变成 init:null，identityHashCode 对不上）；
+    // ③ 顺序在 listTools 之前（反了 ⇒ 两行顺序颠倒）。
+    assertThat(lines(marker))
+        .containsExactly("init:" + System.identityHashCode(store), "listTools");
+  }
+
+  @Test
+  void unconfiguredHostServicesAreHandedOverAsAnEmptyConfig() throws IOException {
+    Path marker = tempDir.resolve("init-none.txt");
+    writeJar(
+        pluginsDir.resolve("a-none.jar"),
+        compilePlugin(
+            List.of(
+                new PluginSource(
+                    "plug.none.NoneSource",
+                    lifecycleTemplate("plug.none", "NoneSource", "none_source", marker)))),
+        "none-plugin",
+        "1.0.0");
+
+    // 3 参构造（既有调用点）：宿主没装配服务面 ⇒ 插件拿到的 config() 必须是 null（可判"未装配"，不是"空 store"）
+    source.loadAll();
+
+    assertThat(lines(marker)).containsExactly("init:null", "listTools");
+  }
+
+  @Test
+  void initFailureRollsBackThePluginAndIsReportedAsAFailedLoad() throws IOException {
+    writeJar(
+        pluginsDir.resolve("a-boom.jar"),
+        compilePlugin(
+            List.of(
+                new PluginSource(
+                    "plug.boom.BoomSource",
+                    """
+                    package plug.boom;
+
+                    import io.mosire.agentlib.plugin.HostServices;
+                    import io.mosire.agentlib.plugin.ToolSource;
+                    import io.mosire.agentlib.tool.AgentTool;
+                    import java.util.List;
+                    import org.pf4j.Extension;
+
+                    @Extension
+                    public class BoomSource implements ToolSource {
+
+                      @Override
+                      public void init(HostServices services) {
+                        throw new IllegalStateException("装载期校验失败：tools.bash.sandbox=bogus");
+                      }
+
+                      @Override
+                      public String id() {
+                        return "boom_source";
+                      }
+
+                      @Override
+                      public List<AgentTool> listTools() {
+                        throw new AssertionError("init 已抛异常，listTools 不该再被调");
+                      }
+
+                      @Override
+                      public AutoCloseable onChange(Runnable listener) {
+                        return () -> {};
+                      }
+                    }
+                    """))),
+        "boom-plugin",
+        "1.0.0");
+
+    assertThatThrownBy(source::loadAll)
+        .isInstanceOf(PluginLoadException.class)
+        .hasMessageContaining("boom-plugin")
+        .hasMessageContaining("装载期校验失败");
+
+    // 判别点：装载失败必须是"响亮异常 + FAILED 事件 + 工具没进 registry"三件齐备——
+    // 只吞异常（静默跳过）、只抛异常不回调、或把工具登记完才发现问题，三种假实现各缺一件。
+    assertThat(events).containsExactly("boom-plugin|FAILED|1.0.0");
+    assertThat(registry.list()).isEmpty();
+    assertThat(source.list()).isEmpty();
+  }
+
+  @Test
+  void disableCallsThePluginCloseAndStopsHoldingItsInstance() throws IOException {
+    Path marker = tempDir.resolve("lifecycle.txt");
+    writeJar(
+        pluginsDir.resolve("a-life.jar"),
+        compilePlugin(
+            List.of(
+                new PluginSource(
+                    "plug.life.LifeSource",
+                    lifecycleTemplate("plug.life", "LifeSource", "life_source", marker)))),
+        "life-plugin",
+        "1.0.0");
+    source.loadAll();
+    assertThat(registry.find("life_source_tool")).isPresent();
+
+    source.disable("life-plugin");
+
+    // 判别点 ①：disable 调了插件的 close()（删掉调用 ⇒ 只剩 init/listTools 两行）
+    assertThat(lines(marker)).containsExactly("init:null", "listTools", "close");
+    // 判别点 ②：工具整组摘除
+    assertThat(registry.find("life_source_tool")).isEmpty();
+    // 判别点 ③：清单项不再持有插件实例——持有就会替已停用的插件钉住 PluginClassLoader，
+    // 把 unloadPlugin 的"释放类加载器"变成账面动作。断言的是<b>引用已置空</b>这一结构事实（不是"GC 后类加载器真的被回收"，
+    // 后者本用例不做——见测试类注释与账本的诚实边界）。
+    assertThat(entrySource("life-plugin")).isNull();
+    assertThat(entrySource("missing-plugin")).as("未知 pluginId 无登记项").isNull();
+  }
+
+  @Test
+  void closeAlsoCallsThePluginCloseOnItsWayOut() throws IOException {
+    Path marker = tempDir.resolve("lifecycle-close.txt");
+    writeJar(
+        pluginsDir.resolve("a-life2.jar"),
+        compilePlugin(
+            List.of(
+                new PluginSource(
+                    "plug.life2.Life2Source",
+                    lifecycleTemplate("plug.life2", "Life2Source", "life2_source", marker)))),
+        "life2-plugin",
+        "1.0.0");
+    source.loadAll();
+
+    source.close();
+
+    assertThat(lines(marker)).containsExactly("init:null", "listTools", "close");
+    assertThat(entrySource("life2-plugin")).isNull();
+  }
+
+  /**
+   * 登记的插件实例引用（反射读私有记录项，可判"启用态持有 / 停用态置空"）。
+   *
+   * <p>为什么用反射：这是本类<b>唯一</b>可确定判定的观测面。等价的"弱引用 + System.gc()"写法是概率性的（GC 不保证发生）， 本仓的既有教训是"概率性判别等于没判别"。
+   */
+  private Object entrySource(String pluginId) {
+    try {
+      Field entriesField = PluginToolSource.class.getDeclaredField("entries");
+      entriesField.setAccessible(true);
+      Object entry = ((java.util.Map<?, ?>) entriesField.get(source)).get(pluginId);
+      if (entry == null) {
+        return null;
+      }
+      Field sourceField = entry.getClass().getDeclaredField("source");
+      sourceField.setAccessible(true);
+      return sourceField.get(entry);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException("读取插件登记项失败（字段改名了？本用例须同步）", e);
+    }
+  }
+
+  /** 标记文件的行（文件不存在 = 空表：没有任何一次调用落过标记）。 */
+  private static List<String> lines(Path marker) throws IOException {
+    return Files.exists(marker) ? Files.readAllLines(marker, StandardCharsets.UTF_8) : List.of();
+  }
+
   // ---------- 测试期插件 JAR 构造（R7：javac API + JarOutputStream，全离线） ----------
 
   /** 一段待编译的插件源码（fqn 决定落盘路径，与源码里的 package/类名一致）。 */
@@ -706,6 +884,89 @@ class PluginToolSourceTest {
         }
         """
         .formatted(pkg, className, sourceId, tools);
+  }
+
+  /**
+   * 生命周期观测用的插件源码：把 {@code init/listTools/close} 的调用<b>按序</b>追加进一处标记文件。
+   *
+   * <p>为什么用标记文件而不是"插件里的静态计数器"：插件类由 {@code PluginClassLoader} 装载，测试类加载器读不到它的静态字段；
+   * 文件是两侧都能看见的同一处事实，且能判<b>顺序</b>（顺序是 init 契约的一部分）。
+   */
+  private static String lifecycleTemplate(
+      String pkg, String className, String sourceId, Path marker) {
+    String literal = marker.toAbsolutePath().toString().replace("\\", "\\\\");
+    return """
+        package %s;
+
+        import io.mosire.agentlib.plugin.HostServices;
+        import io.mosire.agentlib.plugin.ToolSource;
+        import io.mosire.agentlib.tool.AgentTool;
+        import io.mosire.agentlib.tool.ToolContext;
+        import io.mosire.agentlib.tool.ToolResult;
+        import java.io.IOException;
+        import java.nio.file.Files;
+        import java.nio.file.Path;
+        import java.nio.file.StandardOpenOption;
+        import java.util.List;
+        import org.pf4j.Extension;
+
+        @Extension
+        public class %s implements ToolSource {
+
+          private static final Path MARKER = Path.of("%s");
+
+          private static void mark(String line) {
+            try {
+              Files.writeString(
+                  MARKER, line + "\\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+              throw new IllegalStateException("标记写入失败", e);
+            }
+          }
+
+          @Override
+          public void init(HostServices services) {
+            mark(
+                "init:"
+                    + (services.config() == null
+                        ? "null"
+                        : System.identityHashCode(services.config())));
+          }
+
+          @Override
+          public String id() {
+            return "%s";
+          }
+
+          @Override
+          public List<AgentTool> listTools() {
+            mark("listTools");
+            return List.of(
+                new AgentTool() {
+                  @Override
+                  public String name() {
+                    return "%s_tool";
+                  }
+
+                  @Override
+                  public ToolResult execute(ToolContext context) {
+                    return ToolResult.ok("ok");
+                  }
+                });
+          }
+
+          @Override
+          public AutoCloseable onChange(Runnable listener) {
+            return () -> {};
+          }
+
+          @Override
+          public void close() {
+            mark("close");
+          }
+        }
+        """
+        .formatted(pkg, className, literal, sourceId, sourceId);
   }
 
   private void registerBuiltin(String... toolNames) {

@@ -33,8 +33,9 @@ import org.slf4j.LoggerFactory;
  *       id()}（见下"归属校验"）；
  *   <li>以<b>该 id 为 sourceId</b> 逐个 {@code registry.register(sourceId, tool)}（<b>不是</b> {@code
  *       registerAll}，见下"注册路径"）；
- *   <li>{@link #disable(String)}：按本类亲自登记过的 sourceId {@code unregisterAllBySource} 整组摘除工具 → 停止 →
- *       卸载（释放 PluginClassLoader 与 JAR 句柄）；{@link #enable(String)} 从原 JAR 重新装载。
+ *   <li>{@link #disable(String)}：按本类亲自登记过的 sourceId {@code unregisterAllBySource} 整组摘除工具 → 调插件
+ *       {@code close()} → 停止 → 卸载（释放 PluginClassLoader 与 JAR 句柄）；{@link #enable(String)} 从原 JAR
+ *       重新装载 （同时重新调 {@code init(HostServices)}）。
  * </ol>
  *
  * <p><b>信任边界（红线 4，勿误读）</b>：PF4J 的 {@code PluginClassLoader} <b>不是安全边界</b>——它只隔离类与依赖版本冲突；
@@ -56,13 +57,19 @@ import org.slf4j.LoggerFactory;
  * #loadAll()}）；<b>不做任何按 Agent 的放行判断</b>——工具进 registry 只等于"全局可用"，某 Agent 能否调用由其 L3 白名单决定，本类
  * <b>不</b>把插件工具加进任何 Agent 的白名单；不改 {@code App}/{@code Brain}/{@code Main}（装配归启动装配任务）。
  *
- * <p><b>工具集是装载时的快照：不订阅 {@code onChange}、不调用 {@code close()}（本阶段边界，勿误读为"已支持动态工具集"）</b>： 本类只在装载时取一次
- * {@code ToolSource.listTools()} 快照，<b>不订阅</b>插件提供的 {@code ToolSource.onChange}、也<b>不调用</b>其 {@code
- * close()}。而 {@code ToolSource} 的接口契约允许工具集在运行中变化、并经 {@code onChange} 通知注册方做增量同步（姊妹实现 {@code
- * McpSourceBridge} 正是这么做的），故插件侧若自行变更工具集，本类<b>不会</b>跟随：registry 里保留的仍是装载时刻那一份， 直到 {@link
- * #disable(String)} / {@link #enable(String)}（整组摘除 / 重新装载）才被纠正——中间窗口内工具目录是过期集合。
- * 这与上面的"不支持原地重载"是<b>两件不同的事</b>：{@code onChange} 指<b>同一插件的工具集变化</b>，reload 指<b>插件被替换</b>；两者本阶段都不做。
- * 需要工具集跟随插件变化的组合语义，用 {@code disable → enable}（或重启后再 {@link #loadAll()}）。
+ * <p><b>工具集是装载时的快照：不订阅 {@code onChange}（本阶段边界，勿误读为"已支持动态工具集"）</b>： 本类只在装载时取一次 {@code
+ * ToolSource.listTools()} 快照，<b>不订阅</b>插件提供的 {@code ToolSource.onChange}。而 {@code ToolSource}
+ * 的接口契约允许工具集在运行中变化、并经 {@code onChange} 通知注册方做增量同步（姊妹实现 {@code McpSourceBridge} 正是这么做的），
+ * 故插件侧若自行变更工具集，本类<b>不会</b>跟随：registry 里保留的仍是装载时刻那一份， 直到 {@link #disable(String)} / {@link
+ * #enable(String)}（整组摘除 / 重新装载）才被纠正——中间窗口内工具目录是过期集合。 这与上面的"不支持原地重载"是<b>两件不同的事</b>：{@code onChange}
+ * 指<b>同一插件的工具集变化</b>，reload 指<b>插件被替换</b>；两者本阶段都不做。 需要工具集跟随插件变化的组合语义，用 {@code disable →
+ * enable}（或重启后再 {@link #loadAll()}）。
+ *
+ * <p><b>插件的 {@code close()} 会被调（装载期 {@code init} 也一样）</b>：装载时调一次 {@link
+ * ToolSource#init(HostServices)} （早于 {@code listTools()}；抛异常 = 该插件装载失败并回滚）；{@link #disable(String)}
+ * / {@link #close()} 时在<b>摘除工具之后、停止卸载之前</b>调 {@link ToolSource#close()}（异常只记日志，不回滚已生效的摘除——{@code
+ * disable} 之后类加载器就要被卸载，插件若持有线程/句柄 <b>没有第二次机会</b>回收）。已停用插件的实例<b>立刻从本类清单里除名</b>：否则本类持着的那个实例会钉住它的
+ * {@code PluginClassLoader}， 把 {@code unloadPlugin} 的"释放类加载器"意图废掉。
  *
  * <p><b>插件 JAR 的形态</b>（本仓库实测 PF4J {@value #PF4J_PROBE_VERSION}，全离线）：JAR 的 {@code
  * META-INF/MANIFEST.MF} 须含 {@code Plugin-Id}/{@code Plugin-Version}（描述符；缺失则 PF4J
@@ -92,6 +99,7 @@ public final class PluginToolSource implements AutoCloseable {
   private final Path pluginsDir;
   private final ToolRegistry registry;
   private final PluginListener listener;
+  private final HostServices hostServices;
   private final PluginManager plugins;
 
   /** 已发现的插件：pluginId → 登记项（含已 disable 的——它们不在 registry 里，只能由本表回答）。 */
@@ -106,8 +114,10 @@ public final class PluginToolSource implements AutoCloseable {
    * @param pluginsDir 插件目录：<b>显式注入</b>（不读 cwd、不读环境变量）；须已存在的目录，其中的 {@code *.jar} 视为插件
    * @param registry 目标注册表（工具按源登记于此）
    * @param listener 生命周期监听（{@link PluginListener#none()} = 不监听）
+   * @param hostServices 装载期注入给插件的宿主服务面（{@link HostServices#none()} = 不提供任何宿主服务，插件据此退化到缺省）
    */
-  public PluginToolSource(Path pluginsDir, ToolRegistry registry, PluginListener listener) {
+  public PluginToolSource(
+      Path pluginsDir, ToolRegistry registry, PluginListener listener, HostServices hostServices) {
     Objects.requireNonNull(pluginsDir, "pluginsDir");
     if (!Files.isDirectory(pluginsDir)) {
       throw new IllegalArgumentException("插件目录不存在或不是目录: " + pluginsDir);
@@ -115,7 +125,13 @@ public final class PluginToolSource implements AutoCloseable {
     this.pluginsDir = pluginsDir;
     this.registry = Objects.requireNonNull(registry, "registry");
     this.listener = Objects.requireNonNull(listener, "listener");
+    this.hostServices = Objects.requireNonNull(hostServices, "hostServices");
     this.plugins = new JarPluginManager(pluginsDir);
+  }
+
+  /** 3 参重载（既有调用点零改动）：不提供宿主服务（{@link HostServices#none()}，其 {@code config()} 为 null）。 */
+  public PluginToolSource(Path pluginsDir, ToolRegistry registry, PluginListener listener) {
+    this(pluginsDir, registry, listener, HostServices.none());
   }
 
   /** 插件目录（构造注入的那个，只读）。 */
@@ -180,7 +196,8 @@ public final class PluginToolSource implements AutoCloseable {
   }
 
   /**
-   * 停用一个插件：按<b>本类亲自登记过的</b> sourceId 整组摘除其工具 → 停止 → 卸载（释放类加载器/JAR 句柄）。其它源的工具一条不动。 已是停用态则幂等返回。
+   * 停用一个插件：按<b>本类亲自登记过的</b> sourceId 整组摘除其工具 → 调插件 {@code close()}（回收它自己的资源）→ 停止 → 卸载（释放类加载器/JAR
+   * 句柄）。其它源的工具一条不动。 已是停用态则幂等返回。
    *
    * @throws IllegalArgumentException 未知 pluginId —— 本方法<b>不接受</b>任意 id 去整组卸载（防冒用：传 {@code
    *     "builtin"} 只会得到 这个异常，内建工具不受影响）
@@ -309,12 +326,12 @@ public final class PluginToolSource implements AutoCloseable {
           null);
     }
     String version = versionOf(pluginId);
+    List<ToolSource> sources = null;
     try {
       PluginState state = plugins.startPlugin(pluginId);
       if (state != PluginState.STARTED) {
         throw new PluginLoadException("插件启动失败: " + pluginId + " state=" + state);
       }
-      List<ToolSource> sources;
       try {
         sources = plugins.getExtensions(ToolSource.class, pluginId);
       } catch (RuntimeException e) {
@@ -328,16 +345,20 @@ public final class PluginToolSource implements AutoCloseable {
                 + pluginId
                 + " —— 检查 JAR 内 @Extension 生成的 META-INF/extensions.idx 是否缺失，或扩展类是否可实例化");
       }
-      String sourceId = requireUsableSourceId(pluginId, sources.get(0).id(), jar);
-      List<String> toolNames = registerTools(pluginId, sourceId, sources.get(0).listTools());
-      entries.put(pluginId, new Entry(pluginId, jar, version, sourceId, true));
+      ToolSource source = sources.get(0);
+      String sourceId = requireUsableSourceId(pluginId, source.id(), jar);
+      // 装载期注入宿主服务（早于 listTools()）：抛异常 = 本次装载失败，走下面的回滚 + FAILED + 响亮抛出。
+      // 位置在归属校验之后：id 冒用的插件<b>不</b>该先被 init 一遍（那时它的工具就要被拒，init 是多余的副作用面）。
+      source.init(hostServices);
+      List<String> toolNames = registerTools(pluginId, sourceId, source.listTools());
+      entries.put(pluginId, new Entry(pluginId, jar, version, sourceId, true, source));
       LOG.info("插件启用: {} v{} sourceId={} 工具 {} 个", pluginId, version, sourceId, toolNames.size());
       notifyListener(pluginId, version, PluginListener.State.STARTED);
       return pluginId;
     } catch (RuntimeException e) {
       // 回滚：不留"已启动但未记清单"或"记了清单但工具没登记全"的半装载状态
       entries.remove(pluginId);
-      rollback(pluginId, version);
+      rollback(pluginId, version, onlySource(sources));
       notifyListener(pluginId, version, PluginListener.State.FAILED);
       // 归一为本类自己的失败类型（本方法对外的失败契约是 PluginLoadException，不把 PF4J 的原始类型透给调用方）
       throw e instanceof PluginLoadException loadFailure
@@ -364,9 +385,18 @@ public final class PluginToolSource implements AutoCloseable {
         : new PluginLoadException(message, cause);
   }
 
-  /** 停用：按本源登记过的 id 整组摘工具 → 停 → 卸载（释放类加载器/JAR 句柄）→ 记状态 → 通知。 */
+  /**
+   * 停用：按本源登记过的 id 整组摘工具 → 调插件 {@code close()} 让它回收自己 → 停 → 卸载（释放类加载器/JAR 句柄）→ 记状态 → 通知。
+   *
+   * <p>{@code close()} 的<b>位置</b>是有意的：① 在工具摘除之后——插件此刻已不在全局目录里，回收它自己的资源不会与"工具还在册"交叉； ②
+   * 在停止/卸载<b>之前</b>——卸载会把 {@code PluginClassLoader} 关掉，之后插件代码不再可用，那是它<b>最后一次</b>机会。
+   * 异常只记日志：此刻摘除已生效，为"插件没回收干净"回滚一个已经生效的运维动作只会让状态更不可判。
+   *
+   * <p>清单里那一项换成 {@link Entry#stopped()}（<b>丢掉实例引用</b>，见其 javadoc），否则本类会替已停用的插件钉住类加载器。
+   */
   private void stopAndUnregister(Entry entry) {
     int removed = registry.unregisterAllBySource(entry.sourceId());
+    closeSourceQuietly(entry.pluginId(), entry.source());
     try {
       PluginState state = plugins.stopPlugin(entry.pluginId());
       if (state != PluginState.STOPPED) {
@@ -382,8 +412,14 @@ public final class PluginToolSource implements AutoCloseable {
     notifyListener(entry.pluginId(), entry.version(), PluginListener.State.STOPPED);
   }
 
-  /** 失败回滚：停止+卸载（best effort，不掩盖原始失败）。 */
-  private void rollback(String pluginId, String version) {
+  /**
+   * 失败回滚：停止+卸载（best effort，不掩盖原始失败）；已取到扩展实例的话，也给它一次 {@code close()}。
+   *
+   * <p>为什么回滚路径也要调 {@code close()}：{@code init} 抛异常时插件<b>已经拿到宿主服务面</b>（可能已开线程/句柄），随后本类就把它的类加载器卸了——
+   * 不通知它"你被放弃了"，那些资源就没有第二次回收机会。
+   */
+  private void rollback(String pluginId, String version, ToolSource source) {
+    closeSourceQuietly(pluginId, source);
     try {
       plugins.stopPlugin(pluginId);
       plugins.unloadPlugin(pluginId);
@@ -391,6 +427,23 @@ public final class PluginToolSource implements AutoCloseable {
       LOG.warn("插件失败回滚异常（忽略，原始失败已上报）: {}", pluginId, e);
     }
     LOG.warn("插件未启用（已回滚）: {} v{}", pluginId, version);
+  }
+
+  /** 扩展实例至多一个（多份已被拒）；这里只把"恰好一个"时的那一个交给回滚，其余情形传 {@code null}。 */
+  private static ToolSource onlySource(List<ToolSource> sources) {
+    return sources != null && sources.size() == 1 ? sources.get(0) : null;
+  }
+
+  /** 调插件的 {@code close()}：异常只记日志（调用方已落地"摘除"这一既成事实，见各调用点的位置说明）。 */
+  private void closeSourceQuietly(String pluginId, ToolSource source) {
+    if (source == null) {
+      return;
+    }
+    try {
+      source.close();
+    } catch (RuntimeException e) {
+      LOG.warn("插件 close() 异常（忽略，不回滚已生效的摘除）: {}", pluginId, e);
+    }
   }
 
   /** 归属校验（R3）：空白 / 保留名（内建源）/ 与在册源冲突 / 与本实例清单冲突 → 拒绝装载并响亮报错。 */
@@ -442,8 +495,9 @@ public final class PluginToolSource implements AutoCloseable {
   /**
    * 以 sourceId 逐个登记：全有或全无——中途失败（名字重复等）回滚本批，绝不留半个插件的工具在册。
    *
-   * <p>{@code listTools()} 在此被调用<b>恰好一次</b>（装载时的快照）；此后本类不订阅 {@code ToolSource.onChange}，也不调其 {@code
-   * close()}——见类注释"工具集是装载时的快照"。
+   * <p>{@code listTools()} 在此被调用<b>恰好一次</b>（装载时的快照）；此后本类不订阅 {@code
+   * ToolSource.onChange}——见类注释"工具集是装载时的快照"。 （{@code close()} 的调用是另一回事，发生在 {@code disable}/{@code
+   * close} 上，见 {@link #stopAndUnregister}。）
    */
   private List<String> registerTools(String pluginId, String sourceId, List<AgentTool> tools) {
     List<AgentTool> declared = Objects.requireNonNull(tools, "listTools() 不得返回 null");
@@ -494,9 +548,20 @@ public final class PluginToolSource implements AutoCloseable {
     }
   }
 
-  /** 一个已发现插件的登记项（不可变；状态变更整项替换，避免读到半更新状态）。 */
+  /**
+   * 一个已发现插件的登记项（不可变；状态变更整项替换，避免读到半更新状态）。
+   *
+   * <p>{@code source} 是装载时取到的扩展实例（{@code init}/{@code close} 都发在它身上）；<b>启用态才持有</b>——{@link
+   * #stopped()} 把它置空，因为那个实例持着插件自己的 Class 对象，而 Class 持着定义它的 {@code PluginClassLoader}：本类若继续持有实例，
+   * {@code unloadPlugin} 的"释放类加载器"就<b>只是账面动作</b>（这是本仓"陈旧产物"家族在插件面的变体）。
+   */
   private record Entry(
-      String pluginId, Path jar, String version, String sourceId, boolean started) {
+      String pluginId,
+      Path jar,
+      String version,
+      String sourceId,
+      boolean started,
+      ToolSource source) {
 
     PluginStatus toStatus() {
       return new PluginStatus(
@@ -506,8 +571,9 @@ public final class PluginToolSource implements AutoCloseable {
           started ? PluginListener.State.STARTED : PluginListener.State.STOPPED);
     }
 
+    /** 停用态：状态置 STOPPED，并<b>丢掉扩展实例引用</b>（理由见本记录 javadoc）。 */
     Entry stopped() {
-      return new Entry(pluginId, jar, version, sourceId, false);
+      return new Entry(pluginId, jar, version, sourceId, false, null);
     }
   }
 
