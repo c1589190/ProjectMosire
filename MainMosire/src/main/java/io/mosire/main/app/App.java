@@ -6,7 +6,9 @@ import io.mosire.agentlib.approval.ApprovalConfigLoader;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.AutoApproveGate;
 import io.mosire.agentlib.approval.ConfirmGate;
+import io.mosire.agentlib.approval.LlmSuperiorJudgement;
 import io.mosire.agentlib.approval.PendingApprovals;
+import io.mosire.agentlib.approval.SuperiorJudgeGate;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
@@ -22,7 +24,10 @@ import io.mosire.agentlib.mcp.McpServerLinkConfig;
 import io.mosire.agentlib.mcp.McpSourceBridge;
 import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandModeHolder;
+import io.mosire.agentlib.permission.CommandModeLoader;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.store.SqliteConversationStore;
@@ -301,12 +306,26 @@ public final class App implements AutoCloseable {
       PendingApprovals pendingApprovals = new PendingApprovals();
       approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
       approvalHttpChannel = new HttpApprovalChannel(pendingApprovals);
+      // S6：LLM 的装配点<b>上移</b>到审批装配之前——上级判定闸（SuperiorJudgeGate）要用同一个客户端跑一次性判定。
+      // 供应商客户端由 Main.selectLlm 经 llmOverride 注入（生产 = 真模型；App.start 直调无覆盖 = 离线骨架）。
+      LlmClient llm = scriptedLlm(config, llmOverride);
+      // S6：主 Agent 的<b>实时档位</b>——配置 {@code commands.mode} 给初值（缺省 FULL = 本功能引入前的行为），
+      // 运行时经 HTTP 断点（GET/POST /api/commands/mode）可改。读方每次现读：主 Agent 自己的工具调用装配处
+      // （AgentPipeline 建 ToolContext 时）、上级判定闸的"本级是不是完全权限"、派生子 Agent 时的档位单调性守卫。
+      CommandModeHolder commandMode = new CommandModeHolder(CommandModeLoader.load(configStore));
+      LOG.info("命令档位: {}（配置 commands.mode；运行时可经 HTTP 断点改）", commandMode.get().wireName());
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
+      // S6 追加 SuperiorJudgeGate：AutoApproveGate <b>在前</b>是刻意的——会话级放行是人批的口子（用户裁决
+      // "LIMITED 档下只认人批的会话"），人批过的类别不该再让上级 Agent 判一遍；代批闸只覆盖剩下的档位提升请求，
+      // 敏感区与外部面它自己会让开（落到 ConfirmGate，即到人）。
       ApprovalCoordinator approvalCoordinator =
           new ApprovalCoordinator(
-              List.of(new AutoApproveGate(pendingApprovals), new ConfirmGate()),
+              List.of(
+                  new AutoApproveGate(pendingApprovals),
+                  new SuperiorJudgeGate(new LlmSuperiorJudgement(llm), commandMode::get),
+                  new ConfirmGate()),
               List.of(approvalTtyChannel, approvalHttpChannel),
               pendingApprovals,
               approvalConfig.timeout(),
@@ -316,7 +335,7 @@ public final class App implements AutoCloseable {
       if (approvalConfig.http()) {
         approvalServer =
             ApprovalHttpServer.start(
-                approvalConfig.httpPort(), pendingApprovals, approvalCoordinator);
+                approvalConfig.httpPort(), pendingApprovals, approvalCoordinator, commandMode);
         // HTTP 面真的绑定成功了才算可用通道（"配置说要开"不等于"端口在监听"）
         approvalHttpChannel.markUp();
       }
@@ -338,7 +357,8 @@ public final class App implements AutoCloseable {
                 agentConfig,
                 permissionSet,
                 subagentConfigDir,
-                approvalAuthorizer);
+                approvalAuthorizer,
+                commandMode);
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
       }
@@ -354,11 +374,13 @@ public final class App implements AutoCloseable {
                   "mosire-main",
                   Version.VERSION,
                   ToolContext.of(
-                      AccessToken.GUEST, AgentPermissionSet.unrestricted(AccessToken.GUEST)),
+                      AccessToken.GUEST,
+                      AgentPermissionSet.unrestricted(AccessToken.GUEST),
+                      // S6：外部面显式自我介绍（external-mcp + FULL）。档位照旧不变，身份<b>必须</b>显式——
+                      // 判定闸据此认出"这不是我派的下级"，从而不为外部客户端的命令背书（到人，见 SuperiorJudgeGate）
+                      AgentIdentity.external()),
                   approvalAuthorizer)
               : null;
-      // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
-      LlmClient llm = scriptedLlm(config, llmOverride);
       // D30：工具自身配置经 ToolContext.config 注入（运行时缝，不走构造器全局）——read_agent_context 据此定位
       // 子库根（与 subagentCommand 的 --data-dir 同源）与自身事件库；键名归 Brain（AgentContextReader 常量）
       // S4-C：bash 工具的三项配置也走这条缝（键 = 配置里的完整点分路径，见 BashToolConfig）
@@ -371,7 +393,10 @@ public final class App implements AutoCloseable {
           config.dataDir().resolve("events.db").toString());
       toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
       toolConfig.putAll(bashConfig.toToolConfig());
+      // S6：档位持有者经同一个运行时缝下发（AgentPipeline 建调用上下文时现读它定主 Agent 的身份/档位）
+      toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
       toolConfig = Map.copyOf(toolConfig);
+      // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
       // （--demo 恒"零行为变化"是本仓既有约定：它只跑一条脚本回合，没有工具调用面可审批）
       AgentRuntime runtime =
@@ -521,7 +546,8 @@ public final class App implements AutoCloseable {
       AgentConfig parentConfig,
       AgentPermissionSet parentPermissions,
       Path subagentConfigDir,
-      ToolCallAuthorizer authorizer) {
+      ToolCallAuthorizer authorizer,
+      CommandModeHolder commandMode) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
     templateStore.load();
     SubprocessManager processes = new SubprocessManager();
@@ -533,9 +559,17 @@ public final class App implements AutoCloseable {
             PARENT_SERVER_NAME,
             Version.VERSION,
             authorizer);
+    // S6：父级档位取数缝传的是<b>持有者</b>（现读）——HTTP 断点把主 Agent 降到 LIMITED 后，接着派子 Agent 也拿不到 FULL
     SubagentManager manager =
         new SubagentManager(
-            templateStore, executor, events, bus, parentConfig, parentPermissions, 0);
+            templateStore,
+            executor,
+            events,
+            bus,
+            parentConfig,
+            parentPermissions,
+            0,
+            commandMode::get);
     BuiltinToolSource builtin =
         new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager));
     for (AgentTool tool : builtin.listTools()) {

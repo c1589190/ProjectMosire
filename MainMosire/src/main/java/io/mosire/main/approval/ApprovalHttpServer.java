@@ -9,6 +9,8 @@ import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
 import io.mosire.agentlib.approval.ApprovalRequest;
 import io.mosire.agentlib.approval.PendingApprovals;
+import io.mosire.agentlib.permission.CommandMode;
+import io.mosire.agentlib.permission.CommandModeHolder;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -40,6 +42,10 @@ import org.slf4j.LoggerFactory;
  *       {"decision":"approve|deny","scope":"once|session","by":"<可选文本>"}}： 成功 {@code 200} +
  *       决议回执；未知/已过期/已被摘除的 id {@code 404}；重复决议 {@code 409}；坏 body {@code 400}； 方法不符 {@code 405}（带
  *       {@code Allow} 头，同既有惯例）。
+ *   <li>{@code GET /api/commands/mode} → {@code {"mode":"full|limited"}}；{@code POST
+ *       /api/commands/mode} → body {@code {"mode":"full|limited","by":"<可选文本>"}}：改<b>主 Agent
+ *       的命令档位</b>（S6；未装配持有者时该端点不存在， 一律 404）。回执带 {@code
+ *       previous}（改动前的档位）——<b>降档不回滚已批的会话放行</b>，那些键是人当时批的
  * </ul>
  *
  * <p><b>回执里的 scope 是"实际生效"的那个</b>（本类最容易写错的一条）：会话级放行对<b>非唯一身份</b>的调用者（{@code DEFAULT} 桶 = 全部子
@@ -67,6 +73,9 @@ public final class ApprovalHttpServer implements AutoCloseable {
   /** 审批面根路径（{@code GET} 用本路径，{@code POST} 用本路径 + {@code /{id}}）。 */
   static final String PATH = "/api/approvals";
 
+  /** 档位端点路径（S6）：{@code GET} 读、{@code POST} 改。 */
+  static final String PATH_MODE = "/api/commands/mode";
+
   /** 请求体上限（byte）：审批 body 只有几十字节，给足余量后超限直接 400（不做流式解析）。 */
   private static final int MAX_BODY_BYTES = 8192;
 
@@ -77,6 +86,9 @@ public final class ApprovalHttpServer implements AutoCloseable {
   private final ExecutorService executor;
   private final PendingApprovals pending;
   private final ApprovalCoordinator coordinator;
+
+  /** 主 Agent 档位持有者（S6）；{@code null} = 不提供档位端点（该路径一律 404）。 */
+  private final CommandModeHolder commandMode;
 
   /**
    * 启动并绑回环地址（端口 {@code 0} = 由系统分配，实际端口见 {@link #boundPort()}）。
@@ -89,10 +101,26 @@ public final class ApprovalHttpServer implements AutoCloseable {
    */
   public static ApprovalHttpServer start(
       int port, PendingApprovals pending, ApprovalCoordinator coordinator) {
+    return start(port, pending, coordinator, null);
+  }
+
+  /**
+   * 同上 + <b>档位端点</b>（S6）。
+   *
+   * @param commandMode 主 Agent 的档位持有者；{@code null} = 不挂 {@code /api/commands/mode}（既有 3 参重载即此形态）
+   */
+  public static ApprovalHttpServer start(
+      int port,
+      PendingApprovals pending,
+      ApprovalCoordinator coordinator,
+      CommandModeHolder commandMode) {
     try {
       HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
-      ApprovalHttpServer app = new ApprovalHttpServer(server, pending, coordinator);
+      ApprovalHttpServer app = new ApprovalHttpServer(server, pending, coordinator, commandMode);
       server.createContext(PATH, app::handleApprovals);
+      if (commandMode != null) {
+        server.createContext(PATH_MODE, app::handleMode);
+      }
       server.setExecutor(app.executor);
       server.start();
       return app;
@@ -102,11 +130,76 @@ public final class ApprovalHttpServer implements AutoCloseable {
   }
 
   private ApprovalHttpServer(
-      HttpServer server, PendingApprovals pending, ApprovalCoordinator coordinator) {
+      HttpServer server,
+      PendingApprovals pending,
+      ApprovalCoordinator coordinator,
+      CommandModeHolder commandMode) {
     this.server = server;
     this.pending = pending;
     this.coordinator = coordinator;
+    this.commandMode = commandMode;
     this.executor = Executors.newVirtualThreadPerTaskExecutor();
+  }
+
+  /**
+   * 档位端点：{@code GET} 读当前档位，{@code POST} 改。
+   *
+   * <p><b>改档立即对下一次调用生效</b>（读方现读持有者，不经重启）。<b>坏值一律 400、绝不静默当某一档</b>： 把 {@code "partial"} 读成 {@code
+   * FULL} 等于无声放开命令闸，是本功能最不该有的失败形态。
+   *
+   * <p><b>留痕只到日志</b>：档位变更没有对应事件类型（事件词汇表在 Brain，加一类要动那份契约）， 故本层只 {@code LOG.info} 记录 "旧值 → 新值 +
+   * by"。要持久审计得先加事件类型，别在响应里假装。
+   */
+  private void handleMode(HttpExchange exchange) throws IOException {
+    String method = exchange.getRequestMethod();
+    if ("GET".equals(method)) {
+      send(exchange, 200, Map.of("mode", commandMode.get().wireName()));
+      return;
+    }
+    if (!"POST".equals(method)) {
+      exchange.getResponseHeaders().set("Allow", "GET, POST");
+      exchange.sendResponseHeaders(405, -1);
+      exchange.close();
+      return;
+    }
+    byte[] raw = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
+    if (raw.length > MAX_BODY_BYTES) {
+      send(exchange, 400, Map.of("error", "请求体过大（上限 " + MAX_BODY_BYTES + " 字节）"));
+      return;
+    }
+    JsonNode node;
+    try {
+      node = raw.length == 0 ? null : JSON.readTree(raw);
+    } catch (JsonProcessingException e) {
+      send(exchange, 400, Map.of("error", "请求体不是合法 JSON"));
+      return;
+    }
+    if (node == null || !node.isObject()) {
+      send(exchange, 400, Map.of("error", "请求体必须是 JSON 对象"));
+      return;
+    }
+    JsonNode modeNode = node.get("mode");
+    if (modeNode == null || !modeNode.isTextual()) {
+      send(exchange, 400, Map.of("error", "mode 必填且必须是文本（full|limited）"));
+      return;
+    }
+    CommandMode parsed = CommandMode.parse(modeNode.asText());
+    if (parsed == null) {
+      send(exchange, 400, Map.of("error", "mode 只接受 full|limited"));
+      return;
+    }
+    JsonNode byNode = node.get("by");
+    String by =
+        byNode != null && byNode.isTextual() && !byNode.asText().isBlank()
+            ? byNode.asText().strip()
+            : DEFAULT_BY;
+    CommandMode previous = commandMode.set(parsed);
+    LOG.info("命令档位已改: {} → {}（by={}）", previous.wireName(), parsed.wireName(), by);
+    Map<String, Object> receipt = new LinkedHashMap<>();
+    receipt.put("mode", parsed.wireName());
+    receipt.put("previous", previous.wireName());
+    receipt.put("by", by);
+    send(exchange, 200, receipt);
   }
 
   /** 单一上下文 + 路径后缀分发（同既有网关惯例）：{@code ""} = 列表（GET），{@code /{id}} = 决议（POST）。 */
