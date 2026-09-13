@@ -13,6 +13,7 @@ import io.mosire.agentlib.llm.LlmRouteLoader;
 import io.mosire.agentlib.llm.ModelRoute;
 import io.mosire.agentlib.llm.OpenAICompatibleLlmClient;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.main.agent.SubagentProcessMain;
 import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
@@ -189,15 +190,23 @@ public final class Main {
    * 生产装配：从 {@code <configRoot>/config.json} 取路由与密钥，构造真实 LLM 客户端（{@code configRoot} 即 {@code
    * --data-dir}）。
    *
+   * <p><b>走哪条路由</b>（多 provider 并存，2026-09-14）：{@code agents.main.llm.route} → {@code llm.route} →
+   * {@code "default"}（{@link LlmRouteLoader#routeName}）；点到不存在的名字 ⇒ {@code E_LLM_ROUTE_UNKNOWN}
+   * 装配期响亮，<b>绝不</b>回落到别的路由。默认形态（扁平 {@code llm.*}）一字不改。
+   *
    * <p><b>失败一律响亮（D24），绝不退化回 {@link FakeLlmClient}</b>：缺 {@code llm.baseUrl}/{@code llm.model}
    * 在<b>装配期</b> 抛（{@code E_LLM_CONFIG_MISSING}）；缺密钥在<b>取密钥时</b>抛（{@code E_KEY_MISSING}）——SPI 契约要求每次
    * {@code chat} 现取一次密钥以 支持轮换/过期感知，故密钥不在构造期固化（详见 {@link ConfigApiKeySource}），取不到时客户端按调用失败响亮抛出。
+   *
+   * <p><b>不预检密钥</b>（与 {@code SubagentProcessMain.realLlm} 的唯一有意差异）：主进程取密钥失败发生在首次 {@code chat}，由
+   * {@code run} 的回合收敛路径报出；子进程必须预检的理由见那边的 javadoc。
    *
    * <p>包私有：只给 {@code run} 与同包测试用（既有测试入口 {@code App.start(...)} 不经过这里，故离线门禁不受影响）。
    */
   static LlmClient realLlm(Path configRoot) {
     FileConfigStore store = new FileConfigStore(configRoot);
-    ModelRoute route = LlmRouteLoader.load(store);
+    ModelRoute route =
+        LlmRouteLoader.load(store, LlmRouteLoader.routeName(store, AgentIdentity.MAIN_ID));
     return new OpenAICompatibleLlmClient(
         route, new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM));
   }

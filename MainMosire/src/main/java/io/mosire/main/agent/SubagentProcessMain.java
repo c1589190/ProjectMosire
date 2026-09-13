@@ -136,7 +136,9 @@ public final class SubagentProcessMain {
 
       // R-A2-1：--config-dir 缺席 ⇒ 逐字不变地走模板脚本假 LLM；在场 ⇒ 真模型（R-A2-2/R-A2-7：路由与密钥一律取自配置）
       LlmClient llm =
-          options.configDir() == null ? template.scriptedFakeLlm() : realLlm(options.configDir());
+          options.configDir() == null
+              ? template.scriptedFakeLlm()
+              : realLlm(options.configDir(), options.templateId());
       AgentRuntime agent =
           new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions);
       runtime = agent;
@@ -186,23 +188,29 @@ public final class SubagentProcessMain {
    * baseUrl}/模型名/密钥三者全部来自这条 {@link ModelRoute}，模板里的 {@code model}（{@code AgentConfig} 默认字面量 {@code
    * "fake"}）不参与。<b>只传路径</b>：父进程给的是配置根，密钥值由本进程自己读出（D23/R-A2-3）。
    *
+   * <p><b>走哪条路由</b>（多 provider 并存，2026-09-14）：{@code agents.<templateId>.llm.route} → {@code
+   * llm.route} → {@code "default"}（{@link LlmRouteLoader#routeName}）——按<b>模板</b>配（同一模板的实例走同一条），
+   * <b>不新增任何传递面</b>（父侧照旧只给路径）。点到不存在的名字 ⇒ {@code E_LLM_ROUTE_UNKNOWN} 在引导期响亮，<b>绝不</b>回落到别的路由。
+   *
    * <p><b>失败一律响亮（D24），绝不回退 {@code scriptedFakeLlm()}</b>：
    *
    * <ul>
    *   <li>缺 {@code llm.baseUrl}/{@code llm.model} ⇒ {@link LlmRouteLoader#load} 在引导期抛 {@code
    *       E_LLM_CONFIG_MISSING}；
    *   <li>缺密钥 / 引用形态不支持 ⇒ 由下面这次"取密钥预检"在引导期抛 {@link ConfigApiKeySource#E_KEY_MISSING}/{@code
-   *       E_REF_FORM_UNSUPPORTED}。<b>为什么预检</b>：不预检的话，取密钥失败要等到首次 {@code chat} 才发生，而 {@code
-   *       AgentPipeline} 会把 {@code LlmException} 收敛成 {@code StopReason.LLM_ERROR} 的<b>正常回合</b>（退出码
+   *       E_REF_FORM_UNSUPPORTED}——预检对<b>本进程实际选中的那条</b>路由做（多路由下"预检 A、实跑
+   *       B"是会漏掉这条的唯一形态）。<b>为什么预检</b>：不预检的话，取密钥失败要等到首次 {@code chat} 才发生，而 {@code AgentPipeline} 会把
+   *       {@code LlmException} 收敛成 {@code StopReason.LLM_ERROR} 的<b>正常回合</b>（退出码
    *       0）——父侧就再也分辨不出"子体压根没跑起来"。预检只多取一次值、不固化任何东西：{@link ConfigApiKeySource} 每次 {@code chat}
    *       仍现读配置，轮换/过期感知的 SPI 契约不变。
    * </ul>
    *
    * <p>异常消息不含密钥值（引用名也只经 {@link ConfigApiKeySource} 的白名单回显），可直接进子进程 stderr。
    */
-  private static LlmClient realLlm(Path configRoot) {
+  private static LlmClient realLlm(Path configRoot, String templateId) {
     FileConfigStore store = new FileConfigStore(configRoot);
-    ModelRoute route = LlmRouteLoader.load(store);
+    // 走哪条路由（多 provider 并存）：agents.<templateId>.llm.route → llm.route → "default"（按模板配，无需新增传递面）
+    ModelRoute route = LlmRouteLoader.load(store, LlmRouteLoader.routeName(store, templateId));
     ConfigApiKeySource keys =
         new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM);
     keys.apiKey(); // 预检：结果有意丢弃（只要"取得到"这一事实；密钥值不留在本方法里）

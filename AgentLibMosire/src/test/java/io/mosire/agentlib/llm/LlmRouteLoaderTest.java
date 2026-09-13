@@ -163,10 +163,230 @@ class LlmRouteLoaderTest {
     }
   }
 
+  // ---------- 多 provider：按名选路由（2026-09-14） ----------
+
+  /** 两条路由 + 扁平形态共存的完整夹具。 */
+  private static final String MULTI_ROUTE_CONFIG =
+      "{\"llm\":{\"baseUrl\":\"https://flat.example.test/v1\",\"model\":\"flat-model\","
+          + "\"credentialsRef\":\"keys.flat\",\"route\":\"glm\",\"routes\":{"
+          + "\"glm\":{\"baseUrl\":\"https://glm.example.test/v1\",\"model\":\"glm-5.3-flash\","
+          + "\"credentialsRef\":\"keys.glm\"},"
+          + "\"deepseek\":{\"baseUrl\":\"https://ds.example.test/v1\",\"model\":\"deepseek-flash\"}}}}";
+
+  /** 判别性：路由表按名各给各的字段（抓"读表但永远取第一条"的实现）；扁平形态同时在场时仍是 {@code default}（兼容层）。 */
+  @Test
+  void namedRoutesAreSelectedByNameWhileFlatFormStaysDefault() throws IOException {
+    writeConfig(MULTI_ROUTE_CONFIG);
+
+    ModelRoute glm = LlmRouteLoader.load(store(), "glm");
+    ModelRoute deepseek = LlmRouteLoader.load(store(), "deepseek");
+    ModelRoute dflt = LlmRouteLoader.load(store());
+
+    assertThat(List.of(glm.name(), glm.baseUrl(), glm.model(), glm.credentialsRef()))
+        .containsExactly("glm", "https://glm.example.test/v1", "glm-5.3-flash", "keys.glm");
+    assertThat(
+            List.of(
+                deepseek.name(), deepseek.baseUrl(), deepseek.model(), deepseek.credentialsRef()))
+        .as("第二条路由缺 credentialsRef = 匿名（与扁平形态同口径）")
+        .containsExactly("deepseek", "https://ds.example.test/v1", "deepseek-flash", "");
+    assertThat(List.of(dflt.name(), dflt.baseUrl(), dflt.model(), dflt.credentialsRef()))
+        .as("扁平形态 = 名为 default 的路由：老配置一字不改照跑")
+        .containsExactly("default", "https://flat.example.test/v1", "flat-model", "keys.flat");
+  }
+
+  /**
+   * 判别性：名字拼错 ⇒ {@code E_LLM_ROUTE_UNKNOWN}，<b>绝不</b>静默改用另一条路由——<b>即使扁平形态明明可用</b>
+   * （这正是"错误的名字静默回落"最容易被放过的形态）。码与"配置缺失"刻意分开：拼错与没配是两种修法。
+   */
+  @Test
+  void unknownRouteNameIsLoudDistinguishableAndNeverFallsBack() throws IOException {
+    writeConfig(MULTI_ROUTE_CONFIG);
+
+    ConfigException typo =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), "glmm"));
+
+    assertThat(typo).isNotNull();
+    assertThat(typo.code())
+        .isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN)
+        .isNotEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(typo.getMessage())
+        .as("带请求名与可用名，一眼看出是拼错还是没配")
+        .contains("glmm")
+        .contains("glm")
+        .contains("deepseek")
+        .contains("default");
+  }
+
+  /** 名字是往配置树里<b>寻址的段</b>：带点/空白/怪字符的名字不许被当成路径（{@code a.b} 会指到别的节点上）。 */
+  @Test
+  void illegalRouteNamesAreRejectedNotTreatedAsPaths() throws IOException {
+    writeConfig(MULTI_ROUTE_CONFIG);
+
+    for (String bad : List.of("a.b", "-a", "a b", "a/b", "glm.")) {
+      ConfigException failure =
+          catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), bad));
+      assertThat(failure).as("name=%s", bad).isNotNull();
+      assertThat(failure.code()).as("name=%s", bad).isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN);
+    }
+  }
+
+  /** 只有路由表、没有扁平形态时，{@code default} 不在表里也必须响亮——答案只能是"没有"，不是"随便挑一条"。 */
+  @Test
+  void routesOnlyConfigWithoutDefaultEntryIsLoud() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"glm\":{\"baseUrl\":\"https://glm.example.test/v1\","
+            + "\"model\":\"glm-5.3-flash\"}}}}");
+
+    ConfigException failure =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store()));
+
+    assertThat(failure).isNotNull();
+    assertThat(failure.code()).isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN);
+    assertThat(failure.getMessage()).contains("default").contains("glm");
+  }
+
+  /** 没有路由表却点了非默认名：不许静默忽略这个名字（用户以为配了第二条路由，实际在跑第一条）。 */
+  @Test
+  void nonDefaultNameWithoutRoutesTableIsUnknownNotIgnored() throws IOException {
+    writeConfig(config("https://api.example.test/v1", "model-one", "keys.one"));
+
+    ConfigException failure =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), "glm"));
+
+    assertThat(failure).isNotNull();
+    assertThat(failure.code()).isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN);
+    assertThat(failure.getMessage()).contains("glm").contains("default");
+  }
+
+  /** 路由表 / 条目的形态配错 ⇒ 响亮且点名具体键（含路由名）——不是"当成没配"、更不是"当成匿名"。 */
+  @Test
+  void malformedRoutesTableIsLoudWithRouteScopedKeyNames() throws IOException {
+    writeConfig("{\"llm\":{\"routes\":\"glm\"}}");
+    ConfigException tableNotObject =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), "glm"));
+    assertThat(tableNotObject).isNotNull();
+    assertThat(tableNotObject.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(tableNotObject.getMessage()).contains("llm.routes");
+
+    writeConfig("{\"llm\":{\"routes\":{\"glm\":5}}}");
+    ConfigException entryNotObject =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), "glm"));
+    assertThat(entryNotObject).isNotNull();
+    assertThat(entryNotObject.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(entryNotObject.getMessage()).contains("llm.routes.glm");
+
+    writeConfig("{\"llm\":{\"routes\":{\"glm\":{\"baseUrl\":\"https://glm.example.test/v1\"}}}}");
+    ConfigException noModel =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), "glm"));
+    assertThat(noModel).isNotNull();
+    assertThat(noModel.getMessage())
+        .as("两类缺配置必须可分辨，且键名带路由名")
+        .contains("llm.routes.glm.model")
+        .doesNotContain("llm.routes.glm.baseUrl");
+  }
+
+  /** 路由表里的凭据引用同样不许回流值（含凭据样串的 URL 型 baseUrl）。 */
+  @Test
+  void namedRouteMessagesNeverEchoConfiguredValues() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"glm\":{\"baseUrl\":\""
+            + CREDENTIAL_URL
+            + "\",\"model\":\"glm-5.3-flash\",\"credentialsRef\":"
+            + "\""
+            + CREDENTIAL_URL
+            + "\"}}}}");
+
+    ModelRoute route = LlmRouteLoader.load(store(), "glm");
+    assertThat(route.baseUrl()).isEqualTo(CREDENTIAL_URL);
+
+    writeConfig("{\"llm\":{\"routes\":{\"glm\":{\"baseUrl\":\"" + CREDENTIAL_URL + "\"}}}}");
+    ConfigException failure =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), "glm"));
+    assertThat(failure).isNotNull();
+    assertThat(allMessages(failure)).noneMatch(message -> message.contains("sk-live-SECRET123"));
+  }
+
+  // ---------- 多 provider：按 agent 选名字（routeName） ----------
+
+  /**
+   * 三级回退：{@code agents/<id>.llm.route} → {@code llm.route} → {@code
+   * "default"}（配置层不做跨前缀回退，回退是我们自己写的）。
+   */
+  @Test
+  void routeNameFallsBackFromAgentOverrideToGlobalToDefault() throws IOException {
+    writeConfig(MULTI_ROUTE_CONFIG);
+    assertThat(LlmRouteLoader.routeName(store(), "alice")).isEqualTo("glm");
+
+    writeAgentConfig("bob", "{\"llm\":{\"route\":\"deepseek\"}}");
+    assertThat(LlmRouteLoader.routeName(store(), "bob")).isEqualTo("deepseek");
+    assertThat(LlmRouteLoader.routeName(store(), "alice")).as("覆盖只对该 agent 生效").isEqualTo("glm");
+
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"glm\":{\"baseUrl\":\"https://glm.example.test/v1\","
+            + "\"model\":\"glm-5.3-flash\"}}}}");
+    assertThat(LlmRouteLoader.routeName(store(), "alice"))
+        .as("全局也没写 ⇒ default")
+        .isEqualTo("default");
+  }
+
+  /** 端到端合成：子体按 <b>templateId</b> 选名 → 加载器取到那条路由（两个函数接起来的唯一语义）。 */
+  @Test
+  void templateScopedSelectionComposesWithLoad() throws IOException {
+    writeConfig(MULTI_ROUTE_CONFIG);
+    writeAgentConfig("orch-probe", "{\"llm\":{\"route\":\"deepseek\"}}");
+
+    ModelRoute route =
+        LlmRouteLoader.load(store(), LlmRouteLoader.routeName(store(), "orch-probe"));
+
+    assertThat(List.of(route.name(), route.model())).containsExactly("deepseek", "deepseek-flash");
+  }
+
+  /** 覆盖值配错（非文本/空白）⇒ 响亮，不许当成"没覆盖"——后者会静默走另一条路由，正是 D24 要防的形态。 */
+  @Test
+  void malformedOverrideIsLoudNotIgnored() throws IOException {
+    writeConfig(MULTI_ROUTE_CONFIG);
+
+    writeAgentConfig("bob", "{\"llm\":{\"route\":5}}");
+    ConfigException nonTextual =
+        catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.routeName(store(), "bob"));
+    assertThat(nonTextual).isNotNull();
+    assertThat(nonTextual.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(nonTextual.getMessage()).contains("agents.bob.llm.route");
+
+    writeConfig(
+        "{\"llm\":{\"baseUrl\":\"https://api.example.test/v1\",\"model\":\"m\",\"route\":\"  \"}}");
+    ConfigException blankGlobal =
+        catchThrowableOfType(
+            ConfigException.class, () -> LlmRouteLoader.routeName(store(), "alice"));
+    assertThat(blankGlobal).isNotNull();
+    assertThat(blankGlobal.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+  }
+
+  /** 可用名清单：升序、含路由表里的名字与（在场时的）扁平 {@code default}——错误消息据此自解释。 */
+  @Test
+  void availableNamesListsSortedRouteNamesIncludingFlatDefault() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"baseUrl\":\"https://flat.example.test/v1\",\"model\":\"flat-model\","
+            + "\"routes\":{\"zeta\":{\"baseUrl\":\"https://z.example.test/v1\",\"model\":\"z\"},"
+            + "\"alpha\":{\"baseUrl\":\"https://a.example.test/v1\",\"model\":\"a\"}}}}");
+    assertThat(LlmRouteLoader.availableNames(store())).containsExactly("alpha", "default", "zeta");
+
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"zeta\":{\"baseUrl\":\"https://z.example.test/v1\",\"model\":\"z\"}}}}");
+    assertThat(LlmRouteLoader.availableNames(store()))
+        .as("没有扁平形态就没有 default 这个名字")
+        .containsExactly("zeta");
+  }
+
   // ---------- 工具 ----------
 
   private FileConfigStore store() {
     return new FileConfigStore(tempDir);
+  }
+
+  private void writeAgentConfig(String agentId, String json) throws IOException {
+    Path dir = Files.createDirectories(tempDir.resolve("agents"));
+    Files.write(dir.resolve(agentId + ".json"), json.getBytes(StandardCharsets.UTF_8));
   }
 
   private void writeConfig(String json) throws IOException {
