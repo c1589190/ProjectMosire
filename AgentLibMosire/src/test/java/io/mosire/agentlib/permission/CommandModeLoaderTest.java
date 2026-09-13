@@ -15,7 +15,8 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * {@link CommandModeLoader} 的离线闭环（S6）：{@code commands.mode} → 主 Agent 的初始档位。
  *
- * <p>判别性约定（与 {@code BashToolConfigLoaderTest} 同取法）：
+ * <p>判别性约定（与 {@code BashToolConfigLoaderTest}——现 {@code
+ * io.mosire.bash.BashToolConfigLoaderTest}——同取法）：
  *
  * <ul>
  *   <li><b>整项缺失/显式 null ⇒ {@code FULL}</b>：没写过这一项的部署照常起来，行为等于本功能引入前；

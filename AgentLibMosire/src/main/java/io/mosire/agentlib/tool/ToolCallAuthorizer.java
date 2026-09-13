@@ -227,8 +227,9 @@ public final class ToolCallAuthorizer {
   /**
    * 默认脱敏摘要：{@code sha256:<32 hex>}，算的是<b>按参数名排序</b>后的规范化串（同参同摘，便于对账）。
    *
-   * <p><b>实现已上提</b>（C 包接 bash 时）：规范化写法与哈希算法都在 {@link Digest}——命令落账摘要（{@code
-   * ShellTool.ledgerArgs}）与本方法必须共用同一段代码，否则同一条命令会有两个指纹。本方法只剩"喂什么进去"这一件事： <b>全部参数</b>（不是只有命令）。
+   * <p><b>实现已上提</b>（C 包接 bash 时）：规范化写法与哈希算法都在 {@link Digest}——命令落账摘要（{@code ShellTool.ledgerArgs}，现
+   * {@code io.mosire.bash.ShellTool}）与本方法必须共用同一段代码，否则同一条命令会有两个指纹。 本方法只剩"喂什么进去"这一件事：
+   * <b>全部参数</b>（不是只有命令）。
    *
    * <p><b>为什么是这个输入面</b>：摘要进 {@code approval.requested} 事件（持久面）与提示面，人要看的是"这次调用整体是什么"，
    * 故覆盖全部参数；命令落账要的是"命令文本的指纹"，输入面只有 {@code command} 一项——两者不同是有意的（见 {@link Digest} 的类

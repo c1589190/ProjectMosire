@@ -119,8 +119,8 @@ public final class SubProcessExecutor implements AgentExecutor {
    * <b>L2 起点固定</b>（S5-D）：子 JVM 的出生目录 = 它的 {@code fs} 可达面首根（<b>不改 argv</b>，只改 {@code
    * SpawnSpec.workingDir}）。
    *
-   * <p><b>这不是围栏</b>（设计 §2.7 的措辞）：它只让"相对路径"默认落在允许区里，子 JVM 自身的代码不受任何限制。围栏在 L1（参数面硬拒）与 L3（{@link
-   * io.mosire.brain.tools.BashSandbox}）。
+   * <p><b>这不是围栏</b>（设计 §2.7 的措辞）：它只让"相对路径"默认落在允许区里，子 JVM 自身的代码不受任何限制。围栏在 L1（参数面硬拒）与 L3（{@code
+   * io.mosire.bash.BashSandbox}，随 bash 插件化搬入插件模块；{@code @link} 不可用——Brain 不依赖插件模块）。
    *
    * <p>根不存在/不可用 ⇒ 回落到"继承父进程 CWD"并记日志：起点不是安全边界，不许因为一个没建好的目录把子体启动拦死。可达面为"不限"时 没有根列表（{@code dirList()}
    * 为空）⇒ 同样是继承。
@@ -151,8 +151,8 @@ public final class SubProcessExecutor implements AgentExecutor {
    * {@code SubagentManager.childDbPath} 的 {@code <root>/<id>/events.db} 口径逐字对齐）。
    *
    * <p><b>边界（不许含糊）</b>：这里<b>只</b>有这三键，补的是"子体读得到"。bash 三件套等其它工具的配置<b>不</b>在此注入——它们在这条缝上仍拿到空 config ⇒
-   * 各自的缺省口径（{@code BashToolConfig.fromToolConfig} 对空表有安全缺省；<b>但</b>部署侧配的 {@code tools.bash.*}
-   * 附加项对子体不生效——见本轮报告，属未修的独立缝）。
+   * 各自的缺省口径（{@code io.mosire.bash.BashToolConfig.fromToolConfig} 对空表有安全缺省；<b>但</b>部署侧配的 {@code
+   * tools.bash.*} 附加项对子体不生效——见本轮报告，属未修的独立缝）。
    *
    * <p>{@code childDataDir == null}（装配层没注入数据根）⇒ 返回空表，逐字回到本缝接线前的行为：<b>不编路径</b>，读侧拿到的是 {@code
    * CONTEXT_UNAVAILABLE}（响亮），不是一份猜出来的库。

@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ToolGate;
@@ -72,6 +72,10 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p><strong>工作目录</strong>：构造注入基准目录（缺省 = JVM 当前目录），调用参数 {@code cwd} 可逐次覆盖（相对路径按基准目录解析）。
+ *
+ * <p><strong>配置从哪来（一处实现）</strong>：装载期注入（{@link #ShellTool(BashToolConfig)}，插件面经 {@link
+ * BashToolSource#init} 读并校验）优先；未注入（直接构造的老口径、离线单测）⇒ 现读 {@link ToolContext#config()} 并按缺省兜底。优先级只写在
+ * {@link #configOf} 一处。
  *
  * <p><strong>三层围栏（S5-D；分级口径见 {@code 设计-Bash工具与工作目录围栏.md} §2.1，别把这三层混着说）</strong>：
  *
@@ -168,6 +172,13 @@ public final class ShellTool implements AgentTool {
   private final BashSandbox sandbox;
 
   /**
+   * 装载期注入的配置（插件面）；{@code null} = 未注入——那时按调用上下文现读，见 {@link #configOf}。
+   *
+   * <p>不做防御性拷贝：{@link BashToolConfig} 的记录分量恒为不可变容器（构造期 {@code List.copyOf}），与 {@code SCHEMA} 同款理由。
+   */
+  private final BashToolConfig injectedConfig;
+
+  /**
    * 大输出落库 SPI：把被裁掉的完整文本交给宿主（如事件库），返回可引用的 docId。
    *
    * <p>约定：返回非 null 的 {@link Optional}；{@link Optional#empty()} = 未落库（本阶段就是缺省行为）。实现抛异常视为落库失败，
@@ -193,45 +204,71 @@ public final class ShellTool implements AgentTool {
   /** 缺省组装：JVM 当前目录为基准、不落库、normal 模式、1 MiB 采集顶、通用截断预算。 */
   public ShellTool() {
     this(
+        null,
         Path.of("").toAbsolutePath(),
         OutputSink.none(),
         ShellOutputTruncator.Mode.NORMAL,
         ShellOutputTruncator.DEFAULT_MAX_OUTPUT_BYTES,
-        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS);
+        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS,
+        BashSandbox.system());
   }
 
   /** 注入基准工作目录（其余取缺省）——避免行为隐式依赖进程 CWD。 */
   public ShellTool(Path baseWorkingDirectory) {
     this(
+        null,
         baseWorkingDirectory,
         OutputSink.none(),
         ShellOutputTruncator.Mode.NORMAL,
         ShellOutputTruncator.DEFAULT_MAX_OUTPUT_BYTES,
-        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS);
+        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS,
+        BashSandbox.system());
+  }
+
+  /**
+   * 装载期注入配置（插件面用：{@link BashToolSource#init} 在装载时读并校验，之后不再变）。
+   *
+   * <p>这条路上配置<b>已定型</b>：调用上下文里的 {@code config} 不再被读（{@link #configOf} 的优先级），其余取缺省组装。配置非 null
+   * ——插件面拿不到配置时由 {@link BashToolSource} 显式退化到 {@link
+   * BashToolConfig#defaults()}，不让"没配"和"配置为空"在构造器上混成一种。
+   */
+  public ShellTool(BashToolConfig config) {
+    this(
+        Objects.requireNonNull(config, "config"),
+        Path.of("").toAbsolutePath(),
+        OutputSink.none(),
+        ShellOutputTruncator.Mode.NORMAL,
+        ShellOutputTruncator.DEFAULT_MAX_OUTPUT_BYTES,
+        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS,
+        BashSandbox.system());
   }
 
   public ShellTool(Path baseWorkingDirectory, OutputSink sink) {
     this(
+        null,
         baseWorkingDirectory,
         sink,
         ShellOutputTruncator.Mode.NORMAL,
         ShellOutputTruncator.DEFAULT_MAX_OUTPUT_BYTES,
-        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS);
+        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS,
+        BashSandbox.system());
   }
 
   /** 注入缺省输出模式（调用参数 {@code mode} 仍可逐次覆盖）。 */
   public ShellTool(
       Path baseWorkingDirectory, OutputSink sink, ShellOutputTruncator.Mode defaultMode) {
     this(
+        null,
         baseWorkingDirectory,
         sink,
         defaultMode,
         ShellOutputTruncator.DEFAULT_MAX_OUTPUT_BYTES,
-        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS);
+        ShellOutputTruncator.DEFAULT_MAX_INJECTED_CHARS,
+        BashSandbox.system());
   }
 
   /**
-   * 全量组装（测试与小预算场景用）。
+   * 全量组装（测试与小预算场景用）；配置未注入 ⇒ 调用时现读上下文（{@link #configOf}）。
    *
    * @param baseWorkingDirectory 基准工作目录（非 null）
    * @param sink 落库 SPI（非 null；{@link OutputSink#none()} = 不落库）
@@ -246,6 +283,7 @@ public final class ShellTool implements AgentTool {
       int maxOutputBytes,
       int maxInjectedChars) {
     this(
+        null,
         baseWorkingDirectory,
         sink,
         defaultMode,
@@ -255,7 +293,8 @@ public final class ShellTool implements AgentTool {
   }
 
   /**
-   * 全量组装 + 指定沙箱（{@link BashSandbox#unavailable} 是"沙箱不可用 ⇒ 响亮失败"这条分支的构造用入口）。
+   * 全量组装 + 指定沙箱（{@link BashSandbox#unavailable} 是"沙箱不可用 ⇒ 响亮失败"这条分支的构造用入口）；配置未注入 ⇒ 调用时现读上下文（{@link
+   * #configOf}）。
    *
    * @param sandbox L3 沙箱（非 null；{@link BashSandbox#system()} = 本机真探针）
    */
@@ -266,6 +305,23 @@ public final class ShellTool implements AgentTool {
       int maxOutputBytes,
       int maxInjectedChars,
       BashSandbox sandbox) {
+    this(null, baseWorkingDirectory, sink, defaultMode, maxOutputBytes, maxInjectedChars, sandbox);
+  }
+
+  /**
+   * 唯一装配点（上面的构造器都是它的 {@code this(null, …)} 形态：{@code config == null} = 未注入）。
+   *
+   * @param config 装载期注入的配置；{@code null} = 未注入（调用时现读上下文）
+   */
+  private ShellTool(
+      BashToolConfig config,
+      Path baseWorkingDirectory,
+      OutputSink sink,
+      ShellOutputTruncator.Mode defaultMode,
+      int maxOutputBytes,
+      int maxInjectedChars,
+      BashSandbox sandbox) {
+    this.injectedConfig = config;
     this.sandbox = Objects.requireNonNull(sandbox, "sandbox");
     this.baseWorkingDirectory =
         Objects.requireNonNull(baseWorkingDirectory, "baseWorkingDirectory");
@@ -279,6 +335,23 @@ public final class ShellTool implements AgentTool {
     }
     this.maxOutputBytes = maxOutputBytes;
     this.maxInjectedChars = maxInjectedChars;
+  }
+
+  /**
+   * 本次调用用的 bash 配置（<b>一处实现</b>，两条路的优先级写死在这里）：
+   *
+   * <ol>
+   *   <li>装载期注入（{@link #ShellTool(BashToolConfig)}，插件面的正路）：直接用——配置在那里已校验，调用期不再解读；
+   *   <li>未注入（直接构造的老口径、离线单测）：现读 {@code ToolContext.config}，{@link BashToolConfig#fromToolConfig}
+   *       的缺省兜底照旧。
+   * </ol>
+   *
+   * <p>{@code ToolContext} 的 config 恒非 null（构造期归一为 {@code Map.of()}），故第二条路上不判 null。
+   */
+  private BashToolConfig configOf(ToolContext context) {
+    return injectedConfig != null
+        ? injectedConfig
+        : BashToolConfig.fromToolConfig(context.config());
   }
 
   @Override
@@ -328,7 +401,7 @@ public final class ShellTool implements AgentTool {
     if (command == null) {
       return ToolGate.ALLOW;
     }
-    BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
+    BashToolConfig config = configOf(context);
     // 档位来自**宿主绑定的调用者身份**（S6）：不完全权限档下"直放"档会被提升为需审批。
     // 身份不由模型给（ToolContext.identity 由装配/建链方写），这里只读。
     return BashCommandClassifier.classify(
@@ -353,7 +426,7 @@ public final class ShellTool implements AgentTool {
   @Override
   public Map<String, Object> ledgerArgs(ToolContext context) {
     Objects.requireNonNull(context, "context");
-    BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
+    BashToolConfig config = configOf(context);
     if (config.commandLog() == BashToolConfig.CommandLog.FULL) {
       return context.arguments();
     }
@@ -406,7 +479,7 @@ public final class ShellTool implements AgentTool {
       return ToolResult.error(INVALID_ARGUMENTS, "command 为必填参数（非空命令字符串）");
     }
 
-    BashToolConfig config = BashToolConfig.fromToolConfig(context.config());
+    BashToolConfig config = configOf(context);
     // 围栏面（S5-D）：null = 三层围栏都不参与（不限 scope + sandbox=off）⇒ 行为与 S4-C 逐字相同
     ResourceScope fence = fenceOf(context, config);
 

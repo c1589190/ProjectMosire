@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import io.mosire.agentlib.tool.ToolResultTruncator;
 import java.io.ByteArrayOutputStream;

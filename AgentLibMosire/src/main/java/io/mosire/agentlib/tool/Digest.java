@@ -13,9 +13,9 @@ import java.util.TreeMap;
  *
  * <p><b>为什么必须只有一处</b>：本仓有<b>两个</b>不同用途的摘要——审批摘要（{@link
  * ToolCallAuthorizer#defaultDigest(ToolContext)}， 覆盖<b>全部参数</b>，进 {@code approval.requested}
- * 事件与提示面）与命令落账摘要（{@code ShellTool.ledgerArgs}， 只要 {@code command} 一个字段，进 {@code tool.call}
- * 事件）。两者的<b>输入面不同是有意的</b>（一条命令 + cwd/timeout 的参数集合 大于命令本身），但<b>哈希算法与规范化写法必须共用本类</b>：各写一份 sha256
- * 必然分叉，日后对账会发现"同一条命令两个指纹"。
+ * 事件与提示面）与命令落账摘要（{@code ShellTool.ledgerArgs}，现 {@code io.mosire.bash.ShellTool}， 只要 {@code
+ * command} 一个字段，进 {@code tool.call} 事件）。两者的<b>输入面不同是有意的</b>（一条命令 + cwd/timeout 的参数集合
+ * 大于命令本身），但<b>哈希算法与规范化写法必须共用本类</b>：各写一份 sha256 必然分叉，日后对账会发现"同一条命令两个指纹"。
  *
  * <p><b>规范化写法（长度前缀定界 + 类型标记）</b>：逐项 {@code 键长:键 + 值类型 + 值长:值} 再换行。长度前缀是必需的——值里可能
  * 出现任何字符（空格/冒号/换行），拿定界符本身当地界不可靠；类型标记挡住"渲染成同一串、其实是两回事"的碰撞 （{@code {"a":"1"}} 与 {@code

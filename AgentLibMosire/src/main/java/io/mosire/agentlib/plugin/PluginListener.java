@@ -4,8 +4,9 @@ package io.mosire.agentlib.plugin;
  * 插件生命周期监听（窄接口 SPI）：{@link PluginToolSource} 只调它，至于"事件怎么落库、怎么广播"由宿主决定。
  *
  * <p><b>为什么是接口而不是事件类型</b>：事件词汇表（{@code EventTypes}）与 {@code EventWrite}/{@code EventBus} 都在 Brain
- * （{@code io.mosire.brain.runtime}），AgentLib 不得反引（模块边界单向）；故此处照 T14 {@code ShellTool.OutputSink}、T18
- * {@code OpenAICompatibleLlmClient.ApiKeySource} 的先例注入一个窄接口。真实接线（把回调落成事件）归宿主装配。
+ * （{@code io.mosire.brain.runtime}），AgentLib 不得反引（模块边界单向）；故此处照 T14 {@code ShellTool.OutputSink} （现
+ * {@code io.mosire.bash.ShellTool.OutputSink}，随 bash 插件化搬入插件模块）、T18 {@code
+ * OpenAICompatibleLlmClient.ApiKeySource} 的先例注入一个窄接口。真实接线（把回调落成事件）归宿主装配。
  *
  * <p><b>事件词汇（宿主落库时用，本接口不落任何字符串）</b>：事件类型 {@code plugin.lifecycle}，payload 形如 {@code {pluginId,
  * version, state}}——照 {@code agent.lifecycle} 的既有范式（一个类型 + 一个 state 字段），不为 STARTED/STOPPED

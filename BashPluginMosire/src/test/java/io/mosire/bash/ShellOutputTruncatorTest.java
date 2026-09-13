@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;

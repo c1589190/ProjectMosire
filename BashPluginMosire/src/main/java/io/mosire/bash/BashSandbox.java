@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.IOException;

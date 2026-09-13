@@ -7,8 +7,8 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * 把配置里的 {@code commands.mode} 读成主 Agent 的<b>初始档位</b>（读法照 {@code BashToolConfigLoader} / {@code
- * ApprovalConfigLoader}）。
+ * 把配置里的 {@code commands.mode} 读成主 Agent 的<b>初始档位</b>（读法照 {@code BashToolConfigLoader}——现 {@code
+ * io.mosire.bash.BashToolConfigLoader}，随 bash 插件化搬入插件模块——/ {@code ApprovalConfigLoader}）。
  *
  * <p><b>整项缺失 ⇒ {@link CommandMode#FULL}</b>（不是错误）：没写过这一项的部署照常起来，行为等于本功能引入前。 JSON {@code null}
  * 与缺失同口径。

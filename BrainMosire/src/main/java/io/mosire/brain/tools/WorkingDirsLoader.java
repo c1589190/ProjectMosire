@@ -13,7 +13,8 @@ import java.util.Optional;
 
 /**
  * 把配置里的 {@code agents.workingDirs} 读成主 Agent 的 {@code fs} 作用域（S5-B；读法照 {@code BashToolConfigLoader}
- * / {@code SubagentLimitsLoader}）。
+ * ——现 {@code io.mosire.bash.BashToolConfigLoader}，随 bash 插件化搬入插件模块——/ {@code
+ * SubagentLimitsLoader}）。
  *
  * <p><b>整项缺失 ⇒ 不限</b>（不是错误，也不是"哪里都不许"）：这是裁决 ① 的口径——主 Agent 缺省不限， 此后逐跳只减不增。JSON {@code null} 与缺失同口径。
  *

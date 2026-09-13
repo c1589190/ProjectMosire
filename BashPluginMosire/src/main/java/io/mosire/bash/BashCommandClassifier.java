@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.ToolGate;

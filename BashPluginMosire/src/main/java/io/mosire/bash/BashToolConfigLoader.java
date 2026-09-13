@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.mosire.agentlib.config.ConfigException;

@@ -1,4 +1,4 @@
-package io.mosire.brain.tools;
+package io.mosire.bash;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -9,7 +9,7 @@ import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
-import io.mosire.brain.tools.ShellTool.OutputSink;
+import io.mosire.bash.ShellTool.OutputSink;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -100,7 +100,8 @@ class ShellToolTest {
                 new ShellTool(
                     tempDir, OutputSink.none(), ShellOutputTruncator.Mode.NORMAL, 1024, 0))
         .isInstanceOf(IllegalArgumentException.class);
-    assertThatThrownBy(() -> new ShellTool(null)).isInstanceOf(NullPointerException.class);
+    // 显式转型：新增 ShellTool(BashToolConfig) 后裸 null 会重载歧义；本条判据的口径不变（基准目录非 null）
+    assertThatThrownBy(() -> new ShellTool((Path) null)).isInstanceOf(NullPointerException.class);
   }
 
   @Test

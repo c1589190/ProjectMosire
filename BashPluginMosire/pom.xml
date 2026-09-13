@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.mosire</groupId>
+    <artifactId>mosire-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>bash-plugin-mosire</artifactId>
+  <name>BashPluginMosire</name>
+  <description>bash 工具插件（PF4J 插件，包 io.mosire.bash）：打包时默认打包、调试时作为插件——只依赖 agentlib-mosire，不带任何宿主模块</description>
+
+  <dependencies>
+    <!-- 插件 API（ToolSource/HostServices/AgentTool/ToolContext…）：设计 D1/D3 的硬规则是"插件 JAR 不打包宿主 API 的类"，
+         运行时由宿主 classloader 解析——本模块用普通 jar 打包（不用 shade），依赖因此不会进 JAR，与 provided 等效。
+         不用 provided：与 BrainMosire 的 pom 同款，reactor 内解析更直白（见 BrainMosire/pom.xml 对应条目）。 -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>agentlib-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- PF4J 的 @Extension 注解与 APT 处理器（org.pf4j.processor.ExtensionAnnotationProcessor，生成
+         META-INF/extensions.idx）。显式声明而不是吃 agentlib 的传递依赖：插件作者照设计 §四 的配方写 pom 时
+         这一条是必需的，第一方参考实现也不该有隐性依赖。provided = 运行时不带（宿主 classpath 上有）。 -->
+    <dependency>
+      <groupId>org.pf4j</groupId>
+      <artifactId>pf4j</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <!-- 配置读取（BashToolConfigLoader 用 JsonNode 表达值；版本由根 pom jackson-bom 管理） -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- SpotBugs 抑制注解（编译期仅为注解；与 BrainMosire/pom.xml 同款） -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- 测试面才允许依赖宿主模块（D1 的硬规则只管 compile 面：main 源集里 io.mosire.brain.* 必须为 0）。
+         8 个随迁用例里有端到端用例要装 AgentPipeline/BasicContextAssembler，属既有判据，不因搬家而降级。 -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>brain-mosire</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- 插件 JAR 的形态（设计 D3）：不用 shade，只写描述符——Plugin-Id 是插件身份（PF4J 靠它装载、
+           PluginToolSource 靠它落 plugin.lifecycle），Plugin-Version 与宿主同源（parent 的 version）。
+           缺 Plugin-Id ⇒ PF4J 只记日志并静默跳过 ⇒ 宿主的 PluginToolSource 会把它变响亮（响亮失败，绝不静默）。 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Plugin-Id>bash</Plugin-Id>
+              <Plugin-Version>${project.version}</Plugin-Version>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

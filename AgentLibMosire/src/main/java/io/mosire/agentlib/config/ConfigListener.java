@@ -6,9 +6,10 @@ import com.fasterxml.jackson.databind.JsonNode;
  * 配置变更监听（窄接口 SPI）：{@link FileConfigStore} 只调它，"变更如何落事件库/广播"由宿主决定。
  *
  * <p><b>为什么是接口而不是事件类型</b>：事件词汇表（{@code EventTypes}）与事件落库在 Brain （{@code
- * io.mosire.brain.runtime}），AgentLib 不得反引（模块边界单向）；故照 T14 {@code ShellTool.OutputSink}、T18 {@code
- * OpenAICompatibleLlmClient.ApiKeySource}、T19 {@code PluginListener} 的先例注入窄接口。真实接线（把回调落成 {@code
- * config.changed} 事件——该字面量只允许 在 Brain 的 {@code EventTypes} 定义一处，由 T23 装配时接线）归宿主。
+ * io.mosire.brain.runtime}），AgentLib 不得反引（模块边界单向）；故照 T14 {@code ShellTool.OutputSink} （现 {@code
+ * io.mosire.bash.ShellTool.OutputSink}）、T18 {@code OpenAICompatibleLlmClient.ApiKeySource}、T19
+ * {@code PluginListener} 的先例注入窄接口。真实接线（把回调落成 {@code config.changed} 事件——该字面量只允许 在 Brain 的 {@code
+ * EventTypes} 定义一处，由 T23 装配时接线）归宿主。
  *
  * <p><b>回调约定</b>：变更<b>落盘成功后</b>同步回调（回调时刻盘上已能读到新值——先写后播，否则事件 声称的变更可能没发生）；实现<b>勿阻塞、勿抛异常</b>——{@link
  * RuntimeException} 只被记日志， <b>不回滚</b>已生效的写入（与 {@code PluginListener}/{@code ToolRegistry.onChange}

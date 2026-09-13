@@ -7,8 +7,8 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * 把配置里的 {@code subagents.*} 读成一份 {@link SubagentLimits}（读法照 {@code BashToolConfigLoader} / {@code
- * CommandModeLoader}）。
+ * 把配置里的 {@code subagents.*} 读成一份 {@link SubagentLimits}（读法照 {@code BashToolConfigLoader}——现 {@code
+ * io.mosire.bash.BashToolConfigLoader}，随 bash 插件化搬入插件模块——/ {@code CommandModeLoader}）。
  *
  * <p><b>整项缺失 ⇒ 缺省值</b>（不是错误）：没写过 {@code subagents.*} 的部署照常起来，拿到 {@link
  * SubagentLimits#defaults()}。JSON {@code null} 与缺失同口径。
