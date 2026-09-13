@@ -10,7 +10,9 @@ import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
 import java.nio.file.Files;
@@ -135,9 +137,14 @@ class SubagentManagerTest {
     AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
     write(template);
     AgentTemplateStore templateStore = store();
+    // 父深度 = 子深度上限（缺省口径：总层数 3 ⇒ 子深度 ≤ 2）⇒ 再派一层就是 3 > 2
     SubagentManager manager =
         manager(
-            templateStore, new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 4);
+            templateStore,
+            new InProcessExecutor(),
+            parentConfig(),
+            AgentPermissionSet.system(),
+            SubagentLimits.defaults().maxChildDepth());
 
     assertThatThrownBy(
             () ->
@@ -152,8 +159,9 @@ class SubagentManagerTest {
     assertThat(payloadOf(event))
         .containsEntry("decision", "DEPTH_LIMIT")
         .containsEntry("template", "reader")
-        .containsEntry("depth", 5)
-        .containsEntry("maxDepth", SubagentManager.DEFAULT_MAX_DEPTH);
+        .containsEntry("depth", SubagentLimits.defaults().maxChildDepth() + 1)
+        // 事件里报的是**总层数**（配置原值），消息里报的是子深度上限——两个口径都留着，读者不必换算
+        .containsEntry("maxDepth", SubagentLimits.defaults().maxDepth());
   }
 
   @Test
@@ -163,14 +171,182 @@ class SubagentManagerTest {
     AgentTemplateStore templateStore = store();
     SubagentManager manager =
         manager(
-            templateStore, new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 3);
+            templateStore,
+            new InProcessExecutor(),
+            parentConfig(),
+            AgentPermissionSet.system(),
+            SubagentLimits.defaults().maxChildDepth() - 1);
 
     SubagentInstance spawned =
         manager.spawn(new SubagentLaunchRequest("reader", "边界层", null, null, null, null));
 
-    assertThat(spawned.depth()).isEqualTo(4);
+    assertThat(spawned.depth()).isEqualTo(SubagentLimits.defaults().maxChildDepth());
     assertThat(manager.get(spawned.instanceId()))
-        .hasValueSatisfying(i -> assertThat(i.depth()).isEqualTo(4));
+        .hasValueSatisfying(
+            i -> assertThat(i.depth()).isEqualTo(SubagentLimits.defaults().maxChildDepth()));
+  }
+
+  /**
+   * S5-A 锚点修正（权限维）：单调性对照的是<b>调用者</b>的权限集，不是 manager 的构造期常量。
+   *
+   * <p><b>判别性</b>：本 manager 的 {@code parentPermissions} 是 {@code system()}（无白名单限制、全放行）。旧实现（对照
+   * 构造期常量）会把这次派生物<b>放行</b>——模板要 {@code write}、调用者只有 {@code read}；把对照物换回 manager 常量，本用例转红。 拒绝类事件的
+   * {@code agent} 也必须是调用者（"谁被拒了"），不是 manager 的主人。
+   */
+  @Test
+  void monotonicityIsAnchoredToTheCallerNotTheManager() {
+    write(template("writer", Set.of("read", "write"), Set.of(), false, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+
+    AgentPermissionSet callerPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allow("read").build();
+    AgentIdentity caller = AgentIdentity.subagent("caller-1", CommandMode.FULL, "上级派的任务", 1);
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest("writer", "写文件", null, null, null, null),
+                    caller,
+                    callerPermissions))
+        .isInstanceOf(SubagentRejectedException.class)
+        .hasMessageContaining("单调性");
+    assertThat(manager.list()).as("拒绝发生在起实例之前").isEmpty();
+
+    List<Event> denied = query(EventTypes.PERMISSION_DENIED);
+    assertThat(denied).hasSize(1);
+    assertThat(denied.get(0).agent()).isEqualTo("caller-1");
+  }
+
+  /**
+   * S5-A 锚点修正（深度维）：深度对照的是<b>调用者身份的深度 + 1</b>，不是 manager 的 {@code parentDepth}。
+   *
+   * <p><b>判别性</b>：本 manager 的 {@code parentDepth} 是 0（旧实现会算出 depth=1 并放行），而调用者已在上限那一层——
+   * 这正是"两跳以上把孙代拿去和主 Agent 比"的那个缺陷。反向对照（浅一层同 manager 放行）保证本用例不是"怎么都拒"。
+   */
+  @Test
+  void depthIsAnchoredToTheCallerIdentityNotTheManagerConstant() {
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+    int maxChildDepth = SubagentLimits.defaults().maxChildDepth();
+
+    AgentIdentity deepCaller =
+        AgentIdentity.subagent("deep-1", CommandMode.FULL, "已经在上限层", maxChildDepth);
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest("reader", "再派一层", null, null, null, null),
+                    deepCaller,
+                    AgentPermissionSet.system()))
+        .isInstanceOf(SubagentRejectedException.class)
+        .hasMessageContaining("深度");
+
+    AgentIdentity shallowCaller = AgentIdentity.subagent("shallow-1", CommandMode.FULL, "第一层", 0);
+    SubagentInstance spawned =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "正常一层", null, null, null, null),
+            shallowCaller,
+            AgentPermissionSet.system());
+    assertThat(spawned.depth()).isEqualTo(1);
+    assertThat(spawned.parentInstanceId()).isEqualTo("shallow-1");
+  }
+
+  /**
+   * S5-A 繁殖预算（直系维）：额度按<b>调用者</b>分账、只数<b>在管</b>实例，消息带需求/剩余/上限三个数。
+   *
+   * <p>判别性：把"数在管"写成"数全部"，本用例末尾那次重启（第一个子体已 FINISHED）会转红；把额度按全局算， "别家调用者照常派"那步会转红。
+   */
+  @Test
+  void childBudgetLimitsLiveChildrenPerCallerAndFreesSlotsWhenTheyFinish() throws Exception {
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    CountDownLatch release = new CountDownLatch(1);
+    SubagentManager manager =
+        manager(
+            store(),
+            new InProcessExecutor((id, cfg) -> release.await()),
+            parentConfig(),
+            AgentPermissionSet.system(),
+            0,
+            new SubagentLimits(3, 1, 8));
+    AgentIdentity caller = AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1);
+
+    SubagentInstance first =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "第一个", null, null, null, null),
+            caller,
+            AgentPermissionSet.system());
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest("reader", "第二个", null, null, null, null),
+                    caller,
+                    AgentPermissionSet.system()))
+        .isInstanceOf(SubagentBudgetExceededException.class)
+        .hasMessageContaining("BUDGET_EXHAUSTED")
+        .hasMessageContaining("需求=1")
+        .hasMessageContaining("剩余=0")
+        .hasMessageContaining("上限=1");
+    assertThat(manager.list()).as("被拒的那次不留半个实例").hasSize(1);
+
+    List<Event> decisions = query(EventTypes.DECISION);
+    assertThat(decisions).hasSize(1);
+    assertThat(payloadOf(decisions.get(0)))
+        .containsEntry("decision", "BUDGET_EXHAUSTED")
+        .containsEntry("need", 1)
+        .containsEntry("remaining", 0)
+        .containsEntry("limit", 1);
+
+    // 额度按调用者分账：别家调用者不受这家额度影响
+    SubagentInstance other =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "别家", null, null, null, null),
+            AgentIdentity.subagent("parent-2", CommandMode.FULL, "另一家", 1),
+            AgentPermissionSet.system());
+    assertThat(other.status()).isEqualTo(SubagentStatus.RUNNING);
+
+    // 终态不再占额：第一个跑完 ⇒ 同一调用者又能派
+    release.countDown();
+    awaitStatus(manager, first.instanceId(), SubagentStatus.FINISHED);
+    SubagentInstance third =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "第三个", null, null, null, null),
+            caller,
+            AgentPermissionSet.system());
+    assertThat(third.instanceId()).isNotEqualTo(first.instanceId());
+    assertThat(third.parentInstanceId()).isEqualTo("parent-1");
+  }
+
+  /** S5-A 繁殖预算（全局维）：跨调用者共享总额度，越界同样带三个数。 */
+  @Test
+  void globalInstanceBudgetRejectsAcrossDifferentCallers() {
+    write(template("reader", Set.of("read"), Set.of(), true, false, false));
+    CountDownLatch release = new CountDownLatch(1);
+    SubagentManager manager =
+        manager(
+            store(),
+            new InProcessExecutor((id, cfg) -> release.await()),
+            parentConfig(),
+            AgentPermissionSet.system(),
+            0,
+            new SubagentLimits(3, 8, 1));
+
+    manager.spawn(
+        new SubagentLaunchRequest("reader", "占满全局额度", null, null, null, null),
+        AgentIdentity.subagent("parent-a", CommandMode.FULL, "甲", 1),
+        AgentPermissionSet.system());
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest("reader", "别家也派不出", null, null, null, null),
+                    AgentIdentity.subagent("parent-b", CommandMode.FULL, "乙", 1),
+                    AgentPermissionSet.system()))
+        .isInstanceOf(SubagentBudgetExceededException.class)
+        .hasMessageContaining("全局在管子实例")
+        .hasMessageContaining("上限=1");
+    release.countDown();
   }
 
   @Test
@@ -416,8 +592,32 @@ class SubagentManagerTest {
       AgentConfig parentConfig,
       AgentPermissionSet parentPermissions,
       int parentDepth) {
+    return manager(
+        templateStore,
+        launcher,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        SubagentLimits.defaults());
+  }
+
+  private SubagentManager manager(
+      AgentTemplateStore templateStore,
+      SubagentLauncher launcher,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions,
+      int parentDepth,
+      SubagentLimits limits) {
     return new SubagentManager(
-        templateStore, launcher, store, bus, parentConfig, parentPermissions, parentDepth);
+        templateStore,
+        launcher,
+        store,
+        bus,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        () -> CommandMode.FULL,
+        limits);
   }
 
   private static AgentConfig parentConfig() {

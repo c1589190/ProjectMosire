@@ -45,6 +45,8 @@ import io.mosire.brain.subagent.AgentContextReader;
 import io.mosire.brain.subagent.AgentTemplateStore;
 import io.mosire.brain.subagent.SubProcessExecutor;
 import io.mosire.brain.subagent.SubagentInstance;
+import io.mosire.brain.subagent.SubagentLimits;
+import io.mosire.brain.subagent.SubagentLimitsLoader;
 import io.mosire.brain.subagent.SubagentManager;
 import io.mosire.brain.subagent.SubagentOrchestrationTools;
 import io.mosire.brain.tools.BashToolConfig;
@@ -314,6 +316,14 @@ public final class App implements AutoCloseable {
       // （AgentPipeline 建 ToolContext 时）、上级判定闸的"本级是不是完全权限"、派生子 Agent 时的档位单调性守卫。
       CommandModeHolder commandMode = new CommandModeHolder(CommandModeLoader.load(configStore));
       LOG.info("命令档位: {}（配置 commands.mode；运行时可经 HTTP 断点改）", commandMode.get().wireName());
+      // S5-A：繁殖预算（深度/直系/全局三个额度）同一处读——坏值启动即响亮失败，别让它变成"看起来配了、其实按缺省办"
+      SubagentLimits subagentLimits = SubagentLimitsLoader.load(configStore);
+      LOG.info(
+          "子 Agent 预算: 总层数={}（子深度≤{}）单实例直系≤{} 全局在管≤{}（配置 subagents.*）",
+          subagentLimits.maxDepth(),
+          subagentLimits.maxChildDepth(),
+          subagentLimits.maxChildrenPerInstance(),
+          subagentLimits.maxInstances());
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
@@ -358,7 +368,8 @@ public final class App implements AutoCloseable {
                 permissionSet,
                 subagentConfigDir,
                 approvalAuthorizer,
-                commandMode);
+                commandMode,
+                subagentLimits);
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
       }
@@ -537,6 +548,9 @@ public final class App implements AutoCloseable {
    * W3b 子 Agent 编排装配：模板库装载（fail-fast——坏模板/缺目录在启动期暴露）→ 子进程管理器 + 链接形态 {@link AgentCommand}（当前 java +
    * 本进程 classpath + {@code Main agent}，JVM 内存 cap -Xmx128m，目录注入，{@code --parent-link}）→ {@link
    * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 三个内置编排工具以 builtin 供给源注册进工具面（二期 L2：sourceId 归属）。
+   *
+   * <p>S5-A：那句"父级 = 主 Agent 对照"只覆盖 3 参 {@code spawn}（= 主 Agent 在要）；经 MCP 链接进来的下级调用走 {@code
+   * spawn(request, identity, permissions)}，对照物是<b>调用者自己</b>。
    */
   private static SubagentRig wireSubagents(
       BootConfig config,
@@ -547,7 +561,8 @@ public final class App implements AutoCloseable {
       AgentPermissionSet parentPermissions,
       Path subagentConfigDir,
       ToolCallAuthorizer authorizer,
-      CommandModeHolder commandMode) {
+      CommandModeHolder commandMode,
+      SubagentLimits limits) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
     templateStore.load();
     SubprocessManager processes = new SubprocessManager();
@@ -569,7 +584,8 @@ public final class App implements AutoCloseable {
             parentConfig,
             parentPermissions,
             0,
-            commandMode::get);
+            commandMode::get,
+            limits);
     BuiltinToolSource builtin =
         new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager));
     for (AgentTool tool : builtin.listTools()) {

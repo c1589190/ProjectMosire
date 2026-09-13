@@ -23,6 +23,7 @@ import io.mosire.brain.runtime.EventTypes;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,8 +44,15 @@ class SubagentOrchestrationToolsTest {
 
   @TempDir Path tempDir;
 
+  /**
+   * 工具面 spec（S5-A 起 spawn 与另两个<b>分档</b>）：{@code spawn_sub_agent} = DEFAULT 级（子 Agent 也能派孙代），{@code
+   * kill}/{@code list} 仍是 SYSTEM（子体能派、不能收别人的）。
+   *
+   * <p>判别性：把 spawn 的 {@code requiredLevel} 改回 SYSTEM，本用例第一处断言即转红——这正是"降级真的生效"的判别面 （S4-A 之前 spec
+   * 是装饰，MCP 路径裸调 {@code tool.execute}）。
+   */
   @Test
-  void toolsUseSystemLevelSensitiveFalseDestructiveTrue() {
+  void spawnIsDefaultLevelWhileKillAndListStaySystem() {
     Fixture f = fixture(systemParent(), null);
     List<AgentTool> tools = SubagentOrchestrationTools.of(f.manager());
     // D30 起是四个（多 read_agent_context）；注册序 = 名字字典序
@@ -52,12 +60,26 @@ class SubagentOrchestrationToolsTest {
         .extracting(AgentTool::name)
         .containsExactly(
             "kill_sub_agent", "list_sub_agents", "read_agent_context", "spawn_sub_agent");
+
+    Map<String, ToolSpec> specs = new LinkedHashMap<>();
+    for (AgentTool tool : tools) {
+      specs.put(tool.name(), tool.spec());
+    }
+    assertThat(specs.get(SubagentOrchestrationTools.SPAWN_SUB_AGENT))
+        .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, true));
+    assertThat(specs.get(SubagentOrchestrationTools.KILL_SUB_AGENT))
+        .isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
+    assertThat(specs.get(SubagentOrchestrationTools.LIST_SUB_AGENTS))
+        .isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
+    // 读工具的 spec 另有一维（noExport=true）+ sensitive=true，判别在 ReadAgentContextToolTest
+    assertThat(specs.get(SubagentOrchestrationTools.READ_AGENT_CONTEXT))
+        .isEqualTo(ToolSpec.level(AccessToken.SYSTEM, true, false, true));
+
     for (AgentTool tool : tools) {
       if (tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
-        continue; // 读工具的 spec 另有一维（noExport）+ sensitive=true，判别在 ReadAgentContextToolTest
+        continue;
       }
-      assertThat(tool.spec()).isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
-      assertThat(tool.spec().noExport()).isFalse(); // 既有三工具逐字不变：仍可外发（子体拿得到 spawn/kill/list）
+      assertThat(tool.spec().noExport()).isFalse(); // 三个非读工具仍可外发（子体拿得到 spawn/kill/list）
     }
     f.close();
   }
@@ -178,59 +200,134 @@ class SubagentOrchestrationToolsTest {
     f.close();
   }
 
+  /**
+   * 红线 1 单调性在<b>工具路径</b>上按调用者权限集判（S5-A 锚点修正）：调用者只有 {@code echo}，子模板想带 {@code admin-do} ⇒ 拒。
+   *
+   * <p><b>判别性</b>：本 fixture 的 manager 注入的是 {@code system()}（全放行）——旧实现拿构造期常量对照，这次派生物会被
+   * <b>放行</b>；把对照物换回 manager 常量，本用例转红。拒绝类事件的 {@code agent} 必须是调用者实例 id（"谁被拒了"）。
+   */
   @Test
   void escalatedSpawnRejectedWithPermissionDeniedEventAndNoInstance() {
-    // 父级（manager 注入的父权限）只有白名单 echo；子模板想带 admin-do → 红线 1 单调性拒绝。
-    // 调用方是主 Agent（SYSTEM，system() 权限集）——guard 放行，拒绝发生在 manager 单调性检查处
     writeTemplate("grand", Set.of("echo", "admin-do"), "想提权的子 Agent");
-    AgentPermissionSet parentPermissions =
-        AgentPermissionSet.builder(AccessToken.DEFAULT).allow("echo").build();
-    Fixture f = fixture(parentPermissions, null);
+    Fixture f = fixture(systemParent(), null);
     ToolExecutionGuard guard = new ToolExecutionGuard();
     ToolRegistry registry = registryOf(f.manager());
+
+    // 调用者自己的白名单：能调 spawn 且放行破坏性操作（否则连工具都进不来，见 guard 层两个身份闸用例），
+    // 但<b>没有 admin-do</b>——这正是要被单调性拦下的那一项
+    AgentPermissionSet callerPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT)
+            .allow("echo")
+            .allow("spawn_sub_agent")
+            .destructiveAllowed(true)
+            .build();
+    AgentIdentity caller = AgentIdentity.subagent("limited-parent-1", CommandMode.FULL, "上级派的任务");
 
     ToolResult result =
         guard.execute(
             registry,
             "spawn_sub_agent",
             new ToolContext(
-                AccessToken.SYSTEM,
-                AgentPermissionSet.system(),
+                AccessToken.DEFAULT,
+                callerPermissions,
                 Map.of(),
-                Map.of("templateId", "grand", "goal", "提权尝试")));
+                Map.of("templateId", "grand", "goal", "提权尝试"),
+                caller));
     assertThat(result.success()).isFalse();
     assertThat(result.code()).isEqualTo("PERMISSION_DENIED");
     assertThat(result.message()).contains("父级许可");
 
-    // 拒绝类事件 agent=父级 id、correlationId=拟生成的子 id，且没有实例落地
+    // 拒绝类事件 agent=调用者 id、correlationId=拟生成的子 id，且没有实例落地
     List<Event> denied =
-        f.events().query(new EventQuery("main", EventTypes.PERMISSION_DENIED, "", -1, 100));
+        f.events()
+            .query(new EventQuery("limited-parent-1", EventTypes.PERMISSION_DENIED, "", -1, 100));
     assertThat(denied).hasSize(1);
     assertThat(denied.get(0).correlationId()).startsWith("grand-");
     assertThat(f.manager().list()).isEmpty();
     f.close();
   }
 
+  /**
+   * guard 层身份闸（S5-A 起<b>分档</b>）：GUEST 三个工具全拒；DEFAULT（= 子 Agent 的默认级别）只进得去 {@code
+   * spawn_sub_agent}，{@code kill}/{@code list} 仍被 SYSTEM 级挡在门外。
+   *
+   * <p>判别性：spawn 若还是 SYSTEM 级，"DEFAULT 派得出孙代"那步会被 guard 拦下（转红）；kill/list 若跟着降到 DEFAULT， 第二段断言转红。
+   */
   @Test
-  void guardDeniesSystemToolForGuestAndDefaultCallers() {
-    Fixture f = fixture(systemParent(), null);
+  void guardDeniesEverythingForGuestAndOnlySpawnForDefault() {
+    Fixture f = fixture(systemParent(), new InProcessExecutor((instanceId, config) -> {}));
     ToolRegistry registry = registryOf(f.manager());
     ToolExecutionGuard guard = new ToolExecutionGuard();
 
-    for (AccessToken token : List.of(AccessToken.GUEST, AccessToken.DEFAULT)) {
+    for (String name : List.of("spawn_sub_agent", "kill_sub_agent", "list_sub_agents")) {
       ToolResult denied =
           guard.execute(
               registry,
-              "spawn_sub_agent",
+              name,
               new ToolContext(
-                  token,
-                  AgentPermissionSet.builder(token).allowAll().build(),
+                  AccessToken.GUEST,
+                  AgentPermissionSet.builder(AccessToken.GUEST).allowAll().build(),
                   Map.of(),
                   Map.of("templateId", "reader", "goal", "提权尝试")));
-      assertThat(denied.success()).isFalse();
-      assertThat(denied.code()).isEqualTo(ToolExecutionGuard.DENIED);
+      assertThat(denied.success()).as(name).isFalse();
+      assertThat(denied.code()).as(name).isEqualTo(ToolExecutionGuard.DENIED);
       assertThat(denied.message()).contains("身份级别不足");
     }
+
+    // 身份级别闸读的是**权限集的 grantedToken**（PermissionChecker 第 3 条），不是 ToolContext.caller——
+    // 所以"DEFAULT 调用者"必须连权限集一起是 DEFAULT，否则这个用例会因为权限集恰好是 system() 而假通过
+    ToolContext defaultCaller =
+        new ToolContext(
+            AccessToken.DEFAULT,
+            AgentPermissionSet.builder(AccessToken.DEFAULT)
+                .allowAll()
+                .destructiveAllowed(true)
+                .build(),
+            Map.of(),
+            Map.of("templateId", "reader", "goal", "派孙代"));
+    ToolResult spawned = guard.execute(registry, "spawn_sub_agent", defaultCaller);
+    assertThat(spawned.success()).isTrue();
+    assertThat(f.manager().list()).hasSize(1);
+
+    for (String name : List.of("kill_sub_agent", "list_sub_agents")) {
+      ToolResult denied = guard.execute(registry, name, defaultCaller);
+      assertThat(denied.success()).as(name).isFalse();
+      assertThat(denied.code()).as(name).isEqualTo(ToolExecutionGuard.DENIED);
+      assertThat(denied.message()).contains("身份级别不足");
+    }
+    f.close();
+  }
+
+  /**
+   * 预算耗尽在工具面的映射：{@code BUDGET_EXHAUSTED} 与越权 {@code DENIED} <b>分码</b>——前者"现在不行"（等/收敛）， 后者"你不该要"。
+   *
+   * <p>判别性：{@link SubagentBudgetExceededException} 是 {@link SubagentRejectedException} 的子类，catch
+   * 顺序若被 调换（预算落到 {@code SubagentRejectedException} 那支），码会变成 {@code DENIED}，本用例转红。
+   */
+  @Test
+  void exhaustedBudgetMapsToBudgetExhaustedCodeNotDenied() throws Exception {
+    CountDownLatch blocked = new CountDownLatch(1);
+    Fixture f =
+        fixture(
+            systemParent(),
+            new InProcessExecutor((instanceId, config) -> blocked.await()),
+            new SubagentLimits(3, 1, 8));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult first =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "占住额度")));
+    assertThat(first.success()).isTrue();
+
+    ToolResult second =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "再要一个")));
+    assertThat(second.success()).isFalse();
+    assertThat(second.code()).isEqualTo("BUDGET_EXHAUSTED");
+    assertThat(second.message()).contains("需求=1").contains("剩余=0").contains("上限=1");
+    assertThat(f.manager().list()).as("被拒的那次不留半个实例").hasSize(1);
+    blocked.countDown();
     f.close();
   }
 
@@ -384,6 +481,11 @@ class SubagentOrchestrationToolsTest {
   }
 
   private Fixture fixture(AgentPermissionSet parentPermissions, InProcessExecutor executor) {
+    return fixture(parentPermissions, executor, SubagentLimits.defaults());
+  }
+
+  private Fixture fixture(
+      AgentPermissionSet parentPermissions, InProcessExecutor executor, SubagentLimits limits) {
     writeTemplate("reader", Set.of("echo"), "只读问候子 Agent");
     AgentTemplateStore store = new AgentTemplateStore(templateDir());
     store.load();
@@ -404,7 +506,9 @@ class SubagentOrchestrationToolsTest {
             bus,
             AgentConfig.builder("main").build(),
             parentPermissions,
-            0);
+            0,
+            () -> CommandMode.FULL,
+            limits);
     return new Fixture(events, bus, manager);
   }
 

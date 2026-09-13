@@ -21,8 +21,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 四个内置编排工具（中期计划 W3 组件 4 + 三期 D30；仅主 Agent 可调——注册三要素 {@code ToolSpec.level(SYSTEM, sensitive=false,
- * destructive=true)}，GUEST/DEFAULT 在管线 guard 处即被拒绝）。
+ * 四个内置编排工具（中期计划 W3 组件 4 + 三期 D30）。
+ *
+ * <p><b>身份级别（S5-A 起不齐了，逐个看）</b>：{@code spawn_sub_agent} 是 {@code DEFAULT}（子 Agent 也能派孙代， D28
+ * 裁决"开放派生 + 检查锚到调用者"）；{@code kill_sub_agent}/{@code list_sub_agents} 仍是 {@code SYSTEM}（窄面：
+ * 子体不能终止/枚举别家的实例）；{@code read_agent_context} 是 {@code SYSTEM} + {@code sensitive} + {@code
+ * noExport}（禁外发：桥不转发它，子体拿不到句柄）。后三个对 GUEST/DEFAULT 调用者在管线 guard 处即被拒。
  *
  * <p>前三个（{@code spawn_sub_agent}/{@code kill_sub_agent}/{@code list_sub_agents}）形态不变；第四个 {@code
  * read_agent_context}（D30）按实例 id 直读子体上下文，spec 多一个 {@code noExport=true}（禁外发：桥不转发它， 子体拿不到句柄）+ {@code
@@ -36,7 +40,9 @@ import org.slf4j.LoggerFactory;
  * ContextAccessJudge}（同为其唯一判定点的纵深副本）。
  *
  * <p>错误映射契约：参数缺失/非法 → {@code INVALID_ARGUMENTS}；编排层拒绝（单调性/深度，对应 {@link SubagentRejectedException}）→
- * {@code PERMISSION_DENIED}（可读原因经 message 透出）；未知实例 → {@code UNKNOWN_INSTANCE}；启动失败 → {@code
+ * {@code PERMISSION_DENIED}（可读原因经 message 透出）；<b>繁殖预算耗尽</b>（{@link
+ * SubagentBudgetExceededException}）→ {@code
+ * BUDGET_EXHAUSTED}（与越权分码：前者"现在不行"、后者"你不该要"，见该异常的类注释）；未知实例 → {@code UNKNOWN_INSTANCE}；启动失败 → {@code
  * LAUNCH_FAILED}；读上下文失败（库不存在/配置未注入）→ {@code CONTEXT_UNAVAILABLE}（响亮，绝不返回空结果冒充成功）。
  *
  * <p>返回值：spawn = 新实例快照 JSON（instanceId/templateId/status/depth），kill = 终止确认文本， list =
@@ -61,11 +67,18 @@ public final class SubagentOrchestrationTools {
 
   private SubagentOrchestrationTools() {}
 
-  /** spawn：子 Agent 模板起实例（SYSTEM 级编排入口）。 */
+  /**
+   * spawn：子 Agent 模板起实例（<b>DEFAULT 级</b>，S5-A 起对子 Agent 开放派发）。
+   *
+   * <p><b>为什么从 SYSTEM 降到 DEFAULT</b>：spec 的 {@code requiredLevel} 在 S4-A 判定点统一后<b>真的生效</b>（此前 MCP
+   * 路径裸调 {@code tool.execute}，SYSTEM 只是个装饰），不降则子体永远派不了孙代——而"开放派生 + 检查锚到调用者"是 D28
+   * 的裁决之一。开放的安全性由三道闸承担（都在 {@link SubagentManager}，且对照物是<b>调用者</b>）：权限单调性、档位 单调性、深度与繁殖预算。本工具内不再自查
+   * {@code caller == SYSTEM}（那会让降级毫无意义）。
+   */
   static AgentTool spawn(SubagentManager manager) {
     return tool(
         SPAWN_SUB_AGENT,
-        "派生一个子 Agent（由模板驱动；深度/权限/cap 均经父级收紧）。",
+        "派生一个子 Agent（由模板驱动；深度/权限/档位/cap 均经<b>调用者</b>收紧）。",
         Map.of(
             "type",
             "object",
@@ -82,11 +95,9 @@ public final class SubagentOrchestrationTools {
                 "mode", Map.of("type", "string", "enum", List.of("full", "limited"))),
             "required",
             List.of("templateId", "goal")),
+        // S5-A：DEFAULT 级（子 Agent 也能派孙代）；敏感/破坏位与其余编排工具同形
+        ToolSpec.level(AccessToken.DEFAULT, false, true),
         context -> {
-          ToolResult denied = systemOnly(context);
-          if (denied != null) {
-            return denied;
-          }
           String templateId = strArg(context, "templateId");
           String goal = strArg(context, "goal");
           if (templateId == null || goal == null) {
@@ -124,7 +135,11 @@ public final class SubagentOrchestrationTools {
           }
           SubagentInstance instance;
           try {
-            instance = manager.spawn(request);
+            // S5-A：以**调用者自己的**身份与权限集派生——三个守卫都对照它（不是 manager 的构造期常量）
+            instance = manager.spawn(request, context.identity(), context.permissions());
+          } catch (SubagentBudgetExceededException e) {
+            // 预算与越权分码：越权 = "你不该要"，预算 = "现在不行"（模型据此才会等/收敛，而不是换条路接着撞）
+            return ToolResult.error("BUDGET_EXHAUSTED", e.getMessage());
           } catch (SubagentRejectedException e) {
             return ToolResult.error(ToolExecutionGuard.DENIED, e.getMessage());
           } catch (SubagentLaunchException e) {

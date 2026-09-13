@@ -4,6 +4,7 @@ import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
@@ -26,8 +27,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 子 Agent 编排根（计划 §4.4 / 中期计划 W3 组件 2）：spawn / 查询 / kill 的单一入口，状态机、权限 单调性（红线 1）、深度限制（默认 4）、防跑飞 cap
- * 派生与事件链全部在本类闭环。
+ * 子 Agent 编排根（计划 §4.4 / 中期计划 W3 组件 2）：spawn / 查询 / kill 的单一入口，状态机、权限 单调性（红线 1）、档位单调性（S6）、
+ * 深度与繁殖预算（{@link SubagentLimits}，S5-A）、防跑飞 cap 派生与事件链全部在本类闭环。
  *
  * <p><strong>状态机</strong>：{@code
  * CONFIGURED→SPAWNING→RUNNING→(TERMINATING)→(FINISHED|FAILED|KILLED)}， 每次合法推进发一条 {@code
@@ -35,9 +36,14 @@ import org.slf4j.LoggerFactory;
  * IllegalStateException}（"非法推进直接抛错而非静默漂移"——SubagentStatus 设计约定）。崩溃恢复 （M3）= 事件重放，本期只落事件、不写恢复逻辑。
  *
  * <p><strong>spawn 检查顺序</strong>（中期计划 W3）：模板存在 → 权限单调性 （{@link PermissionChecker#isSubset}，拒绝即
- * {@link SubagentRejectedException} + {@code permission.denied} 事件）→ 深度（{@code parentDepth+1 >
- * DEFAULT_MAX_DEPTH} 拒绝，{@code decision:DEPTH_LIMIT} 事件）→ launcher 启动。cap 派生：{@code min(模板, 请求收紧,
- * 父级)}——子级只能更小（D10 硬顶的" 单调性第四维度"）。
+ * {@link SubagentRejectedException} + {@code permission.denied} 事件）→ 档位单调性（S6，{@code decision}
+ * 无事件、拒绝走 {@code permission.denied}）→ 深度（{@code 调用者depth+1 > 子深度上限} 拒绝，{@code decision:DEPTH_LIMIT}
+ * 事件）→〔锁内〕繁殖预算（{@code decision:BUDGET_EXHAUSTED} 事件）→ launcher 启动。cap 派生： {@code min(模板, 请求收紧,
+ * 父级)}——子级只能更小（D10 硬顶的"单调性第四维度"）。
+ *
+ * <p><strong>S5-A 起三个守卫的对照物是"调用者"</strong>（{@link #spawn(SubagentLaunchRequest, AgentIdentity,
+ * AgentPermissionSet)}）：权限对调用者权限集、深度对调用者深度 + 1、档位对调用者档位。manager 的构造期 {@code
+ * parentPermissions/parentDepth} 只服务于 3 参 {@code spawn}（= "主 Agent 在要"）。
  *
  * <p><strong>kill</strong>（红线 5：kill 是 Manager 的编排入口，不是"工具关进程"）：RUNNING 一步转为 TERMINATING（事件）→ 经
  * {@link SubagentLauncher} 窄缝关闭（真实实现即三层关停：关 stdin → SIGTERM → 宽限 → 树级 SIGKILL）→ 终态确认 →
@@ -56,9 +62,6 @@ public final class SubagentManager implements AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(SubagentManager.class);
 
-  /** 子 Agent 深度上限默认值（计划 §4.4 / 中期计划 W3：默认 4；根即主 Agent = 0）。 */
-  public static final int DEFAULT_MAX_DEPTH = 4;
-
   /** 退出观测轮询间隔（毫秒）。 */
   private static final long EXIT_POLL_MILLIS = 100L;
 
@@ -73,6 +76,7 @@ public final class SubagentManager implements AutoCloseable {
   private final AgentPermissionSet parentPermissions;
   private final Supplier<CommandMode> parentMode;
   private final int parentDepth;
+  private final SubagentLimits limits;
 
   /** 私有锁：状态记录/事件顺序/句柄表全部在锁内原子推进（同 SubprocessManager/USO 理由）。 */
   private final Object lock = new Object();
@@ -126,6 +130,34 @@ public final class SubagentManager implements AutoCloseable {
       AgentPermissionSet parentPermissions,
       int parentDepth,
       Supplier<CommandMode> parentMode) {
+    this(
+        templateStore,
+        launcher,
+        events,
+        bus,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        parentMode,
+        SubagentLimits.defaults());
+  }
+
+  /**
+   * 全参装配 + <b>繁殖预算</b>（S5-A / D28）。
+   *
+   * @param limits 深度/直系/全局三个额度（见 {@link SubagentLimits}）；缺省 {@link SubagentLimits#defaults()}
+   */
+  public SubagentManager(
+      AgentTemplateStore templateStore,
+      SubagentLauncher launcher,
+      EventStore events,
+      EventBus bus,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions,
+      int parentDepth,
+      Supplier<CommandMode> parentMode,
+      SubagentLimits limits) {
+    this.limits = Objects.requireNonNull(limits, "limits");
     this.templateStore = Objects.requireNonNull(templateStore, "templateStore");
     this.launcher = Objects.requireNonNull(launcher, "launcher");
     this.events = Objects.requireNonNull(events, "events");
@@ -145,12 +177,43 @@ public final class SubagentManager implements AutoCloseable {
    * <p>检查顺序（中期计划 W3）：模板存在 → 权限单调性 → 深度限制 → cap 派生 → 状态机 CONFIGURED→SPAWNING→RUNNING。启动失败（{@link
    * SubagentLaunchException}）把状态推进到 FAILED 并 原样传播（WIP 异常 Javadoc）。
    *
+   * <p><b>S5-A 起"谁在要"进入判定</b>：本 3 参形态 = "主 Agent 在要"（口径逐字等于本段之前的行为——身份取 {@code
+   * parentConfig.id()}、权限对照取构造期的 {@code parentPermissions}、深度取构造期的 {@code parentDepth}）。 经 MCP
+   * 链接进来的下级调用走 {@link #spawn(SubagentLaunchRequest, AgentIdentity, AgentPermissionSet)}：那一支的对照物是
+   * <b>调用者自己</b>，而不是这个 manager 属于谁。
+   *
    * @return RUNNING 时的实例快照（此后记录以 manager 内 map 为准）
    * @throws SubagentRejectedException 模板不存在 / 权限越权（+{@code permission.denied} 事件）/ 深度超限 （+{@code
    *     decision:DEPTH_LIMIT} 事件）
+   * @throws SubagentBudgetExceededException 繁殖预算耗尽（+{@code decision:BUDGET_EXHAUSTED}
+   *     事件，消息含需求/剩余/上限）
    * @throws SubagentLaunchException launcher 无法拉起子进程（+lifecycle FAILED 事件）
    */
   public SubagentInstance spawn(SubagentLaunchRequest request) {
+    CommandMode mode = parentMode.get();
+    AgentIdentity self =
+        new AgentIdentity(
+            parentConfig.id(), mode == null ? CommandMode.FULL : mode, "", parentDepth);
+    return spawn(request, self, parentPermissions);
+  }
+
+  /**
+   * 以<b>调用者身份</b>派生一个子 Agent（S5-A 的锚点修正）。
+   *
+   * <p><b>三个守卫的对照物全部换成 {@code caller}</b>——权限单调性对 {@code callerPermissions}、深度上限对 {@code
+   * caller.depth() + 1}、档位单调性对 {@code caller.mode()}。此前它们对照的是 manager 的构造期常量（{@code
+   * parentPermissions}/{@code parentDepth}/父档位缝），只有"调用者恰好就是那个父"时才等价：两跳以上会把孙代拿去和 <b>主 Agent</b>
+   * 比，于是"孙 ⊆ 子"的形状对、对象错（S4 登记的构造期常量缺陷）。
+   *
+   * <p><b>预算在锁内判</b>：额度数的是在管子实例，"先数后建"若不在同一临界区里，并发两次 spawn 可以双双通过。
+   *
+   * @param caller 调用者身份（实例 id + 档位 + 深度；宿主绑定，模型给不出）
+   * @param callerPermissions 调用者自己的权限集（单调性对照真值）
+   */
+  public SubagentInstance spawn(
+      SubagentLaunchRequest request, AgentIdentity caller, AgentPermissionSet callerPermissions) {
+    Objects.requireNonNull(caller, "caller");
+    Objects.requireNonNull(callerPermissions, "callerPermissions");
     ensureOpen();
     AgentTemplate template =
         templateStore
@@ -159,10 +222,10 @@ public final class SubagentManager implements AutoCloseable {
                 () -> new SubagentRejectedException("子 Agent 模板不存在: " + request.templateId()));
     String instanceId = instanceIdOf(template.id());
     AgentPermissionSet permissions = tightenPermissions(template, request);
-    checkMonotonicity(template, instanceId, permissions);
-    CommandMode mode = resolveMode(template, instanceId, request);
-    int depth = parentDepth + 1;
-    checkDepth(template, instanceId, depth);
+    checkMonotonicity(template, instanceId, permissions, callerPermissions, caller.instanceId());
+    CommandMode mode = resolveMode(template, instanceId, request, caller);
+    int depth = caller.depth() + 1;
+    checkDepth(template, instanceId, depth, caller.instanceId());
     AgentConfig childConfig = deriveConfig(template, request, instanceId, permissions);
 
     SubagentInstance configured =
@@ -174,7 +237,8 @@ public final class SubagentManager implements AutoCloseable {
             permissions,
             mode,
             depth,
-            SubagentStatus.CONFIGURED);
+            SubagentStatus.CONFIGURED,
+            caller.instanceId());
     SubagentInstance running;
     LaunchedSubagent handle = null;
     try {
@@ -184,6 +248,7 @@ public final class SubagentManager implements AutoCloseable {
       // 会因 canTransition 不允许 CONFIGURED→FAILED 而抛裸 ISE）。
       synchronized (lock) {
         ensureOpen();
+        checkBudget(template, instanceId, caller);
         instances.put(instanceId, configured);
         emitLifecycle(instanceId, template.id(), "configured", depth, request.goal(), null);
         transition(
@@ -341,14 +406,17 @@ public final class SubagentManager implements AutoCloseable {
    * 也不回写权限集，只判够不够（{@code CommandMode.covers}）。
    */
   private CommandMode resolveMode(
-      AgentTemplate template, String instanceId, SubagentLaunchRequest request) {
+      AgentTemplate template,
+      String instanceId,
+      SubagentLaunchRequest request,
+      AgentIdentity caller) {
     CommandMode requested = request.mode() == null ? CommandMode.LIMITED : request.mode();
-    CommandMode parent = parentMode.get();
+    CommandMode parent = caller.mode();
     if (parent == null || !parent.covers(requested)) {
       String message = "子 Agent 档位超出父级许可（单调性）: 父级=" + parent + " 子级=" + requested;
       emit(
           EventTypes.PERMISSION_DENIED,
-          parentConfig.id(),
+          caller.instanceId(),
           instanceId,
           Map.of("template", template.id(), "childId", instanceId, "reason", message));
       throw new SubagentRejectedException(message);
@@ -358,20 +426,83 @@ public final class SubagentManager implements AutoCloseable {
 
   /**
    * 红线 1：权限单调性（{@link PermissionChecker#isSubset} 是判定真值，本方法只负责"拒绝 + 事件"的 编排；具体维度诊断仅供消息可读性，判定不分叉）。
+   *
+   * <p><b>对照物是调用者的权限集</b>（S5-A）：拒绝类事件的 {@code agent} 字段也记调用者实例 id——事件要能回答"谁被拒了"， 而不是"manager 属于谁"。
    */
   private void checkMonotonicity(
-      AgentTemplate template, String instanceId, AgentPermissionSet permissions) {
-    if (PermissionChecker.isSubset(permissions, parentPermissions)) {
+      AgentTemplate template,
+      String instanceId,
+      AgentPermissionSet permissions,
+      AgentPermissionSet callerPermissions,
+      String callerId) {
+    if (PermissionChecker.isSubset(permissions, callerPermissions)) {
       return;
     }
     String message =
-        "子 Agent 权限超出父级许可（红线 1 单调性）: " + nonSubsetReason(permissions, parentPermissions);
+        "子 Agent 权限超出父级许可（红线 1 单调性）: " + nonSubsetReason(permissions, callerPermissions);
     emit(
         EventTypes.PERMISSION_DENIED,
-        parentConfig.id(),
+        callerId,
         instanceId,
         Map.of("template", template.id(), "childId", instanceId, "reason", message));
     throw new SubagentRejectedException(message);
+  }
+
+  /**
+   * 繁殖预算（D28 基础项）：单调用者直系 + 全局在管两个额度，<b>只数在管（非终态）实例</b>——跑完的不再占额。
+   *
+   * <p><b>必须在锁内调用</b>：只数不建会让并发 spawn 双双越过额度。消息带<b>需求/剩余/上限</b>三个数，模型据此才知道差距是 1 还是 100。
+   *
+   * <p>深度不在这里（它由 {@link #checkDepth} 判、码也不同）：深度是"链有多长"，本方法是"这一层有多少"——两者的终止 手段不同（改模板 vs 等/收）。
+   */
+  private void checkBudget(AgentTemplate template, String instanceId, AgentIdentity caller) {
+    long liveTotal = instances.values().stream().filter(i -> !i.status().isFinal()).count();
+    if (liveTotal + 1 > limits.maxInstances()) {
+      throw budgetExceeded(
+          template, instanceId, "全局在管子实例", liveTotal, limits.maxInstances(), caller);
+    }
+    long liveChildren =
+        instances.values().stream()
+            .filter(i -> !i.status().isFinal() && caller.instanceId().equals(i.parentInstanceId()))
+            .count();
+    if (liveChildren + 1 > limits.maxChildrenPerInstance()) {
+      throw budgetExceeded(
+          template,
+          instanceId,
+          "调用者 " + caller.instanceId() + " 的直系在管子实例",
+          liveChildren,
+          limits.maxChildrenPerInstance(),
+          caller);
+    }
+  }
+
+  /**
+   * 预算拒绝：{@code decision:BUDGET_EXHAUSTED} 事件 + 带三个数的异常（口径见 {@link
+   * SubagentBudgetExceededException}）。
+   */
+  private SubagentBudgetExceededException budgetExceeded(
+      AgentTemplate template,
+      String instanceId,
+      String what,
+      long current,
+      int limit,
+      AgentIdentity caller) {
+    long remaining = Math.max(0, limit - current);
+    String message =
+        "子 Agent 繁殖预算耗尽（BUDGET_EXHAUSTED）: " + what + " 需求=1 剩余=" + remaining + " 上限=" + limit;
+    emit(
+        EventTypes.DECISION,
+        caller.instanceId(),
+        instanceId,
+        Map.of(
+            "decision", "BUDGET_EXHAUSTED",
+            "template", template.id(),
+            "childId", instanceId,
+            "scope", what,
+            "need", 1,
+            "remaining", remaining,
+            "limit", limit));
+    return new SubagentBudgetExceededException(message);
   }
 
   /** 诊断用：返回第一个不满足的维度（与 isSubset 规则逐条镜像，仅供消息）。 */
@@ -404,22 +535,33 @@ public final class SubagentManager implements AutoCloseable {
     return "权限集不在父级范围内";
   }
 
-  /** 深度限制（默认 4，超限拒绝 + decision:DEPTH_LIMIT 事件）。 */
-  private void checkDepth(AgentTemplate template, String instanceId, int depth) {
-    if (depth <= DEFAULT_MAX_DEPTH) {
+  /**
+   * 深度限制（{@code subagents.maxDepth}，<b>总层数口径</b>，超限拒绝 + {@code decision:DEPTH_LIMIT} 事件）。
+   *
+   * <p>对照深度是<b>调用者的深度 + 1</b>（不再用构造期常量）：event 里的 {@code maxDepth} 报的是总层数（配置原值），
+   * 消息里报的是子深度上限——两个口径都写清楚，免得读者按哪个判都对不上。
+   */
+  private void checkDepth(AgentTemplate template, String instanceId, int depth, String callerId) {
+    int maxChildDepth = limits.maxChildDepth();
+    if (depth <= maxChildDepth) {
       return;
     }
-    String message = "子 Agent 深度超限: depth=" + depth + " > max=" + DEFAULT_MAX_DEPTH;
+    String message = "子 Agent 深度超限: depth=" + depth + " > max=" + maxChildDepth;
     emit(
         EventTypes.DECISION,
-        parentConfig.id(),
+        callerId,
         instanceId,
         Map.of(
-            "decision", "DEPTH_LIMIT",
-            "template", template.id(),
-            "childId", instanceId,
-            "depth", depth,
-            "maxDepth", DEFAULT_MAX_DEPTH));
+            "decision",
+            "DEPTH_LIMIT",
+            "template",
+            template.id(),
+            "childId",
+            instanceId,
+            "depth",
+            depth,
+            "maxDepth",
+            limits.maxDepth()));
     throw new SubagentRejectedException(message);
   }
 

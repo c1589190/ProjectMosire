@@ -200,12 +200,18 @@ class ReadAgentContextToolTest {
     assertThat(read.spec().noExport()).isTrue();
     assertThat(read.spec().destructive()).isFalse();
     assertThat(read.spec().sensitive()).isTrue();
-    // 前三个既有工具逐字不变（noExport 缺省 false ⇒ 仍可外发）
+    // 其余工具：kill/list 仍是 SYSTEM（noExport 缺省 false ⇒ 仍可外发）；spawn 从 S5-A 起降为 DEFAULT
+    // （对子 Agent 开放派发——判别面在 SubagentOrchestrationToolsTest，这里只锁定"本工具的邻居没被顺手改坏"）
     for (AgentTool tool : tools) {
-      if (!tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
-        assertThat(tool.spec()).isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
-        assertThat(tool.spec().noExport()).isFalse();
+      if (tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
+        continue;
       }
+      AccessToken expected =
+          tool.name().equals(SubagentOrchestrationTools.SPAWN_SUB_AGENT)
+              ? AccessToken.DEFAULT
+              : AccessToken.SYSTEM;
+      assertThat(tool.spec()).as(tool.name()).isEqualTo(ToolSpec.level(expected, false, true));
+      assertThat(tool.spec().noExport()).as(tool.name()).isFalse();
     }
     // schema：view 的 enum 与读取器 VIEWS 同源（不含口径外的视图名）
     @SuppressWarnings("unchecked")
