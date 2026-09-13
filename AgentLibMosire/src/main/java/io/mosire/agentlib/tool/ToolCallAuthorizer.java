@@ -142,8 +142,8 @@ public final class ToolCallAuthorizer {
   /**
    * 需要人裁决的一次调用：由本类（宿主侧）构造 {@link ApprovalRequest} 并交给编排器。
    *
-   * <p><b>不可自报身份</b>：{@code tool}/{@code classKey}/{@code callerKey} 全部取自宿主已知的东西
-   * （工具实例、工具自报的闸位、调用上下文），模型给不出也改不了。
+   * <p><b>不可自报身份</b>：{@code tool}/ {@code classKey}/{@code callerKey}/{@code requesterId}/{@code
+   * kind}/{@code goal} 全部取自宿主已知的东西 （工具实例、工具自报的闸位、调用上下文），模型给不出也改不了。
    *
    * <p>返回空 = 已放行；非空 = 拒（含未装配编排器的 fail-closed 情形）。
    */
@@ -168,7 +168,12 @@ public final class ToolCallAuthorizer {
             digest.apply(context),
             now,
             now + coordinator.timeout().toMillis(),
-            context.caller().name());
+            // 桶键（会话放行的左半键）与实例身份（S6：上级判定要回答"谁在问、被派去干什么"）都取自宿主已知的
+            // ToolContext——模型给不出也改不了。kind 取工具自报的闸位（只有分类器知道"为什么问"）。
+            context.caller().name(),
+            context.identity().instanceId(),
+            ask.kind(),
+            context.identity().goal());
     ApprovalDecision decision = coordinator.decide(request);
     if (decision == ApprovalDecision.APPROVE_ONCE || decision == ApprovalDecision.APPROVE_SESSION) {
       return Optional.empty();

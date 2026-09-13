@@ -268,6 +268,9 @@ public final class PendingApprovals {
    *
    * <p>给编排器用：{@link #submit} 对空 id 会补发一个 id，但<b>不会</b>改写调用方手里的那个请求对象——事件面/等待面必须统一到 <b>生效</b>
    * id，否则会出现"人答在补发 id 上、编排器却等在原 id 上"（一路挂到超时）。
+   *
+   * <p><b>逐字段拷贝是刻意的</b>（不是 {@code req.withId(...)} 之类）：新增组件时编译器会在这里提醒—— 漏拷一个字段（如 {@code
+   * requesterId}/{@code kind}）会让"补发 id 的那条路"上的请求丢掉身份与分流依据， 而那种丢失<b>不会</b>报错，只会表现为"有的请求判错人、有的请求走错闸"。
    */
   public static ApprovalRequest withId(ApprovalRequest req, String id) {
     return new ApprovalRequest(
@@ -278,7 +281,10 @@ public final class PendingApprovals {
         req.digest(),
         req.createdAtEpochMs(),
         req.deadlineEpochMs(),
-        req.callerKey());
+        req.callerKey(),
+        req.requesterId(),
+        req.kind(),
+        req.goal());
   }
 
   /** 登记项：请求 + 决议（{@code null} = 待裁决）。全部字段只在持锁时读写。 */

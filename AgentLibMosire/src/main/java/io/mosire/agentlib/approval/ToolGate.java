@@ -22,8 +22,11 @@ public sealed interface ToolGate {
   /**
    * 需审批。{@code classKey} = remember 的键（<b>不是</b>工具名、也<b>不是</b>整条命令），如 {@code
    * bash:ask:systemctl}；会话级放行按 {@code (调用者, classKey)} 归类。{@code summary} 是给人看的一行说明 （只进提示面，不进事件）。
+   *
+   * <p>{@code kind} = <b>为什么问</b>（见 {@link AskKind}）：决定"谁有资格批"——系统敏感区只能到人， 档位提升可交上级 Agent
+   * 判定。工具<b>必须</b>如实报（报 {@code SENSITIVE} 就是"这类只能人批"，不是"我判断更严"）。
    */
-  record Ask(String classKey, String summary) implements ToolGate {
+  record Ask(String classKey, String summary, AskKind kind) implements ToolGate {
 
     public Ask {
       Objects.requireNonNull(classKey, "classKey");
@@ -31,6 +34,12 @@ public sealed interface ToolGate {
         throw new IllegalArgumentException("classKey 不得为空白（它是会话级 remember 的键）");
       }
       summary = summary == null ? "" : summary;
+      kind = kind == null ? AskKind.SENSITIVE : kind;
+    }
+
+    /** 2 参兼容构造：理由缺省 = {@link AskKind#SENSITIVE}（见该枚举的"缺省取 SENSITIVE"）。 */
+    public Ask(String classKey, String summary) {
+      this(classKey, summary, AskKind.SENSITIVE);
     }
   }
 

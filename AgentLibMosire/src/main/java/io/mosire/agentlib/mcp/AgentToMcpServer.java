@@ -332,12 +332,15 @@ public final class AgentToMcpServer implements AutoCloseable {
       return error("工具不存在: " + request.name());
     }
     // 参数与上下文拼装：MCP 客户端可传任意参数，ToolContext.arguments 为调用白名单来源（M3 细化）
+    // 身份逐字来自链接上的 caller 模板（S6）：**MCP 客户端给不出也改不了**——它只能决定 arguments，
+    // 而"这是哪个 Agent、按哪一档办"由建链方绑定（子 Agent 链接 = 子实例身份 + 子档位；外部面 = external-mcp）。
     ToolContext context =
         new ToolContext(
             caller.caller(),
             caller.permissions(),
             caller.config(),
-            request.arguments() == null ? Map.of() : request.arguments());
+            request.arguments() == null ? Map.of() : request.arguments(),
+            caller.identity());
     return toCallToolResult(authorizer.execute(registry, request.name(), context));
   }
 
