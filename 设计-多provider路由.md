@@ -137,3 +137,30 @@ LlmRouteLoader.routeName(ConfigStore store, String ownerId)   // ① agents/<own
 3. **agent 自选路由的权限边界**（§2.2 提醒）——真接上配置写工具前必须裁决。
 4. `ModelCapabilities` / 上下文预算按路由区分（1M 上下文 vs 128k）——本设计只做**选路**，不做按路由调参。
 5. 密钥轮换/多密钥池——`ConfigApiKeySource` 每次现读已支持"换值即生效"，但**不**支持一条路由多个 key。
+6. **路由名不进事件库**：`llm.call` 的 payload 仍只有服务端自报的 `model`。两条路由共用同一个模型名时，事件库分不出走的
+   哪条（运维排查要靠 `config.json` 反推）。闭合要给 `LlmClient` 加"路由名"面并按线落到事件——**不在本轮**
+   （避免在 D 块验收前动 `AgentPipeline` 的事件形状）。当前只有错误消息带名字（`E_LLM_ROUTE_UNKNOWN`）。
+7. **`scripts/smoke-live.sh` 的选路是 Java 侧的镜像**：脚本用 python 复刻了 `LlmRouteLoader` 的解析规则（`llm.route` →
+   `llm.routes.<name>` → 扁平兼容层），因为脚本要**先**知道扫哪条路由的密钥值。改 Java 规则必须同批改脚本，否则
+   "预检通过的配置"与"实跑用的路由"分叉（本轮修的就是这个：修前多路由配置在预检处直接 die，扫错密钥还能打 PASS）。
+   根治办法是给 `Main` 加配置自检子命令，属新增 CLI 面，不在本轮。
+
+---
+
+## 五、评审与修复轮（2026-09-14，对 `547e2ce`）
+
+独立评审未能证伪产品代码（D24 七个出口逐条走查 + 进程级实测均无静默回落），但抓到**三条必改**，全部有可构造证据：
+
+| # | 缺陷 | 证据（修前） | 修法 | 复验 |
+|---|---|---|---|---|
+| 1 | 路由名合法性校验的用例**零判别力** | 删掉 `SAFE_NAME` 校验后 17/17 仍全绿（样本名在表里都不存在，两种实现都落"未知名 ⇒ UNKNOWN"） | 新增"表里**真有一个**字面含点/空白的键"的用例 | 变异后新用例**红**、旧的仍绿 |
+| 2a | `Main.realLlm` 的选路接线**无自动化判据** | 忽略选名后 20/20 全绿 | `MainRealLlmTest` 加两条（正/反向），夹具让"扁平那条缺密钥、被点名那条可用"两个后果**互斥** | 变异后 2 条**红** |
+| 2b | `SubagentProcessMain` 的**模板作用域**无判据 | 把 `templateId` 换成 `"main"` 后 20/20 全绿 | `SubagentRealModelTest` 加"请求体里的模型名必须是被点名那条的" | 变异后 1 条**红** |
+| 3 | `smoke-live.sh` 的预检与密钥提取指向扁平那条 | 多路由配置在预检处直接 die（提交者自己的 `.work/multi-route/config.json` 无法被该脚本复跑）；两条都在场时**扫错密钥仍打 PASS** | 预检与取密钥合并为**一次解析**，规则与 `LlmRouteLoader` 逐条对齐 | 三向复跑：多路由取到该条、老扁平配置不变、坏名字响亮 |
+
+**顺手改**（评审建议，均已落地）：`routeName(store, null)` 现在 `requireNonNull`（原先会去读 `agents/null.json`）；
+`normalizeName` 的文案与正则对齐（原说"不以连字符开头"，实测也拒首下划线）；`DEFAULT_ROUTE_NAME` 的 javadoc
+删掉"事件里作为路由标识用"这句**不成立**的断言，改为如实登记（见 §四.6）。
+
+**未验**（如实登记）：本轮修复没跑真模型、没跑 `smoke-live.sh` 全脚本、没跑全量门禁 / SpotBugs——真模型验收归 D 块与
+smoke-live 复跑。

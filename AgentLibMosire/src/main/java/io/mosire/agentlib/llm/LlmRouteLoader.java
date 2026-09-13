@@ -54,8 +54,11 @@ public final class LlmRouteLoader {
   /**
    * 默认路由名：扁平形态 {@code llm.*} 就是它（老配置一字不改照跑），也是 {@code llm.route} 缺席时的取值。
    *
-   * <p>取固定 {@code "default"} 而非从 {@code model}/URL 派生：①它必须在配置改写之间保持稳定（日志/事件里作为路由标识用）；②
-   * 派生值会把"模型名"与"路由名"混为一谈；③"default" 是"唯一隐含条目"的惯例叫法。
+   * <p>取固定 {@code "default"} 而非从 {@code model}/URL 派生：①它必须在配置改写之间保持稳定（作为路由标识：错误消息按名报， {@link
+   * ModelRoute#name()} 供调用方落日志）；②派生值会把"模型名"与"路由名"混为一谈；③"default" 是"唯一隐含条目"的惯例叫法。
+   *
+   * <p><b>如实登记</b>：本轮<b>不</b>把路由名写进事件库（{@code llm.call} 的 payload 仍只有服务端自报的 {@code
+   * model}）——两条路由共用同一个模型名时，事件库分不出走的是哪条。设计文档 §四的开口项，不是"已支持"。
    */
   private static final String DEFAULT_ROUTE_NAME = "default";
 
@@ -133,6 +136,8 @@ public final class LlmRouteLoader {
    */
   public static String routeName(ConfigStore store, String ownerId) {
     Objects.requireNonNull(store, "store");
+    // ownerId 为 null 会读 agents/null.json（"以为没配覆盖、其实查了另一个文件"）——这里是调用方编程错误，不是配置错误
+    Objects.requireNonNull(ownerId, "ownerId");
     // 寻址 = agents.<id>.llm.route：agent 分支拿的是 key（"llm.route"）去 agents/<id>.json 里下钻
     // （FileConfigStore 的 agent 分支用 key、全局分支用 fullKey）——所以前缀是 "agents.<id>"、键带 "llm."；
     // 写成 (prefix="agents.bob", key="route") 会去读 bob.json 的顶层 "route"，键不同且不报错
@@ -236,7 +241,7 @@ public final class LlmRouteLoader {
     String name = routeName.strip();
     if (!SAFE_NAME.matcher(name).matches()) {
       throw new ConfigException(
-          E_LLM_ROUTE_UNKNOWN, "LLM 路由名非法：只能由字母/数字/下划线/连字符组成，且不以连字符开头（它是配置树里的寻址段）");
+          E_LLM_ROUTE_UNKNOWN, "LLM 路由名非法：只能以字母/数字开头，其后可含字母/数字/下划线/连字符（它是配置树里的寻址段）");
     }
     return name;
   }

@@ -94,33 +94,51 @@ command -v python3 >/dev/null 2>&1 || { echo "缺 python3（解析 JSON 响应�
   exit 1
 }
 
-# 配置形状预检（只检查存在性，**不打印任何值**）
-python3 - "$CONFIG" <<'PY' || die "配置形状非法：$CONFIG"
+# 配置形状预检 + 取密钥值（**一次解析、两用**）：失败文案走 stderr（非零退出 ⇒ die），成功时密钥值走 stdout
+# 被命令替换捕获进 SECRET——只进变量，绝不 echo、不进 argv。预检失败与"要用哪条密钥"必须来自**同一次**解析，
+# 否则会出现"检 A 条、扫 B 条密钥"的假绿（多路由配置下真的发生过）。
+#
+# 选路规则与 Java 侧 LlmRouteLoader **逐条对齐**（这是镜像，不是第二份真源）：
+#   llm.routes.<llm.route> →（route=default 时）扁平 llm.* → 否则响亮，绝不回落到别的路由（D24）。
+# Java 侧改规则时本块必须同批改——解析分叉会让"预检通过的配置"和"实跑用的路由"不是同一条。
+SECRET="$(python3 - "$CONFIG" <<'PY'
 import json, sys
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
 try:
     cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception as e:
-    print("配置不是合法 JSON: %s" % type(e).__name__, file=sys.stderr); sys.exit(1)
+    fail("配置不是合法 JSON: %s" % type(e).__name__)
+
 llm = cfg.get("llm") or {}
 keys = cfg.get("keys") or {}
-ref = llm.get("credentialsRef") or ""
-missing = [k for k in ("baseUrl", "model") if not llm.get(k)]
-if missing:
-    print("llm 缺字段: %s" % ",".join(missing), file=sys.stderr); sys.exit(1)
-if not ref.startswith("keys."):
-    print("credentialsRef 必须形如 keys.<name>（D20），实际不满足：%s" % repr(ref), file=sys.stderr); sys.exit(1)
-if not keys.get(ref[len("keys."):]):
-    print("credentialsRef 指向的 keys.%s 为空/缺失" % ref[len("keys."):], file=sys.stderr); sys.exit(1)
-PY
+name = (llm.get("route") or "default").strip() or "default"
+routes = llm.get("routes")
+route = None
+if isinstance(routes, dict) and isinstance(routes.get(name), dict):
+    route = routes[name]
+elif name == "default" and llm.get("baseUrl") and llm.get("model"):
+    route = llm          # 扁平形态 = 名为 default 的路由（LlmRouteLoader 的兼容层）
+if route is None:
+    available = sorted(routes) if isinstance(routes, dict) else []
+    fail("llm.route 点名了不可用的路由 %r（可用：%s；也没有可用的扁平 llm.baseUrl/model）"
+         % (name, ", ".join(available) or "无"))
 
-# 密钥值（只进变量，绝不 echo / 不进任何参数）
-SECRET="$(python3 - "$CONFIG" <<'PY'
-import json, sys
-cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-ref = (cfg.get("llm") or {}).get("credentialsRef") or ""
-print((cfg.get("keys") or {}).get(ref[len("keys."):], "") or "")
+missing = [k for k in ("baseUrl", "model") if not route.get(k)]
+if missing:
+    fail("llm 路由 %r 缺字段: %s" % (name, ",".join(missing)))
+ref = route.get("credentialsRef") or ""
+if not ref.startswith("keys."):
+    fail("credentialsRef 必须形如 keys.<name>（D20），实际不满足：%s" % repr(ref))
+secret = keys.get(ref[len("keys."):])
+if not isinstance(secret, str) or not secret:
+    fail("credentialsRef 指向的 keys.%s 为空/缺失/非文本" % ref[len("keys."):])
+print(secret)
 PY
-)"
+)" || die "配置形状非法：$CONFIG"
 
 say "== P3-4 smoke-live（联网真模型）: data=$DATA_DIR jar=$(basename "$JAR") config=$(basename "$CONFIG")"
 rm -rf "$DATA_DIR"

@@ -217,7 +217,12 @@ class LlmRouteLoaderTest {
         .contains("default");
   }
 
-  /** 名字是往配置树里<b>寻址的段</b>：带点/空白/怪字符的名字不许被当成路径（{@code a.b} 会指到别的节点上）。 */
+  /**
+   * 名字是往配置树里<b>寻址的段</b>：带点/空白/怪字符的名字不许被当成路径（{@code a.b} 会指到别的节点上）。
+   *
+   * <p><b>判别力的边界（如实登记）</b>：本用例的样本名在夹具表里<b>都不存在</b>，所以"拦名字"与"把名字当路径去查" 两种实现都落到"未知名 ⇒
+   * UNKNOWN"——它钉的是<b>码</b>与"不静默回落"，不钉名字校验本身。 名字校验的判别性归下一条用例（表里真放字面键）。
+   */
   @Test
   void illegalRouteNamesAreRejectedNotTreatedAsPaths() throws IOException {
     writeConfig(MULTI_ROUTE_CONFIG);
@@ -227,6 +232,35 @@ class LlmRouteLoaderTest {
           catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), bad));
       assertThat(failure).as("name=%s", bad).isNotNull();
       assertThat(failure.code()).as("name=%s", bad).isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN);
+    }
+  }
+
+  /**
+   * 判别性：表里<b>真有一个</b>字面含点/空白的键时，同名请求仍必须 UNKNOWN。
+   *
+   * <p>为什么必须有这一条：上一条用例的名字全部落空，删掉 {@code SAFE_NAME} 校验后它<b>仍然全绿</b>（判据零判别力，已实测）。
+   * 这里让字面键<b>命中</b>，两种走样实现各有一个可观测后果：①按字面命中 ⇒ 直接返回一条"名叫 {@code a.b} 的路由" （不抛）；②把名字当路径段下钻 ⇒ 报 {@code
+   * E_LLM_CONFIG_MISSING} 并点名 {@code llm.routes.a.b.baseUrl}
+   * 这种<b>误导性键名</b>（用户照着改怎么也改不好）。正确实现两条都拦在名字校验里。
+   */
+  @Test
+  void illegalNamesAreStillUnknownEvenWhenSuchALiteralKeyExists() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"a.b\":{\"baseUrl\":\"https://dotted.example.test/v1\","
+            + "\"model\":\"dotted-model\"},\"a b\":{\"baseUrl\":\"https://spaced.example.test/v1\","
+            + "\"model\":\"spaced-model\"}}}}");
+
+    for (String bad : List.of("a.b", "a b")) {
+      ConfigException failure =
+          catchThrowableOfType(ConfigException.class, () -> LlmRouteLoader.load(store(), bad));
+      assertThat(failure).as("name=%s：字面键在场也不许被当成一条可用路由", bad).isNotNull();
+      assertThat(failure.code())
+          .as("name=%s：拼错/非法名字 ⇒ 路由不存在，不是配置缺失", bad)
+          .isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN)
+          .isNotEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+      assertThat(failure.getMessage())
+          .as("name=%s：不许把点/空白当路径段下钻——也就不得报出这样的键名", bad)
+          .doesNotContain("llm.routes." + bad + ".");
     }
   }
 

@@ -174,6 +174,35 @@ class SubagentRealModelTest {
         .anySatisfy(payload -> assertThat(payload).contains("TIME_BUDGET"));
   }
 
+  // ---------- 多 provider 路由接线（2026-09-14） ----------
+
+  /**
+   * 多 provider 接线：子体的路由选择必须是 {@code agents.<templateId>.llm.route}。
+   *
+   * <p><b>为什么补这条</b>：把 ownerId 换成 {@code "main"}（= 忽略模板作用域）后，本文件与主 Agent 那批用例 20/20 全绿 （评审 M6
+   * 实测）——这条接线此前零自动化判据。
+   *
+   * <p>夹具把两条路由的<b>可观测后果</b>拉开：扁平那条的密钥引用<b>缺失</b>、模板作用域那条在场。忽略模板作用域的实现会落到 扁平路由上，在取密钥阶段就失败（{@code
+   * E_KEY_MISSING} + 非零退出 + 假端点零请求）；正确接线则跑完一回合，且假端点收到的请求体里是 <b>被点名那条</b>的模型名——两个后果互斥，不是"看起来对"。
+   */
+  @Test
+  void templateScopedRouteSelectsTheModelTheChildActuallyCalls() throws Exception {
+    Path templates = writeTemplate("route-scoped", 5, 5, 60, 0);
+    Path configRoot = multiRouteConfigRoot("route-scoped", "deep", "route-scoped-model");
+    Path dataDir = tempDir.resolve("child-route-scope");
+
+    ChildRun run = run("route-scoped", "route-scoped", templates, dataDir, configRoot);
+
+    assertThat(run.finished()).as("模板作用域那条可用 ⇒ 必须跑完，不得挂起").isTrue();
+    assertThat(run.exitCode()).as("落到扁平路由的实现会在取密钥期失败（那条的引用有意缺失）").isZero();
+    assertThat(run.stderr()).doesNotContain(ConfigApiKeySource.E_KEY_MISSING);
+    assertThat(stub.requestBodies())
+        .as("请求体里的模型名必须是被点名那条路由的（模板作用域覆盖的判据）")
+        .isNotEmpty()
+        .allSatisfy(body -> assertThat(body).contains("\"model\":\"route-scoped-model\""))
+        .allSatisfy(body -> assertThat(body).doesNotContain("\"model\":\"" + CONFIG_MODEL + "\""));
+  }
+
   // ---------- 工具 ----------
 
   /**
@@ -283,6 +312,37 @@ class SubagentRealModelTest {
             + "\",\"credentialsRef\":\""
             + refName
             + "\"}}",
+        StandardCharsets.UTF_8);
+    return root;
+  }
+
+  /**
+   * 多 provider 配置根：扁平路由 = 假端点 + {@link #CONFIG_MODEL} + <b>缺失</b>引用（"落到扁平路由上就起不来"，可判别）； 模板作用域那条 =
+   * 假端点 + 调用方给的模型名 + 在场引用；另写 {@code agents/<templateId>.json} 放选名覆盖。
+   */
+  private Path multiRouteConfigRoot(String templateId, String scopedRoute, String scopedModel)
+      throws Exception {
+    Path root = tempDir.resolve("config-root-multi");
+    Files.createDirectories(root.resolve("agents"));
+    Files.writeString(
+        root.resolve("agents").resolve(templateId + ".json"),
+        "{\"llm\":{\"route\":" + JSON.writeValueAsString(scopedRoute) + "}}",
+        StandardCharsets.UTF_8);
+    Files.writeString(
+        root.resolve("config.json"),
+        "{\"keys\":{\"local\":"
+            + JSON.writeValueAsString(SENTINEL_KEY)
+            + "},\"llm\":{\"baseUrl\":\""
+            + stub.baseUrl()
+            + "\",\"model\":\""
+            + CONFIG_MODEL
+            + "\",\"credentialsRef\":\"keys.missing\",\"routes\":{"
+            + JSON.writeValueAsString(scopedRoute)
+            + ":{\"baseUrl\":\""
+            + stub.baseUrl()
+            + "\",\"model\":\""
+            + scopedModel
+            + "\",\"credentialsRef\":\"keys.local\"}}}}",
         StandardCharsets.UTF_8);
     return root;
   }

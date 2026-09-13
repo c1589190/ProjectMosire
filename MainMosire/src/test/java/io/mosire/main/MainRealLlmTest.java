@@ -229,6 +229,67 @@ class MainRealLlmTest {
         .noneMatch(message -> message.contains(CREDENTIAL));
   }
 
+  // ---------- F3 多 provider 路由接线（2026-09-14） ----------
+
+  /**
+   * F3（选路接线）：{@code Main.realLlm} 必须走 {@code llm.route} 点名的那条路由。
+   *
+   * <p><b>为什么补这条</b>：这条接线此前<b>零自动化判据</b>——把选名整个忽略掉（退回 {@code load(store)} 单参形态）后， 本文件与子体那批用例 20/20
+   * 全绿（评审 M5 实测）。
+   *
+   * <p>夹具把两条路由的<b>可观测后果</b>拉开（不是"断言看起来对"）：扁平那条的密钥引用 {@code keys.flat} <b>缺失</b>，被点名那条的 {@code
+   * keys.second} <b>在场</b>。于是两种实现互斥——忽略选名的实现落到扁平路由上，{@code chat} 在<b>取密钥阶段</b>就失败（{@code
+   * E_KEY_MISSING}）；正确接线则在<b>连接阶段</b>失败（127.0.0.1:2 拒绝，无 {@code E_KEY_MISSING}）。
+   */
+  @Test
+  void realLlmFollowsTheSelectedRouteNotTheFlatForm() throws IOException {
+    writeConfig(
+        "{\"keys\":{\"second\":\""
+            + CREDENTIAL
+            + "\"},\"llm\":{\"baseUrl\":\"http://127.0.0.1:1/v1\",\"model\":\"flat-model\","
+            + "\"credentialsRef\":\"keys.flat\",\"route\":\"second\",\"routes\":{\"second\":"
+            + "{\"baseUrl\":\"http://127.0.0.1:2/v1\",\"model\":\"second-model\","
+            + "\"credentialsRef\":\"keys.second\"}}}}");
+
+    LlmClient client = Main.realLlm(tempDir);
+    assertThat(((OpenAICompatibleLlmClient) client).route().name()).isEqualTo("second");
+    assertThat(((OpenAICompatibleLlmClient) client).route().model()).isEqualTo("second-model");
+
+    LlmException failure = chatFailure(client);
+    assertThat(failure.getMessage())
+        .as("正向：被点名那条的密钥在场 ⇒ 必须走到连接阶段（落到扁平路由的实现止步于取密钥）")
+        .startsWith("LLM 调用失败（")
+        .contains("ConnectException");
+    assertThat(allMessages(failure))
+        .as("不得报出扁平路由那条缺失的引用")
+        .noneMatch(message -> message.contains("E_KEY_MISSING"))
+        .noneMatch(message -> message.contains("keys.flat"));
+  }
+
+  /**
+   * F3 反向：{@code llm.route} 点名了一条<b>不存在</b>的路由 ⇒ 装配期响亮，且<b>绝不</b>改用扁平那条（它明明可用）。
+   *
+   * <p>这正是"未知名静默回落"最容易被放过的形态：配置里有一条完好可用的扁平路由，拼错的路由名若被忽略，进程会照常起来。
+   */
+  @Test
+  void realLlmRefusesToFallBackToFlatFormWhenTheNamedRouteIsUnknown() throws IOException {
+    writeConfig(
+        "{\"keys\":{\"deepseek\":\""
+            + CREDENTIAL
+            + "\"},\"llm\":{\"baseUrl\":\""
+            + UNREACHABLE_BASE_URL
+            + "\",\"model\":\"flat-model\",\"credentialsRef\":\"keys.deepseek\",\"route\":\"glmm\","
+            + "\"routes\":{\"glm\":{\"baseUrl\":\"https://glm.example.test/v1\",\"model\":"
+            + "\"glm-5.3-flash\",\"credentialsRef\":\"keys.deepseek\"}}}}");
+
+    ConfigException failure =
+        catchThrowableOfType(ConfigException.class, () -> Main.realLlm(tempDir));
+
+    assertThat(failure).isNotNull();
+    assertThat(failure.code()).isEqualTo(LlmRouteLoader.E_LLM_ROUTE_UNKNOWN);
+    assertThat(failure.getMessage()).contains("glmm").contains("glm");
+  }
+
   // ---------- 工具 ----------
 
   private void writeConfig(String json) throws IOException {
