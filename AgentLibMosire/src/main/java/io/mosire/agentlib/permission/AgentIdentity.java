@@ -22,8 +22,11 @@ import java.util.Objects;
  * @param mode 命令档位（见 {@link CommandMode}）
  * @param goal 该 Agent 的派生目标（子 Agent = 父给它的任务；主 Agent/外部面 = 空串）。上级判定要用它回答"这条命令与它的任务相符吗"，
  *     <b>只进内存态提示面与判定提示</b>，不进事件库
+ * @param depth <b>派生深度</b>（主 Agent/外部面 = 0，子 Agent = 父 + 1）。S5-A 起随身份走：<b>逐跳守卫必须锚到</b> {@code
+ *     调用者}的深度——{@code SubagentManager} 里那个"父深度"是构造期常量，两跳以上就是拿孙代去和主 Agent 比（S4 登记的
+ *     "构造期常量缺陷"）。这里带的是"谁在要"的那一层，不是"我这个 manager 属于谁"
  */
-public record AgentIdentity(String instanceId, CommandMode mode, String goal) {
+public record AgentIdentity(String instanceId, CommandMode mode, String goal, int depth) {
 
   /**
    * 主 Agent 的实例 id（{@code App} 装配处显式绑定；与 {@code ToolContext} 的 {@code CONFIG_SELF_AGENT_ID} 同值）。
@@ -34,7 +37,7 @@ public record AgentIdentity(String instanceId, CommandMode mode, String goal) {
   public static final String EXTERNAL_ID = "external-mcp";
 
   /** 未知身份：{@code FULL} + 中立 id（见类 javadoc 的"缺省值选 UNKNOWN"）。 */
-  public static final AgentIdentity UNKNOWN = new AgentIdentity("unknown", CommandMode.FULL, "");
+  public static final AgentIdentity UNKNOWN = new AgentIdentity("unknown", CommandMode.FULL, "", 0);
 
   public AgentIdentity {
     Objects.requireNonNull(instanceId, "instanceId");
@@ -44,16 +47,31 @@ public record AgentIdentity(String instanceId, CommandMode mode, String goal) {
       // 空白 id 会让"按实例归类"退化成事实上的同一桶，构造期拒比事后追责便宜
       throw new IllegalArgumentException("instanceId 不得为空白");
     }
+    if (depth < 0) {
+      // 负深度会让"父 + 1"算出比父还浅的层级 ⇒ 深度上限形同虚设（构造期拒，别等到逐跳判定才发现）
+      throw new IllegalArgumentException("depth 不能为负: " + depth);
+    }
   }
 
-  /** 主 Agent 身份（{@code main} + 给定档位）。 */
+  /** 3 参兼容构造（S5-A 之前）：深度取 0（= 主 Agent 所在层；既有调用点的语义逐字不变）。 */
+  public AgentIdentity(String instanceId, CommandMode mode, String goal) {
+    this(instanceId, mode, goal, 0);
+  }
+
+  /** 主 Agent 身份（{@code main} + 给定档位；深度 0）。 */
   public static AgentIdentity main(CommandMode mode) {
-    return new AgentIdentity(MAIN_ID, mode, "");
+    return new AgentIdentity(MAIN_ID, mode, "", 0);
   }
 
-  /** 子 Agent 身份（实例 id + 档位 + 目标）。 */
+  /** 子 Agent 身份（实例 id + 档位 + 目标）。深度取 0——<b>只有测试与不关心层级的装配</b>才该用；真实派生用 4 参那个。 */
   public static AgentIdentity subagent(String instanceId, CommandMode mode, String goal) {
-    return new AgentIdentity(instanceId, mode, goal);
+    return new AgentIdentity(instanceId, mode, goal, 0);
+  }
+
+  /** 子 Agent 身份（实例 id + 档位 + 目标 + <b>派生深度</b>）——父侧建链时绑的就是这个。 */
+  public static AgentIdentity subagent(
+      String instanceId, CommandMode mode, String goal, int depth) {
+    return new AgentIdentity(instanceId, mode, goal, depth);
   }
 
   /**
@@ -64,12 +82,17 @@ public record AgentIdentity(String instanceId, CommandMode mode, String goal) {
    * SuperiorJudgeGate}）。
    */
   public static AgentIdentity external() {
-    return new AgentIdentity(EXTERNAL_ID, CommandMode.FULL, "");
+    return new AgentIdentity(EXTERNAL_ID, CommandMode.FULL, "", 0);
   }
 
   /** 同档位换 id（测试/装配便利）。 */
   public AgentIdentity withMode(CommandMode newMode) {
-    return new AgentIdentity(instanceId, newMode, goal);
+    return new AgentIdentity(instanceId, newMode, goal, depth);
+  }
+
+  /** 换深度（保持 id/档位/目标逐字不变）：给"带父深度构造的 manager"造缺省身份时用。 */
+  public AgentIdentity withDepth(int newDepth) {
+    return new AgentIdentity(instanceId, mode, goal, newDepth);
   }
 
   /**

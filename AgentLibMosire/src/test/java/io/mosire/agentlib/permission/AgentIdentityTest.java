@@ -65,4 +65,47 @@ class AgentIdentityTest {
   void nullGoalBecomesEmpty() {
     assertThat(AgentIdentity.subagent("bash-probe-1", CommandMode.LIMITED, null).goal()).isEmpty();
   }
+
+  /** 深度是 S5-A 加的第二维身份要素：三参工厂/构造是兼容形态，深度取 0（= "发起者那一层"）。 */
+  @Test
+  void depthIsCarriedAndDefaultsToZeroForLegacyFactories() {
+    assertThat(AgentIdentity.subagent("a-1", CommandMode.LIMITED, "目标").depth()).isZero();
+    assertThat(new AgentIdentity("a-1", CommandMode.LIMITED, "目标").depth()).isZero();
+    assertThat(AgentIdentity.main(CommandMode.FULL).depth()).isZero();
+    assertThat(AgentIdentity.UNKNOWN.depth()).isZero();
+    assertThat(AgentIdentity.external().depth()).isZero();
+
+    assertThat(AgentIdentity.subagent("a-2", CommandMode.LIMITED, "目标", 3).depth()).isEqualTo(3);
+  }
+
+  /**
+   * {@code withMode}/{@code withDepth} 是<b>单维替换</b>：只换那一维，其余逐字保留。
+   *
+   * <p>判别性：把 {@code withDepth} 实现成"重建身份时丢掉 mode/goal"（或反过来让 {@code withMode} 把深度清零），本组断言转红——
+   * 而链上任何一次换档都会顺手把深度抹平，深度闸随之失效。
+   */
+  @Test
+  void singleDimensionReplacementKeepsEveryOtherComponent() {
+    AgentIdentity identity = AgentIdentity.subagent("a-3", CommandMode.LIMITED, "目标", 2);
+
+    AgentIdentity remoded = identity.withMode(CommandMode.FULL);
+    assertThat(remoded.instanceId()).isEqualTo("a-3");
+    assertThat(remoded.goal()).isEqualTo("目标");
+    assertThat(remoded.depth()).isEqualTo(2);
+
+    AgentIdentity redeped = identity.withDepth(5);
+    assertThat(redeped.instanceId()).isEqualTo("a-3");
+    assertThat(redeped.mode()).isEqualTo(CommandMode.LIMITED);
+    assertThat(redeped.goal()).isEqualTo("目标");
+  }
+
+  /** 负深度在构造期响亮拒绝：深度参与"调用者深度 + 1"的链长计算，负数会让闸门反向。 */
+  @Test
+  void negativeDepthIsRejectedAtConstruction() {
+    assertThat(
+            catchThrowableOfType(
+                IllegalArgumentException.class,
+                () -> AgentIdentity.subagent("a-4", CommandMode.LIMITED, "目标", -1)))
+        .isNotNull();
+  }
 }
