@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -39,12 +40,18 @@ import org.slf4j.LoggerFactory;
  * agent.lifecycle} 事件（correlationId = 子 Agent 实例 id）；非法推进直接抛 {@link
  * IllegalStateException}（"非法推进直接抛错而非静默漂移"——SubagentStatus 设计约定）。崩溃恢复 （M3）= 事件重放，本期只落事件、不写恢复逻辑。
  *
- * <p><strong>spawn 检查顺序</strong>（中期计划 W3）：模板存在 → <b>工作目录越界</b>（S5-B，请求面要了调用者够不着的地方 ⇒ {@link
+ * <p><strong>spawn 检查顺序</strong>（中期计划 W3 + D27 的 I1 与血缘）：模板存在 → <b>{@code A1}
+ * 工具越界</b>（D27：请求面点名了调用者没有的工具 ⇒ {@link SubagentRejectedException} + {@code permission.denied} 事件，见
+ * {@link #checkRequestedToolsWithinCaller}）→ <b>工作目录越界</b>（S5-B，请求面要了调用者够不着的地方 ⇒ {@link
  * WorkingDirDeniedException} + {@code permission.denied} 事件）→ 权限单调性 （{@link
  * PermissionChecker#isSubset}，拒绝即 {@link SubagentRejectedException} + {@code permission.denied}
  * 事件）→ 档位单调性（S6，{@code decision} 无事件、拒绝走 {@code permission.denied}）→ 深度（{@code 调用者depth+1 > 子深度上限}
  * 拒绝，{@code decision:DEPTH_LIMIT} 事件）→〔锁内〕繁殖预算（{@code decision:BUDGET_EXHAUSTED} 事件）→ launcher
  * 启动。cap 派生： {@code min(模板, 请求收紧, 父级)}——子级只能更小（D10 硬顶的"单调性第四维度"）。
+ *
+ * <p><strong>血缘（D27）</strong>：每个实例在派发那一刻被写上 {@code lineagePath}（{@code main/a1/a1-1}，见 {@link
+ * #lineagePathOf}），判定读它（{@link ContextAccessJudge}）。它是<b>事实记录</b>而不是守卫输入—— 父解析不出时记空串、照常派发，由判定面对空串
+ * fail-closed。
  *
  * <p><strong>S5-A 起三个守卫的对照物是"调用者"</strong>（{@link #spawn(SubagentLaunchRequest, AgentIdentity,
  * AgentPermissionSet)}）：权限对调用者权限集、深度对调用者深度 + 1、档位对调用者档位。manager 的构造期 {@code
@@ -179,13 +186,20 @@ public final class SubagentManager implements AutoCloseable {
   /**
    * 拉起一个子 Agent（同步到 RUNNING；执行体真正的运行时长由 launcher/退出观测接续推进）。
    *
-   * <p>检查顺序（中期计划 W3）：模板存在 → 权限单调性 → 深度限制 → cap 派生 → 状态机 CONFIGURED→SPAWNING→RUNNING。启动失败（{@link
-   * SubagentLaunchException}）把状态推进到 FAILED 并 原样传播（WIP 异常 Javadoc）。
+   * <p>检查顺序（中期计划 W3 + D27 的 I1）：模板存在 → {@code A1} 工具越界（请求面点名调用者没有的工具 ⇒ 派发即拒） → 权限单调性 → 深度限制 → cap
+   * 派生 → 状态机 CONFIGURED→SPAWNING→RUNNING。启动失败（{@link SubagentLaunchException}）把状态推进到 FAILED 并
+   * 原样传播（WIP 异常 Javadoc）。
    *
    * <p><b>S5-A 起"谁在要"进入判定</b>：本 3 参形态 = "主 Agent 在要"（口径逐字等于本段之前的行为——身份取 {@code
    * parentConfig.id()}、权限对照取构造期的 {@code parentPermissions}、深度取构造期的 {@code parentDepth}）。 经 MCP
    * 链接进来的下级调用走 {@link #spawn(SubagentLaunchRequest, AgentIdentity, AgentPermissionSet)}：那一支的对照物是
    * <b>调用者自己</b>，而不是这个 manager 属于谁。
+   *
+   * <p><b>可达性前提（防呆）</b>：本重载给自己造的身份是 {@code parentConfig.id()}——只有它等于 {@link AgentIdentity#MAIN_ID}
+   * 时，派出的子体才有可解析的父 path（{@code lineagePath = "main/<id>"}）。装配层若把别的 id 塞进 {@code parentConfig}（既不是
+   * {@code main}，也不在本 manager 的实例表里），子体照常派发但 {@code lineagePath} 记空串 ⇒ 任何工具面都够不着它 （判定④/⑤
+   * fail-closed，见 {@link #lineagePathOf}），只剩 {@link #kill(String)}/{@link #close()} 的关停面能收。生产此重载零调用
+   * （主 Agent 经编排工具走 3 参那一支），保留它只为兼容既有夹具与"manager 自己就是主 Agent"的老装配。
    *
    * @return RUNNING 时的实例快照（此后记录以 manager 内 map 为准）
    * @throws SubagentRejectedException 模板不存在 / 权限越权（+{@code permission.denied} 事件）/ 深度超限 （+{@code
@@ -216,8 +230,16 @@ public final class SubagentManager implements AutoCloseable {
    * {@link #effectiveScopes}）。请求要了调用者够不着的地方 ⇒ {@link WorkingDirDeniedException} （{@code
    * DIR_NOT_ALLOWED}），子体不落地。
    *
+   * <p><b>授权面（D27 的 {@code A1}）同样锚在 {@code callerPermissions} 上</b>：请求点了调用者没有的工具 ⇒ {@link
+   * #checkRequestedToolsWithinCaller} 派发即拒（{@code permission.denied} 事件点名越界工具）；给了白名单就与模板求交（只收窄，见
+   * {@link #tightenPermissions}）。
+   *
+   * <p><b>血缘在派发那一刻落账</b>：{@code lineagePath} 由本方法拼给实例（{@link #lineagePathOf}），子体改不了也给不出；
+   * 父身份解析不出时记空串、照常派发（判定面 fail-closed）。
+   *
    * @param caller 调用者身份（实例 id + 档位 + 深度；宿主绑定，模型给不出）
    * @param callerPermissions 调用者自己的权限集（单调性对照真值 + 资源可达面的来源）
+   * @throws SubagentRejectedException 模板不存在 / {@code A1} 点名了调用者没有的工具（D27 的 I1）/ 权限或档位越权 / 深度超限
    * @throws WorkingDirDeniedException 请求面的工作目录超出调用者可达面（{@code DIR_NOT_ALLOWED} 码，见该异常类注释）
    */
   public SubagentInstance spawn(
@@ -231,6 +253,8 @@ public final class SubagentManager implements AutoCloseable {
             .orElseThrow(
                 () -> new SubagentRejectedException("子 Agent 模板不存在: " + request.templateId()));
     String instanceId = instanceIdOf(template.id());
+    // D27：授权面点名 ⊆ 调用者能力集（I1）——<b>派发即拒</b>，与目录越界同形（同"请求面是要求"口径）
+    checkRequestedToolsWithinCaller(template, instanceId, request, callerPermissions, caller);
     AgentPermissionSet permissions =
         tightenPermissions(template, request, callerPermissions, instanceId, caller.instanceId());
     checkMonotonicity(template, instanceId, permissions, callerPermissions, caller.instanceId());
@@ -238,6 +262,7 @@ public final class SubagentManager implements AutoCloseable {
     int depth = caller.depth() + 1;
     checkDepth(template, instanceId, depth, caller.instanceId());
     AgentConfig childConfig = deriveConfig(template, request, instanceId, permissions);
+    String lineagePath = lineagePathOf(caller.instanceId(), instanceId);
 
     SubagentInstance configured =
         new SubagentInstance(
@@ -249,7 +274,8 @@ public final class SubagentManager implements AutoCloseable {
             mode,
             depth,
             SubagentStatus.CONFIGURED,
-            caller.instanceId());
+            caller.instanceId(),
+            lineagePath);
     SubagentInstance running;
     LaunchedSubagent handle = null;
     try {
@@ -391,8 +417,90 @@ public final class SubagentManager implements AutoCloseable {
   }
 
   /**
-   * 权限收紧：模板权限集 + 请求 extraDenied（只增不减，白名单永不放大——SubagentLaunchRequest 语义）+ <b>资源可达面物化</b> （S5-B：调用者 ∩
-   * 模板建议 ∩ 请求，逐命名空间落成子体的具体取值）。
+   * 血缘路径（D27）：主 Agent 的 path = {@code main}（= {@link AgentIdentity#MAIN_ID}）；子实例 = {@code 父path +
+   * "/" + 自己的 instanceId}（形态 {@code main/a1/a1-1}）。
+   *
+   * <p><b>谁写</b>：只有本方法（{@link #spawn} 内、实例 id 生成处），写进 {@link SubagentInstance#lineagePath()}
+   * 后不可变。子体 <b>不参与、也给不出</b>（I4 不可自报）——判定读的是 manager 里的这一份，不是子体自报的任何东西。事件面不新增明文（path 只进实例记录）。
+   *
+   * <p><b>父解析不出 ⇒ 记空串，不拒派发</b>：把不确定挡在决策点（{@link ContextAccessJudge} 对空 path fail-closed），而不是挡在构造点——
+   * 否则 S5-A/S6 的三参兼容路径与既有夹具会被"身份不完整"整片拒掉。
+   *
+   * <p><b>空串 path 的实例在工具面上谁都动不了</b>（本段 2026-09-13 修正：此前写的"它照样能被父 kill"不成立）：目标 path 空 + 调用者可解析 ⇒
+   * 判定⑤拒；而空 path 只可能由解析不出的父派生（{@link #lineagePathOfCaller} 返回空串）⇒ 那个父自己的 callerPath 也空 ⇒
+   * 判定④<b>先</b>拒；连 {@code target=self} 都过不去（②按"调用者能解析出"才放行）。两条路都 fail-closed，不存在"谁经工具面还能碰它"。
+   *
+   * <p><b>补偿手段 = 关停面，不是工具面</b>：这类实例仍进得出 {@link #kill(String)} 与 {@link #close()}——两者都直呼 {@link
+   * #terminate(String)}（编排入口，不经 {@link ContextAccessJudge}、不看 path），所以"读写面够不着"不会变成实例/进程泄漏；要清掉它们走
+   * manager 入口，别试图从工具面绕。
+   */
+  private String lineagePathOf(String callerId, String childId) {
+    String parentPath = lineagePathOfCaller(callerId);
+    return parentPath.isEmpty() ? "" : parentPath + "/" + childId;
+  }
+
+  /**
+   * 调用者的血缘路径（{@code ""} = 解析不出：既不是 main，也不在本 manager 里）。<b>委托</b> {@link
+   * ContextAccessJudge#pathOf(String, SubagentManager)}——判定面（范围）与写入面（拼子体 path）必须只有一份身份解析，
+   * 两处各写一遍就会分叉 （同族缺陷温床）。
+   */
+  private String lineagePathOfCaller(String callerId) {
+    return ContextAccessJudge.pathOf(callerId, this);
+  }
+
+  /**
+   * D27 / {@code A1} 的<b>硬上限检查</b>（I1）：请求面点名的工具必须 ⊆ {@link #tightenPermissions} 之前的<b>调用者能力集</b>。
+   *
+   * <p><b>为什么在派发那刻、而不是"运行期调用时才失败"</b>：点名越界是<b>结构性问题</b>（请求面写错了一个工具名/想给子体自己没有的权力），
+   * 派发即拒让调用者在启动前就知道"这次要的东西不成立"，而不是等子体跑起来、某个工具调用时才撞墙（那时责任面已模糊，模型只会看到"工具不可用"）。 与 {@code allowedDirs}
+   * 的"请求面是要求"完全同形：<b>不静默截断</b>。
+   *
+   * <p>对照物是 {@code callerPermissions}——{@code isToolAllowed} 的既有口径（含 {@code "*"} 通配：调用者白名单通配 ⇒
+   * 全放行）。 拒绝走既有 {@link SubagentRejectedException}（{@code PERMISSION_DENIED} 码）+ {@code
+   * permission.denied} 事件（<b>点名</b> 越界工具），并<b>不建实例、不建链、不花预算</b>。
+   *
+   * <p>只有请求面给了白名单才检查（{@code null} = 不指定 ⇒ 模板说了算，逐字回到本字段引入前的行为）。
+   */
+  private void checkRequestedToolsWithinCaller(
+      AgentTemplate template,
+      String instanceId,
+      SubagentLaunchRequest request,
+      AgentPermissionSet callerPermissions,
+      AgentIdentity caller) {
+    if (request.allowedTools() == null) {
+      return;
+    }
+    Set<String> beyond = new LinkedHashSet<>();
+    for (String tool : request.allowedTools()) {
+      if (!callerPermissions.isToolAllowed(tool)) {
+        beyond.add(tool);
+      }
+    }
+    if (beyond.isEmpty()) {
+      return;
+    }
+    String message = "子 Agent 授权超出调用者能力（I1 单调性）: 以下工具不在调用者白名单内: " + beyond;
+    emit(
+        EventTypes.PERMISSION_DENIED,
+        caller.instanceId(),
+        instanceId,
+        Map.of(
+            "template", template.id(),
+            "childId", instanceId,
+            "reason", message,
+            "requestedTools", request.allowedTools(),
+            "beyondCaller", List.copyOf(beyond)));
+    throw new SubagentRejectedException(message);
+  }
+
+  /**
+   * 权限收紧：模板权限集 + 请求 {@code allowedTools}（{@code A1}，白名单只做<b>求交</b>——永不放大）+ 请求 extraDenied
+   * （只增不减，白名单永不放大——SubagentLaunchRequest 语义）+ <b>资源可达面物化</b>（S5-B：调用者 ∩ 模板建议 ∩ 请求，逐命名空间落成子体的具体取值）。
+   *
+   * <p><b>{@code A1} 的三层语义</b>（见 {@link
+   * SubagentLaunchRequest#allowedTools()}）：模板白名单是<b>基线</b>（部署者写的）， 请求是<b>收窄要求</b>（超出模板 ⇒
+   * 静默求交），调用者能力集是<b>硬上限</b>（超出 ⇒ {@link #checkRequestedToolsWithinCaller}
+   * 派发即拒，不在这里）。求交结果为空是<b>合法</b>取值（显式"什么都不给"）， 不是错误；{@code null}（没提这一嘴）逐字退回模板白名单。
    *
    * <p><b>为什么继承要物化而不是"运行时往上问父级"</b>：{@link PermissionChecker#isSubset} 比的是两份<b>权限集数据</b>。
    * 如果子体这一维留空（"我照父级的办"）， covers 只能看到"子级没表态"，无从证明它不比父级宽——判定会静默放行一个运行期真正生效的面比父级宽的子体（锚错对象的同族缺陷， 见 S5-A
@@ -406,7 +514,7 @@ public final class SubagentManager implements AutoCloseable {
       String callerId) {
     ResourceScopeMap scopes =
         effectiveScopes(template, request, callerPermissions, instanceId, callerId);
-    AgentPermissionSet base = template.toPermissionSet();
+    AgentPermissionSet base = narrowedTemplatePermissions(template, request);
     if (request.extraDenied().isEmpty()) {
       return base.withResourceScopes(scopes);
     }
@@ -420,6 +528,51 @@ public final class SubagentManager implements AutoCloseable {
         base.sensitiveAllowed(),
         base.readOnly(),
         scopes);
+  }
+
+  /**
+   * 模板权限集 + {@code A1} 收窄后的白名单（{@code null} = 不指定 ⇒ 逐字退回模板那一份）。
+   *
+   * <p><b>{@code "*"} 是"不过滤"的过滤器元素，不是工具名</b>（{@link AgentPermissionSet#ALL_TOOLS}）——三种组合：
+   *
+   * <ul>
+   *   <li>{@code A1} 含 {@code "*"} ⇒ <b>不过滤</b>：结果逐字是<b>模板那一份</b>（模板也通配 ⇒ 仍 {@code
+   *       "*"}）。"全域"不是可点名的工具， 请求面只收窄、不放大；模板说了算的东西不因为一句"随便"多出来；
+   *   <li>模板通配 + {@code A1} 有限 ⇒ 结果 = {@code A1}（两侧都放行才留——"模板通配"不把请求没点的工具塞回来）；
+   *   <li>两侧都有限 ⇒ 求交（模板之外的点名静默掉，同 {@code allowedDirs} 的"模板是建议"口径）。
+   * </ul>
+   *
+   * <p><b>I1 对 {@code "*"} 的行为（有意如此，别放宽）</b>：{@code callerPermissions.isToolAllowed("*")}
+   * 只在<b>调用者自己的白名单本身通配</b>时为真 （{@link AgentPermissionSet#isToolAllowed(String)} 的既有口径，{@code "*"}
+   * 不做跨集合比较）⇒ 受限调用者点 {@code A1=["*"]} 会在 {@link #checkRequestedToolsWithinCaller}
+   * 被<b>派发即拒</b>（{@code beyondCaller=["*"]}）——"受限者不得借通配把自己放大成全域" 的直接结果，不是漏判。
+   */
+  private static AgentPermissionSet narrowedTemplatePermissions(
+      AgentTemplate template, SubagentLaunchRequest request) {
+    AgentPermissionSet base = template.toPermissionSet();
+    if (request.allowedTools() == null) {
+      return base;
+    }
+    // A1 通配 = 不过滤（见 javadoc）：逐字返回模板那一份，不是"求交得到空集"
+    if (request.allowedTools().contains(AgentPermissionSet.ALL_TOOLS)) {
+      return base;
+    }
+    Set<String> narrowed = new LinkedHashSet<>();
+    for (String tool : request.allowedTools()) {
+      if (template.allowedTools().contains(AgentPermissionSet.ALL_TOOLS)
+          || template.allowedTools().contains(tool)) {
+        narrowed.add(tool);
+      }
+    }
+    // 空集合法（= 子体一个工具都没有）；A1 有限而模板通配 ⇒ narrowed = A1 本身（上面那条分支只挡"含 *"）
+    return new AgentPermissionSet(
+        base.grantedToken(),
+        narrowed,
+        base.deniedTools(),
+        base.destructiveAllowed(),
+        base.sensitiveAllowed(),
+        base.readOnly(),
+        base.resourceScopes());
   }
 
   /**

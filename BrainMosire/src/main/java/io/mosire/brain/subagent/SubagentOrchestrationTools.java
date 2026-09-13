@@ -21,33 +21,35 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 四个内置编排工具（中期计划 W3 组件 4 + 三期 D30）。
+ * 四个内置编排工具（中期计划 W3 组件 4 + 三期 D30 / D27）。
  *
- * <p><b>身份级别（S5-A 起不齐了，逐个看）</b>：{@code spawn_sub_agent} 是 {@code DEFAULT}（子 Agent 也能派孙代， D28
- * 裁决"开放派生 + 检查锚到调用者"）；{@code kill_sub_agent}/{@code list_sub_agents} 仍是 {@code SYSTEM}（窄面：
- * 子体不能终止/枚举别家的实例）；{@code read_agent_context} 是 {@code SYSTEM} + {@code sensitive} + {@code
- * noExport}（禁外发：桥不转发它，子体拿不到句柄）。后三个对 GUEST/DEFAULT 调用者在管线 guard 处即被拒。
+ * <p><b>身份级别（D27 起四个全 {@code DEFAULT}，逐个看）</b>：{@code spawn_sub_agent} = {@code DEFAULT} 级（S5-A 起子
+ * Agent 也能派孙代，D28 裁决"开放派生 + 检查锚到调用者"）；{@code kill_sub_agent} = {@code DEFAULT} + {@code
+ * destructive=true}（D27 起子体能收自己派的下级，能不能收由<b>血缘判定</b>说了算）；{@code list_sub_agents} = {@code
+ * DEFAULT}（D27 起子体只列自己的子树）；{@code read_agent_context} = {@code DEFAULT} 且<b>不再</b> {@code
+ * sensitive}/{@code noExport}（D27 的读侧降级，见 {@link #read(SubagentManager)}
+ * 的"安全性声明"）。四个都<b>不再</b>在工具内自查 {@code caller == SYSTEM}——身份级别不是判据（{@code AccessToken}
+ * 只有三个桶，答不出"你是谁"），判据是 {@link ContextAccessJudge} 的能力位 + 血缘。
  *
- * <p>前三个（{@code spawn_sub_agent}/{@code kill_sub_agent}/{@code list_sub_agents}）形态不变；第四个 {@code
- * read_agent_context}（D30）按实例 id 直读子体上下文，spec 多一个 {@code noExport=true}（禁外发：桥不转发它， 子体拿不到句柄）+ {@code
- * sensitive=true}（读别家上下文需显式放行）。
+ * <p><strong>判定两处，各管一边（别互相替代）</strong>：
  *
- * <p><strong>工具级身份校验（纵深防御副本，已非权威判定）</strong>：本类工具在 execute 入口校验 {@code caller == SYSTEM} （红线
- * R7：子体拿父侧 SYSTEM 工具即提权，结果必须是 {@code PERMISSION_DENIED} 而不是执行）。<b>2026-09-12 S4-A 判定点统一后， 权威判定已上移到
- * {@link io.mosire.agentlib.tool.ToolCallAuthorizer}</b>——它同时收口管线与 MCP 两条路径（此前 {@link
- * AgentToMcpServer} 是裸 {@code tool.execute}，本类这道闸正是为补那个洞而写；洞已堵，本闸保留为纵深防御，不再是唯一防线）。 判定读的是工具自己的
- * {@code spec()}，与 authorizer 同源、不会分叉。{@code read_agent_context} 的同性质校验收敛在 {@link
- * ContextAccessJudge}（同为其唯一判定点的纵深副本）。
+ * <ul>
+ *   <li><b>工具可用性</b>（白名单/级别/敏感/破坏）由 {@code spec()} + {@link
+ *       io.mosire.agentlib.tool.ToolCallAuthorizer} 在调用入口判（管线与 MCP 两条路径同源）；
+ *   <li><b>"这一个是你能不能动的"</b>（能力位 + subtree）由 {@link ContextAccessJudge} 判——它是唯一判定点，本类只调用、不自判。
+ * </ul>
  *
- * <p>错误映射契约：参数缺失/非法 → {@code INVALID_ARGUMENTS}；编排层拒绝（单调性/深度，对应 {@link SubagentRejectedException}）→
- * {@code PERMISSION_DENIED}（可读原因经 message 透出）；<b>工作目录越界</b>（{@link WorkingDirDeniedException}）→
- * {@code DIR_NOT_ALLOWED}（S5-B：与"你不该用这个工具"分码——它要说的是"你要的目录不在上级可达面里"）；<b>繁殖预算耗尽</b>（{@link
+ * <p>错误映射契约：参数缺失/非法 → {@code INVALID_ARGUMENTS}；编排层拒绝（工具越界/单调性/深度，对应 {@link
+ * SubagentRejectedException}）→ {@code PERMISSION_DENIED}（可读原因经 message 透出）；<b>工作目录越界</b>（{@link
+ * WorkingDirDeniedException}）→ {@code
+ * DIR_NOT_ALLOWED}（S5-B：与"你不该用这个工具"分码——它要说的是"你要的目录不在上级可达面里"）；<b>繁殖预算耗尽</b>（{@link
  * SubagentBudgetExceededException}）→ {@code
- * BUDGET_EXHAUSTED}（与越权分码：前者"现在不行"、后者"你不该要"，见该异常的类注释）；未知实例 → {@code UNKNOWN_INSTANCE}；启动失败 → {@code
- * LAUNCH_FAILED}；读上下文失败（库不存在/配置未注入）→ {@code CONTEXT_UNAVAILABLE}（响亮，绝不返回空结果冒充成功）。
+ * BUDGET_EXHAUSTED}（与越权分码：前者"现在不行"、后者"你不该要"，见该异常的类注释）；未知实例 → {@code UNKNOWN_INSTANCE}；<b>越出血缘范围</b>
+ * → {@code SUBTREE_DENIED}（D27；模型面只说"这一类被拒"，细节进日志）；启动失败 → {@code LAUNCH_FAILED}；读上下文失败（库不存在/配置未注入）→
+ * {@code CONTEXT_UNAVAILABLE}（响亮，绝不返回空结果冒充成功）。
  *
  * <p>返回值：spawn = 新实例快照 JSON（instanceId/templateId/status/depth），kill = 终止确认文本， list =
- * 实例快照数组，read_agent_context = 结构化视图体（视图/条目/分页游标）。除 read 外均幂等安全（重复 kill = 空操作成功）。
+ * 实例快照数组（<b>只有自己的子树</b>），read_agent_context = 结构化视图体（视图/条目/分页游标）。 除 read 外均幂等安全（重复 kill = 空操作成功）。
  */
 public final class SubagentOrchestrationTools {
 
@@ -58,7 +60,7 @@ public final class SubagentOrchestrationTools {
   public static final String KILL_SUB_AGENT = "kill_sub_agent";
   public static final String LIST_SUB_AGENTS = "list_sub_agents";
 
-  /** D30：按实例 id 读子 Agent 上下文（禁外发——见 {@link #read(SubagentManager)} 的 spec）。 */
+  /** D30：按实例 id 读子 Agent 上下文（D27 起可外发、由血缘判定守——见 {@link #read(SubagentManager)} 的 javadoc）。 */
   public static final String READ_AGENT_CONTEXT = "read_agent_context";
 
   /** 注册排序（名字字典序）：kill / list / read / spawn——测试与目录稳定。 */
@@ -73,8 +75,8 @@ public final class SubagentOrchestrationTools {
    *
    * <p><b>为什么从 SYSTEM 降到 DEFAULT</b>：spec 的 {@code requiredLevel} 在 S4-A 判定点统一后<b>真的生效</b>（此前 MCP
    * 路径裸调 {@code tool.execute}，SYSTEM 只是个装饰），不降则子体永远派不了孙代——而"开放派生 + 检查锚到调用者"是 D28
-   * 的裁决之一。开放的安全性由三道闸承担（都在 {@link SubagentManager}，且对照物是<b>调用者</b>）：权限单调性、档位 单调性、深度与繁殖预算。本工具内不再自查
-   * {@code caller == SYSTEM}（那会让降级毫无意义）。
+   * 的裁决之一。开放的安全性由四道闸承担（都在 {@link SubagentManager}，且对照物是<b>调用者</b>）：{@code A1} 工具越界（D27 的 I1）、
+   * 权限单调性、档位单调性、深度与繁殖预算。本工具内不再自查 {@code caller == SYSTEM}（那会让降级毫无意义）。
    */
   static AgentTool spawn(SubagentManager manager) {
     return tool(
@@ -85,18 +87,37 @@ public final class SubagentOrchestrationTools {
             "object",
             "properties",
             Map.of(
-                "templateId", Map.of("type", "string"),
-                "goal", Map.of("type", "string"),
-                "extraDenied", Map.of("type", "array", "items", Map.of("type", "string")),
+                "templateId",
+                Map.of("type", "string"),
+                "goal",
+                Map.of("type", "string"),
+                "extraDenied",
+                Map.of("type", "array", "items", Map.of("type", "string")),
                 // S5-B：子体的工作目录（可选）。给 = 明确要求（超出调用者可达面直接拒，码 DIR_NOT_ALLOWED）；
                 // 空数组 = 要求"哪里都不许"；不给 = 不额外收窄（调用者 ∩ 模板说了算）。
-                "allowedDirs", Map.of("type", "array", "items", Map.of("type", "string")),
-                "maxTurnsCap", Map.of("type", "integer"),
-                "timeBudgetSecondsCap", Map.of("type", "integer"),
-                "quotaMaxTokensCap", Map.of("type", "integer"),
+                "allowedDirs",
+                Map.of("type", "array", "items", Map.of("type", "string")),
+                // D27（A1）：点名给子体的工具白名单（可选）。给 = 明确要求（只收窄：与模板白名单求交；点名调用者自己没有的
+                // 工具 ⇒ 派发即拒，码 PERMISSION_DENIED 且消息点名那个工具）；空数组 = 显式"一个工具都不给"；
+                // 不给 = 模板白名单说了算（现状，逐字不变）。描述要进 schema——模型只能看见 schema，看不见这行注释。
+                "allowedTools",
+                Map.of(
+                    "type",
+                    "array",
+                    "items",
+                    Map.of("type", "string"),
+                    "description",
+                    "给子体的工具白名单（可选）：不填 = 模板白名单说了算；空数组 = 一个工具都不给；" + "点名调用者自己没有的工具 ⇒ 派发即拒"),
+                "maxTurnsCap",
+                Map.of("type", "integer"),
+                "timeBudgetSecondsCap",
+                Map.of("type", "integer"),
+                "quotaMaxTokensCap",
+                Map.of("type", "integer"),
                 // S6：命令档位（可选）。不给 = 子 Agent 缺省 LIMITED（所有命令都要审批）；要 FULL 得父级本身是 FULL，
                 // 否则 spawn 直接拒（单调性，见 SubagentManager#resolveMode）——"能要"不等于"能拿到"。
-                "mode", Map.of("type", "string", "enum", List.of("full", "limited"))),
+                "mode",
+                Map.of("type", "string", "enum", List.of("full", "limited"))),
             "required",
             List.of("templateId", "goal")),
         // S5-A：DEFAULT 级（子 Agent 也能派孙代）；敏感/破坏位与其余编排工具同形
@@ -133,7 +154,8 @@ public final class SubagentOrchestrationTools {
                     longArg(context, "timeBudgetSecondsCap"),
                     longArg(context, "quotaMaxTokensCap"),
                     mode,
-                    strListArg(context, "allowedDirs"));
+                    strListArg(context, "allowedDirs"),
+                    strListArg(context, "allowedTools"));
           } catch (IllegalArgumentException e) {
             // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
             return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());
@@ -165,46 +187,68 @@ public final class SubagentOrchestrationTools {
         });
   }
 
-  /** kill：按实例 id 终止一个在管子 Agent（终态幂等）。 */
+  /**
+   * kill：按实例 id 终止一个在管子 Agent（终态幂等）——<b>判据是血缘，不是身份级别</b>（D27：子体能收自己派的下级，收不了别家分支）。
+   *
+   * <p>三要素：{@code DEFAULT} 级（子体也能用）+ {@code destructive=true}（模板要显式放行才给子体这条能力）+ 逐目标判 {@link
+   * ContextAccessJudge#judge}（能力位 + subtree）。工具内不再自查 {@code caller == SYSTEM}——那会让"开放到判定"落空，
+   * 而判定的判别性正是本段唯一的保证。
+   */
   static AgentTool kill(SubagentManager manager) {
     return tool(
         KILL_SUB_AGENT,
-        "终止一个在管子 Agent（三层关停：关送 stdin → SIGTERM → 宽限 → 树级 KILL）。",
+        "终止一个在管子 Agent（三层关停：关送 stdin → SIGTERM → 宽限 → 树级 KILL）。只能终止自己子树内的实例。",
         Map.of(
             "type", "object",
             "properties", Map.of("instanceId", Map.of("type", "string")),
             "required", List.of("instanceId")),
+        ToolSpec.level(AccessToken.DEFAULT, false, true),
         context -> {
-          ToolResult denied = systemOnly(context);
-          if (denied != null) {
-            return denied;
-          }
           String instanceId = strArg(context, "instanceId");
           if (instanceId == null) {
             return ToolResult.error("INVALID_ARGUMENTS", "instanceId 为必填参数");
           }
+          // 判定收敛在 ContextAccessJudge（不假设"能进来就一定有权限"——MCP 路径不经管线 guard）
+          ContextAccessJudge.Decision decision =
+              ContextAccessJudge.judge(context, manager, instanceId, KILL_SUB_AGENT);
+          if (!decision.allowed()) {
+            return ToolResult.error(decision.code(), decision.reason());
+          }
           try {
             manager.kill(instanceId);
           } catch (IllegalArgumentException e) {
+            // 判定已保证"本 manager 已知实例"；走到这里说明判完到 kill 之间实例没了（竞态），如实报未知
             return ToolResult.error("UNKNOWN_INSTANCE", e.getMessage());
           }
           return ToolResult.ok("已发出子 Agent 终止请求: " + instanceId);
         });
   }
 
-  /** list：全部子 Agent 实例快照（含非终态；按实例 id 升序）。 */
+  /**
+   * list：列<b>调用者自己子树</b>的实例快照（含非终态；按实例 id 升序）——main 列全部，子体只看得到自己与自己的子孙（D27 §3.4）。
+   *
+   * <p><b>为什么从"列全部"改口径</b>：{@code list} 是"有哪些下级"的枚举口，跨分支枚举会泄漏别的分支的存在与状态——判定要挡的
+   * 不只是动作，还有"看得见什么"。逐目标判见 {@link ContextAccessJudge#judge}；调用者身份解析不出 ⇒ <b>拒</b>（不是"空列表当成功"）。
+   */
   static AgentTool list(SubagentManager manager) {
     return tool(
         LIST_SUB_AGENTS,
-        "列出全部子 Agent 实例（id/模板/层级/状态快照）。",
+        "列出自己子树内的 Agent 实例（id/模板/层级/状态快照）：主 Agent 列全部，子 Agent 只列自己与自己的子孙。",
         Map.of("type", "object"),
+        // D27：降 DEFAULT 级 + 非敏感非破坏（判定接管：能力位 + subtree）
+        ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
-          ToolResult denied = systemOnly(context);
-          if (denied != null) {
-            return denied;
+          String callerPath = ContextAccessJudge.callerLineagePath(context, manager);
+          if (callerPath.isEmpty()) {
+            // 身份解析不出 = 不知道你是谁 ⇒ 不列任何东西（fail-closed；模型面只给"这一类被拒"）
+            return ToolResult.error(
+                ContextAccessJudge.SUBTREE_DENIED, ContextAccessJudge.OUT_OF_SCOPE_REASON);
           }
           List<Map<String, Object>> rows = new ArrayList<>();
           for (SubagentInstance instance : manager.list()) {
+            if (!ContextAccessJudge.inSubtree(callerPath, instance.lineagePath())) {
+              continue; // 别家分支的存在与状态不外泄（含未记录血缘的老记录）
+            }
             rows.add(
                 Map.of(
                     "instanceId", instance.instanceId(),
@@ -222,12 +266,15 @@ public final class SubagentOrchestrationTools {
    * <p><b>只读</b>：库经 {@link SqliteEventStore#openReadOnly} 打开（{@code mode=ro} 优先、退化 {@code PRAGMA
    * query_only}），不建表/不迁移/不写；子体可能正在写同一个库（WAL），读侧不打断它。
    *
-   * <p><b>禁外发</b>（{@code noExport=true}）：本工具不进 MCP 桥接工具表——桥把整个 Registry 交给子体，若外发则
-   * "每个子体都能读别家子体的上下文"（D27 读侧明令禁止）。子体拿不到句柄 = 读权力不外包。
+   * <p><b>D27 起可外发，判定接管</b>：本工具<b>不再</b>带 {@code noExport} 位（S5-E 那次桥启动行报的"外发 3 个、未外发 1 个"变成 4
+   * 个）——因为"子体必须能读自己创建的子 Agent"是用户 2026-09-13 的裁决（{@code 设计-身份与血缘.md} §四）。
+   * <b>代价要说清楚</b>：跨血脉读取从"结构上不可能"变成"被判定拒绝"，判别性完全压在 {@link ContextAccessJudge} 的 subtree 判定 + 用例 +
+   * 变异上（该设计 §七）。三要素一并回落到 {@code DEFAULT} + 非敏感 + 非破坏：{@code sensitive} 必须去掉——子体权限集里 {@code
+   * sensitiveAllowed} 是<b>全局一位</b>，为它开一位等于给子体放开所有敏感工具。
    *
-   * <p><b>判定</b>：收敛到 {@link ContextAccessJudge#judge} 一处（能力位 + 已知子体；D27 落地时只改那里）。
+   * <p><b>判定</b>：收敛到 {@link ContextAccessJudge#judge} 一处（能力位 + subtree；细节与拒绝面见其类注释）。
    *
-   * <p><b>描述文案的诚实口径</b>：明写"当前仅对同进程已知子体开放；跨 Agent 血缘判定待 D27 落地"—— 不把"暂不支持"粉饰成"已按权限模型保护"。
+   * <p><b>描述文案的诚实口径</b>：按血缘陈述（能读自己与自己创建的子 Agent），不用"暂不支持"含糊其辞，也不把判定式拒绝说成"结构性隔离"。
    */
   static AgentTool read(SubagentManager manager) {
     return tool(
@@ -235,7 +282,7 @@ public final class SubagentOrchestrationTools {
         "读取一个 Agent 的上下文（子 Agent 按 instanceId，或 target=self 读自己）——直读其事件库，只读。"
             + "视图：summary(缺省，含最后一条 output 与 token 汇总)/turns(逐条输入+输出)/results(只要结果)"
             + "/search(关键词命中)/events(原始事件)。"
-            + "【边界如实说明】当前仅对同进程已知子体开放；跨 Agent 血缘判定待 D27 落地。",
+            + "【边界】只能读自己与自己创建的子 Agent（血缘范围）；越出范围的读取一律拒绝。",
         Map.of(
             "type",
             "object",
@@ -270,14 +317,15 @@ public final class SubagentOrchestrationTools {
                     "description", "翻页游标：只取 seq 大于它的条目，缺省 0；续页传上一页的 nextSinceSeq")),
             "required",
             List.of("target")),
-        // D30 安全必需：SYSTEM 级（仅主 Agent）+ 敏感（读别家上下文需显式放行）+ 非破坏 + 禁外发
-        ToolSpec.level(AccessToken.SYSTEM, true, false, true),
+        // D27：DEFAULT 级（子体也能用）+ 非敏感 + 非破坏 + 可外发——隔离改由判定接管（见上方 javadoc）
+        ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
           String target = strArg(context, "target");
           // 判定收敛在 ContextAccessJudge（不假设"能进来就一定有权限"——独立入口，不靠调用链上游）。
           // 2026-09-12 S4-A 后 ToolCallAuthorizer 已成为工具调用唯一入口（管线 + MCP 两条路径都经它），
-          // 本判定是与 spec() 同源的纵深副本，不再是唯一防线（见类注释）。
-          ContextAccessJudge.Decision decision = ContextAccessJudge.judge(context, manager, target);
+          // 本判定是权威判定（能力位 + 血缘都在它里面），不是"纵深副本"了。
+          ContextAccessJudge.Decision decision =
+              ContextAccessJudge.judge(context, manager, target, READ_AGENT_CONTEXT);
           if (!decision.allowed()) {
             return ToolResult.error(decision.code(), decision.reason());
           }
@@ -351,26 +399,7 @@ public final class SubagentOrchestrationTools {
     return Path.of(String.valueOf(value));
   }
 
-  /**
-   * 身份校验（<b>纵深防御副本</b>——2026-09-12 S4-A 判定点统一后权威判定已上移到 {@code ToolCallAuthorizer}， 它同时收口管线与 MCP
-   * 两条路径；本方法保留但不承重，且与 {@code spec()} 的 SYSTEM 级别同源、不会分叉。见类注释）。
-   */
-  private static ToolResult systemOnly(ToolContext context) {
-    if (context.caller() == AccessToken.SYSTEM) {
-      return null;
-    }
-    return ToolResult.error(ToolExecutionGuard.DENIED, "身份级别不足：系统级编排工具仅限主 Agent（SYSTEM）调用");
-  }
-
-  private static AgentTool tool(
-      String name,
-      String description,
-      Map<String, Object> schema,
-      java.util.function.Function<ToolContext, ToolResult> fn) {
-    return tool(name, description, schema, ToolSpec.level(AccessToken.SYSTEM, false, true), fn);
-  }
-
-  /** 带显式三要素的形态（D30：read_agent_context 需要"禁外发"位，与三个编排工具的 spec 不同）。 */
+  /** 工具构造（三要素由调用点显式给——四个工具的档位/敏感/破坏/外发位各不相同，没有共同缺省）。 */
   private static AgentTool tool(
       String name,
       String description,
@@ -418,9 +447,9 @@ public final class SubagentOrchestrationTools {
   }
 
   /**
-   * 字符串数组参数（S5-B 的 {@code allowedDirs}）：字段缺失 → {@code null}（"没提这一嘴"，与"给了空数组 = 哪里都不许"不同口径）； 给了集合 →
-   * 逐元素取字符串（元素为空/空白 ⇒ 抛 {@link IllegalArgumentException}，调用方落 {@code INVALID_ARGUMENTS}）； 给了单个标量 →
-   * 当成单元素表（与 {@code strSetArg} 同惯例）。
+   * 字符串数组参数（S5-B 的 {@code allowedDirs}、D27 的 {@code allowedTools}）：字段缺失 → {@code null}（"没提这一嘴"，
+   * 与"给了空数组 = 什么都不给"不同口径）； 给了集合 → 逐元素取字符串（元素为空/空白 ⇒ 抛 {@link IllegalArgumentException}， 调用方落 {@code
+   * INVALID_ARGUMENTS}）； 给了单个标量 → 当成单元素表（与 {@code strSetArg} 同惯例）。
    */
   private static java.util.List<String> strListArg(ToolContext context, String name) {
     Object value = context.arguments().get(name);
@@ -430,18 +459,18 @@ public final class SubagentOrchestrationTools {
     java.util.List<String> out = new java.util.ArrayList<>();
     if (value instanceof java.util.Collection<?> collection) {
       for (Object item : collection) {
-        out.add(dirText(name, item));
+        out.add(elementText(name, item));
       }
     } else {
-      out.add(dirText(name, value));
+      out.add(elementText(name, value));
     }
     return java.util.List.copyOf(out);
   }
 
-  private static String dirText(String name, Object raw) {
+  private static String elementText(String name, Object raw) {
     String text = raw == null ? "" : String.valueOf(raw).strip();
     if (text.isEmpty()) {
-      throw new IllegalArgumentException("参数 " + name + " 的元素必须是非空白路径文本");
+      throw new IllegalArgumentException("参数 " + name + " 的元素必须是非空白文本");
     }
     return text;
   }

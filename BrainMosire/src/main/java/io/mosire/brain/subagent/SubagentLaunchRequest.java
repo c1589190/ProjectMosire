@@ -22,6 +22,11 @@ import java.util.Set;
  *     <b>显式要求"哪里都不许"</b>（与 {@code allowedTools: []} 同形同义）。
  *     <b>与模板的分工</b>：模板那一份是<b>建议</b>（超出父级就静默求交），请求这一份是<b>要求</b>—— 超出父级可达面一律响亮拒（{@code
  *     DIR_NOT_ALLOWED}），不静默截断
+ * @param allowedTools 想要给子体的<b>工具白名单</b>（D27 的 {@code A1}）。{@code null} = 不指定（子体的工具面由模板白名单说了算，
+ *     逐字回到本字段引入前的行为）； 空表 = <b>显式"一个工具都不给"</b>（与 {@code allowedDirs: []}
+ *     同形同义）。<b>与模板的分工</b>：模板那一份是<b>建议</b> （通用配置，超出调用者可达面就静默求交），请求这一份是<b>要求</b>——点名调用者自己没有的工具，{@link
+ *     SubagentManager#spawn} 一律响亮拒（{@code
+ *     SubagentRejectedException}，消息点名越界工具），不静默截断；求交结果为空是<b>合法</b>取值（= 子体一个工具都没有）， 不是错误
  */
 public record SubagentLaunchRequest(
     String templateId,
@@ -31,7 +36,8 @@ public record SubagentLaunchRequest(
     Long timeBudgetSecondsCap,
     Long quotaMaxTokensCap,
     CommandMode mode,
-    List<String> allowedDirs) {
+    List<String> allowedDirs,
+    List<String> allowedTools) {
 
   public SubagentLaunchRequest {
     if (templateId == null || templateId.isBlank()) {
@@ -48,8 +54,16 @@ public record SubagentLaunchRequest(
         }
       }
     }
+    if (allowedTools != null) {
+      for (String tool : allowedTools) {
+        if (tool == null || tool.isBlank()) {
+          throw new IllegalArgumentException("allowedTools 的元素必须是非空白工具名: " + allowedTools);
+        }
+      }
+    }
     // 不可变副本（内联 copyOf：让 SpotBugs 看得见来源）；null 保持 null——"没提这一嘴"与"显式空表"是两种取值
     allowedDirs = allowedDirs == null ? null : List.copyOf(allowedDirs);
+    allowedTools = allowedTools == null ? null : List.copyOf(allowedTools);
   }
 
   /** 6 参兼容构造（S6 之前）：档位未指定、工作目录不指定。 */
@@ -88,6 +102,28 @@ public record SubagentLaunchRequest(
         timeBudgetSecondsCap,
         quotaMaxTokensCap,
         mode,
+        null);
+  }
+
+  /** 8 参兼容构造（D27 之前）：工具白名单不指定（子体的工具面由模板说了算）。 */
+  public SubagentLaunchRequest(
+      String templateId,
+      String goal,
+      Set<String> extraDenied,
+      Integer maxTurnsCap,
+      Long timeBudgetSecondsCap,
+      Long quotaMaxTokensCap,
+      CommandMode mode,
+      List<String> allowedDirs) {
+    this(
+        templateId,
+        goal,
+        extraDenied,
+        maxTurnsCap,
+        timeBudgetSecondsCap,
+        quotaMaxTokensCap,
+        mode,
+        allowedDirs,
         null);
   }
 }

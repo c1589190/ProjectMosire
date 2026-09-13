@@ -26,7 +26,12 @@ import org.junit.jupiter.api.Test;
  */
 class AgentToMcpServerNoExportTest {
 
-  /** 名字与真实 D30 工具同名（本测试验证的是"带禁外发位的工具不进桥表"这一机制，不是 Brain 侧那只工具）。 */
+  /**
+   * 名字与真实 D30 工具同名（本测试验证的是"带禁外发位的工具不进桥表"这一机制，不是 Brain 侧那只工具）。
+   *
+   * <p>此处的同名工具是<b>合成夹具</b>：真实 {@code read_agent_context} 自 D27 起已<b>不带</b> {@code noExport}（读侧改为外发
+   * + subtree 判定守，见 {@code 设计-身份与血缘.md} §四）⇒ 本用例的判别力全部来自这个桩上的位，与那只工具现况无关。
+   */
   private static AgentTool tool(String name, ToolSpec spec) {
     return new AgentTool() {
       @Override

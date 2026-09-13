@@ -14,9 +14,13 @@ import java.util.Objects;
  * </ul>
  *
  * <p><b>为什么需要 {@code noExport}</b>：桥接把父进程<b>整个</b> {@code ToolRegistry} 交给子体当 MCP 工具面 （{@code App}
- * 的 {@code --mcp-expose}）。凡"只准主 Agent 用、一旦外发就是越权"的工具（如 D30 的 {@code read_agent_context}：外发给子体 =
- * 每个子体都能读别家子体的上下文，正是 D27 读侧明令禁止的事），必须有一个 <b>结构性</b>的标注位把"不可外包"写在工具自己身上——而不是靠调用点逐个记得传过滤器（会漏）。判定落点是
- * {@code AgentToMcpServer} 的暴露判定，见 {@code exportable}。
+ * 的 {@code --mcp-expose}）。凡"只准主 Agent 用、一旦外发就是越权"的工具，必须有一个 <b>结构性</b>的标注位把"不可外包"写在工具自己身上——而不是
+ * 靠调用点逐个记得传过滤器（会漏）。判定落点是 {@code AgentToMcpServer} 的暴露判定，见 {@code exportable}。
+ *
+ * <p><b>当代口径（2026-09-13 起）：退路位，当前生产零使用者</b>。它的来历是 D30 的"结构性隔离"——那时读类工具靠本字段干脆不给子体看；D27 起读侧改为<b>外发 +
+ * subtree 判定守</b>（用户 2026-09-13 裁决"子 Agent 肯定要有能力读自己创建的子 Agent"，见 {@code 设计-身份与血缘.md}
+ * §四），最后一个使用者也随之摘掉。<b>保留本字段的原因</b>：它仍是"不可外包"的唯一结构性写法（历史来历即如此）， 若日后收回某一类工具的外发，退路就是它；判别性用例（{@code
+ * AgentToMcpServerNoExportTest}，合成工具）仍在门禁里钉着这条机制。 使用者须自证"外发即越权"成立—— 判定点不在调用点。
  */
 public record ToolSpec(
     AccessToken requiredLevel, boolean sensitive, boolean destructive, boolean noExport) {

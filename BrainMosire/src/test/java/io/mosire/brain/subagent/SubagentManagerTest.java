@@ -830,6 +830,200 @@ class SubagentManagerTest {
         .isInstanceOf(IllegalStateException.class);
   }
 
+  // ---- D27：A1（派发时点名工具白名单） ----
+
+  /**
+   * {@code A1} 越界（I1）：请求面点名调用者没有的工具 ⇒ <b>派发即拒</b>（{@link SubagentRejectedException} + 点名工具的事件），
+   * <b>不建实例、不建链、不花预算</b>。
+   *
+   * <p>判别性：把这条检查删掉（或挪到"运行期调用时才失败"），本次派发会成功落地 ⇒ 前三条断言转红；把额度算在被拒那一次头上， 末尾那次合法派发会撞 {@code
+   * BUDGET_EXHAUSTED} ⇒ 转红（每父额度只有 1）。
+   */
+  @Test
+  void requestedToolsBeyondTheCallerAreRejectedAtDispatchWithoutSpendingBudget() {
+    write(template("writer", Set.of("read", "write"), Set.of(), false, false, false));
+    SubagentManager manager =
+        manager(
+            store(),
+            new InProcessExecutor(),
+            parentConfig(),
+            AgentPermissionSet.system(),
+            0,
+            new SubagentLimits(3, 1, 8));
+    AgentIdentity caller = AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1);
+    AgentPermissionSet callerPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allow("read", "write").build();
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest(
+                        "writer",
+                        "提权尝试",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        List.of("read", "admin-do")),
+                    caller,
+                    callerPermissions))
+        .isInstanceOf(SubagentRejectedException.class)
+        .hasMessageContaining("admin-do")
+        .hasMessageContaining("I1");
+
+    assertThat(manager.list()).as("不建实例").isEmpty();
+    assertThat(query(EventTypes.AGENT_LIFECYCLE)).as("不建链（一个生命周期事件都没有）").isEmpty();
+
+    List<Event> denied = query(EventTypes.PERMISSION_DENIED);
+    assertThat(denied).hasSize(1);
+    assertThat(denied.get(0).agent()).as("谁被拒了").isEqualTo("parent-1");
+    assertThat(payloadOf(denied.get(0)))
+        .containsEntry("template", "writer")
+        .containsEntry("requestedTools", List.of("read", "admin-do"))
+        .containsEntry("beyondCaller", List.of("admin-do"));
+
+    // 不花预算：每父额度 = 1 —— 被拒的那一次若不占额，这次合法派发才过得去
+    SubagentInstance ok =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "writer", "合法收窄", null, null, null, null, null, null, List.of("read")),
+            caller,
+            callerPermissions);
+    assertThat(ok.status()).isEqualTo(SubagentStatus.RUNNING);
+  }
+
+  /**
+   * {@code A1} 收窄生效：生效白名单 = <b>模板 ∩ A1</b>（请求只收窄、不放大），并逐维落到子体的权限集与运行配置；{@code null} 逐字退回模板那一份。
+   *
+   * <p>判别性：把 A1 写成"直接覆盖模板"⇒"模板之外的点名工具进不来"与"调用者通配也不例外"转红；写成"忽略 A1"⇒ "被收窄掉的模板工具"与"空表什么都不给"转红。
+   */
+  @Test
+  void requestedToolsNarrowToTheIntersectionWithTheTemplate() {
+    write(template("reader", Set.of("read", "echo"), Set.of(), false, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+    AgentIdentity main = AgentIdentity.main(CommandMode.FULL);
+    AgentPermissionSet mainPermissions = AgentPermissionSet.system();
+
+    // 调用者是通配（* ⇒ I1 全放行），但模板只有 read/echo ⇒ admin-do 静默求交掉（请求面只收窄，不放大）
+    SubagentInstance child =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "reader", "收窄", null, null, null, null, null, null, List.of("read", "admin-do")),
+            main,
+            mainPermissions);
+    assertThat(child.permissions().isToolAllowed("read")).isTrue();
+    assertThat(child.permissions().isToolAllowed("admin-do")).as("模板没有 ⇒ 求交掉").isFalse();
+    assertThat(child.permissions().isToolAllowed("echo")).as("请求没点名 ⇒ 从模板基线里被收窄掉").isFalse();
+    assertThat(child.config().allowedTools()).containsExactly("read");
+    assertThat(child.lineagePath()).isEqualTo("main/" + child.instanceId());
+
+    // 空表 = 显式"一个工具都不给"（与 allowedDirs: [] 同形同义）
+    SubagentInstance none =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "reader", "零工具", null, null, null, null, null, null, List.of()),
+            main,
+            mainPermissions);
+    assertThat(none.permissions().allowedTools()).isEmpty();
+    assertThat(none.permissions().isToolAllowed("read")).isFalse();
+
+    // null = 没提这一嘴 ⇒ 逐字退回模板白名单（本字段引入前的行为）
+    SubagentInstance byTemplate =
+        manager.spawn(
+            new SubagentLaunchRequest("reader", "模板说了算", null, null, null, null, null, null, null),
+            main,
+            mainPermissions);
+    assertThat(byTemplate.permissions().isToolAllowed("read")).isTrue();
+    assertThat(byTemplate.permissions().isToolAllowed("echo")).isTrue();
+  }
+
+  /**
+   * {@code A1} 含 {@code "*"} = <b>不过滤</b>（{@link AgentPermissionSet#ALL_TOOLS} 是过滤器元素、不是工具名）：模板有限 ⇒
+   * 子体权限集 逐字是模板那一份——既不放大成全域，也不是"求交求没了"的空集。
+   *
+   * <p>判别性（本轮变异靶）：把 {@code "*"} 当普通工具名走求交 ⇒ 模板有限这一支得到空集（①的三条断言整片转红）；把 {@code "*"} 当"放行一切"⇒
+   * 模板没有的工具也会进白名单（①的第三条断言转红）。
+   */
+  @Test
+  void wildcardAllowedToolsMeansNoFilterAgainstTheTemplate() {
+    write(template("reader", Set.of("read", "echo"), Set.of(), false, false, false));
+    write(template("wild", Set.of("*"), Set.of(), false, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+    AgentIdentity main = AgentIdentity.main(CommandMode.FULL);
+    AgentPermissionSet mainPermissions = AgentPermissionSet.system();
+
+    // ① 模板有限 + A1=["*"] ⇒ 结果 = 模板那一份（逐名断言）
+    SubagentInstance noFilter =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "reader", "通配不过滤", null, null, null, null, null, null, List.of("*")),
+            main,
+            mainPermissions);
+    assertThat(noFilter.permissions().isToolAllowed("read")).isTrue();
+    assertThat(noFilter.permissions().isToolAllowed("echo")).isTrue();
+    assertThat(noFilter.permissions().isToolAllowed("admin-do")).as("不是全域：模板没有的就是没有").isFalse();
+    assertThat(noFilter.permissions().allowedTools()).containsExactlyInAnyOrder("read", "echo");
+
+    // ② 模板通配 + A1 有限 ⇒ 结果 = A1（既有行为，别改坏）
+    SubagentInstance narrowed =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "wild", "模板通配收窄", null, null, null, null, null, null, List.of("read")),
+            main,
+            mainPermissions);
+    assertThat(narrowed.permissions().allowedTools()).containsExactly("read");
+    assertThat(narrowed.permissions().isToolAllowed("echo")).isFalse();
+
+    // ③ 两侧通配 ⇒ 仍通配（"不过滤"落在通配模板上就是模板自己）
+    SubagentInstance stillWild =
+        manager.spawn(
+            new SubagentLaunchRequest(
+                "wild", "两侧通配", null, null, null, null, null, null, List.of("*")),
+            main,
+            mainPermissions);
+    assertThat(stillWild.permissions().isToolAllowed("whatever-tool")).isTrue();
+  }
+
+  /**
+   * 受限调用者点 {@code A1=["*"]} ⇒ <b>派发即拒</b>（I1）：{@code callerPermissions.isToolAllowed("*")}
+   * 只在<b>调用者自己的白名单通配</b>时为真 （{@code "*"} 不做跨集合比较）——"受限者不得借通配把自己放大成全域"。<b>这是有意行为，别放宽成"I1 见到 *
+   * 就放行"</b>。
+   *
+   * <p>判别性：把 {@code "*"} 特判成"I1 一律放行"⇒ 第一条断言转红（派发会成功落地、事件不出现）。
+   */
+  @Test
+  void wildcardRequestFromRestrictedCallerIsRejectedAtDispatch() {
+    write(template("reader", Set.of("read", "echo"), Set.of(), false, false, false));
+    SubagentManager manager =
+        manager(store(), new InProcessExecutor(), parentConfig(), AgentPermissionSet.system(), 0);
+    AgentIdentity caller = AgentIdentity.subagent("parent-1", CommandMode.FULL, "派活", 1);
+    AgentPermissionSet callerPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allow("read", "echo").build();
+
+    assertThatThrownBy(
+            () ->
+                manager.spawn(
+                    new SubagentLaunchRequest(
+                        "reader", "通配提权", null, null, null, null, null, null, List.of("*")),
+                    caller,
+                    callerPermissions))
+        .isInstanceOf(SubagentRejectedException.class)
+        .hasMessageContaining("*")
+        .hasMessageContaining("I1");
+
+    assertThat(manager.list()).as("不建实例").isEmpty();
+    List<Event> denied = query(EventTypes.PERMISSION_DENIED);
+    assertThat(denied).hasSize(1);
+    assertThat(denied.get(0).agent()).isEqualTo("parent-1");
+    assertThat(payloadOf(denied.get(0)))
+        .containsEntry("requestedTools", List.of("*"))
+        .containsEntry("beyondCaller", List.of("*"));
+  }
+
   // ---- helpers ----
 
   private AgentTemplateStore store() {

@@ -8,7 +8,9 @@ import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
@@ -28,6 +30,11 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * D30 {@code read_agent_context} 工具面契约：<b>权限位为假 = 可辨的拒绝（不是空结果）</b>、{@code target=self}、 未知实例、越界
  * id、配置缺失/库缺失一律响亮报错、描述与 spec 的诚实口径。
+ *
+ * <p>D27 起判定读<b>身份</b>（{@code ToolContext.identity().instanceId()} 查表得血缘 path）而不是 token：本类的调用者一律显式绑
+ * {@code main} 身份（等价于"主 Agent 在问"），身份解析不出的用例单独一条（{@link
+ * #unknownIdentityDeniedEvenWithUnrestrictedPermissions}）。判定的分维判别（血脉/能力位）与按段匹配见 {@link
+ * SubagentLineageJudgeTest}。
  *
  * <p>全离线：{@link InProcessExecutor} 假执行体，子库由测试直接写文件；不起真进程、不花 token。
  */
@@ -70,20 +77,28 @@ class ReadAgentContextToolTest {
     f.close();
   }
 
+  /**
+   * D27：身份<b>解析不出</b>的调用者（缺省 {@link AgentIdentity#UNKNOWN}）即便权限集全放行也读不到任何东西——判定读的是 {@code
+   * identity().instanceId()}，<b>不读 token</b>（token 只有三个桶，答不出"这是谁在问"）。
+   *
+   * <p>判别性：把"调用者 path 空 ⇒ 拒"这条删掉（或退回按 token/级别判身份），本用例会读到子库 ⇒ 转红。两个面分开（f4060c1 纪律）：模型面只说"这一类被拒"，不递
+   * path/id。
+   */
   @Test
-  void nonSystemCallerDeniedWithSecondGate() throws Exception {
+  void unknownIdentityDeniedEvenWithUnrestrictedPermissions() throws Exception {
     Fixture f = fixture();
     SubagentInstance child = spawn(f);
 
-    // MCP 路径不走管线 guard（本用例不建库：闸在读之前就该拦住）：子体身份（DEFAULT）拿 allowAll 也读不了别家上下文（红线 R7 的第二道闸）
     ToolResult denied =
-        f.callDirect(
+        f.callDirectAs(
+            AgentIdentity.UNKNOWN,
             AgentPermissionSet.unrestricted(AccessToken.DEFAULT),
             f.childConfig(),
             args(child.instanceId()));
     assertThat(denied.success()).isFalse();
-    assertThat(denied.code()).isEqualTo(ToolExecutionGuard.DENIED);
-    assertThat(denied.message()).contains("身份级别不足");
+    assertThat(denied.code()).isEqualTo(ContextAccessJudge.SUBTREE_DENIED);
+    assertThat(denied.message()).isEqualTo(ContextAccessJudge.OUT_OF_SCOPE_REASON);
+    assertThat(denied.message()).doesNotContain(child.instanceId()).doesNotContain("/");
     f.close();
   }
 
@@ -126,7 +141,7 @@ class ReadAgentContextToolTest {
       ToolResult denied = f.callDirect(AgentPermissionSet.system(), f.childConfig(), args(target));
       assertThat(denied.success()).as("target=%s 不应成功", target).isFalse();
       assertThat(denied.code()).as("target=%s", target).isEqualTo("UNKNOWN_INSTANCE");
-      assertThat(denied.message()).contains("D27");
+      assertThat(denied.message()).contains("本进程已知");
     }
 
     // 纵深防御：即便判定被绕过，路径拼接本身也挡越界 id（本用例直接对拼接函数判别）
@@ -175,8 +190,15 @@ class ReadAgentContextToolTest {
     f.close();
   }
 
+  /**
+   * D27 起四个工具的 spec 与描述都改成"判定接管"的诚实口径：读工具不再 {@code sensitive}、不再 {@code noExport}（结构性隔离
+   * 降级为判定式拒绝），描述按<b>血缘</b>陈述边界而不是"暂不支持"。
+   *
+   * <p>判别性：把 {@code noExport}/{@code sensitive}/SYSTEM 级别任一项改回去，第一条断言转红；描述若退回含糊其辞
+   * （"同进程已知子体"/"暂不支持"），描述断言转红——描述是模型唯一能看见的口径，它撒谎 = 边界撒谎。
+   */
   @Test
-  void schemaSpecAndDescriptionAreHonestAboutD27Gap() {
+  void schemaSpecAndDescriptionAreHonestAboutTheLineageBoundary() {
     Fixture f = fixture();
     List<AgentTool> tools = SubagentOrchestrationTools.of(f.manager());
     assertThat(tools)
@@ -189,30 +211,50 @@ class ReadAgentContextToolTest {
             .filter(t -> t.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT))
             .findFirst()
             .orElseThrow();
-    // 描述诚实：明写"暂不支持"的边界，不把它说成"已按权限模型保护"
+    // 描述诚实：按血缘陈述边界（能读自己与自己创建的子 Agent），不说"暂不支持"，也不把判定式拒绝说成结构性隔离
     assertThat(read.description())
-        .contains("D27")
-        .contains("同进程已知子体")
+        .contains("血缘")
+        .contains("自己创建的子 Agent")
         .contains("只读")
+        .doesNotContain("同进程已知子体")
         .doesNotContain("已按权限模型保护");
-    // 三要素 + 禁外发位
-    assertThat(read.spec()).isEqualTo(ToolSpec.level(AccessToken.SYSTEM, true, false, true));
-    assertThat(read.spec().noExport()).isTrue();
+    // 三要素一并回落到 DEFAULT + 非敏感 + 非破坏，且可外发
+    assertThat(read.spec()).isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, false));
+    assertThat(read.spec().noExport()).isFalse();
     assertThat(read.spec().destructive()).isFalse();
-    assertThat(read.spec().sensitive()).isTrue();
-    // 其余工具：kill/list 仍是 SYSTEM（noExport 缺省 false ⇒ 仍可外发）；spawn 从 S5-A 起降为 DEFAULT
-    // （对子 Agent 开放派发——判别面在 SubagentOrchestrationToolsTest，这里只锁定"本工具的邻居没被顺手改坏"）
+    assertThat(read.spec().sensitive()).isFalse();
+    // 其余工具：D27 起四个全 DEFAULT（kill/spawn 破坏位、list/read 非破坏）；noExport 一个都不带
+    Map<String, ToolSpec> expectedSpecs =
+        Map.of(
+            SubagentOrchestrationTools.KILL_SUB_AGENT,
+            ToolSpec.level(AccessToken.DEFAULT, false, true),
+            SubagentOrchestrationTools.LIST_SUB_AGENTS,
+            ToolSpec.level(AccessToken.DEFAULT, false, false),
+            SubagentOrchestrationTools.SPAWN_SUB_AGENT,
+            ToolSpec.level(AccessToken.DEFAULT, false, true));
     for (AgentTool tool : tools) {
       if (tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
         continue;
       }
-      AccessToken expected =
-          tool.name().equals(SubagentOrchestrationTools.SPAWN_SUB_AGENT)
-              ? AccessToken.DEFAULT
-              : AccessToken.SYSTEM;
-      assertThat(tool.spec()).as(tool.name()).isEqualTo(ToolSpec.level(expected, false, true));
+      assertThat(tool.spec()).as(tool.name()).isEqualTo(expectedSpecs.get(tool.name()));
       assertThat(tool.spec().noExport()).as(tool.name()).isFalse();
     }
+    // spawn 的 schema 要带 allowedTools（模型只能看见 schema）：三句话缺一句模型就会猜
+    AgentTool spawn =
+        tools.stream()
+            .filter(t -> t.name().equals(SubagentOrchestrationTools.SPAWN_SUB_AGENT))
+            .findFirst()
+            .orElseThrow();
+    @SuppressWarnings("unchecked")
+    Map<String, Object> spawnProps = (Map<String, Object>) spawn.jsonSchema().get("properties");
+    @SuppressWarnings("unchecked")
+    Map<String, Object> allowedTools = (Map<String, Object>) spawnProps.get("allowedTools");
+    assertThat(allowedTools).as("spawn 的 allowedTools 参数在 schema 里").isNotNull();
+    assertThat(allowedTools.get("type")).isEqualTo("array");
+    assertThat(String.valueOf(allowedTools.get("description")))
+        .contains("模板")
+        .contains("空数组")
+        .contains("派发即拒");
     // schema：view 的 enum 与读取器 VIEWS 同源（不含口径外的视图名）
     @SuppressWarnings("unchecked")
     Map<String, Object> properties = (Map<String, Object>) read.jsonSchema().get("properties");
@@ -277,12 +319,23 @@ class ReadAgentContextToolTest {
     /**
      * 直接调工具（绕过管线 guard——模拟 MCP 路径：判定必须自己在工具里做）。
      *
-     * <p>身份取自权限集的 token（与管线一致：调用者是谁 = 权限集发给谁）——不写死 SYSTEM，否则"子体身份"用例 会假绿。
+     * <p>身份缺省取 {@code main}（"主 Agent 在问"）——判定读的是<b>身份</b>，不是 token/级别；要验别的身份走 {@link
+     * #callDirectAs(AgentIdentity, AgentPermissionSet, Map, Map)}。
      */
     ToolResult callDirect(
         AgentPermissionSet permissions, Map<String, Object> config, Map<String, Object> args) {
+      return callDirectAs(mainIdentity(), permissions, config, args);
+    }
+
+    /** 带身份的直调（D27：判定的输入是"谁在问"）。 */
+    ToolResult callDirectAs(
+        AgentIdentity identity,
+        AgentPermissionSet permissions,
+        Map<String, Object> config,
+        Map<String, Object> args) {
       AgentTool tool = registry.find(SubagentOrchestrationTools.READ_AGENT_CONTEXT).orElseThrow();
-      return tool.execute(new ToolContext(permissions.grantedToken(), permissions, config, args));
+      return tool.execute(
+          new ToolContext(permissions.grantedToken(), permissions, config, args, identity));
     }
 
     /** 常规管线路径（guard 在前）。 */
@@ -292,7 +345,12 @@ class ReadAgentContextToolTest {
           .execute(
               registry,
               SubagentOrchestrationTools.READ_AGENT_CONTEXT,
-              new ToolContext(permissions.grantedToken(), permissions, config, args));
+              new ToolContext(
+                  permissions.grantedToken(), permissions, config, args, mainIdentity()));
+    }
+
+    private AgentIdentity mainIdentity() {
+      return AgentIdentity.main(CommandMode.FULL);
     }
 
     @Override

@@ -7,7 +7,9 @@ import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolResult;
@@ -180,7 +182,13 @@ class MainRunSubagentConfigDirGateTest {
 
   // ---------- 工具 ----------
 
-  /** 经编排工具起一个真子进程（与主 Agent 经 LLM 调用同一入口；本用例主 Agent 从不 chat，故端点请求只可能来自子体）。 */
+  /**
+   * 经编排工具起一个真子进程（与主 Agent 经 LLM 调用同一入口；本用例主 Agent 从不 chat，故端点请求只可能来自子体）。
+   *
+   * <p>身份必须与生产同源（{@code AgentPipeline} 装配的 main 身份；本夹具没配 {@code CommandModeHolder} ⇒ {@code
+   * FULL}）：{@code spawn} 以 {@code context.identity()} 为调用者拼 {@code lineagePath}，4 参构造的 {@code
+   * UNKNOWN} 解析不出父 path ⇒ 子体 {@code lineagePath} 记空串，之后连主 Agent 都 kill 不动它（判定⑤：目标 path 空）。
+   */
   private void spawn(App app) {
     ToolResult result =
         new ToolExecutionGuard()
@@ -191,7 +199,8 @@ class MainRunSubagentConfigDirGateTest {
                     AccessToken.SYSTEM,
                     AgentPermissionSet.system(),
                     Map.of(),
-                    Map.of("templateId", TEMPLATE_ID, "goal", "MED-1 判据任务")));
+                    Map.of("templateId", TEMPLATE_ID, "goal", "MED-1 判据任务"),
+                    AgentIdentity.main(CommandMode.FULL)));
     assertThat(result.success()).as("spawn 必须成功: %s", result.message()).isTrue();
   }
 
@@ -204,7 +213,8 @@ class MainRunSubagentConfigDirGateTest {
                 AccessToken.SYSTEM,
                 AgentPermissionSet.system(),
                 Map.of(),
-                Map.of("instanceId", instanceId)));
+                Map.of("instanceId", instanceId),
+                AgentIdentity.main(CommandMode.FULL)));
   }
 
   private SubagentInstance awaitChild(App app) throws Exception {

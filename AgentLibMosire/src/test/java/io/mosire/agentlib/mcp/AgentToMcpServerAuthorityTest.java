@@ -28,7 +28,8 @@ import org.junit.jupiter.api.Test;
  *
  * <p><b>为什么单独立一个用例类</b>：改这一行之前，{@code handleCall} 是裸的 {@code tool.execute(context)}——权限判定完全缺席。
  * 于是"工具名级白名单 / 身份级别 / 敏感·破坏需显式放行"这一整套规则在 MCP 这条路上<b>从不生效</b>，各系统级工具只能在自己的 execute 里补一道"第二道闸"（{@code
- * SubagentOrchestrationTools.systemOnly} 的注释自陈如此）。本用例把该洞钉住： 把它还原成裸 execute，三条断言全部转红。
+ * SubagentOrchestrationTools} 里那个已随 D27 判定点统一而卸掉的 {@code systemOnly} 自查，其注释当时即自陈如此）。本用例把该洞钉住：
+ * 把它还原成裸 execute，三条断言全部转红。
  *
  * <p>走的是真实 MCP 握手（管道传输 + SDK 官方客户端），不是直接调私有方法——避免"测了个假入口"。
  */

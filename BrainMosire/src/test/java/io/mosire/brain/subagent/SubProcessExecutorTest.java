@@ -16,6 +16,7 @@ import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import java.util.List;
+import java.util.Map;
 import java.util.OptionalInt;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -93,6 +94,56 @@ class SubProcessExecutorTest {
             "--data-dir",
             "/opt/mosire/data/subagents/r-1",
             "--parent-link");
+  }
+
+  /**
+   * D27 读侧接线：链接上下文的 {@code ToolContext.config} 由 {@link SubProcessExecutor#linkToolConfig} 只补
+   * {@code read_agent_context} 的三键，且路径与 {@code argv} 的 {@code --data-dir} <b>同源</b>（库在哪由 argv
+   * 决定，读侧不另立真相）。
+   *
+   * <p>判别性（本轮变异靶）：把 {@code resolve("events.db")} 去掉、或让子库根另取一处 ⇒ 断言转红；把 null 分支改成"编一个缺省根" ⇒ 下一条用例转红。
+   */
+  @Test
+  void linkToolConfigPinsTheThreeReadKeysToTheSameRootAsArgv() {
+    AgentCommand command =
+        new AgentCommand(
+            "/usr/bin/java",
+            List.of(),
+            List.of("-jar", "/opt/mosire/mosire.jar", "agent"),
+            "--id",
+            "/opt/mosire/templates",
+            "/opt/mosire/data/subagents",
+            true);
+    SubProcessExecutor executor =
+        new SubProcessExecutor(
+            mock(SubprocessManager.class), command, new ToolRegistry(), "n", "v");
+    SubagentInstance instance = instance("reader-1a2b3c4d", "reader", "问好");
+
+    Map<String, Object> config = executor.linkToolConfig(instance);
+
+    assertThat(config)
+        .hasSize(3)
+        .containsEntry(AgentContextReader.CONFIG_SUBAGENTS_ROOT, "/opt/mosire/data/subagents")
+        .containsEntry(
+            AgentContextReader.CONFIG_SELF_EVENTS_DB,
+            "/opt/mosire/data/subagents/reader-1a2b3c4d/events.db")
+        .containsEntry(AgentContextReader.CONFIG_SELF_AGENT_ID, "reader-1a2b3c4d");
+    // 同源证据：argv 里的 --data-dir 就是"自身库所在的那个目录"
+    assertThat(command.argv(instance))
+        .contains("--data-dir", "/opt/mosire/data/subagents/reader-1a2b3c4d");
+  }
+
+  /**
+   * 装配层没注入数据根（{@code childDataDir == null}）⇒ <b>空表</b>：不编路径，读侧据此响亮报 {@code
+   * CONTEXT_UNAVAILABLE}——"猜一个库的位置"比"读不到"危险得多。
+   */
+  @Test
+  void linkToolConfigStaysEmptyWithoutAnInjectedDataRoot() {
+    SubProcessExecutor executor =
+        new SubProcessExecutor(
+            mock(SubprocessManager.class), AgentCommand.javaJar("java", "mosire.jar"));
+
+    assertThat(executor.linkToolConfig(instance("a-9", "reader", "g"))).isEmpty();
   }
 
   @Test

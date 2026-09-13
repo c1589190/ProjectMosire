@@ -35,10 +35,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * W3 组件 4 契约：三个内置编排工具（{@code spawn_sub_agent}/{@code kill_sub_agent}/{@code
- * list_sub_agents}）的注册签名、权限三要素（{@code ToolSpec.level(SYSTEM, sensitive=false,
- * destructive=true)}——GUEST/DEFAULT 经 guard 天然拒绝）、参数约定与错误映射。 全离线（InProcessExecutor + COUNT_DOWN
- * 门闩；无真实子进程——真实子进程见 Main 侧 W3 E2E）。
+ * W3 组件 4 契约：四个内置编排工具（{@code spawn_sub_agent}/{@code kill_sub_agent}/{@code list_sub_agents}/{@code
+ * read_agent_context}）的注册签名、权限三要素、参数约定与错误映射。
+ *
+ * <p><b>D27 起的判定两处各管一边</b>：guard/spec 只管"这一档能不能进这个工具"（四个工具全 {@code DEFAULT} 级），"这一个你能不能动" 由 {@link
+ * ContextAccessJudge} 判（能力位 + 血缘）——所以本类的 kill/list 用例要把<b>身份</b>绑成 main（缺省 UNKNOWN 会被判定 fail-closed
+ * 拒掉，见 {@link #guardOnlyAdmitsDefaultLevelAndTheJudgmentDecides}）。 全离线（InProcessExecutor +
+ * COUNT_DOWN 门闩；无真实子进程——真实子进程见 Main 侧 W3 E2E）。
  */
 class SubagentOrchestrationToolsTest {
 
@@ -47,14 +50,15 @@ class SubagentOrchestrationToolsTest {
   @TempDir Path tempDir;
 
   /**
-   * 工具面 spec（S5-A 起 spawn 与另两个<b>分档</b>）：{@code spawn_sub_agent} = DEFAULT 级（子 Agent 也能派孙代），{@code
-   * kill}/{@code list} 仍是 SYSTEM（子体能派、不能收别人的）。
+   * 工具面 spec（D27 起<b>四个全 DEFAULT 级</b>）：级别只回答"这一档能不能进这个工具"，"这一个你能不能动"归血缘判定 （{@link
+   * ContextAccessJudge}）。破坏位仍分开：{@code kill}/{@code spawn} = destructive（模板要显式放行），{@code
+   * list}/{@code read} 不是。
    *
-   * <p>判别性：把 spawn 的 {@code requiredLevel} 改回 SYSTEM，本用例第一处断言即转红——这正是"降级真的生效"的判别面 （S4-A 之前 spec
-   * 是装饰，MCP 路径裸调 {@code tool.execute}）。
+   * <p>判别性：把任一工具的 {@code requiredLevel} 改回 SYSTEM，本用例对应断言即转红——这正是"降级真的生效"的判别面 （S4-A 之前 spec 是装饰，MCP
+   * 路径裸调 {@code tool.execute}）。
    */
   @Test
-  void spawnIsDefaultLevelWhileKillAndListStaySystem() {
+  void allFourOrchestrationToolsAreDefaultLevelWithJudgmentInCharge() {
     Fixture f = fixture(systemParent(), null);
     List<AgentTool> tools = SubagentOrchestrationTools.of(f.manager());
     // D30 起是四个（多 read_agent_context）；注册序 = 名字字典序
@@ -70,18 +74,17 @@ class SubagentOrchestrationToolsTest {
     assertThat(specs.get(SubagentOrchestrationTools.SPAWN_SUB_AGENT))
         .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, true));
     assertThat(specs.get(SubagentOrchestrationTools.KILL_SUB_AGENT))
-        .isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
+        .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, true));
     assertThat(specs.get(SubagentOrchestrationTools.LIST_SUB_AGENTS))
-        .isEqualTo(ToolSpec.level(AccessToken.SYSTEM, false, true));
-    // 读工具的 spec 另有一维（noExport=true）+ sensitive=true，判别在 ReadAgentContextToolTest
+        .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, false));
     assertThat(specs.get(SubagentOrchestrationTools.READ_AGENT_CONTEXT))
-        .isEqualTo(ToolSpec.level(AccessToken.SYSTEM, true, false, true));
+        .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, false));
 
     for (AgentTool tool : tools) {
-      if (tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
-        continue;
-      }
-      assertThat(tool.spec().noExport()).isFalse(); // 三个非读工具仍可外发（子体拿得到 spawn/kill/list）
+      assertThat(tool.spec().noExport())
+          .as(tool.name())
+          .isFalse(); // 四个都可外发（D27：读工具也去掉 noExport，改由判定守）
+      assertThat(tool.spec().sensitive()).as(tool.name()).isFalse();
     }
     f.close();
   }
@@ -109,7 +112,8 @@ class SubagentOrchestrationToolsTest {
                     AccessToken.SYSTEM,
                     AgentPermissionSet.system(),
                     Map.of(),
-                    Map.of("templateId", "reader", "goal", "向主 Agent 问好")));
+                    Map.of("templateId", "reader", "goal", "向主 Agent 问好"),
+                    AgentIdentity.main(CommandMode.FULL)));
     assertThat(result.success()).isTrue();
     Map<String, Object> snapshot = JSON.readValue(result.message(), Map.class);
     String childId = (String) snapshot.get("instanceId");
@@ -117,6 +121,8 @@ class SubagentOrchestrationToolsTest {
     assertThat(snapshot.get("status")).isEqualTo("RUNNING");
     assertThat(snapshot.get("depth")).isEqualTo(1);
 
+    // D27 血缘：派发那一刻由 manager 写上（主 Agent 派的就是 main 段），子体不参与、也给不出
+    assertThat(f.manager().get(childId).orElseThrow().lineagePath()).isEqualTo("main/" + childId);
     // 生命周期事件链已落库（correlationId = 子实例 id）
     assertThat(f.lifecycleActions(childId)).containsExactly("configured", "spawning", "running");
     assertThat(f.manager().get(childId).orElseThrow().permissions().isToolAllowed("echo")).isTrue();
@@ -137,6 +143,7 @@ class SubagentOrchestrationToolsTest {
     ToolExecutionGuard guard = new ToolExecutionGuard();
     ToolRegistry registry = registryOf(f.manager());
 
+    // 派发时绑 main 身份：子体的血缘 path（main/<id>）由身份解析得来，之后 kill 才落得进它的 subtree
     ToolResult spawn =
         guard.execute(
             registry,
@@ -145,7 +152,8 @@ class SubagentOrchestrationToolsTest {
                 AccessToken.SYSTEM,
                 AgentPermissionSet.system(),
                 Map.of(),
-                Map.of("templateId", "reader", "goal", "g")));
+                Map.of("templateId", "reader", "goal", "g"),
+                AgentIdentity.main(CommandMode.FULL)));
     String childId = (String) JSON.<Map>readValue(spawn.message(), Map.class).get("instanceId");
     assertThat(childId).isNotNull();
 
@@ -187,7 +195,8 @@ class SubagentOrchestrationToolsTest {
             AccessToken.SYSTEM,
             AgentPermissionSet.system(),
             Map.of(),
-            Map.of("templateId", "reader", "goal", "g")));
+            Map.of("templateId", "reader", "goal", "g"),
+            AgentIdentity.main(CommandMode.FULL)));
 
     ToolResult list = guard.execute(registry, "list_sub_agents", context(Map.of()));
     assertThat(list.success()).isTrue();
@@ -250,18 +259,23 @@ class SubagentOrchestrationToolsTest {
   }
 
   /**
-   * guard 层身份闸（S5-A 起<b>分档</b>）：GUEST 三个工具全拒；DEFAULT（= 子 Agent 的默认级别）只进得去 {@code
-   * spawn_sub_agent}，{@code kill}/{@code list} 仍被 SYSTEM 级挡在门外。
+   * guard 层身份闸（S5-A 起<b>分档</b>）+ 判定的分工（D27）：GUEST 四个工具全拒（身份级别不足）；DEFAULT（= 子 Agent 的默认级别）
+   * <b>进得去</b>四个工具，但"能不能动到东西"由血缘判定说了算——身份解析不出（缺省 {@code UNKNOWN}）一律 fail-closed， 而同一份级别、只把身份换成 main
+   * 就放行：<b>级别不是判据，身份/血缘才是</b>。
    *
-   * <p>判别性：spawn 若还是 SYSTEM 级，"DEFAULT 派得出孙代"那步会被 guard 拦下（转红）；kill/list 若跟着降到 DEFAULT， 第二段断言转红。
+   * <p>判别性：把 kill/list 的 spec 改回 SYSTEM，"进得去工具"那步会被 guard 拦下（码是 {@code DENIED} 而不是 {@code
+   * SUBTREE_DENIED}）⇒ 转红；把判定换回 {@code caller == SYSTEM} 自查，第三段（DEFAULT 权限 + main 身份）会被拒 ⇒ 转红。
    */
   @Test
-  void guardDeniesEverythingForGuestAndOnlySpawnForDefault() {
-    Fixture f = fixture(systemParent(), new InProcessExecutor((instanceId, config) -> {}));
+  void guardOnlyAdmitsDefaultLevelAndTheJudgmentDecides() throws Exception {
+    CountDownLatch blocked = new CountDownLatch(1);
+    Fixture f =
+        fixture(systemParent(), new InProcessExecutor((instanceId, config) -> blocked.await()));
     ToolRegistry registry = registryOf(f.manager());
     ToolExecutionGuard guard = new ToolExecutionGuard();
 
-    for (String name : List.of("spawn_sub_agent", "kill_sub_agent", "list_sub_agents")) {
+    for (String name :
+        List.of("spawn_sub_agent", "kill_sub_agent", "list_sub_agents", "read_agent_context")) {
       ToolResult denied =
           guard.execute(
               registry,
@@ -278,25 +292,67 @@ class SubagentOrchestrationToolsTest {
 
     // 身份级别闸读的是**权限集的 grantedToken**（PermissionChecker 第 3 条），不是 ToolContext.caller——
     // 所以"DEFAULT 调用者"必须连权限集一起是 DEFAULT，否则这个用例会因为权限集恰好是 system() 而假通过
-    ToolContext defaultCaller =
-        new ToolContext(
-            AccessToken.DEFAULT,
-            AgentPermissionSet.builder(AccessToken.DEFAULT)
-                .allowAll()
-                .destructiveAllowed(true)
-                .build(),
-            Map.of(),
-            Map.of("templateId", "reader", "goal", "派孙代"));
-    ToolResult spawned = guard.execute(registry, "spawn_sub_agent", defaultCaller);
-    assertThat(spawned.success()).isTrue();
+    AgentPermissionSet defaultPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allowAll().destructiveAllowed(true).build();
+    // 派发绑 main 身份（子体才有可解析的血缘 path），级别仍是 DEFAULT——"谁能进工具"与"这个能不能动"是两回事
+    ToolResult spawned =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                defaultPermissions,
+                Map.of(),
+                Map.of("templateId", "reader", "goal", "派孙代"),
+                AgentIdentity.main(CommandMode.FULL)));
+    assertThat(spawned.success()).as(spawned.message()).isTrue();
     assertThat(f.manager().list()).hasSize(1);
+    String childId = f.manager().list().get(0).instanceId();
+    assertThat(f.manager().get(childId).orElseThrow().lineagePath())
+        .as("主 Agent 派的子体：path 有 main 段")
+        .isEqualTo("main/" + childId);
 
-    for (String name : List.of("kill_sub_agent", "list_sub_agents")) {
-      ToolResult denied = guard.execute(registry, name, defaultCaller);
+    // 同一份 DEFAULT 权限 + 身份解析不出：工具进得去，判定拒（fail-closed）
+    for (String name : List.of("kill_sub_agent", "list_sub_agents", "read_agent_context")) {
+      Map<String, Object> args =
+          name.equals("kill_sub_agent")
+              ? Map.of("instanceId", childId)
+              : name.equals("read_agent_context") ? Map.of("target", childId) : Map.of();
+      ToolResult denied =
+          guard.execute(
+              registry,
+              name,
+              new ToolContext(AccessToken.DEFAULT, defaultPermissions, Map.of(), args));
       assertThat(denied.success()).as(name).isFalse();
-      assertThat(denied.code()).as(name).isEqualTo(ToolExecutionGuard.DENIED);
-      assertThat(denied.message()).contains("身份级别不足");
+      assertThat(denied.code()).as(name).isEqualTo(ContextAccessJudge.SUBTREE_DENIED);
+      assertThat(denied.message()).as(name).isEqualTo(ContextAccessJudge.OUT_OF_SCOPE_REASON);
     }
+
+    // 同一份级别、只换身份（main）⇒ 判定放行：DEFAULT 级不再是"能不能动"的判据
+    ToolResult killed =
+        guard.execute(
+            registry,
+            "kill_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                defaultPermissions,
+                Map.of(),
+                Map.of("instanceId", childId),
+                AgentIdentity.main(CommandMode.FULL)));
+    assertThat(killed.success()).as(killed.message()).isTrue();
+    ToolResult listed =
+        guard.execute(
+            registry,
+            "list_sub_agents",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                defaultPermissions,
+                Map.of(),
+                Map.of(),
+                AgentIdentity.main(CommandMode.FULL)));
+    assertThat(listed.success()).as(listed.message()).isTrue();
+    assertThat(listed.message()).contains(childId);
+    blocked.countDown();
     f.close();
   }
 
@@ -589,6 +645,75 @@ class SubagentOrchestrationToolsTest {
     f.close();
   }
 
+  // ---- D27：A1（派发时点名工具白名单） ----
+
+  /**
+   * {@code allowedTools} 参数面（D27 的 {@code A1}）：透传到派发（生效值 = <b>模板 ∩ A1</b>），点名调用者没有的工具 ⇒ {@code
+   * PERMISSION_DENIED}（消息点名那个工具）且<b>不留实例</b>。
+   *
+   * <p>判别性：参数面漏接（schema 有、请求构造没接）⇒ 子体仍拿模板全量 ⇒ 收窄断言转红；把越界做成"静默求交"⇒ 本该失败的派发 成功落地、manager 里多一个实例 ⇒
+   * 后两条断言转红。
+   */
+  @Test
+  void allowedToolsArgumentNarrowsTheChildAndRejectsBeyondCaller() throws Exception {
+    writeTemplate("pair", Set.of("echo", SubagentOrchestrationTools.READ_AGENT_CONTEXT), "双工具模板");
+    Fixture f = fixture(systemParent(), new InProcessExecutor((instanceId, config) -> {}));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    // 调用者自己有 echo + read_agent_context + spawn（I1 的两个基准都在），但**没有** admin-do
+    AgentPermissionSet callerPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT)
+            .allow("echo", SubagentOrchestrationTools.READ_AGENT_CONTEXT, "spawn_sub_agent")
+            .destructiveAllowed(true)
+            .build();
+    AgentIdentity caller = AgentIdentity.subagent("a1-instance", CommandMode.FULL, "派活", 1);
+
+    ToolResult narrowed =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                callerPermissions,
+                Map.of(),
+                Map.of("templateId", "pair", "goal", "收窄一个工具", "allowedTools", List.of("echo")),
+                caller));
+    assertThat(narrowed.success()).as(narrowed.message()).isTrue();
+    String childId = (String) JSON.<Map>readValue(narrowed.message(), Map.class).get("instanceId");
+    assertThat(f.manager().get(childId).orElseThrow().permissions().isToolAllowed("echo")).isTrue();
+    assertThat(
+            f.manager()
+                .get(childId)
+                .orElseThrow()
+                .permissions()
+                .isToolAllowed(SubagentOrchestrationTools.READ_AGENT_CONTEXT))
+        .as("模板里有、请求没点名 ⇒ 被 A1 收窄掉")
+        .isFalse();
+
+    ToolResult rejected =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                callerPermissions,
+                Map.of(),
+                Map.of(
+                    "templateId",
+                    "pair",
+                    "goal",
+                    "点名越界工具",
+                    "allowedTools",
+                    List.of("echo", "admin-do")),
+                caller));
+    assertThat(rejected.success()).isFalse();
+    assertThat(rejected.code()).isEqualTo(ToolExecutionGuard.DENIED);
+    assertThat(rejected.message()).contains("admin-do").contains("I1");
+    assertThat(f.manager().list()).as("被拒那次不留实例").hasSize(1);
+    f.close();
+  }
+
   // ---- fixtures ----
 
   /** 管理器 + 事件库 + 总线（测试自建并注入，便于直接查事件）。 */
@@ -709,8 +834,17 @@ class SubagentOrchestrationToolsTest {
     }
   }
 
+  /**
+   * 缺省调用上下文 = <b>主 Agent 在问</b>（SYSTEM 权限 + {@code main} 身份）。D27 起身份是判定的输入之一：不绑身份会被血缘判定 fail-closed
+   * 拒掉（这正是 {@link #guardOnlyAdmitsDefaultLevelAndTheJudgmentDecides} 的反向面）。
+   */
   private static ToolContext context(Map<String, Object> args) {
-    return new ToolContext(AccessToken.SYSTEM, AgentPermissionSet.system(), Map.of(), args);
+    return new ToolContext(
+        AccessToken.SYSTEM,
+        AgentPermissionSet.system(),
+        Map.of(),
+        args,
+        AgentIdentity.main(CommandMode.FULL));
   }
 
   /** 换一份<b>调用者权限集</b>的上下文（S5-B：fs 面受限的调用者）。 */

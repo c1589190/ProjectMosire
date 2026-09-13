@@ -19,6 +19,13 @@ import io.mosire.brain.runtime.AgentConfig;
  * @param status 当前状态快照（以 Manager 内 map 中的最新记录为准）
  * @param parentInstanceId <b>谁派的它</b>（调用者实例 id；主 Agent 派的就是 {@code main}）。S5-A 起承载：单实例直系额度按它计数
  *     （{@link SubagentManager#spawn}），也是 D27 血缘判定的原料之一。空串 = 未记录（老构造路径/测试夹具）， 不计入任何调用者的额度
+ * @param lineagePath <b>血缘路径</b>（D27）：{@code /} 分段的实例链，形态 {@code main/a1/a1-1}——主 Agent 的 path 是
+ *     {@code main}（= {@link io.mosire.agentlib.permission.AgentIdentity#MAIN_ID}），子实例是 {@code 父path
+ *     + "/" + 自己的 instanceId}。<b>只有 manager 写</b>（派发那一刻拼进实例记录，见 {@link
+ *     SubagentManager#spawn}）：子体<b>不参与</b>、 也给不出（I4 不可自报），因此判定永远发生在父进程、读的是 manager
+ *     里的这一份，而不是子体自报的任何东西。判定只做<b>按段前缀匹配</b> （{@code path(t).equals(path(c)) ||
+ *     path(t).startsWith(path(c) + "/")}，见 {@link ContextAccessJudge}）。 空串 = 未记录（兼容构造/老记录/父身份解析不出）
+ *     ⇒ 判定面 fail-closed（拒绝），<b>不拒派发</b>
  */
 public record SubagentInstance(
     String instanceId,
@@ -29,11 +36,13 @@ public record SubagentInstance(
     CommandMode mode,
     int depth,
     SubagentStatus status,
-    String parentInstanceId) {
+    String parentInstanceId,
+    String lineagePath) {
 
   public SubagentInstance {
     mode = mode == null ? CommandMode.LIMITED : mode;
     parentInstanceId = parentInstanceId == null ? "" : parentInstanceId;
+    lineagePath = lineagePath == null ? "" : lineagePath;
   }
 
   /** 7 参兼容构造（S6 之前）：档位取 {@link CommandMode#LIMITED}——<b>子 Agent 的缺省档</b>（用户裁决"必须是子 Agent 的默认"）。 */
@@ -61,6 +70,30 @@ public record SubagentInstance(
     this(instanceId, templateId, goal, config, permissions, mode, depth, status, "");
   }
 
+  /** 9 参兼容构造（D27 之前）：血缘路径未记录（空串 = 判定面 fail-closed，见类 javadoc）。 */
+  public SubagentInstance(
+      String instanceId,
+      String templateId,
+      String goal,
+      AgentConfig config,
+      AgentPermissionSet permissions,
+      CommandMode mode,
+      int depth,
+      SubagentStatus status,
+      String parentInstanceId) {
+    this(
+        instanceId,
+        templateId,
+        goal,
+        config,
+        permissions,
+        mode,
+        depth,
+        status,
+        parentInstanceId,
+        "");
+  }
+
   /** 换状态返回新实例（record 无 wither，收敛到一处避免散落的拷贝构造）。 */
   SubagentInstance withStatus(SubagentStatus newStatus) {
     return new SubagentInstance(
@@ -72,6 +105,7 @@ public record SubagentInstance(
         mode,
         depth,
         newStatus,
-        parentInstanceId);
+        parentInstanceId,
+        lineagePath);
   }
 }

@@ -9,7 +9,9 @@ import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.FakeLlmClient;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
@@ -197,11 +199,14 @@ class W3SubagentE2ETest {
         .execute(
             app.runtime().registry(),
             "kill_sub_agent",
+            // 主 Agent 身份（与 AgentPipeline 装配的 main 身份同源；本夹具无 CommandModeHolder ⇒ FULL）：
+            // 血缘判定按 identity 查表，4 参构造的 UNKNOWN 解析不出 callerPath ⇒ kill 一律 SUBTREE_DENIED
             new ToolContext(
                 AccessToken.SYSTEM,
                 AgentPermissionSet.system(),
                 Map.of(),
-                Map.of("instanceId", instanceId)));
+                Map.of("instanceId", instanceId),
+                AgentIdentity.main(CommandMode.FULL)));
   }
 
   // ---- helpers ----

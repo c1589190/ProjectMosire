@@ -30,7 +30,9 @@ import org.slf4j.LoggerFactory;
  *   <li>W3b 链接形态（{@link #SubProcessExecutor(SubprocessManager, AgentCommand, ToolRegistry, String,
  *       String)}）：子进程 stdin/stdout 被父侧接管为 MCP stdio 链接（{@code protocolStdout=true}，stdout
  *       泵让位），父侧为每个子 Agent 起一个 {@link AgentToMcpServer}，以<b>子 Agent 自身的权限集</b>调用 父级工具（红线 R7：不经此默认
- *       GUEST/unrestricted；调用者身份=子体身份，父级 SYSTEM 权限不外借）。
+ *       GUEST/unrestricted；调用者身份=子体身份，父级 SYSTEM 权限不外借）；<b>链接上下文的 {@code ToolContext.config} 只补
+ *       {@code read_agent_context} 需要的三键</b>（见 {@link #linkToolConfig}——不补则子体读谁都是 {@code
+ *       CONTEXT_UNAVAILABLE}，"读侧同判"（V4）根本走不到判定之后那一步）。
  * </ul>
  *
  * <p>进程级生命周期全委托 {@link SubprocessManager}（红线 5：进程句柄与管道归进程装配层持有， 本类只是委托入口，不外泄任何流/句柄给工具层）；启动命令按 Rul C
@@ -136,6 +138,40 @@ public final class SubProcessExecutor implements AgentExecutor {
     return null;
   }
 
+  /**
+   * 链接上下文的工具配置（D27 的读侧接线）：<b>只补 {@code read_agent_context} 需要的三键</b>（ {@link
+   * AgentContextReader#CONFIG_SUBAGENTS_ROOT}/{@link
+   * AgentContextReader#CONFIG_SELF_EVENTS_DB}/{@link AgentContextReader#CONFIG_SELF_AGENT_ID}）。
+   *
+   * <p><b>为什么与 {@link AgentCommand#argv} 同源</b>：子体的事件库在哪，由父侧交给它的 {@code --data-dir} 决定——{@code
+   * argv} 写的是 {@code <childDataDir>/<实例 id>}（装配层侧 = {@code
+   * <数据根>/subagents}），读侧就按同一处取，<b>不给第二份真相</b>： 自身库 = {@code <childDataDir>/<实例
+   * id>/events.db}；{@code read_agent_context} 的子库根 = {@code
+   * childDataDir}（实例的数据目录一律由<b>本进程</b>这个根派生——子体的 {@code spawn_sub_agent} 经父侧编排执行，孙代也在同一个根下落库， 与
+   * {@code SubagentOrchestrationTools.childDbPath} 的 {@code <root>/<id>/events.db} 口径逐字对齐）。
+   *
+   * <p><b>边界（不许含糊）</b>：这里<b>只</b>有这三键，补的是"子体读得到"。bash 三件套等其它工具的配置<b>不</b>在此注入——它们在这条缝上仍拿到空 config ⇒
+   * 各自的缺省口径（{@code BashToolConfig.fromToolConfig} 对空表有安全缺省；<b>但</b>部署侧配的 {@code tools.bash.*}
+   * 附加项对子体不生效——见本轮报告，属未修的独立缝）。
+   *
+   * <p>{@code childDataDir == null}（装配层没注入数据根）⇒ 返回空表，逐字回到本缝接线前的行为：<b>不编路径</b>，读侧拿到的是 {@code
+   * CONTEXT_UNAVAILABLE}（响亮），不是一份猜出来的库。
+   */
+  Map<String, Object> linkToolConfig(SubagentInstance instance) {
+    if (command.childDataDir() == null) {
+      return Map.of();
+    }
+    Path root = Path.of(command.childDataDir());
+    String instanceId = instance.instanceId();
+    return Map.of(
+        AgentContextReader.CONFIG_SUBAGENTS_ROOT,
+        root.toString(),
+        AgentContextReader.CONFIG_SELF_EVENTS_DB,
+        root.resolve(instanceId).resolve("events.db").toString(),
+        AgentContextReader.CONFIG_SELF_AGENT_ID,
+        instanceId);
+  }
+
   @Override
   public LaunchedSubagent launch(SubagentInstance instance) {
     List<String> argv = command.argv(instance);
@@ -161,10 +197,14 @@ public final class SubProcessExecutor implements AgentExecutor {
             parentTools,
             serverName,
             serverVersion,
-            ToolContext.of(
+            new ToolContext(
                 instance.permissions().grantedToken(),
                 // 红线 R7：父侧调用上下文 = 子体自身权限集（非父级 SYSTEM/unrestricted）
                 instance.permissions(),
+                // D27 读侧接线：read_agent_context 的三键（与 argv 同源，见 linkToolConfig）；
+                // 其它工具配置不在此注入——各自缺省口径。
+                linkToolConfig(instance),
+                Map.of(),
                 // S6：子体的<b>实例身份 + 命令档位 + 目标</b>绑在这条链上（绑一次，链上每次调用都取它）。
                 // 这是子体身份的唯一来源：模型给不出、子进程自己报不了——它决定"命令闸工具按哪一档分流"，
                 // 以及审批请求里的 requesterId/goal（上级判定据此回答"谁在问、被派去干什么"）。
