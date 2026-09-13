@@ -44,12 +44,26 @@ import org.junit.jupiter.api.io.TempDir;
  *   <li>孙代（同 grand 模板，真实子进程）：{@code depth=2}、{@code parentInstanceId=grand 实例}——身份穿透<b>两个</b> MCP
  *       跳的证据；它再派时 {@code depth=3 > 子深度上限 2}，被<b>深度闸</b>拒绝（拒绝类事件落在父级事件库、 子体侧 tool.result
  *       ok=false），父侧不留半个实例——"子体能派"与"派不出跑飞"同时钉住；
- *   <li>三个子体跑完脚本后阻塞等待父侧关停信号内（{@code whenClosed}），父级 kill → TERMINATING→KILLED 事件链。
+ *   <li>三个子体跑完脚本后<b>即退</b>（§2.2：不再阻塞等父侧关停信号），退栈前把自己的终局记录落进<b>自己的</b> events.db （§2.1）； 父侧不 kill
+ *       任何一个，生命周期链自己走到 {@code finished} 且带终局字段（§2.3 规则 1）。
  * </ol>
  *
- * <p>断言面：父级事件库 = 主 Agent 的 spawn 工具调用/结果 + 三个子 Agent 的完整生命周期链（configured→…→killed）+ 孙代越界的 {@code
- * decision:DEPTH_LIMIT}；子级事件库（{@code <dataDir>/subagents/<instanceId>/events.db}） = 各自的
- * tool.call/tool.result。
+ * <p>断言面：父级事件库 = 主 Agent 的 spawn 工具调用/结果 + 三个子 Agent 的完整生命周期链（configured→…→finished，含
+ * stopReason/turns/toolCalls/exitCode）+ 孙代越界的 {@code decision:DEPTH_LIMIT}；子级事件库（{@code
+ * <dataDir>/subagents/<instanceId>/events.db}） = 各自的 tool.call/tool.result + 自己的终局记录。
+ *
+ * <p><b>判别性（设计 §四.1/§四.2，本轮变异靶）</b>：
+ *
+ * <ul>
+ *   <li>变异回"链接形态保留 {@code whenClosed} 阻塞" ⇒ 子体答完不退栈、终局记录不落库、父侧永远停在 {@code RUNNING} ⇒ {@link
+ *       #realChildSubprocessCallsParentToolsViaMcpAndFinishesOnItsOwn} 在 await 生命周期链上超时转红；
+ *   <li>把子体落库挪到退栈之后（或删掉）⇒ 同一条 await（父侧判据 = 子库终局事件）转红；
+ *   <li>把终局记录写成缺 {@code stopReason} 的老形态 ⇒ 子库记录断言与父侧 {@code FINISHED} 链双双转红。
+ * </ul>
+ *
+ * <p>第二个用例把<b>异常终局</b>（§四.3 的第二个混淆项、§四.6 的退出码）钉在真进程上：子体引导期就死（配置根缺 {@code llm.*}） ⇒ 子库没有终局记录 ⇒ 父侧
+ * {@code FAILED} + {@code reason=未留下终局记录} + <b>真实退出码 1</b>（不是编出来的 0）， 且模型面（{@code
+ * list_sub_agents}/{@code wait_sub_agent}）能区分"跑完了"与"没留下记录"。
  */
 class W3SubagentE2ETest {
 
@@ -58,7 +72,7 @@ class W3SubagentE2ETest {
   @TempDir Path tempDir;
 
   @Test
-  void realChildSubprocessCallsParentToolsViaMcpAndDiesOnKill() throws Exception {
+  void realChildSubprocessCallsParentToolsViaMcpAndFinishesOnItsOwn() throws Exception {
     Path templates = tempDir.resolve("templates");
     Files.createDirectories(templates);
     writeTemplate(
@@ -91,10 +105,11 @@ class W3SubagentE2ETest {
         new BootConfig(0, dataDir, false, "", null, false, "127.0.0.1", 0, templates);
     App app = App.start(config, mainLlm, List.of(echoTool()));
     try (app) {
-      // W3b 接线验收：主 Agent 工具面含三个内置编排工具（Brain 注册三要素 SYSTEM/非敏感/破坏性）
+      // W3b 接线验收：主 Agent 工具面含内置编排工具（含 B 块新增的等取口 wait_sub_agent）
       assertThat(app.runtime().registry().find("spawn_sub_agent")).isPresent();
       assertThat(app.runtime().registry().find("kill_sub_agent")).isPresent();
       assertThat(app.runtime().registry().find("list_sub_agents")).isPresent();
+      assertThat(app.runtime().registry().find("wait_sub_agent")).isPresent();
 
       // 回合 1：主 Agent（脚本）spawn reader —— 真实子进程
       app.runtime().chat("请派一个问候子 Agent");
@@ -140,14 +155,48 @@ class W3SubagentE2ETest {
       // 父侧实例账：只有三个（reader / grand / 孙代），被拒的那次不留半个实例
       assertThat(app.subagents()).hasSize(3);
 
-      // kill（经主 Agent 的 guard 出口驱动——与主 Agent 管线执行工具相同的路径）→ 三层关停 → 生命周期链
+      // §2.2 即退 + §2.3 规则 1：主 Agent <b>一次 kill 都没发</b>，三个子体跑完脚本自行退出；父侧按"子库终局事件的有无"判终局
+      // ——链自己走到 finished 且带 stopReason/turns/toolCalls/exitCode。
+      // 判别性：变异回"链接形态保留 whenClosed 阻塞" ⇒ 子体永不退栈 ⇒ 本 await 超时转红（本轮变异靶 §四.1）。
       for (SubagentInstance child : List.of(reader, grand, grandchild)) {
-        assertThat(kill(app, child.instanceId()).success()).isTrue();
         awaitLifecycleActions(
-            dataDir,
-            child.instanceId(),
-            List.of("configured", "spawning", "running", "terminating", "killed"));
+            dataDir, child.instanceId(), List.of("configured", "spawning", "running", "finished"));
+
+        // 父侧终局事件（§2.4 的持久面）：停因来自子体自己落的那条记录，退出码来自真句柄（不是编的 0）
+        Map<String, Object> terminal = terminalEventPayload(dataDir, child.instanceId());
+        assertThat(terminal)
+            .as("父侧终局事件 id=%s", child.instanceId())
+            .containsEntry("action", "finished")
+            .containsEntry("stopReason", "FINISHED")
+            .doesNotContainKey("reason");
+        assertThat(terminal).containsKeys("turns", "toolCalls", "exitCode");
+        assertThat((Integer) terminal.get("turns")).isPositive();
+        assertThat((Integer) terminal.get("toolCalls")).isPositive();
+        assertThat((Integer) terminal.get("exitCode"))
+            .as("即退路径的退出码 = 真句柄给的 0（子进程已退出，不是编出来的）")
+            .isZero();
+
+        // 子体自己库里的终局记录（§2.1）——父侧那条 FINISHED 的判据本身；变异挪到退栈后/删掉 ⇒ 上面 await 与这里双双转红
+        Map<String, Object> ownRecord =
+            awaitChildTerminalRecord(childEvents(dataDir, child.instanceId()), child.instanceId());
+        assertThat(ownRecord)
+            .as("子库终局记录 id=%s", child.instanceId())
+            .containsEntry("action", "finished")
+            .containsEntry("stopReason", "FINISHED");
+        assertThat(ownRecord).containsKeys("turns", "toolCalls");
       }
+
+      // §2.6：对已经是终态的子体再 kill ⇒ 如实回"已是终态"，不谎报"已终止"（真进程路径同口径）
+      ToolResult reKill = kill(app, reader.instanceId());
+      assertThat(reKill.success()).isTrue();
+      assertThat(reKill.message()).contains("已是终态").contains("FINISHED");
+
+      // §2.5 + C 块：等取口对已终态实例立即返回终局字段（模型面能看到"为什么停"）
+      Map<String, Object> waited = jsonBody(waitFor(app, reader.instanceId(), 0));
+      assertThat(waited)
+          .containsEntry("status", "FINISHED")
+          .containsEntry("stopReason", "FINISHED");
+      assertThat(waited).containsKeys("turns", "toolCalls", "exitCode", "waitedMillis");
 
       // 主 Agent 父级事件库：spawn 工具调用/结果（脚本驱动、成功）+ 越权类事件为零
       // （孙代的深度拒绝发的是 decision:DEPTH_LIMIT，不是 permission.denied）
@@ -167,6 +216,81 @@ class W3SubagentE2ETest {
                 mainStore.query(new EventQuery("main", EventTypes.PERMISSION_DENIED, "", -1, 100)))
             .isEmpty();
       }
+    }
+  }
+
+  /**
+   * §2.3 规则 2 的真进程形态（§四.3 第二个混淆项 + §四.6）：子体<b>引导期就死</b>（配置根里没有 {@code llm.*} ⇒ {@code
+   * E_LLM_CONFIG_MISSING}）⇒ 它一条终局记录都没留下 ⇒ 父侧记 {@code FAILED} + {@code reason=未留下终局记录} + <b>真实退出码
+   * 1</b>，且模型面（{@code list_sub_agents}/{@code wait_sub_agent}）能区分"跑完了"与"没留下记录"。
+   *
+   * <p><b>为什么这就是 §四.3 的判别点</b>：同一条链上，"正常跑完"（上一个用例）父侧是 {@code FINISHED} + {@code stopReason}，这里父侧是
+   * {@code FAILED} 且<b>没有</b> {@code stopReason}——两个混淆项（跑完了 / 没留下记录）分开验，模型可见面 如实分叉。若父侧退回"RUNNING
+   * 退出一律记 FINISHED"（旧口径），本用例转红。
+   *
+   * <p><b>§四.6 的判别点</b>：断言 {@code exitCode == 1}——把 {@code exitCodeOf} 写成"拿不到补 0"/恒 0（看着无害的改法）⇒
+   * 本用例转红；也能抓到"读子库记录时把退出码写成常量"的改法。
+   */
+  @Test
+  void childThatDiesBeforeLeavingATerminalRecordIsFailedAndVisibleOnTheModelFace()
+      throws Exception {
+    Path templates = tempDir.resolve("templates");
+    Files.createDirectories(templates);
+    writeTemplate(templates, "broken", List.of(), List.of());
+    Path dataDir = tempDir.resolve("data");
+    // 配置根：只有密钥、没有 llm.*——生产真模型形态（装配层把配置根交给子体）下，子体引导期即失败：
+    // stderr 一行 + 非零退出，chat 从未开始 ⇒ 子库终局记录必然缺席（§2.3 规则 2 的真实触发形态）
+    Path configRoot = tempDir.resolve("config-root");
+    Files.createDirectories(configRoot);
+    Files.writeString(
+        configRoot.resolve("config.json"), "{\"keys\":{\"local\":\"sk-sentinel-not-a-real-key\"}}");
+    BootConfig config =
+        new BootConfig(0, dataDir, false, "", null, false, "127.0.0.1", 0, templates);
+    FakeLlmClient mainLlm =
+        FakeLlmClient.with(
+            LlmResponse.toolCall(
+                "m-1", "spawn_sub_agent", Map.of("templateId", "broken", "goal", "注定失败")),
+            LlmResponse.text("已派遣"));
+    App app = App.start(config, mainLlm, List.of(), configRoot);
+    try (app) {
+      app.runtime().chat("派一个必崩的子 Agent");
+      SubagentInstance child = awaitChild(app, i -> "broken".equals(i.templateId()));
+
+      // 规则 2：RUNNING 退出 + 子库无终局事件 ⇒ FAILED（不是 FINISHED——那正是旧口径的谎言）
+      awaitLifecycleActions(
+          dataDir, child.instanceId(), List.of("configured", "spawning", "running", "failed"));
+      Map<String, Object> terminal = terminalEventPayload(dataDir, child.instanceId());
+      assertThat(terminal).containsEntry("action", "failed").containsEntry("reason", "未留下终局记录");
+      assertThat(terminal)
+          .as("没留下终局记录 ⇒ 不编 stopReason（'未知'不许伪装成'正常完成'）")
+          .doesNotContainKey("stopReason")
+          .doesNotContainKey("turns")
+          .doesNotContainKey("toolCalls");
+      assertThat(terminal).containsEntry("exitCode", 1);
+
+      // 子库确实没有终局记录（父侧的 FAILED 不是读库失败造成的假象——库在，记录不在）
+      assertThat(Files.isRegularFile(childEvents(dataDir, child.instanceId())))
+          .as("子体已建库（引导期在模板装载之后建库）")
+          .isTrue();
+      assertThat(childTerminalRecord(childEvents(dataDir, child.instanceId()), child.instanceId()))
+          .isNull();
+
+      // C 块模型面：等取口如实回 FAILED + 无 stopReason（模型据此区分"跑完了"与"没留下记录"）
+      Map<String, Object> waited = jsonBody(waitFor(app, child.instanceId(), 0));
+      assertThat(waited)
+          .containsEntry("status", "FAILED")
+          .containsEntry("exitCode", 1)
+          .doesNotContainKey("stopReason");
+      // list 行同口径（异常终局在模型面可见——C 块的落点）
+      Map<String, Object> row =
+          listRows(app).stream()
+              .filter(r -> child.instanceId().equals(r.get("instanceId")))
+              .findFirst()
+              .orElseThrow(() -> new AssertionError("list 里应有该子体: " + child.instanceId()));
+      assertThat(row)
+          .containsEntry("status", "FAILED")
+          .containsEntry("exitCode", 1)
+          .doesNotContainKey("stopReason");
     }
   }
 
@@ -195,17 +319,31 @@ class W3SubagentE2ETest {
   }
 
   private ToolResult kill(App app, String instanceId) {
+    return callTool(app, "kill_sub_agent", Map.of("instanceId", instanceId));
+  }
+
+  private ToolResult waitFor(App app, String instanceId, long timeoutMs) {
+    return callTool(
+        app, "wait_sub_agent", Map.of("instanceId", instanceId, "timeoutMs", timeoutMs));
+  }
+
+  /**
+   * 经主 Agent 的 guard 出口调用编排工具（与主 Agent 管线执行工具相同的路径）。
+   *
+   * <p>身份必须与生产同源（{@code AgentPipeline} 装配的 main 身份；本夹具无 {@code CommandModeHolder} ⇒ {@code
+   * FULL}）：血缘判定按 identity 查表，4 参构造的 {@code UNKNOWN} 解析不出 callerPath ⇒ kill 一律 {@code
+   * SUBTREE_DENIED}。
+   */
+  private ToolResult callTool(App app, String tool, Map<String, Object> args) {
     return new ToolExecutionGuard()
         .execute(
             app.runtime().registry(),
-            "kill_sub_agent",
-            // 主 Agent 身份（与 AgentPipeline 装配的 main 身份同源；本夹具无 CommandModeHolder ⇒ FULL）：
-            // 血缘判定按 identity 查表，4 参构造的 UNKNOWN 解析不出 callerPath ⇒ kill 一律 SUBTREE_DENIED
+            tool,
             new ToolContext(
                 AccessToken.SYSTEM,
                 AgentPermissionSet.system(),
                 Map.of(),
-                Map.of("instanceId", instanceId),
+                args,
                 AgentIdentity.main(CommandMode.FULL)));
   }
 
@@ -339,17 +477,98 @@ class W3SubagentE2ETest {
         "等待事件 " + type + " " + key + "=" + value + " 且 " + key2 + " 含 [" + contained + "]");
   }
 
-  /** 轮询某子 Agent 的生命周期动作序列（父级事件库）。 */
+  /** 轮询某子 Agent 的生命周期动作序列（父级事件库）；超时消息带上<b>实际链</b>（失败要一眼看出差在哪条）。 */
   private void awaitLifecycleActions(Path dataDir, String childId, List<String> expected)
       throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(30_000);
+    List<String> actual = List.of();
+    while (System.nanoTime() < deadline) {
+      try (SqliteEventStore store = SqliteEventStore.open(dataDir.resolve("events.db"))) {
+        actual = lifecycleActions(store, childId);
+        if (actual.equals(expected)) {
+          return;
+        }
+      }
+      Thread.sleep(100);
+    }
+    throw new AssertionError(
+        "超时（30000ms）: 等待生命周期链 " + childId + " = " + expected + "，实际 = " + actual);
+  }
+
+  /**
+   * 轮询子体<b>自己</b>库里的终局记录（§2.1）——父侧判定的唯一判据本身；子进程刚退出，轮询容忍并发写。
+   *
+   * @return 记录 payload（{@code action=finished} 且带非空 {@code stopReason}）；超时未落库 ⇒ 断言失败
+   */
+  private Map<String, Object> awaitChildTerminalRecord(Path db, String instanceId)
+      throws Exception {
+    @SuppressWarnings("unchecked")
+    Map<String, Object>[] found = new Map[1];
     await(
         () -> {
-          try (SqliteEventStore store = SqliteEventStore.open(dataDir.resolve("events.db"))) {
-            return lifecycleActions(store, childId).equals(expected);
-          }
+          found[0] = childTerminalRecord(db, instanceId);
+          return found[0] != null;
         },
         30_000,
-        "等待生命周期链 " + childId + " = " + expected);
+        "等待子库终局记录 " + instanceId);
+    return found[0];
+  }
+
+  /** 子库里的终局记录（没有 ⇒ null）；口径与父侧读侧逐字一致：{@code action=finished} 且 {@code stopReason} 非空。 */
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> childTerminalRecord(Path db, String instanceId) {
+    if (!Files.isRegularFile(db)) {
+      return null;
+    }
+    try (SqliteEventStore store = SqliteEventStore.open(db)) {
+      for (Event event :
+          store.query(
+              new EventQuery(instanceId, EventTypes.AGENT_LIFECYCLE, instanceId, -1, 100))) {
+        Map<String, Object> payload = JSON.readValue(event.payload(), Map.class);
+        if ("finished".equals(payload.get("action"))
+            && payload.get("stopReason") != null
+            && !String.valueOf(payload.get("stopReason")).isBlank()) {
+          return payload;
+        }
+      }
+      return null;
+    } catch (Exception e) {
+      return null; // 库刚建/正被写：视为"尚未落库"，轮询会再来（与父侧读侧同口径）
+    }
+  }
+
+  /** 父库里该子 Agent 的<b>最新</b>一条生命周期事件 payload（用例在 await 收束后调用 = 终局事件）。 */
+  private static Map<String, Object> terminalEventPayload(Path dataDir, String childId) {
+    try (SqliteEventStore store = SqliteEventStore.open(dataDir.resolve("events.db"))) {
+      List<Event> events =
+          store.query(new EventQuery(childId, EventTypes.AGENT_LIFECYCLE, childId, -1, 100));
+      assertThat(events).as("生命周期事件非空: %s", childId).isNotEmpty();
+      return payloadMap(events.get(0)); // 倒序（seq 降序）：第一条 = 最新
+    } catch (Exception e) {
+      throw new AssertionError("读父级终局事件失败: " + childId, e);
+    }
+  }
+
+  /** {@code list_sub_agents} 的行（主 Agent 身份）——C 块的模型可见面。 */
+  @SuppressWarnings("unchecked")
+  private List<Map<String, Object>> listRows(App app) {
+    ToolResult listed = callTool(app, "list_sub_agents", Map.of());
+    assertThat(listed.success()).as("list 应成功: %s", listed.message()).isTrue();
+    try {
+      return JSON.readValue(listed.message(), List.class);
+    } catch (Exception e) {
+      throw new AssertionError("list 返回体无法解析: " + listed.message(), e);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> jsonBody(ToolResult result) {
+    assertThat(result.success()).as("工具调用应成功: %s", result.message()).isTrue();
+    try {
+      return JSON.readValue(result.message(), Map.class);
+    } catch (Exception e) {
+      throw new AssertionError("工具返回体无法解析: " + result.message(), e);
+    }
   }
 
   private static List<String> lifecycleActions(SqliteEventStore store, String childId) {
@@ -370,6 +589,15 @@ class W3SubagentE2ETest {
 
   private static Path childEvents(Path dataDir, String instanceId) {
     return dataDir.resolve("subagents").resolve(instanceId).resolve("events.db");
+  }
+
+  @SuppressWarnings("unchecked")
+  private static Map<String, Object> payloadMap(Event event) {
+    try {
+      return JSON.readValue(event.payload(), Map.class);
+    } catch (Exception e) {
+      throw new AssertionError("事件 payload 无法解析: " + event.payload(), e);
+    }
   }
 
   @SuppressWarnings("unchecked")

@@ -70,6 +70,48 @@ class PipeMcpClientTransportTest {
     }
   }
 
+  /**
+   * 传输的收发线程<b>必须守护化</b>（子 Agent 终局设计 §2.2"即退"的前提）：进站线程长期阻塞在不可中断的管道读上，非守护化会把子进程 钉在 {@code main}
+   * 返回之后（实测 thread dump：{@code DestroyJavaVM} 等一个 {@code inboundLoop} 线程，子体"跑完不退出"换个形态复现）。
+   *
+   * <p>判别性：去掉 {@code daemonThreads(...)}（回到 {@code Executors.newSingleThreadExecutor()}）⇒ 本用例转红。
+   */
+  @Test
+  void transportThreadsAreDaemonSoTheyCannotPinTheJvmAlive() throws Exception {
+    PipedInputStream serverReads = new PipedInputStream();
+    PipedOutputStream clientWrites = new PipedOutputStream(serverReads);
+    PipedInputStream clientReads = new PipedInputStream();
+    PipedOutputStream serverWrites = new PipedOutputStream(clientReads);
+    ToolRegistry registry = new ToolRegistry();
+    registry.register(echoTool());
+
+    try (AgentToMcpServer server =
+        AgentToMcpServer.startWith(
+            registry,
+            "daemon-server",
+            "0.1.0",
+            ToolContext.of(AccessToken.GUEST, AgentPermissionSet.unrestricted(AccessToken.GUEST)),
+            new StdioServerTransportProvider(
+                McpJsonDefaults.getMapper(), serverReads, serverWrites))) {
+      PipeMcpClientTransport transport =
+          new PipeMcpClientTransport(McpJsonDefaults.getMapper(), clientReads, clientWrites);
+      McpSyncClient client = McpClient.sync(transport).build();
+      try {
+        client.initialize(); // 握手走完：收发线程都已实际起过（惰性创建）
+        for (String name : List.of("mosire-mcp-inbound", "mosire-mcp-outbound")) {
+          List<Thread> threads =
+              Thread.getAllStackTraces().keySet().stream()
+                  .filter(t -> name.equals(t.getName()))
+                  .toList();
+          assertThat(threads).as("传输线程 %s 应已创建", name).isNotEmpty();
+          assertThat(threads).as("%s 必须守护化（否则钉住 JVM 退出）", name).allMatch(Thread::isDaemon);
+        }
+      } finally {
+        client.closeGracefully();
+      }
+    }
+  }
+
   private static AgentTool echoTool() {
     return new AgentTool() {
       @Override

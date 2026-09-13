@@ -50,22 +50,26 @@ class SubagentOrchestrationToolsTest {
   @TempDir Path tempDir;
 
   /**
-   * 工具面 spec（D27 起<b>四个全 DEFAULT 级</b>）：级别只回答"这一档能不能进这个工具"，"这一个你能不能动"归血缘判定 （{@link
+   * 工具面 spec（D27 起<b>五个全 DEFAULT 级</b>）：级别只回答"这一档能不能进这个工具"，"这一个你能不能动"归血缘判定 （{@link
    * ContextAccessJudge}）。破坏位仍分开：{@code kill}/{@code spawn} = destructive（模板要显式放行），{@code
-   * list}/{@code read} 不是。
+   * list}/{@code read}/{@code wait} 不是。
    *
    * <p>判别性：把任一工具的 {@code requiredLevel} 改回 SYSTEM，本用例对应断言即转红——这正是"降级真的生效"的判别面 （S4-A 之前 spec 是装饰，MCP
    * 路径裸调 {@code tool.execute}）。
    */
   @Test
-  void allFourOrchestrationToolsAreDefaultLevelWithJudgmentInCharge() {
+  void allFiveOrchestrationToolsAreDefaultLevelWithJudgmentInCharge() {
     Fixture f = fixture(systemParent(), null);
     List<AgentTool> tools = SubagentOrchestrationTools.of(f.manager());
-    // D30 起是四个（多 read_agent_context）；注册序 = 名字字典序
+    // D30 起四个（多 read_agent_context）、§2.5 起五个（多 wait_sub_agent）；注册序 = 名字字典序
     assertThat(tools)
         .extracting(AgentTool::name)
         .containsExactly(
-            "kill_sub_agent", "list_sub_agents", "read_agent_context", "spawn_sub_agent");
+            "kill_sub_agent",
+            "list_sub_agents",
+            "read_agent_context",
+            "spawn_sub_agent",
+            "wait_sub_agent");
 
     Map<String, ToolSpec> specs = new LinkedHashMap<>();
     for (AgentTool tool : tools) {
@@ -79,11 +83,14 @@ class SubagentOrchestrationToolsTest {
         .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, false));
     assertThat(specs.get(SubagentOrchestrationTools.READ_AGENT_CONTEXT))
         .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, false));
+    // §2.5：只读等待 ⇒ DEFAULT + 非敏感 + 非破坏（且不设 noExport——判定说了算）
+    assertThat(specs.get(SubagentOrchestrationTools.WAIT_SUB_AGENT))
+        .isEqualTo(ToolSpec.level(AccessToken.DEFAULT, false, false));
 
     for (AgentTool tool : tools) {
       assertThat(tool.spec().noExport())
           .as(tool.name())
-          .isFalse(); // 四个都可外发（D27：读工具也去掉 noExport，改由判定守）
+          .isFalse(); // 五个都可外发（D27：读工具也去掉 noExport，改由判定守）
       assertThat(tool.spec().sensitive()).as(tool.name()).isFalse();
     }
     f.close();
@@ -163,6 +170,14 @@ class SubagentOrchestrationToolsTest {
     assertThat(kill.success()).isTrue();
     assertThat(kill.message()).contains(childId);
 
+    // §2.6：kill 返回<b>终态</b>而不是"已请求"——KILLED 明说，且<b>不带</b> stopReason（被杀的子体没交代过停因）
+    Map<String, Object> killBody = okBody(kill);
+    assertThat(killBody)
+        .containsEntry("instanceId", childId)
+        .containsEntry("status", "KILLED")
+        .doesNotContainKey("stopReason");
+    assertThat(killBody.get("message").toString()).contains("已终止").contains(childId);
+
     awaitStatus(f.manager(), childId, "KILLED");
     assertThat(f.lifecycleActions(childId))
         .containsExactly("configured", "spawning", "running", "terminating", "killed");
@@ -207,8 +222,257 @@ class SubagentOrchestrationToolsTest {
         .containsEntry("templateId", "reader");
     assertThat(rows.get(0).get("status")).isEqualTo("RUNNING");
     assertThat(rows.get(0).get("depth")).isEqualTo(1);
+    // §2.6：没终结就没有终局字段——"没有 stopReason"本身就是信息（不是填出来的假值）
+    assertThat(rows.get(0)).doesNotContainKey("stopReason").doesNotContainKey("exitCode");
     blocked.countDown();
     f.close();
+  }
+
+  /**
+   * §2.5 + §2.6（C 块落点）：{@code wait_sub_agent} 等到终态 ⇒ 带 {@code stopReason}/{@code turns}/{@code
+   * toolCalls}； {@code list} 的同一份终局字段也带上——"正常完成"与"异常退出"在模型面上由此可分。
+   *
+   * <p>判别性：把终局字段从返回体里去掉（只留 status）⇒ 断言转红；把"等到终态"写成"立刻返回当前状态"⇒ status 断言转红。
+   */
+  @Test
+  void waitToolReturnsTerminalOutcomeAndListCarriesTerminalFields() throws Exception {
+    Fixture f =
+        fixture(
+            systemParent(),
+            new InProcessExecutor(
+                (instanceId, config) -> writeChildTerminalRecord(instanceId, "FINISHED", 4, 3)));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult spawn =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "跑完就退")));
+    String childId = (String) okBody(spawn).get("instanceId");
+
+    ToolResult waited =
+        guard.execute(
+            registry, "wait_sub_agent", context(Map.of("instanceId", childId, "timeoutMs", 5000)));
+    Map<String, Object> body = okBody(waited);
+    assertThat(body)
+        .containsEntry("instanceId", childId)
+        .containsEntry("status", "FINISHED")
+        .containsEntry("stopReason", "FINISHED")
+        .containsEntry("turns", 4)
+        .containsEntry("toolCalls", 3);
+    assertThat(((Number) body.get("waitedMillis")).longValue()).isBetween(0L, 5000L);
+
+    ToolResult list = guard.execute(registry, "list_sub_agents", context(Map.of()));
+    List<Map<String, Object>> rows = JSON.readValue(list.message(), List.class);
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0))
+        .containsEntry("status", "FINISHED")
+        .containsEntry("stopReason", "FINISHED")
+        .containsEntry("turns", 4);
+    f.close();
+  }
+
+  /**
+   * §2.5 / §四.4 的第二态：<b>超时不是错误</b>——到点成功返回当前 {@code status}（不抛、不报错误码），模型自己决定再等还是 kill。
+   *
+   * <p>判别性：把超时实现成 {@code ToolResult.error}（"等不到就报错"的直觉改法）⇒ {@link #okBody} 断言转红；把等待实现成"立即返回"⇒
+   * {@code elapsedMillis} 断言转红。
+   */
+  @Test
+  void waitToolTimesOutWithoutError() throws Exception {
+    CountDownLatch blocked = new CountDownLatch(1);
+    Fixture f =
+        fixture(systemParent(), new InProcessExecutor((instanceId, config) -> blocked.await()));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult spawn =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "长任务")));
+    String childId = (String) okBody(spawn).get("instanceId");
+
+    long started = System.nanoTime();
+    ToolResult waited =
+        guard.execute(
+            registry, "wait_sub_agent", context(Map.of("instanceId", childId, "timeoutMs", 300)));
+    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+    Map<String, Object> body = okBody(waited); // 成功结果：超时不是错误
+    assertThat(body)
+        .containsEntry("status", "RUNNING")
+        .doesNotContainKey("stopReason")
+        .doesNotContainKey("exitCode");
+    assertThat(elapsedMillis).as("真把预算等完了（不是立刻返回）").isGreaterThanOrEqualTo(200L);
+    blocked.countDown();
+    f.close();
+  }
+
+  /**
+   * §四.4 的第三态 + 能力位：{@code wait} 的判据是 A 块的血缘判定（能力位 + subtree）—— <b>兄弟分支等不了</b>（两边 path 都能解析出，只是不在同一
+   * subtree），<b>父等得了自己的子</b>；能力位缺则 {@code DENIED}。
+   *
+   * <p>判别性：把判据换成"能进工具就能等"⇒ 兄弟分支那条断言转红；把能力位与"能调这个工具"混作一谈 ⇒ {@code DENIED} 断言转红。
+   */
+  @Test
+  void waitJudgementIsLineageBased() throws Exception {
+    Fixture f =
+        fixture(
+            systemParent(),
+            new InProcessExecutor(
+                (instanceId, config) -> writeChildTerminalRecord(instanceId, "FINISHED", 1, 0)));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+    AgentPermissionSet defaultPermissions =
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allowAll().destructiveAllowed(true).build();
+
+    ToolResult spawnedA =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "A")));
+    String childA = (String) okBody(spawnedA).get("instanceId");
+    ToolResult spawnedB =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "B")));
+    String childB = (String) okBody(spawnedB).get("instanceId");
+    // 孙代（A 自己派的）：父等自己的子 = 允许
+    ToolResult spawnedG =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                defaultPermissions,
+                Map.of(),
+                Map.of("templateId", "reader", "goal", "G"),
+                AgentIdentity.subagent(childA, CommandMode.FULL, "上级派的任务", 1)));
+    String childG = (String) okBody(spawnedG).get("instanceId");
+    assertThat(f.manager().get(childG).orElseThrow().lineagePath())
+        .isEqualTo("main/" + childA + "/" + childG);
+
+    // 兄弟分支（B 等 A 的子）：两边 path 都能解析（main/B 与 main/A/G），但不同血脉 ⇒ SUBTREE_DENIED
+    ToolResult denied =
+        guard.execute(
+            registry,
+            "wait_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                defaultPermissions,
+                Map.of(),
+                Map.of("instanceId", childG, "timeoutMs", 5000),
+                AgentIdentity.subagent(childB, CommandMode.FULL, "别家的活", 1)));
+    assertThat(denied.success()).isFalse();
+    assertThat(denied.code()).isEqualTo(ContextAccessJudge.SUBTREE_DENIED);
+    assertThat(denied.message())
+        .as("模型面只说这一类被拒（细节进日志，f4060c1 口径）")
+        .isEqualTo(ContextAccessJudge.OUT_OF_SCOPE_REASON);
+
+    // 反向对照：父等自己的子 ⇒ 放行（否则本用例退化成"怎么都拒"）
+    ToolResult allowed =
+        guard.execute(
+            registry,
+            "wait_sub_agent",
+            new ToolContext(
+                AccessToken.DEFAULT,
+                defaultPermissions,
+                Map.of(),
+                Map.of("instanceId", childG, "timeoutMs", 5000),
+                AgentIdentity.subagent(childA, CommandMode.FULL, "上级派的任务", 1)));
+    assertThat(okBody(allowed)).containsEntry("status", "FINISHED");
+
+    // 能力位独立于"能不能进这个工具"：白名单里没有 wait_sub_agent ⇒ 判定第⑥条 DENIED。
+    // 注意必须<b>直呼工具</b>（不经 guard）：guard 的入口白名单会在更前面就拒掉，那样验到的是 guard 那一层，
+    // 判定里的能力位反而没被走到——"探针没走到判定点"正是要避免的假通过。
+    AgentPermissionSet noWait =
+        AgentPermissionSet.builder(AccessToken.DEFAULT).allow("list_sub_agents").build();
+    AgentTool waitTool = registry.find(SubagentOrchestrationTools.WAIT_SUB_AGENT).orElseThrow();
+    ToolResult deniedByBit =
+        waitTool.execute(
+            new ToolContext(
+                AccessToken.DEFAULT,
+                noWait,
+                Map.of(),
+                Map.of("instanceId", childG, "timeoutMs", 5000),
+                AgentIdentity.main(CommandMode.FULL)));
+    assertThat(deniedByBit.success()).isFalse();
+    assertThat(deniedByBit.code()).isEqualTo(ToolExecutionGuard.DENIED);
+    assertThat(deniedByBit.message()).contains("能力位");
+    f.close();
+  }
+
+  /** §2.5：{@code timeoutMs} 必填且非负——参数问题是 {@code INVALID_ARGUMENTS}，不落到判定/等待里。 */
+  @Test
+  void waitToolRequiresNonNegativeTimeout() {
+    Fixture f = fixture(systemParent(), null);
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult missing =
+        guard.execute(registry, "wait_sub_agent", context(Map.of("instanceId", "reader-nope")));
+    assertThat(missing.success()).isFalse();
+    assertThat(missing.code()).isEqualTo("INVALID_ARGUMENTS");
+    assertThat(missing.message()).contains("timeoutMs");
+
+    ToolResult negative =
+        guard.execute(
+            registry,
+            "wait_sub_agent",
+            context(Map.of("instanceId", "reader-nope", "timeoutMs", -1)));
+    assertThat(negative.success()).isFalse();
+    assertThat(negative.code()).isEqualTo("INVALID_ARGUMENTS");
+
+    ToolResult noId = guard.execute(registry, "wait_sub_agent", context(Map.of("timeoutMs", 10)));
+    assertThat(noId.code()).isEqualTo("INVALID_ARGUMENTS");
+    f.close();
+  }
+
+  /**
+   * §2.6 的诚实口径：{@code kill} 等一小段确认后返回终态——在管子体 ⇒ {@code KILLED}；已经跑完的实例 ⇒ 照实报 {@code FINISHED} +
+   * {@code stopReason}（<b>不谎报"已终止"</b>）。
+   *
+   * <p>判别性：把返回体换回固定的"已发出终止请求"文本（旧口径）⇒ 两条 {@code message} 断言转红。
+   */
+  @Test
+  void killReportsTerminalStateHonestly() throws Exception {
+    CountDownLatch blocked = new CountDownLatch(1);
+    Fixture f =
+        fixture(systemParent(), new InProcessExecutor((instanceId, config) -> blocked.await()));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult spawn =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "长任务")));
+    String childId = (String) okBody(spawn).get("instanceId");
+    Map<String, Object> killed =
+        okBody(guard.execute(registry, "kill_sub_agent", context(Map.of("instanceId", childId))));
+    assertThat(killed).containsEntry("status", "KILLED").doesNotContainKey("stopReason");
+    assertThat(killed.get("message").toString()).contains("已终止").contains(childId);
+    blocked.countDown();
+
+    // 已经自己跑完的实例：kill 不改状态、不假装"刚被终止"——照实报 FINISHED + stopReason
+    Fixture finished =
+        fixture(
+            systemParent(),
+            new InProcessExecutor(
+                (instanceId, config) -> writeChildTerminalRecord(instanceId, "TURN_LIMIT", 9, 5)));
+    ToolRegistry finishedRegistry = registryOf(finished.manager());
+    ToolResult spawn2 =
+        guard.execute(
+            finishedRegistry,
+            "spawn_sub_agent",
+            context(Map.of("templateId", "reader", "goal", "跑完")));
+    String child2 = (String) okBody(spawn2).get("instanceId");
+    awaitStatus(finished.manager(), child2, "FINISHED");
+
+    Map<String, Object> lateKill =
+        okBody(
+            guard.execute(
+                finishedRegistry, "kill_sub_agent", context(Map.of("instanceId", child2))));
+    assertThat(lateKill)
+        .containsEntry("status", "FINISHED")
+        .containsEntry("stopReason", "TURN_LIMIT");
+    assertThat(lateKill.get("message").toString()).contains("已是终态").contains(child2);
+
+    f.close();
+    finished.close();
   }
 
   /**
@@ -275,7 +539,12 @@ class SubagentOrchestrationToolsTest {
     ToolExecutionGuard guard = new ToolExecutionGuard();
 
     for (String name :
-        List.of("spawn_sub_agent", "kill_sub_agent", "list_sub_agents", "read_agent_context")) {
+        List.of(
+            "spawn_sub_agent",
+            "kill_sub_agent",
+            "list_sub_agents",
+            "read_agent_context",
+            "wait_sub_agent")) {
       ToolResult denied =
           guard.execute(
               registry,
@@ -313,11 +582,14 @@ class SubagentOrchestrationToolsTest {
         .isEqualTo("main/" + childId);
 
     // 同一份 DEFAULT 权限 + 身份解析不出：工具进得去，判定拒（fail-closed）
-    for (String name : List.of("kill_sub_agent", "list_sub_agents", "read_agent_context")) {
+    for (String name :
+        List.of("kill_sub_agent", "list_sub_agents", "read_agent_context", "wait_sub_agent")) {
       Map<String, Object> args =
           name.equals("kill_sub_agent")
               ? Map.of("instanceId", childId)
-              : name.equals("read_agent_context") ? Map.of("target", childId) : Map.of();
+              : name.equals("wait_sub_agent")
+                  ? Map.of("instanceId", childId, "timeoutMs", 0)
+                  : name.equals("read_agent_context") ? Map.of("target", childId) : Map.of();
       ToolResult denied =
           guard.execute(
               registry,
@@ -790,8 +1062,44 @@ class SubagentOrchestrationToolsTest {
             parentPermissions,
             0,
             () -> CommandMode.FULL,
-            limits);
+            limits,
+            childDataRoot());
     return new Fixture(events, bus, manager);
+  }
+
+  /** 子库根（§2.3）：生产装配是 {@code <dataDir>/subagents}，测试里跟父库同挂 {@code tempDir/data} 下。 */
+  private Path childDataRoot() {
+    return tempDir.resolve("data").resolve("subagents");
+  }
+
+  /** 模拟子体的协议义务（§2.1）：终局记录写进<b>自己的</b>库 {@code <root>/<id>/events.db}。 */
+  private void writeChildTerminalRecord(
+      String instanceId, String stopReason, int turns, int toolCalls) {
+    Path dir = childDataRoot().resolve(instanceId);
+    try {
+      Files.createDirectories(dir);
+      try (SqliteEventStore child = SqliteEventStore.open(dir.resolve("events.db"))) {
+        child.append(
+            io.mosire.agentlib.event.EventWrite.of(
+                EventTypes.AGENT_LIFECYCLE,
+                instanceId,
+                JSON.writeValueAsString(
+                    Map.of(
+                        "action", "finished",
+                        "stopReason", stopReason,
+                        "turns", turns,
+                        "toolCalls", toolCalls)),
+                instanceId));
+      }
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("子库终局记录写入失败: " + instanceId, e);
+    }
+  }
+
+  /** 工具返回体（JSON）→ Map；顺带断言"是成功结果"。 */
+  private static Map<String, Object> okBody(ToolResult result) throws Exception {
+    assertThat(result.success()).as(result.message()).isTrue();
+    return JSON.readValue(result.message(), Map.class);
   }
 
   private ToolRegistry registryOf(SubagentManager manager) {

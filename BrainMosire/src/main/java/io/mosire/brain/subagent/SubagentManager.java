@@ -1,9 +1,13 @@
 package io.mosire.brain.subagent;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
+import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
+import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
@@ -14,6 +18,7 @@ import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Comparator;
@@ -27,6 +32,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,10 +68,12 @@ import org.slf4j.LoggerFactory;
  * KILLED（事件）；kill-before-running 按 {@link SubagentStatus#FAILED} 语义收束。终结后幂等（重复 kill 是空操作）。Manager
  * 不持有 {@link SubprocessManager}——它归装配层（Main） 持有。
  *
- * <p><strong>退出观测</strong>：{@link LaunchedSubagent} 只暴露 {@code isAlive()/close()} 与诊断面 {@code
- * exitDiagnostics()}（窄缝不泄漏 onExit/退出码——决策回溯见其 Javadoc），本类以一个每实例虚拟线程做轮询桥接 ({@value
- * #EXIT_POLL_MILLIS}ms)，自然退出 → FINISHED、关停中退出 → KILLED；W3b 接协议层后（MCP stdio 终止/退出码回报）可换为事件驱动，桥接点收敛在
- * {@link #onChildExited} 一处。管理核心仍单线程语义： 所有状态转移在同一把私有锁下原子完成，观测线程只投递"已退出"事实。
+ * <p><strong>退出观测（§2.3 起重写）</strong>：{@link LaunchedSubagent} 只暴露 {@code isAlive()/close()}、诊断面
+ * {@code exitDiagnostics()} 与退出码 {@code exitCode()}（窄缝不泄漏 onExit），本类以一个每实例虚拟线程做轮询桥接 ({@value
+ * #EXIT_POLL_MILLIS}ms)，把"已退出"事实投递给唯一收束点 {@link #onChildExited}。<b>判据是子库终局事件的有无</b>（子体在 {@code
+ * chat()} 返回后先落库再退栈，见 {@code SubagentProcessMain}）而不是退出码——被杀的子体照常 {@code return 0}，码答不出"为什么停"：
+ * 有终局记录 ⇒ FINISHED + stopReason（哪怕此刻在 TERMINATING）；无记录 ⇒ RUNNING 记 FAILED（{@code 未留下终局记录} + 退出码）、
+ * TERMINATING 记 KILLED、SPAWNING 记 FAILED（既有口径）。管理核心仍单线程语义： 所有状态转移在同一把私有锁下原子完成，观测线程只投递"已退出"事实。
  *
  * <p><strong>事件面</strong>：生命周期事件 {@code agent=childId, correlationId=childId}；拒绝类事件 {@code agent=父级
  * id, correlationId=拟生成的子实例 id}（查询可串起"尝试+转移"全程）。
@@ -77,8 +85,27 @@ public final class SubagentManager implements AutoCloseable {
   /** 退出观测轮询间隔（毫秒）。 */
   private static final long EXIT_POLL_MILLIS = 100L;
 
-  /** kill 终态确认宽限（进程三层关停内已等过一次，这里只做收尾确认）。 */
-  private static final long KILL_CONFIRM_MILLIS = SubprocessManager.DEFAULT_GRACE.toMillis();
+  /**
+   * kill 终态确认宽限（进程三层关停内已等过一次，这里只做收尾确认）。
+   *
+   * <p>§2.6 起也供 {@code kill_sub_agent} 工具复用：工具在 {@code kill()} 之外只补"这一段预算的剩余部分"（见 {@code
+   * SubagentOrchestrationTools#kill}），所以总时延不叠加。
+   */
+  public static final long KILL_CONFIRM_MILLIS = SubprocessManager.DEFAULT_GRACE.toMillis();
+
+  /** 子库终局记录的扫描上限（倒序取最近若干条 {@code agent.lifecycle}——终局记录必在尾部）。 */
+  private static final int TERMINAL_SCAN_LIMIT = 50;
+
+  /** 子库终局事件的动作名（设计 §2.1：{@code agent.lifecycle/action=finished}）——父侧判定的唯一判据。 */
+  private static final String TERMINAL_ACTION = "finished";
+
+  /** 子库里的终局记录缺失时给模型面的原因（规则 2，设计 §2.3 逐字）。 */
+  static final String NO_TERMINAL_RECORD_REASON = "未留下终局记录";
+
+  /** 子体在确认存活之前就退出时给模型面的原因（规则 4，既有口径逐字保留）。 */
+  static final String EXIT_BEFORE_RUNNING_REASON = "subagent 退出于确认存活之前";
+
+  private static final ObjectMapper JSON = new ObjectMapper();
 
   private final AgentTemplateStore templateStore;
   private final SubagentLauncher launcher;
@@ -90,12 +117,27 @@ public final class SubagentManager implements AutoCloseable {
   private final int parentDepth;
   private final SubagentLimits limits;
 
+  /**
+   * 子 Agent 数据根（{@code <dataDir>/subagents}）——父侧读<b>子库终局记录</b>的路径源（设计 §2.3 的判据）。
+   *
+   * <p>与 {@link AgentCommand#childDataDir()} 同源（子体的 {@code --data-dir} 就是它底下的 {@code <实例 id>}），
+   * 路径再由本类拼成 {@code <root>/<实例id>/events.db}——与 {@code SubagentOrchestrationTools.childDbPath}、
+   * {@code AgentContextReader} 的口径逐字一致（不给第二份真相）。
+   *
+   * <p><b>{@code null} = 装配层没注入</b>（既有夹具/离线形态）⇒ 读不到任何终局记录 ⇒ 一律按"未留下终局记录"处理（fail-closed：宁可
+   * 报异常终局，也不假装子体交代过）。生产装配（{@code App.wireSubagents}）必注入。
+   */
+  private final Path childDataRoot;
+
   /** 私有锁：状态记录/事件顺序/句柄表全部在锁内原子推进（同 SubprocessManager/USO 理由）。 */
   private final Object lock = new Object();
 
   private final Map<String, SubagentInstance> instances = new HashMap<>();
   private final Map<String, LaunchedSubagent> handles = new HashMap<>();
   private final Set<Thread> watchers = new HashSet<>();
+
+  /** 父侧观测到的终局（设计 §2.4 的内存面；父库事件是同一份事实的持久面）。终态不受理新增，单调写入。 */
+  private final Map<String, TerminalOutcome> outcomes = new HashMap<>();
 
   private volatile boolean closed;
 
@@ -169,6 +211,38 @@ public final class SubagentManager implements AutoCloseable {
       int parentDepth,
       Supplier<CommandMode> parentMode,
       SubagentLimits limits) {
+    this(
+        templateStore,
+        launcher,
+        events,
+        bus,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        parentMode,
+        limits,
+        null);
+  }
+
+  /**
+   * 全参装配 + <b>子库根</b>（设计 §2.3 的终局判据）。
+   *
+   * @param childDataRoot 子 Agent 数据根（每实例取其 {@code <root>/<实例 id>/events.db}，与 {@link
+   *     AgentCommand#childDataDir()} 同源）。{@code null} = 未注入 ⇒ 读不到终局记录 ⇒ 一律按"未留下终局记录"
+   *     处理（fail-closed，不假装子体交代过）；生产装配必注入（{@code App.wireSubagents}）
+   */
+  public SubagentManager(
+      AgentTemplateStore templateStore,
+      SubagentLauncher launcher,
+      EventStore events,
+      EventBus bus,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions,
+      int parentDepth,
+      Supplier<CommandMode> parentMode,
+      SubagentLimits limits,
+      Path childDataRoot) {
+    this.childDataRoot = childDataRoot;
     this.limits = Objects.requireNonNull(limits, "limits");
     this.templateStore = Objects.requireNonNull(templateStore, "templateStore");
     this.launcher = Objects.requireNonNull(launcher, "launcher");
@@ -351,6 +425,44 @@ public final class SubagentManager implements AutoCloseable {
   }
 
   /**
+   * 父侧观测到的<b>终局</b>（设计 §2.4 的内存面）：未知/尚未终结的实例返回 {@link Optional#empty()}。
+   *
+   * <p>模型面（{@code list}/{@code wait}/{@code kill} 三个工具）据此带出 {@code stopReason} 等字段——这是 C 块"正常完成 vs
+   * 异常退出"可见的<b>唯一数据来源</b>；{@code status} 仍是唯一状态来源，本表只管"为什么停"。
+   */
+  public Optional<TerminalOutcome> terminalOutcome(String instanceId) {
+    synchronized (lock) {
+      return Optional.ofNullable(outcomes.get(instanceId));
+    }
+  }
+
+  /**
+   * 等到<b>终态</b>或超时（设计 §2.5）：100 ms 轮询某个实例的状态机状态，<b>不占锁</b>（每次只短暂取锁读快照， 关停路径的宽限等待不在这里）。
+   *
+   * <p><b>超时不是错误</b>：到点返回<b>当前快照</b>（可能仍是非终态），由调用方决定再等还是收——工具层照实回显，不抛异常。 与 {@link
+   * #awaitDead(LaunchedSubagent, long)} 的分工：那个等的是<b>句柄</b>（进程真的死了才算数，kill 收尾用，且必须在观测线程 已停的 {@link
+   * #close()} 路径上也能工作），本方法等的是<b>状态机终态</b>（观测线程投递的结果）；两者共用同一个 100 ms 轮询骨架 {@link
+   * #pollUntil(BooleanSupplier, long)}（设计 §2.5 的"`awaitDead` 是它的特例"——特例的是<b>条件</b>，骨架只有一份）。
+   *
+   * @param timeoutMillis 最长等待毫秒（≤0 ⇒ 立即返回当前快照）
+   * @return 终态或（超时的）当前快照
+   * @throws IllegalArgumentException 未知 id（工具层的判定已保证"已知实例"，走到这里说明判完到等待之间实例没了）
+   */
+  public SubagentInstance awaitTerminal(String instanceId, long timeoutMillis) {
+    pollUntil(() -> snapshotOrThrow(instanceId).status().isFinal(), timeoutMillis);
+    return snapshotOrThrow(instanceId);
+  }
+
+  /** 实例快照（未知 id 抛 {@link IllegalArgumentException}——调用方已完成判定，走到这里实例没了是程序错误）。 */
+  private SubagentInstance snapshotOrThrow(String instanceId) {
+    SubagentInstance current = get(instanceId).orElse(null);
+    if (current == null) {
+      throw new IllegalArgumentException("未知子 Agent: " + instanceId);
+    }
+    return current;
+  }
+
+  /**
    * kill：Manager 编排入口（红线 5，非"工具关进程"）。
    *
    * <p>RUNNING → TERMINATING（事件）→ launcher 句柄关闭（真实实现 = 三层关停）→ 终态确认 → KILLED （事件）；SPAWNING →
@@ -370,6 +482,9 @@ public final class SubagentManager implements AutoCloseable {
    *
    * <p>语义：子进程的生命周期归 SubprocessManager/Main（红线 5），这里的"清理"是编排收尾——逐个 terminate +
    * 通知启动缝释放自身资源，进程级兜底（宽限强杀）由 SubprocessManager 侧承担。
+   *
+   * <p><b>顺序由深到浅</b>（设计 §2.7）：按 {@code lineagePath} 段数降序关停，{@code lineagePath} 为空的老记录排<b>最后</b>。
+   * 仍是同一条 {@link #terminate(String)} 路径，异常吞成日志（既有口径）——顺序只是"谁先谁后"，不改任何终态语义。
    */
   @Override
   public void close() {
@@ -386,6 +501,11 @@ public final class SubagentManager implements AutoCloseable {
       live =
           instances.values().stream()
               .filter(i -> !i.status().isFinal())
+              // 由深到浅（设计 §2.7）：先关子孙再关祖辈，别让"祖辈先死 ⇒ 子孙的父侧链路断在半路"。
+              // lineagePath 为空的老记录段数记 -1 ⇒ 排在最后，不与深层抢序（它们没有可信的深度可言）
+              .sorted(
+                  Comparator.comparingInt((SubagentInstance i) -> lineageDepth(i.lineagePath()))
+                      .reversed())
               .map(SubagentInstance::instanceId)
               .toList();
     }
@@ -446,6 +566,25 @@ public final class SubagentManager implements AutoCloseable {
    */
   private String lineagePathOfCaller(String callerId) {
     return ContextAccessJudge.pathOf(callerId, this);
+  }
+
+  /**
+   * 血缘段数（{@code main/a1/a1-1} ⇒ 3）：只服务 {@link #close()} 的"由深到浅"排序。
+   *
+   * <p>空串（老记录/父身份解析不出）记 {@code -1}——它是"深度未知"，必须排在所有已知深度之后（设计 §2.7："不与深层抢序"）， 而不是被当成"第 0 层"（那会把它排到段数
+   * 1 之前）。
+   */
+  private static int lineageDepth(String lineagePath) {
+    if (lineagePath == null || lineagePath.isEmpty()) {
+      return -1;
+    }
+    int segments = 1;
+    for (int i = 0; i < lineagePath.length(); i++) {
+      if (lineagePath.charAt(i) == '/') {
+        segments++;
+      }
+    }
+    return segments;
   }
 
   /**
@@ -1031,15 +1170,10 @@ public final class SubagentManager implements AutoCloseable {
     }
     boolean dead = handle == null || awaitDead(handle, KILL_CONFIRM_MILLIS);
     if (dead) {
-      synchronized (lock) {
-        SubagentInstance current = instances.get(instanceId);
-        if (current != null && !current.status().isFinal()) {
-          transition(
-              instanceId,
-              SubagentStatus.KILLED,
-              lifecyclePayload("killed", current.templateId(), current.depth(), null, null));
-        }
-      }
+      // 与观测线程<b>同一个</b>收束函数（设计 §2.3：两条收束路径必须幂等、终态不重复迁移）：
+      // TERMINATING + 无终局记录 ⇒ KILLED；罕见但正确的一支 = 子体在被关停前已把终局落了库 ⇒ 以事件为准记 FINISHED + stopReason。
+      // 谁先到谁生效，后到的那条在锁内看到终态即返回（不重复迁移、不重复发事件）。
+      onChildExited(instanceId, handle);
     } else {
       // 三层关停后仍未死：留 TERMINATING，由退出观测在真正死亡时落 KILLED——不谎报终态
       LOG.warn("子 Agent 关停后仍存活（等待退出观测收束）: {}", instanceId);
@@ -1077,56 +1211,167 @@ public final class SubagentManager implements AutoCloseable {
   }
 
   /**
-   * 已退出事实投递（观测线程）：RUNNING→FINISHED（自然完成）；TERMINATING→KILLED；余为防御性 FAILED。
+   * 已退出事实的<b>唯一收束点</b>（设计 §2.3 重写；观测线程与 {@link #terminate(String)} 的 {@code awaitDead} 两条路径都走这里）。
    *
-   * <p><b>S5-E：异常退出要留一行原因</b>。子体在确认存活之后退出，过去在事件面与日志上同形——"干完活正常退"与"启动即崩"都只有 一个 {@code
-   * finished}（实测：子体拿到解析不到的相对 {@code --templates-dir} 当场退出，父侧零行日志）。现在<b>非零退出</b>会在父侧日志 留一行 WARN，文本取自
-   * {@link LaunchedSubagent#exitDiagnostics()}（子进程 stderr 尾部）。
+   * <p><b>判据 = 子库终局事件的有无，不是退出码</b>（被杀的子体照常 {@code return 0}，码答不出"为什么停"）：
    *
-   * <p><b>只记日志，不动状态</b>：状态说的是"这个子体的生命周期走到哪了"（确认存活后退出 = 终态），退出码是<b>诊断面</b>。 把非零一律翻成 FAILED
-   * 反而制造状态谎言（子体可以跑完目标再以非零码退栈），而且需求/预算/事件账目都挂在状态上。对应的口径是既有先例： 模型只见粗类，细节进日志。
+   * <table>
+   *   <caption>四条规则</caption>
+   *   <tr><th>观测<th>终态<th>理由</tr>
+   *   <tr><td>有终局记录（任何非终态）<td>{@code FINISHED} + {@code stopReason}/{@code turns}/{@code toolCalls}
+   *       <td>子体自己交代了它为什么停；含"TERMINATING 而子库有终局事件"——子体确实跑完了这一轮，谎报 KILLED 比"kill 请求落空"更糟</tr>
+   *   <tr><td>{@code RUNNING} 退出、无记录<td>{@code FAILED}（`未留下终局记录`）+ 退出码
+   *       <td>正常路径<b>一定</b>先落库后退栈；没有 ⇒ 异常退栈（崩了/被外部杀了）</tr>
+   *   <tr><td>{@code TERMINATING} 退出、无记录<td>{@code KILLED}（无 {@code stopReason}）
+   *       <td>既有口径逐字保留：是我们要求的关停，不许假装子体交代过停因</td></tr>
+   *   <tr><td>{@code SPAWNING} 退出<td>{@code FAILED}（`subagent 退出于确认存活之前`）
+   *       <td>既有口径逐字保留</td></tr>
+   * </table>
    *
-   * <p>TERMINATING（我们自己要求的关停）<b>不记</b>：那里的非零退出（SIGTERM 惯常 143）是预期形态，记了就是噪声——噪声里再出问题没人看。
+   * <p><b>幂等（两条路径同刻到达）</b>：状态已是终态 ⇒ 直接返回（不重复迁移、不重复发事件）。靠"先读后判"在同一把锁内完成， 而不是靠 {@code canTransition}
+   * 兜底——`KILLED→FAILED` 恰是非法迁移，靠它挡会把设计缺陷伪装成"恰好没炸"。
    *
-   * <p>诊断在<b>锁外</b>取：它读子进程输出尾部（自己一把锁），而输出泵在"输出超限"路径上会经 stopGracefully → 移除回调进本类的锁——
-   * 持锁取诊断等于把两条锁序接起来。诊断是尽力而为的面，取不到照样走状态机。
+   * <p><b>LLM 失败不算异常终局</b>：{@code AgentPipeline} 已把它收敛成 {@code StopReason#LLM_ERROR} 的正常回合 ⇒ 走规则 1，
+   * 模型面如实看到"模型坏了"（这正是 C 块要的）。
+   *
+   * <p><b>S5-E 的异常退出日志保留</b>：无终局记录且拿到诊断文本（子进程 stderr 尾部）时记一行 WARN——"干完活正常退"与"启动即崩"
+   * 在事件面上不能再同形。诊断与子库读取都在<b>锁外</b>做（前者读子进程输出尾部有自己一把锁，后者是文件 IO）， 持锁做等于把两条锁序接起来。
    */
   private void onChildExited(String instanceId, LaunchedSubagent handle) {
     String diagnostics = diagnosticsOf(handle);
+    Integer exitCode = exitCodeOf(handle);
+    // 子库读取是文件 IO，锁外做：读到什么就是什么，进锁后只做状态迁移
+    TerminalOutcome record =
+        readChildTerminalRecord(instanceId)
+            .map(
+                found ->
+                    new TerminalOutcome(
+                        found.stopReason(), found.turns(), found.toolCalls(), exitCode))
+            .orElse(null);
     boolean abnormal;
     synchronized (lock) {
       SubagentInstance current = instances.get(instanceId);
       if (current == null || current.status().isFinal()) {
-        return;
+        return; // 幂等：另一条收束路径已落定（或实例从未建立），不重复迁移
       }
-      switch (current.status()) {
-        case RUNNING -> {
-          abnormal = true;
-          transition(
-              instanceId,
-              SubagentStatus.FINISHED,
-              lifecyclePayload("finished", current.templateId(), current.depth(), null, null));
-        }
-        case TERMINATING -> {
-          abnormal = false;
-          transition(
-              instanceId,
-              SubagentStatus.KILLED,
-              lifecyclePayload("killed", current.templateId(), current.depth(), null, null));
-        }
-        default -> {
-          abnormal = true;
-          transition(
-              instanceId,
-              SubagentStatus.FAILED,
-              lifecyclePayload(
-                  "failed", current.templateId(), current.depth(), null, "subagent 退出于确认存活之前"));
+      TerminalOutcome outcome =
+          record != null ? record : new TerminalOutcome(null, null, null, exitCode);
+      outcomes.put(instanceId, outcome);
+      if (record != null) {
+        abnormal = false;
+        transition(
+            instanceId,
+            SubagentStatus.FINISHED,
+            terminalPayload(current, "finished", null, outcome));
+      } else {
+        switch (current.status()) {
+          case RUNNING -> {
+            abnormal = true;
+            transition(
+                instanceId,
+                SubagentStatus.FAILED,
+                terminalPayload(current, "failed", NO_TERMINAL_RECORD_REASON, outcome));
+          }
+          case TERMINATING -> {
+            abnormal = false;
+            transition(
+                instanceId,
+                SubagentStatus.KILLED,
+                terminalPayload(current, "killed", null, outcome));
+          }
+          default -> {
+            abnormal = true;
+            transition(
+                instanceId,
+                SubagentStatus.FAILED,
+                terminalPayload(current, "failed", EXIT_BEFORE_RUNNING_REASON, outcome));
+          }
         }
       }
     }
     if (abnormal && diagnostics != null) {
       // 锁外记日志：诊断文本可能很长，别让它占着状态机的锁
       LOG.warn("子 Agent 异常退出（未留下正常终局）: id={} 原因: {}", instanceId, diagnostics);
+    }
+  }
+
+  /**
+   * 子库终局记录（设计 §2.1 的 {@code agent.lifecycle/action=finished}）：<b>父侧终局判定的唯一判据</b>。
+   *
+   * <p>读取口径（只读、不建表、不迁移）：
+   *
+   * <ul>
+   *   <li>路径 = {@code <childDataRoot>/<实例 id>/events.db}（与子进程的 {@code --data-dir} 同源）；
+   *   <li>库不存在 / 未注入根 / 读失败 ⇒ {@code empty}（并按"未留下终局记录"处理，读失败只在父侧日志留痕，不进模型面）；
+   *   <li><b>兼容老库</b>：事件必须<b>带</b> {@code stopReason} 键才认——老事件（无该键）⇒ 按"未留下终局记录"处理，<b>不编造</b>；
+   *   <li>{@code turns}/{@code toolCalls} 缺失 ⇒ {@code null}（不填 0）。
+   * </ul>
+   */
+  private Optional<TerminalOutcome> readChildTerminalRecord(String instanceId) {
+    if (childDataRoot == null) {
+      return Optional.empty(); // 装配层没注入根：读不到就等于没留下（fail-closed），不猜路径
+    }
+    Path db = childDataRoot.resolve(instanceId).resolve("events.db");
+    if (!Files.isRegularFile(db)) {
+      return Optional.empty();
+    }
+    try (SqliteEventStore store = SqliteEventStore.openReadOnly(db)) {
+      // 倒序取最近若干条 lifecycle（终局记录必在尾部），命中第一条带 stopReason 的 finished
+      for (Event event :
+          store.query(
+              new EventQuery(
+                  instanceId, EventTypes.AGENT_LIFECYCLE, instanceId, -1, TERMINAL_SCAN_LIMIT))) {
+        JsonNode payload;
+        try {
+          payload = JSON.readTree(event.payload());
+        } catch (java.io.IOException e) {
+          continue; // 单条坏 payload 不该让整个判定崩（同 AgentContextReader 口径）
+        }
+        if (payload == null
+            || !TERMINAL_ACTION.equals(payload.path("action").asText())
+            || payload.path("stopReason").asText().isBlank()) {
+          continue;
+        }
+        return Optional.of(
+            new TerminalOutcome(
+                payload.path("stopReason").asText(),
+                intField(payload, "turns"),
+                intField(payload, "toolCalls"),
+                null)); // 退出码不在子库里：由调用方从句柄补（拿不到就是 null）
+      }
+      return Optional.empty();
+    } catch (RuntimeException e) {
+      LOG.warn("子 Agent 终局记录读取失败（按未留下终局记录处理）: id={} db={}", instanceId, db, e);
+      return Optional.empty();
+    }
+  }
+
+  /** 终局事件 payload：终局字段<b>有才写</b>（{@link TerminalOutcome#fields()}）。 */
+  private static Map<String, Object> terminalPayload(
+      SubagentInstance instance, String action, String reason, TerminalOutcome outcome) {
+    Map<String, Object> payload =
+        lifecyclePayload(action, instance.templateId(), instance.depth(), null, reason);
+    payload.putAll(outcome.fields());
+    return payload;
+  }
+
+  /** 数字字段（缺失/非数字 ⇒ {@code null}，不编 0）。 */
+  private static Integer intField(JsonNode payload, String key) {
+    JsonNode value = payload.get(key);
+    return value != null && value.isNumber() ? value.asInt() : null;
+  }
+
+  /** 退出码（{@code null} = 拿不到）：<b>不编 0</b>——拿不到就当没有，事件里不写这个键（§四.6）。 */
+  private static Integer exitCodeOf(LaunchedSubagent handle) {
+    if (handle == null) {
+      return null;
+    }
+    try {
+      java.util.OptionalInt code = handle.exitCode();
+      return code.isPresent() ? code.getAsInt() : null;
+    } catch (RuntimeException e) {
+      LOG.warn("子 Agent 退出码获取失败（按拿不到处理，不编 0）", e);
+      return null;
     }
   }
 
@@ -1143,19 +1388,37 @@ public final class SubagentManager implements AutoCloseable {
     }
   }
 
+  /** {@link #awaitTerminal(String, long)} 的<b>句柄级特例</b>（设计 §2.5）：同一个骨架，条件换成"句柄死亡"。 */
   private static boolean awaitDead(LaunchedSubagent handle, long maxMillis) {
-    long deadline = System.nanoTime() + maxMillis * 1_000_000L;
-    try {
-      while (System.nanoTime() < deadline) {
-        if (!handle.isAlive()) {
-          return true;
-        }
-        Thread.sleep(EXIT_POLL_MILLIS);
+    return pollUntil(() -> !handle.isAlive(), maxMillis);
+  }
+
+  /**
+   * 100 ms 轮询骨架（设计 §2.5）：{@code awaitTerminal} 与 {@code awaitDead} 共用——<b>不占锁</b>（每次只短暂取锁读快照， 关停路径的
+   * 10s 宽限等待不在这里）。只做"等/不等得到"这一件事，超时与中断都不抛异常。
+   *
+   * <p>条件先判、后判超时：预算为 0 时先看当刻事实（"已经满足"不该被 0 预算吞掉），再原地返回。
+   *
+   * @return true = 条件在预算内成立；false = 超时或中断（此时条件<b>不</b>成立——中断前再判一次）
+   */
+  private static boolean pollUntil(BooleanSupplier condition, long timeoutMillis) {
+    long budgetNanos =
+        java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMillis));
+    long started = System.nanoTime();
+    while (true) {
+      if (condition.getAsBoolean()) {
+        return true;
       }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
+      if (System.nanoTime() - started >= budgetNanos) {
+        return false;
+      }
+      try {
+        Thread.sleep(EXIT_POLL_MILLIS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return condition.getAsBoolean();
+      }
     }
-    return !handle.isAlive();
   }
 
   private static void closeQuietly(LaunchedSubagent handle) {

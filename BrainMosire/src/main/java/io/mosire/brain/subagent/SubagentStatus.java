@@ -41,7 +41,12 @@ public enum SubagentStatus {
    * 状态机推进合法性：合法返回 true，否则 false。
    *
    * <p>图：CONFIGURED→SPAWNING；SPAWNING→RUNNING|FAILED；RUNNING→TERMINATING|FINISHED|FAILED；
-   * TERMINATING→KILLED|FAILED；终态→同终态（幂等）。其余一律拒绝——调用方负责把 false 转成 异常或忽略（幂等场景）。
+   * TERMINATING→KILLED|FINISHED|FAILED；终态→同终态（幂等）。其余一律拒绝——调用方负责把 false 转成 异常或忽略（幂等场景）。
+   *
+   * <p><b>TERMINATING→FINISHED（2026-09-13，子 Agent 终局设计 §2.3）</b>：关停请求与"子体自己跑完"可能同刻到达——子库已有终局事件时以
+   * <b>事件</b>为准（{@code SubagentManager.onChildExited} 记 FINISHED + stopReason）。子体确实跑完了这一轮， 谎报
+   * {@code KILLED} 比"kill 请求落空"更糟，所以这条边必须合法（少了它，收束路径会撞 {@link IllegalStateException}——观测线程里抛异常 =
+   * 状态机停摆）。
    *
    * @param from 当前状态（null 视为非法）
    * @param to 目标状态（null 视为非法）
@@ -54,7 +59,7 @@ public enum SubagentStatus {
       case CONFIGURED -> to == SPAWNING;
       case SPAWNING -> to == RUNNING || to == FAILED;
       case RUNNING -> to == TERMINATING || to == FINISHED || to == FAILED;
-      case TERMINATING -> to == KILLED || to == FAILED;
+      case TERMINATING -> to == KILLED || to == FINISHED || to == FAILED;
       case FINISHED, FAILED, KILLED -> from == to;
     };
   }

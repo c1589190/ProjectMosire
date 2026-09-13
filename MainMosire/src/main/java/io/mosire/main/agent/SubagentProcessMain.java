@@ -1,8 +1,11 @@
 package io.mosire.main.agent;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.EventBus;
+import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.ConfigApiKeySource;
 import io.mosire.agentlib.llm.LlmClient;
@@ -17,6 +20,7 @@ import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
+import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.TurnResult;
 import io.mosire.brain.subagent.AgentTemplate;
 import io.mosire.brain.subagent.AgentTemplateStore;
@@ -26,6 +30,8 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.function.Predicate;
 
@@ -49,9 +55,20 @@ import java.util.function.Predicate;
  *
  * <p><strong>父链接（{@code --parent-link}）</strong>：stdin/stdout 是父进程建好的 MCP stdio 链路（标准换行帧、 一帧一
  * JSON-RPC），本进程以 <b>MCP client</b> 身份接管（{@link PipeMcpClientTransport}——官方 StdioClientTransport 只
- * spawn 不接管流），经 {@link McpSourceBridge}（按模板白名单过滤）把父级暴露面同步进本地 registry；跑完目标任务后<b>阻塞在 {@code
- * whenClosed()}</b>——父侧 kill 先关其 server（本进程 EOF 感知关停信号） 再走三层进程关停，父侧把"关停信号"当协议事件而非直接
- * SIGKILL，本进程可收尾落事件库。
+ * spawn 不接管流），经 {@link McpSourceBridge}（按模板白名单过滤）把父级暴露面同步进本地 registry。
+ *
+ * <p><strong>即退与终局记录（§2.1/§2.2，2026-09-13）</strong>：跑完目标回合后<b>不再</b>阻塞等"关停信号"（那会让子体答完还空转 ≥171 s，
+ * 父侧全程看到 {@code RUNNING}）——{@code chat()} 返回 ⇒ 先把自己的终局（{@code agent.lifecycle/action=finished} +
+ * {@code stopReason}/{@code turns}/{@code toolCalls}）<b>落进自己的
+ * events.db</b>，再退栈退出。父侧以<b>这条记录的有无</b>判终局 （见 {@code SubagentManager.onChildExited}）：有 ⇒ {@code
+ * FINISHED} + 停因，没有 ⇒ 异常终局（{@code 未留下终局记录}）——所以 落库必须发生在 {@code AgentRuntime.close()}
+ * <b>之前</b>，且写失败要响亮（stderr + 非零退出），不许静默吞。 链接形态的关停路径（父侧 kill）因此变成：父侧先关它的 MCP server（子体读到
+ * EOF/管道关闭），再走三层进程关停；子体来不及落库是<b>已知的诚实边界</b> ——父侧按 {@code KILLED} 记，不假装它交代过停因。
+ *
+ * <p><b>"即退"还要求传输侧线程守护化</b>：删掉 {@code whenClosed().get()} 只解决了"业务上不再等"，进程能退出还需要 JVM 里没有非守护线程
+ * ——进站读线程会永久阻塞在不可中断的 {@code System.in} 读上（{@code closeGracefully()} 的 dispose 也中断不了它），非守护化会把 子进程钉在
+ * exit 前（实测 thread dump：{@code main} 已返回、{@code DestroyJavaVM} 在等那个线程）。守护化落在 {@code
+ * PipeMcpClientTransport}（见其类注释）。
  *
  * <p><strong>stdout 纪律</strong>：本进程 stdout = MCP 帧通道。所有可见输出只准走 stderr（启动即把 {@code System.out}
  * 与协议流解绑——帧用早期捕获的原始流，日志/错误经 stderr；使用期间任何窗口进程 若把信息写 {@code System.out} 都会污染协议帧，代码评审红线）。
@@ -66,12 +83,14 @@ import java.util.function.Predicate;
  */
 public final class SubagentProcessMain {
 
+  private static final ObjectMapper JSON = new ObjectMapper();
+
   private SubagentProcessMain() {}
 
   /**
-   * 运行一次子 Agent 进程。
+   * 运行一次子 Agent 进程：{@code chat()} 返回 ⇒ 落终局记录（§2.1）⇒ <b>即退</b>（§2.2，链接形态也<b>不再</b>等父侧关停信号）。
    *
-   * @return 进程退出码：0 = 目标回合完成且（链接形态下）收到父侧关停信号并正常退栈；1 = 引导/运行失败
+   * @return 进程退出码：0 = 目标回合完成且终局记录已落库；1 = 引导/运行失败（含终局记录写入失败——父侧据此按"未留下终局记录"处理）
    */
   public static int execute(Options options) {
     Objects.requireNonNull(options, "options");
@@ -127,17 +146,21 @@ public final class SubagentProcessMain {
               "子 Agent 回合完成: id=%s stop=%s turns=%d toolCalls=%d",
               options.instanceId(), result.stopReason(), result.turns(), result.toolCalls()));
 
-      if (transport != null) {
-        // 链接形态：目标跑完后阻塞——父侧关停 = 对本进程的"协议关停信号"（EOF），先收尾再退
-        try {
-          transport.whenClosed().get();
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          diagnostics.println("子 Agent 等待父侧关停被中断: " + options.instanceId());
-        }
+      // §2.1 终局记录（父侧终局判定的唯一判据）：chat() 返回 ⇒ 先落库，再退栈（finally 里的 runtime.close()）。
+      // 写失败 = 协议义务没履行 ⇒ 响亮（stderr + 非零退出），绝不静默吞；父侧据此按"未留下终局记录"记异常终局。
+      try {
+        eventStore.append(
+            EventWrite.of(
+                EventTypes.AGENT_LIFECYCLE,
+                options.instanceId(),
+                terminalPayload(result),
+                options.instanceId()));
+      } catch (RuntimeException e) {
+        diagnostics.println("子 Agent 终局记录写入失败（父侧将按未留下终局记录处理）: " + e.getMessage());
+        return 1;
       }
       return 0;
-    } catch (RuntimeException | java.io.IOException | java.util.concurrent.ExecutionException e) {
+    } catch (RuntimeException | java.io.IOException e) {
       diagnostics.println("子 Agent 引导/运行失败: " + e.getMessage());
       return 1;
     } finally {
@@ -184,6 +207,27 @@ public final class SubagentProcessMain {
         new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM);
     keys.apiKey(); // 预检：结果有意丢弃（只要"取得到"这一事实；密钥值不留在本方法里）
     return new OpenAICompatibleLlmClient(route, keys);
+  }
+
+  /**
+   * 终局记录 payload（§2.1）：{@code action=finished} + 子体流水线自己的计数器（{@link TurnResult}）。
+   *
+   * <p>键名与父侧读侧（{@code SubagentManager.readChildTerminalRecord}）逐字对齐：父侧只认<b>带非空 {@code
+   * stopReason}</b> 的 {@code action=finished} 事件——所以这里不写假值：{@code stopReason} 取枚举名，{@code
+   * turns}/{@code toolCalls} 取自本篇回合结果。
+   */
+  private static String terminalPayload(TurnResult result) {
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("action", "finished");
+    payload.put("stopReason", result.stopReason().name());
+    payload.put("turns", result.turns());
+    payload.put("toolCalls", result.toolCalls());
+    try {
+      return JSON.writeValueAsString(payload);
+    } catch (JsonProcessingException e) {
+      // 三个标量键写不出 JSON 属结构性缺陷，不该在这里兜：抛出去由外层按"引导/运行失败"收（+stderr、非零退出）
+      throw new IllegalStateException("终局记录 payload 序列化失败", e);
+    }
   }
 
   /** 模板权限集 → 桥同步过滤器：白名单通配（{@code "*"}）不过滤，否则按名命中。 */

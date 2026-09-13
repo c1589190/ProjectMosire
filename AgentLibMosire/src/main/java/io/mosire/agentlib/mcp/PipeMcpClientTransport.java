@@ -34,6 +34,13 @@ import reactor.core.scheduler.Schedulers;
  *
  * <p>附加契约 {@link #whenClosed()}：管道对端关闭（读端 EOF / 大消息越界）或本端 {@link #closeGracefully()} 时完成该 Future——子
  * Agent 进程用它在主线程阻塞等待"父侧断开/关停"信号（父进程做进程树关停时，EOF 先到， 子体即可自行收尾退出，等待语义收敛）。
+ *
+ * <p><b>线程必须是守护线程（2026-09-13，子 Agent 终局设计 §2.2 即退）</b>：两个 {@code ExecutorService}
+ * 的线程若为非守护，进站线程会<b>永久阻塞</b>在 {@code readLine()} 上——管道是阻塞式 {@code InputStream}（通常就是 {@code
+ * System.in}/fd 0），读阻塞<b>不可中断</b>，{@link #closeGracefully()} 的 {@code dispose()}（= {@code
+ * shutdownNow}）只能置中断标志，线程仍卡在 read 里 ⇒ {@code main} 返回后 JVM 等它到天荒地老。实测（真子进程 thread dump）：即退后只剩
+ * {@code main} 已返回、{@code DestroyJavaVM} 在等一个非守护的 {@code inboundLoop} 线程，子体"跑完不退出"换个形态复现。 守护化后 JVM
+ * 可在 {@code main} 返回时正常收尾（子进程正常路径 exit 0；父侧 kill 路径的 EOF 语义逐字不变）。
  */
 public final class PipeMcpClientTransport implements McpClientTransport {
 
@@ -53,13 +60,29 @@ public final class PipeMcpClientTransport implements McpClientTransport {
   private final int inputMaxSize;
 
   private final Scheduler inboundScheduler =
-      Schedulers.fromExecutorService(Executors.newSingleThreadExecutor(), "mosire-mcp-inbound");
+      Schedulers.fromExecutorService(
+          Executors.newSingleThreadExecutor(daemonThreads("mosire-mcp-inbound")),
+          "mosire-mcp-inbound");
   private final Scheduler outboundScheduler =
-      Schedulers.fromExecutorService(Executors.newSingleThreadExecutor(), "mosire-mcp-outbound");
+      Schedulers.fromExecutorService(
+          Executors.newSingleThreadExecutor(daemonThreads("mosire-mcp-outbound")),
+          "mosire-mcp-outbound");
 
   private final CompletableFuture<Void> closed = new CompletableFuture<>();
 
   private volatile boolean isClosing;
+
+  /**
+   * 守护线程工厂（见类注释"线程必须是守护线程"）：传输的收发线程只服务于这对管道——它们<b>不该</b>决定进程何时能退出。 进站线程会长期阻塞在不可中断的 {@code
+   * readLine()} 上，非守护化等于"进程被自己的 IO 线程钉住"。
+   */
+  private static java.util.concurrent.ThreadFactory daemonThreads(String name) {
+    return runnable -> {
+      Thread thread = new Thread(runnable, name);
+      thread.setDaemon(true);
+      return thread;
+    };
+  }
 
   public PipeMcpClientTransport(McpJsonMapper jsonMapper, InputStream in, OutputStream out) {
     this(jsonMapper, in, out, DEFAULT_INPUT_MAX_SIZE);

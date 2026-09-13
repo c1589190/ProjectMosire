@@ -230,6 +230,30 @@ class SubProcessExecutorTest {
   }
 
   /**
+   * 终局语义 §2.3 / §四.6：句柄的 {@code exitCode()} 如实转发 {@code managed.exitValue()}，<b>拿不到就是 empty，绝不编
+   * 0</b>。
+   *
+   * <p>判别性（本轮变异靶）：把转发改成 {@code OptionalInt.of(0)}（或"empty 时补个 0"）⇒ 第二条断言转红——"未知"被伪装成
+   * "正常退出"，父侧的异常终局就到了错误的分支；把转发改成常量（如恒 1）⇒ 第一条断言转红。
+   */
+  @Test
+  void handleDelegatesExitCodeAndNeverFabricatesZero() {
+    SubprocessManager processes = mock(SubprocessManager.class);
+    ManagedProcess managed = mock(ManagedProcess.class);
+    when(processes.spawn(any(SpawnSpec.class))).thenReturn(managed);
+    when(managed.exitValue()).thenReturn(OptionalInt.of(137));
+    SubProcessExecutor executor =
+        new SubProcessExecutor(processes, AgentCommand.javaJar("java", "mosire.jar"));
+
+    LaunchedSubagent handle = executor.launch(instance("a-6", "reader", "g"));
+    assertThat(handle.exitCode()).hasValue(137);
+
+    // 拿不到（仍存活 / adopt 形态没有 Process 句柄）
+    when(managed.exitValue()).thenReturn(OptionalInt.empty());
+    assertThat(handle.exitCode()).as("拿不到 ⇒ empty，绝不编 0").isEmpty();
+  }
+
+  /**
    * 正常退出（0）与仍在运行 ⇒ 空诊断：诊断面不是"每条退出都刷一行"——那会把日志淹掉，真异常就没人看了。
    *
    * <p>adopt 形态（{@link ManagedProcess#exitValue()} 拿不到退出码）同样为空——"拿不到"不是"异常"，不许猜。

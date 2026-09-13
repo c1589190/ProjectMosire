@@ -69,7 +69,10 @@ class SubagentManagerTest {
     AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
     write(template);
     AgentTemplateStore templateStore = store();
-    InProcessExecutor executor = new InProcessExecutor();
+    // 子体正常跑完 ⇒ 按 §2.1 先把自己的终局落库（夹具模拟子进程的义务），父侧据此判 FINISHED + 停因
+    InProcessExecutor executor =
+        new InProcessExecutor(
+            (childId, config) -> writeChildTerminalRecord(childId, "FINISHED", 3, 2));
     SubagentManager manager =
         manager(templateStore, executor, parentConfig(), AgentPermissionSet.system(), 0);
 
@@ -104,6 +107,20 @@ class SubagentManagerTest {
         .containsEntry("template", "reader")
         .containsEntry("depth", 1)
         .containsEntry("goalLength", "通读 README 并汇报结构".length());
+    // §2.4：终局字段进父库事件（有才写）——这是"正常完成"的账
+    assertThat(payloadOf(chain.get(3)))
+        .containsEntry("action", "finished")
+        .containsEntry("stopReason", "FINISHED")
+        .containsEntry("turns", 3)
+        .containsEntry("toolCalls", 2);
+    // 内存面与事件面同一份事实（§2.4）
+    assertThat(manager.terminalOutcome(id))
+        .hasValueSatisfying(
+            outcome -> {
+              assertThat(outcome.stopReason()).isEqualTo("FINISHED");
+              assertThat(outcome.turns()).isEqualTo(3);
+              assertThat(outcome.toolCalls()).isEqualTo(2);
+            });
     assertThat(manager.get(id))
         .hasValueSatisfying(i -> assertThat(i.status()).isEqualTo(SubagentStatus.FINISHED));
   }
@@ -268,7 +285,12 @@ class SubagentManagerTest {
     SubagentManager manager =
         manager(
             store(),
-            new InProcessExecutor((id, cfg) -> release.await()),
+            new InProcessExecutor(
+                (id, cfg) -> {
+                  release.await();
+                  // 放行后按 §2.1 落终局再"退栈"——否则父侧看到的是"未留下终局记录"的异常终局
+                  writeChildTerminalRecord(id, "FINISHED", 1, 0);
+                }),
             parentConfig(),
             AgentPermissionSet.system(),
             0,
@@ -584,16 +606,19 @@ class SubagentManagerTest {
   }
 
   /**
-   * S5-E：子体在确认存活之后异常退出（非零码）⇒ 状态<b>仍是 FINISHED</b>（生命周期走到终局），原因经诊断面取回。
+   * §2.3 规则 2（§四.3 的"异常终局可分"）：确认存活之后退出、但子库<b>没有</b>终局记录 ⇒ {@code FAILED} + 理由 {@code "未留下终局记录"} +
+   * 退出码。
    *
-   * <p>判别性：把"非零退出"顺手翻成 {@link SubagentStatus#FAILED}（一种看着更"对"的改法）会让事件链断言变红——状态是生命周期
-   * 事实（确认存活后退出就是终态），退出码是诊断事实，二者混用会让需求/预算/事件账目跟着撒谎。
+   * <p><b>这正是本块推翻的旧口径</b>：原文担心"非零一律翻 FAILED 制造状态谎言"，那是<b>没有终局记录</b>的时代。今天"子体先落库后退栈"是协议义务，
+   * <b>缺失</b>才是异常 ⇒ 谎言风险由协议消除。判别性：把判定回退成"RUNNING 退出即 FINISHED"（旧口径）⇒ 状态与事件链断言转红； 把 reason 换成任意文本 ⇒
+   * payload 断言转红。
    */
   @Test
-  void abnormalExitStaysFinishedAndTakesReasonFromTheHandle() throws Exception {
+  void exitWithoutTerminalRecordIsFailedWithDesignReason() throws Exception {
     AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
     write(template);
-    CrashingLauncher launcher = new CrashingLauncher("exitCode=1；末段输出: 模板目录不存在", false);
+    CrashingLauncher launcher =
+        new CrashingLauncher("exitCode=1；末段输出: 模板目录不存在", false, java.util.OptionalInt.of(1));
     SubagentManager manager =
         manager(store(), launcher, parentConfig(), AgentPermissionSet.system(), 0);
 
@@ -602,11 +627,121 @@ class SubagentManagerTest {
     String id = spawned.instanceId();
     assertThat(spawned.status()).isEqualTo(SubagentStatus.RUNNING);
 
-    awaitStatus(manager, id, SubagentStatus.FINISHED);
+    awaitStatus(manager, id, SubagentStatus.FAILED);
 
-    assertThat(lifecycleActions(id))
-        .containsExactly("configured", "spawning", "running", "finished");
+    assertThat(lifecycleActions(id)).containsExactly("configured", "spawning", "running", "failed");
+    List<Event> chain = lifecycleEvents(id);
+    assertThat(payloadOf(chain.get(3)))
+        .containsEntry("action", "failed")
+        .containsEntry("reason", "未留下终局记录")
+        .containsEntry("exitCode", 1); // 退出码是诊断面：有值才写（§四.6）
+    assertThat(manager.terminalOutcome(id))
+        .hasValueSatisfying(
+            outcome -> {
+              assertThat(outcome.hasStopReason()).as("异常终局：没有停因，也不编一个").isFalse();
+              assertThat(outcome.exitCode()).isEqualTo(1);
+            });
     assertThat(launcher.diagnosticsCalls()).as("异常退出必须真去取原因（缝加了不用 = 没加）").isPositive();
+  }
+
+  /**
+   * §四.6：句柄给不出退出码（{@code OptionalInt.empty()}）⇒ <b>事件里不写这个键</b>，绝不编 0（"拿不到"与"码是 0"是两件事）。
+   *
+   * <p>判别性：把 {@code exitCodeOf} 写成 {@code orElse(0)}（看着无害的"补个缺省"）⇒ {@code doesNotContainKey} 断言转红。
+   */
+  @Test
+  void missingExitCodeIsNotFabricatedAsZero() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    CrashingLauncher launcher =
+        new CrashingLauncher("（无诊断文本，只有死）", false, java.util.OptionalInt.empty());
+    SubagentManager manager =
+        manager(store(), launcher, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+    String id = spawned.instanceId();
+
+    awaitStatus(manager, id, SubagentStatus.FAILED);
+    List<Event> chain = lifecycleEvents(id);
+    assertThat(payloadOf(chain.get(3)))
+        .as("拿不到码 ⇒ 不写键（写 0 = 把未知伪装成正常退出）")
+        .doesNotContainKey("exitCode")
+        .doesNotContainKey("stopReason");
+    assertThat(manager.terminalOutcome(id))
+        .hasValueSatisfying(outcome -> assertThat(outcome.exitCode()).isNull());
+  }
+
+  /**
+   * §2.3 的竞态裁决：状态停在 {@code TERMINATING}、而子库<b>已有</b>终局记录 ⇒ 以事件为准记 {@code FINISHED} + {@code
+   * stopReason} （"子体确实跑完了这一轮，谎报 KILLED 比 kill 请求落空更糟"）。
+   *
+   * <p>判别性：把这一支删掉（TERMINATING 一律 KILLED）⇒ 状态/事件链断言转红；去掉"已是终态即返回"的幂等 ⇒ 两条收束路径各发一条终局事件 ⇒ {@code
+   * containsExactly} 转红。
+   */
+  @Test
+  void terminatingWithChildTerminalRecordFinishesHonestly() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    RecordingLauncher launcher =
+        new RecordingLauncher(); // 句柄活着；close() 才死（kill 的 awaitDead 因此快速收束）
+    SubagentManager manager =
+        manager(store(), launcher, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+    String id = spawned.instanceId();
+
+    // 子体在被关停之前跑完并落了库（真实形态：kill 与"自己跑完"撞在同一刻）
+    writeChildTerminalRecord(id, "TURN_LIMIT", 7, 4);
+    assertThat(manager.kill(id)).isTrue();
+
+    awaitStatus(manager, id, SubagentStatus.FINISHED);
+    assertThat(lifecycleActions(id))
+        .containsExactly("configured", "spawning", "running", "terminating", "finished");
+    assertThat(payloadOf(lifecycleEvents(id).get(4)))
+        .containsEntry("action", "finished")
+        .containsEntry("stopReason", "TURN_LIMIT")
+        .containsEntry("turns", 7)
+        .containsEntry("toolCalls", 4);
+    assertThat(manager.terminalOutcome(id))
+        .hasValueSatisfying(outcome -> assertThat(outcome.stopReason()).isEqualTo("TURN_LIMIT"));
+
+    // 幂等：终态后重复 kill 是空操作，且不重复迁移/不重复发事件（两条收束路径只落一条终局）
+    assertThat(manager.kill(id)).isFalse();
+    assertThat(lifecycleActions(id)).hasSize(5);
+  }
+
+  /**
+   * 装配层没注入子库根（{@code null}）⇒ 读不到任何终局记录 ⇒ 一律按"未留下终局记录"处理（fail-closed：宁可报异常终局，也不假装子体交代过）。
+   *
+   * <p>判别性：把 {@code null} 实现成"猜一个缺省路径"（{@code dataDir/subagents} 之类）⇒ 本用例转红。
+   */
+  @Test
+  void missingChildDataRootFailsClosed() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    // 子体照常落库（库在 tempDir/subagents 下），但父侧<b>没被告知</b>这个根 ⇒ 不得去猜
+    InProcessExecutor executor =
+        new InProcessExecutor(
+            (childId, config) -> writeChildTerminalRecord(childId, "FINISHED", 1, 1));
+    SubagentManager manager =
+        manager(
+            store(),
+            executor,
+            parentConfig(),
+            AgentPermissionSet.system(),
+            0,
+            SubagentLimits.defaults(),
+            null);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+    awaitStatus(manager, spawned.instanceId(), SubagentStatus.FAILED);
+    assertThat(lifecycleActions(spawned.instanceId()))
+        .containsExactly("configured", "spawning", "running", "failed");
+    assertThat(manager.terminalOutcome(spawned.instanceId()))
+        .hasValueSatisfying(outcome -> assertThat(outcome.hasStopReason()).isFalse());
   }
 
   /**
@@ -625,8 +760,68 @@ class SubagentManagerTest {
     SubagentInstance spawned =
         manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
 
-    awaitStatus(manager, spawned.instanceId(), SubagentStatus.FINISHED);
+    awaitStatus(manager, spawned.instanceId(), SubagentStatus.FAILED);
     assertThat(launcher.diagnosticsCalls()).as("确认诊断面真被调过（否则本用例是空转）").isPositive();
+  }
+
+  /**
+   * §2.7 / §四.5：{@code close()} <b>由深到浅</b>——父 + 孙都在管时，孙先收到关停（别让"祖辈先死 ⇒ 子孙的父侧链路断在半路"）。
+   *
+   * <p>判别性：把排序去掉（回到 {@code HashMap} 遍历序）⇒ 断言转红。构造上让"偶然对"几乎不可能：7 个实例里 3 个是深层（深度 2）， 无序序把它们全排在前的概率 =
+   * 1/C(7,3) ≈ 3%。
+   */
+  @Test
+  void closeTerminatesDeepestFirst() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    OrderRecordingLauncher launcher = new OrderRecordingLauncher();
+    SubagentManager manager =
+        manager(
+            store(),
+            launcher,
+            parentConfig(),
+            AgentPermissionSet.system(),
+            0,
+            new SubagentLimits(3, 8, 8));
+
+    List<String> allIds = new ArrayList<>();
+    List<String> shallowIds = new ArrayList<>();
+    for (int i = 0; i < 4; i++) { // 主 Agent 的直系（path 段数 2）
+      String id =
+          manager
+              .spawn(new SubagentLaunchRequest("reader", "浅 " + i, null, null, null, null))
+              .instanceId();
+      shallowIds.add(id);
+      allIds.add(id);
+    }
+    List<String> deepIds = new ArrayList<>();
+    for (int i = 0; i < 3; i++) { // 孙代（path 段数 3）：调用者身份 = 父实例本身 ⇒ path = main/<父>/<孙>
+      String id =
+          manager
+              .spawn(
+                  new SubagentLaunchRequest("reader", "深 " + i, null, null, null, null),
+                  AgentIdentity.subagent(shallowIds.get(i), CommandMode.FULL, "孙代任务", 1),
+                  AgentPermissionSet.system())
+              .instanceId();
+      deepIds.add(id);
+      allIds.add(id);
+    }
+    assertThat(manager.get(deepIds.get(0)).orElseThrow().lineagePath())
+        .as("夹具前提：孙代的 path 真的比父深一段")
+        .isEqualTo("main/" + shallowIds.get(0) + "/" + deepIds.get(0));
+
+    manager.close();
+
+    assertThat(launcher.closeOrder())
+        .as("全部在管实例都被关停过（防空列表恒真）")
+        .containsExactlyInAnyOrderElementsOf(allIds);
+    List<Integer> depths =
+        launcher.closeOrder().stream()
+            .map(id -> deepIds.contains(id) ? 3 : 2) // 血缘段数：main/<父> = 2，main/<父>/<孙> = 3
+            .toList();
+    assertThat(depths)
+        .as("关停顺序按血缘段数降序（深的先关）: " + launcher.closeOrder())
+        .isSortedAccordingTo(java.util.Comparator.reverseOrder());
   }
 
   @Test
@@ -1054,6 +1249,25 @@ class SubagentManagerTest {
       AgentPermissionSet parentPermissions,
       int parentDepth,
       SubagentLimits limits) {
+    return manager(
+        templateStore,
+        launcher,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        limits,
+        childDataRoot());
+  }
+
+  /** 全参重载：{@code childDataRoot} 显式给（{@code null} = 复现"装配层没注入子库根"的 fail-closed 形态）。 */
+  private SubagentManager manager(
+      AgentTemplateStore templateStore,
+      SubagentLauncher launcher,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions,
+      int parentDepth,
+      SubagentLimits limits,
+      Path childDataRoot) {
     return new SubagentManager(
         templateStore,
         launcher,
@@ -1063,7 +1277,42 @@ class SubagentManagerTest {
         parentPermissions,
         parentDepth,
         () -> CommandMode.FULL,
-        limits);
+        limits,
+        childDataRoot);
+  }
+
+  /** 子库根（§2.3）：与生产装配同形（{@code <dataDir>/subagents}），测试里挂在 {@link #tempDir} 下。 */
+  private Path childDataRoot() {
+    return tempDir.resolve("subagents");
+  }
+
+  /**
+   * 模拟子体的协议义务（§2.1）：把终局记录写进<b>自己的</b>库 {@code <root>/<id>/events.db}。
+   *
+   * <p>为什么夹具要写它：父侧判终局<b>只认这条记录</b>（子体正常路径一定先落库后退栈）。夹具里"跑完"的子体不写 ⇒ 被如实记成异常终局 —— 这正是判别性的一半（另一半见
+   * {@link #exitWithoutTerminalRecordIsFailedWithDesignReason}）。
+   */
+  private void writeChildTerminalRecord(
+      String instanceId, String stopReason, int turns, int toolCalls) {
+    Path dir = childDataRoot().resolve(instanceId);
+    try {
+      Files.createDirectories(dir);
+      try (SqliteEventStore child = SqliteEventStore.open(dir.resolve("events.db"))) {
+        child.append(
+            io.mosire.agentlib.event.EventWrite.of(
+                EventTypes.AGENT_LIFECYCLE,
+                instanceId,
+                JSON.writeValueAsString(
+                    Map.of(
+                        "action", "finished",
+                        "stopReason", stopReason,
+                        "turns", turns,
+                        "toolCalls", toolCalls)),
+                instanceId));
+      }
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("子库终局记录写入失败: " + instanceId, e);
+    }
   }
 
   private static AgentConfig parentConfig() {
@@ -1282,11 +1531,21 @@ class SubagentManagerTest {
 
     private final String diagnostics;
     private final boolean throwOnDiagnostics;
+    private final java.util.OptionalInt exitCode;
     private final AtomicInteger diagnosticsCalls = new AtomicInteger();
 
     CrashingLauncher(String diagnostics, boolean throwOnDiagnostics) {
+      this(diagnostics, throwOnDiagnostics, java.util.OptionalInt.empty());
+    }
+
+    /**
+     * @param exitCode 句柄能否给出退出码（§四.6：拿不到就 {@code empty} ⇒ 事件里不写键，绝不编 0）
+     */
+    CrashingLauncher(
+        String diagnostics, boolean throwOnDiagnostics, java.util.OptionalInt exitCode) {
       this.diagnostics = diagnostics;
       this.throwOnDiagnostics = throwOnDiagnostics;
+      this.exitCode = exitCode;
     }
 
     int diagnosticsCalls() {
@@ -1311,7 +1570,52 @@ class SubagentManagerTest {
         }
 
         @Override
+        public java.util.OptionalInt exitCode() {
+          return exitCode;
+        }
+
+        @Override
         public void close() {}
+      };
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  /**
+   * 关停顺序 launcher（§2.7 的观测面）：每个句柄的 {@code close()} 把自己记进<b>一个全局序列</b>——"谁先收到关停"由此可判。
+   *
+   * <p>句柄一直活着，直到被关停（close 置死）：这既是 close() 路径的前提，也让 {@code terminate} 的 {@code awaitDead} 快速收束。
+   */
+  private static final class OrderRecordingLauncher implements SubagentLauncher {
+
+    private final List<String> closeOrder =
+        java.util.Collections.synchronizedList(new ArrayList<>());
+    private final Map<String, AtomicBoolean> alive = new java.util.concurrent.ConcurrentHashMap<>();
+
+    List<String> closeOrder() {
+      return List.copyOf(closeOrder);
+    }
+
+    @Override
+    public LaunchedSubagent launch(SubagentInstance instance) {
+      String id = instance.instanceId();
+      alive.put(id, new AtomicBoolean(true));
+      AtomicBoolean closed = new AtomicBoolean(false); // close 幂等：序列里一个实例只出现一次
+      return new LaunchedSubagent() {
+        @Override
+        public boolean isAlive() {
+          return alive.get(id).get();
+        }
+
+        @Override
+        public void close() {
+          if (closed.compareAndSet(false, true)) {
+            alive.get(id).set(false);
+            closeOrder.add(id);
+          }
+        }
       };
     }
 

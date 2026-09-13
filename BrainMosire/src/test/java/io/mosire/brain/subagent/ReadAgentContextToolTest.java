@@ -191,8 +191,8 @@ class ReadAgentContextToolTest {
   }
 
   /**
-   * D27 起四个工具的 spec 与描述都改成"判定接管"的诚实口径：读工具不再 {@code sensitive}、不再 {@code noExport}（结构性隔离
-   * 降级为判定式拒绝），描述按<b>血缘</b>陈述边界而不是"暂不支持"。
+   * D27 起（§2.5 起五个）工具的 spec 与描述都改成"判定接管"的诚实口径：读/等工具不再 {@code sensitive}、不再 {@code noExport}
+   * （结构性隔离降级为判定式拒绝），描述按<b>血缘</b>陈述边界而不是"暂不支持"。
    *
    * <p>判别性：把 {@code noExport}/{@code sensitive}/SYSTEM 级别任一项改回去，第一条断言转红；描述若退回含糊其辞
    * （"同进程已知子体"/"暂不支持"），描述断言转红——描述是模型唯一能看见的口径，它撒谎 = 边界撒谎。
@@ -204,7 +204,11 @@ class ReadAgentContextToolTest {
     assertThat(tools)
         .extracting(AgentTool::name)
         .containsExactly(
-            "kill_sub_agent", "list_sub_agents", "read_agent_context", "spawn_sub_agent");
+            "kill_sub_agent",
+            "list_sub_agents",
+            "read_agent_context",
+            "spawn_sub_agent",
+            "wait_sub_agent");
 
     AgentTool read =
         tools.stream()
@@ -223,7 +227,7 @@ class ReadAgentContextToolTest {
     assertThat(read.spec().noExport()).isFalse();
     assertThat(read.spec().destructive()).isFalse();
     assertThat(read.spec().sensitive()).isFalse();
-    // 其余工具：D27 起四个全 DEFAULT（kill/spawn 破坏位、list/read 非破坏）；noExport 一个都不带
+    // 其余工具：D27 起全 DEFAULT（kill/spawn 破坏位、list/read/wait 非破坏）；noExport 一个都不带
     Map<String, ToolSpec> expectedSpecs =
         Map.of(
             SubagentOrchestrationTools.KILL_SUB_AGENT,
@@ -231,7 +235,9 @@ class ReadAgentContextToolTest {
             SubagentOrchestrationTools.LIST_SUB_AGENTS,
             ToolSpec.level(AccessToken.DEFAULT, false, false),
             SubagentOrchestrationTools.SPAWN_SUB_AGENT,
-            ToolSpec.level(AccessToken.DEFAULT, false, true));
+            ToolSpec.level(AccessToken.DEFAULT, false, true),
+            SubagentOrchestrationTools.WAIT_SUB_AGENT,
+            ToolSpec.level(AccessToken.DEFAULT, false, false));
     for (AgentTool tool : tools) {
       if (tool.name().equals(SubagentOrchestrationTools.READ_AGENT_CONTEXT)) {
         continue;

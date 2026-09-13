@@ -246,6 +246,17 @@ public final class SubProcessExecutor implements AgentExecutor {
         "exitCode=" + code.getAsInt() + (tail.isEmpty() ? "（子进程没有输出）" : "；末段输出: " + tail));
   }
 
+  /**
+   * 退出码（终局语义 §2.3 / §四.6）：<b>如实回吐</b> {@link ManagedProcess#exitValue()}——拿不到的情形（仍存活 / adopt 形态没有
+   * {@code Process} 句柄）一律 {@link OptionalInt#empty()}，<b>绝不编 0</b>（0 = "正常跑完"，编出来会让
+   * "崩了没留下终局记录"伪装成"正常完成"）。
+   *
+   * <p>两个句柄共用这一段（生产真进程走 {@link LinkedHandle}）：写得一样的地方只留一处，两处各写一遍迟早分叉。
+   */
+  static OptionalInt exitCodeOf(ManagedProcess managed) {
+    return managed.exitValue();
+  }
+
   /** 真进程句柄的窄缝适配：存亡/终止全数委托 {@link ManagedProcess}。 */
   private static final class ManagedHandle implements LaunchedSubagent {
 
@@ -263,6 +274,11 @@ public final class SubProcessExecutor implements AgentExecutor {
     @Override
     public Optional<String> exitDiagnostics() {
       return exitDiagnosticsOf(managed);
+    }
+
+    @Override
+    public OptionalInt exitCode() {
+      return exitCodeOf(managed);
     }
 
     @Override
@@ -292,6 +308,11 @@ public final class SubProcessExecutor implements AgentExecutor {
     @Override
     public Optional<String> exitDiagnostics() {
       return exitDiagnosticsOf(managed);
+    }
+
+    @Override
+    public OptionalInt exitCode() {
+      return exitCodeOf(managed);
     }
 
     @Override

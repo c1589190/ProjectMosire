@@ -27,6 +27,19 @@ public interface LaunchedSubagent extends AutoCloseable {
     return java.util.Optional.empty();
   }
 
+  /**
+   * 子执行体的<b>退出码</b>（设计-子Agent终局与等取口 §2.3）；跑完即退之后，码仍是诊断面而不是状态判据（父侧判终局读的是子库终局事件）。
+   *
+   * <p><b>拿不到 ⇒ {@link java.util.OptionalInt#empty()}，绝不编 0</b>（设计 §四.6）：仍在运行没有码，adopt 形态没有 {@code
+   * Process} 句柄也没有码——"拿不到"与"码是 0"是两件事，写成 0 会把"未知"伪装成"正常退出"。调用方（{@link
+   * SubagentManager}）据此只在该字段有值时才写事件键。
+   *
+   * <p>实现约定：<b>不得抛异常</b>（它在退出观测线程/终局收束路径里被调用），且只在"进程已退出且拿得到码"时返回值。
+   */
+  default java.util.OptionalInt exitCode() {
+    return java.util.OptionalInt.empty();
+  }
+
   /** 请求终止执行体；幂等。 */
   @Override
   void close();

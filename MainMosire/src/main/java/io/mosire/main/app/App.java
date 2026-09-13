@@ -556,10 +556,14 @@ public final class App implements AutoCloseable {
   /**
    * W3b 子 Agent 编排装配：模板库装载（fail-fast——坏模板/缺目录在启动期暴露）→ 子进程管理器 + 链接形态 {@link AgentCommand}（当前 java +
    * 本进程 classpath + {@code Main agent}，JVM 内存 cap -Xmx128m，目录注入，{@code --parent-link}）→ {@link
-   * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 三个内置编排工具以 builtin 供给源注册进工具面（二期 L2：sourceId 归属）。
+   * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 五个内置编排工具以 builtin 供给源注册进工具面（二期 L2：sourceId 归属）。
    *
    * <p>S5-A：那句"父级 = 主 Agent 对照"只覆盖 3 参 {@code spawn}（= 主 Agent 在要）；经 MCP 链接进来的下级调用走 {@code
    * spawn(request, identity, permissions)}，对照物是<b>调用者自己</b>。
+   *
+   * <p><b>子库根（§2.3）</b>：{@code config.dataDir().resolve("subagents")} —— 与 {@link #subagentCommand}
+   * 交给子进程的 {@code --data-dir} <b>同源</b>（同一个表达式，两处各写一遍会分叉）。父侧按 {@code <root>/<实例 id>/events.db}
+   * 读子体终局记录。
    */
   private static SubagentRig wireSubagents(
       BootConfig config,
@@ -594,7 +598,8 @@ public final class App implements AutoCloseable {
             parentPermissions,
             0,
             commandMode::get,
-            limits);
+            limits,
+            config.dataDir().resolve("subagents"));
     BuiltinToolSource builtin =
         new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager));
     for (AgentTool tool : builtin.listTools()) {

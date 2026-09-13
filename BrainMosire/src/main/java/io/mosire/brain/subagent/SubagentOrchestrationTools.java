@@ -21,15 +21,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 四个内置编排工具（中期计划 W3 组件 4 + 三期 D30 / D27）。
+ * 五个内置编排工具（中期计划 W3 组件 4 + 三期 D30 / D27 / D28 的"等取口"）。
  *
- * <p><b>身份级别（D27 起四个全 {@code DEFAULT}，逐个看）</b>：{@code spawn_sub_agent} = {@code DEFAULT} 级（S5-A 起子
+ * <p><b>身份级别（D27 起五个全 {@code DEFAULT}，逐个看）</b>：{@code spawn_sub_agent} = {@code DEFAULT} 级（S5-A 起子
  * Agent 也能派孙代，D28 裁决"开放派生 + 检查锚到调用者"）；{@code kill_sub_agent} = {@code DEFAULT} + {@code
  * destructive=true}（D27 起子体能收自己派的下级，能不能收由<b>血缘判定</b>说了算）；{@code list_sub_agents} = {@code
  * DEFAULT}（D27 起子体只列自己的子树）；{@code read_agent_context} = {@code DEFAULT} 且<b>不再</b> {@code
- * sensitive}/{@code noExport}（D27 的读侧降级，见 {@link #read(SubagentManager)}
- * 的"安全性声明"）。四个都<b>不再</b>在工具内自查 {@code caller == SYSTEM}——身份级别不是判据（{@code AccessToken}
- * 只有三个桶，答不出"你是谁"），判据是 {@link ContextAccessJudge} 的能力位 + 血缘。
+ * sensitive}/{@code noExport}（D27 的读侧降级，见 {@link #read(SubagentManager)} 的"安全性声明"）；{@code
+ * wait_sub_agent} = {@code DEFAULT}、非敏感、非破坏（只读等待，设计 §2.5）。五个都<b>不再</b>在工具内自查 {@code caller ==
+ * SYSTEM}——身份级别不是判据（{@code AccessToken} 只有三个桶，答不出"你是谁"），判据是 {@link ContextAccessJudge} 的能力位 + 血缘。
  *
  * <p><strong>判定两处，各管一边（别互相替代）</strong>：
  *
@@ -48,8 +48,10 @@ import org.slf4j.LoggerFactory;
  * → {@code SUBTREE_DENIED}（D27；模型面只说"这一类被拒"，细节进日志）；启动失败 → {@code LAUNCH_FAILED}；读上下文失败（库不存在/配置未注入）→
  * {@code CONTEXT_UNAVAILABLE}（响亮，绝不返回空结果冒充成功）。
  *
- * <p>返回值：spawn = 新实例快照 JSON（instanceId/templateId/status/depth），kill = 终止确认文本， list =
- * 实例快照数组（<b>只有自己的子树</b>），read_agent_context = 结构化视图体（视图/条目/分页游标）。 除 read 外均幂等安全（重复 kill = 空操作成功）。
+ * <p>返回值：spawn = 新实例快照 JSON（instanceId/templateId/status/depth），kill = 终止确认 JSON（<b>终态 +
+ * 终局字段</b>，设计 §2.6），list = 实例快照数组（<b>只有自己的子树</b>，每行带终局字段——C 块"正常/异常终局可见"的落点）， wait_sub_agent = 等待结果
+ * JSON（status + 终局字段 + waitedMillis），read_agent_context = 结构化视图体（视图/条目/分页游标）。 除 read 外均幂等安全（重复 kill
+ * = 空操作成功）。
  */
 public final class SubagentOrchestrationTools {
 
@@ -63,9 +65,12 @@ public final class SubagentOrchestrationTools {
   /** D30：按实例 id 读子 Agent 上下文（D27 起可外发、由血缘判定守——见 {@link #read(SubagentManager)} 的 javadoc）。 */
   public static final String READ_AGENT_CONTEXT = "read_agent_context";
 
-  /** 注册排序（名字字典序）：kill / list / read / spawn——测试与目录稳定。 */
+  /** §2.5：等一个实例进入终态（或超时返回当前状态）——"等取口"的取。 */
+  public static final String WAIT_SUB_AGENT = "wait_sub_agent";
+
+  /** 注册排序（名字字典序）：kill / list / read / spawn / wait——测试与目录稳定。 */
   public static List<AgentTool> of(SubagentManager manager) {
-    return List.of(kill(manager), list(manager), read(manager), spawn(manager));
+    return List.of(kill(manager), list(manager), read(manager), spawn(manager), wait(manager));
   }
 
   private SubagentOrchestrationTools() {}
@@ -193,6 +198,11 @@ public final class SubagentOrchestrationTools {
    * <p>三要素：{@code DEFAULT} 级（子体也能用）+ {@code destructive=true}（模板要显式放行才给子体这条能力）+ 逐目标判 {@link
    * ContextAccessJudge#judge}（能力位 + subtree）。工具内不再自查 {@code caller == SYSTEM}——那会让"开放到判定"落空，
    * 而判定的判别性正是本段唯一的保证。
+   *
+   * <p><b>§2.6 起返回终态</b>：kill 之后再等一小段确认（复用 {@link SubagentManager#KILL_CONFIRM_MILLIS} 这段预算的
+   * <b>剩余部分</b>——{@code manager.kill} 内部已等过一次宽限，不叠加），返回 {@code status} + 终局字段（有才带）。三种诚实口径： 已 {@code
+   * KILLED} ⇒ 报 {@code KILLED}；仍 {@code TERMINATING} ⇒ 照实说"已请求，尚未确认"（<b>不谎报</b>）； 子体抢在关停前
+   * 自己跑完并留下终局记录 ⇒ 报 {@code FINISHED} + {@code stopReason}（§2.3 的"以事件为准"）。
    */
   static AgentTool kill(SubagentManager manager) {
     return tool(
@@ -214,13 +224,24 @@ public final class SubagentOrchestrationTools {
           if (!decision.allowed()) {
             return ToolResult.error(decision.code(), decision.reason());
           }
+          long started = System.nanoTime();
           try {
             manager.kill(instanceId);
           } catch (IllegalArgumentException e) {
             // 判定已保证"本 manager 已知实例"；走到这里说明判完到 kill 之间实例没了（竞态），如实报未知
             return ToolResult.error("UNKNOWN_INSTANCE", e.getMessage());
           }
-          return ToolResult.ok("已发出子 Agent 终止请求: " + instanceId);
+          // §2.6：只补"这一段预算的剩余部分"——kill() 内部已经等过 KILL_CONFIRM_MILLIS 的关停宽限，
+          // 这里不叠加（否则一次 kill 能占住模型两条 10s 预算）。已用光 ⇒ 剩余 0 ⇒ 立即拿当前状态，照实回显。
+          long elapsedMillis =
+              java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+          SubagentInstance after =
+              manager.awaitTerminal(
+                  instanceId, Math.max(0L, SubagentManager.KILL_CONFIRM_MILLIS - elapsedMillis));
+          Map<String, Object> body =
+              terminalBody(after, manager.terminalOutcome(instanceId).orElse(null));
+          body.put("message", killSummary(instanceId, after.status()));
+          return ToolResult.ok(toJson(body));
         });
   }
 
@@ -229,11 +250,16 @@ public final class SubagentOrchestrationTools {
    *
    * <p><b>为什么从"列全部"改口径</b>：{@code list} 是"有哪些下级"的枚举口，跨分支枚举会泄漏别的分支的存在与状态——判定要挡的
    * 不只是动作，还有"看得见什么"。逐目标判见 {@link ContextAccessJudge#judge}；调用者身份解析不出 ⇒ <b>拒</b>（不是"空列表当成功"）。
+   *
+   * <p><b>§2.6 起每行带终局字段</b>（{@code stopReason}/{@code turns}/{@code toolCalls}/{@code
+   * exitCode}，有才带）—— <b>这是 C 块"模型面区分正常完成与异常退出"的落点</b>：{@code status}
+   * 说明"走到哪了"，终局字段说明"为什么停"。没有终局记录的实例 （异常退出或还在跑）不带这些键，模型据此看到差异，而不是看到一堆填出来的假 0。
    */
   static AgentTool list(SubagentManager manager) {
     return tool(
         LIST_SUB_AGENTS,
-        "列出自己子树内的 Agent 实例（id/模板/层级/状态快照）：主 Agent 列全部，子 Agent 只列自己与自己的子孙。",
+        "列出自己子树内的 Agent 实例（id/模板/层级/状态快照）：主 Agent 列全部，子 Agent 只列自己与自己的子孙。"
+            + "已结束的实例附终局字段（stopReason/turns/toolCalls/exitCode，有则带）——没有 stopReason 即为异常退出（未留下终局记录）。",
         Map.of("type", "object"),
         // D27：降 DEFAULT 级 + 非敏感非破坏（判定接管：能力位 + subtree）
         ToolSpec.level(AccessToken.DEFAULT, false, false),
@@ -250,14 +276,110 @@ public final class SubagentOrchestrationTools {
               continue; // 别家分支的存在与状态不外泄（含未记录血缘的老记录）
             }
             rows.add(
-                Map.of(
-                    "instanceId", instance.instanceId(),
-                    "templateId", instance.templateId(),
-                    "depth", instance.depth(),
-                    "status", instance.status().name()));
+                terminalBody(
+                    instance, manager.terminalOutcome(instance.instanceId()).orElse(null)));
           }
           return ToolResult.ok(toJson(rows));
         });
+  }
+
+  /**
+   * wait_sub_agent：等一个实例进入<b>终态</b>或超时（设计 §2.5）——编排的"等取口"，把"派了活怎么收"从轮询 {@code list} 变成一次等待。
+   *
+   * <p><b>超时不是错误</b>：到点回当前 {@code status}（可能仍非终态），模型自己决定再等还是 kill；不抛异常、不报错码——"还没完"是正常结果，
+   * 把它渲染成错误会让模型去修一个不存在的问题。
+   *
+   * <p><b>判据 = A 块的血缘</b>（能不能等 = 能不能管它，能力位 {@code wait_sub_agent} + subtree），与 kill/list/read
+   * 同一判定点； main 看全部。判定细节（哪个 path 越界）只进日志。
+   *
+   * <p><b>等待期间不占锁</b>：{@link SubagentManager#awaitTerminal} 每 100 ms 只短暂取锁读快照——关停路径的 10s 宽限等待
+   * 不会把编排核心锁住。服务端<b>不设</b>超时上限（设计未定）：模型给的就是它的等待预算，封顶的是流水线自己的回合/时间预算。
+   */
+  static AgentTool wait(SubagentManager manager) {
+    return tool(
+        WAIT_SUB_AGENT,
+        "等一个子 Agent 进入终态（或超时返回当前状态；超时不报错）。终态时附终局字段：stopReason/turns/toolCalls/exitCode（有则带）；"
+            + "没有 stopReason = 异常退出（未留下终局记录）。只能等自己子树内的实例。",
+        Map.of(
+            "type",
+            "object",
+            "properties",
+            Map.of(
+                "instanceId",
+                Map.of("type", "string", "description", "子 Agent 实例 id（见 list_sub_agents）"),
+                "timeoutMs",
+                Map.of("type", "integer", "description", "最长等待毫秒（到点返回当前状态，不是错误）")),
+            "required",
+            List.of("instanceId", "timeoutMs")),
+        // §2.5：DEFAULT 级 + 非敏感 + 非破坏 + 可外发（只读等待；判据是血缘判定，不是身份级别）
+        ToolSpec.level(AccessToken.DEFAULT, false, false),
+        context -> {
+          String instanceId = strArg(context, "instanceId");
+          if (instanceId == null) {
+            return ToolResult.error("INVALID_ARGUMENTS", "instanceId 为必填参数");
+          }
+          Long timeoutMs;
+          try {
+            timeoutMs = longArg(context, "timeoutMs");
+          } catch (IllegalArgumentException e) {
+            return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());
+          }
+          if (timeoutMs == null) {
+            return ToolResult.error("INVALID_ARGUMENTS", "timeoutMs 为必填参数（毫秒）");
+          }
+          if (timeoutMs < 0) {
+            return ToolResult.error("INVALID_ARGUMENTS", "timeoutMs 不能为负: " + timeoutMs);
+          }
+          // 判定收敛在 ContextAccessJudge（能力位 wait_sub_agent + subtree；细节进日志，"这一类被拒"进模型面）
+          ContextAccessJudge.Decision decision =
+              ContextAccessJudge.judge(context, manager, instanceId, WAIT_SUB_AGENT);
+          if (!decision.allowed()) {
+            return ToolResult.error(decision.code(), decision.reason());
+          }
+          long started = System.nanoTime();
+          SubagentInstance after;
+          try {
+            after = manager.awaitTerminal(instanceId, timeoutMs);
+          } catch (IllegalArgumentException e) {
+            // 判定已保证"本 manager 已知实例"；查到判之间实例没了 ⇒ 如实报未知
+            return ToolResult.error("UNKNOWN_INSTANCE", e.getMessage());
+          }
+          Map<String, Object> body =
+              terminalBody(after, manager.terminalOutcome(instanceId).orElse(null));
+          body.put(
+              "waitedMillis",
+              java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+          return ToolResult.ok(toJson(body));
+        });
+  }
+
+  /**
+   * 一行终局可见体（{@code list} 的每行、{@code kill}/{@code wait} 的返回体共用）：身份/状态是骨架，终局字段<b>有才带</b> （{@link
+   * TerminalOutcome#fields()}）——"没有 stopReason"本身就是信息（异常退出、未留下终局记录）。
+   */
+  private static Map<String, Object> terminalBody(
+      SubagentInstance instance, TerminalOutcome outcome) {
+    Map<String, Object> body = new java.util.LinkedHashMap<>();
+    body.put("instanceId", instance.instanceId());
+    body.put("templateId", instance.templateId());
+    body.put("depth", instance.depth());
+    body.put("status", instance.status().name());
+    if (outcome != null) {
+      body.putAll(outcome.fields());
+    }
+    return body;
+  }
+
+  /** kill 的人话结论（§2.6 的三种诚实口径；状态机语义不变，只是不再把"已请求"说成"已终止"）。 */
+  private static String killSummary(String instanceId, SubagentStatus status) {
+    return switch (status) {
+      case KILLED -> "已终止子 Agent: " + instanceId;
+      case TERMINATING -> "已发出子 Agent 终止请求，尚未确认（仍为 TERMINATING）: " + instanceId;
+      default ->
+          status.isFinal()
+              ? "子 Agent 已是终态（" + status.name() + "），kill 未再改动: " + instanceId
+              : "已发出子 Agent 终止请求，尚未确认（当前 " + status.name() + "）: " + instanceId;
+    };
   }
 
   /**
