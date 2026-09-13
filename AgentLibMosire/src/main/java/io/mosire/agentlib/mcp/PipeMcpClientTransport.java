@@ -32,8 +32,10 @@ import reactor.core.scheduler.Schedulers;
  * 角色）的 stdin/stdout 由父进程建好并注入——本类填补"复用已有管道"的缺口，行帧、序列化、 优雅关闭等语义与官方传输逐点对齐（实现逐条镜像其反编译字节码，仅去掉
  * stderr/errorSink 与进程自管部分）。
  *
- * <p>附加契约 {@link #whenClosed()}：管道对端关闭（读端 EOF / 大消息越界）或本端 {@link #closeGracefully()} 时完成该 Future——子
- * Agent 进程用它在主线程阻塞等待"父侧断开/关停"信号（父进程做进程树关停时，EOF 先到， 子体即可自行收尾退出，等待语义收敛）。
+ * <p>附加契约 {@link #whenClosed()}：管道对端关闭（读端 EOF / 大消息越界）或本端 {@link #closeGracefully()} 时完成该 Future。
+ * <b>它不再是任何业务路径的等待点</b>（2026-09-13 子 Agent 终局设计 §2.2 "即退"修正）：子进程 <b>不再</b>在主线程阻塞等"父侧
+ * 断开/关停"信号——那个等待（{@code whenClosed().get()}）正是"子体答完还空转 ≥171 s、父侧全程看到 RUNNING"的成因，已删除。
+ * 今天生产代码<b>没有</b>调用方（只剩测试拿它观测关停时机），保留它是因为"链接何时关"本身仍是可观测事实。
  *
  * <p><b>线程必须是守护线程（2026-09-13，子 Agent 终局设计 §2.2 即退）</b>：两个 {@code ExecutorService}
  * 的线程若为非守护，进站线程会<b>永久阻塞</b>在 {@code readLine()} 上——管道是阻塞式 {@code InputStream}（通常就是 {@code
@@ -110,7 +112,10 @@ public final class PipeMcpClientTransport implements McpClientTransport {
   }
 
   /**
-   * 管道关闭（对端断开 / 优雅关停）时完成；对 {@code whenClosed().get()} 的调用方是唯一阻塞等待者。
+   * 管道关闭（对端断开 / 优雅关停）时完成。
+   *
+   * <p><b>生产代码无调用方</b>（2026-09-13 §2.2 "即退"后）：子 Agent 不再阻塞等关停信号（见类注释），测试用它观测关停时机—— 别再按"子体在主线程
+   * {@code get()} 它"的旧口径理解本方法。
    *
    * <p>返回副本（{@link CompletableFuture#copy()}）：完成时机/值与原 Future 一致，但调用方拿不到内部引用、
    * 也不能经该副本反向操纵本实例（EI_EXPOSE_REP 防御性拷贝）。

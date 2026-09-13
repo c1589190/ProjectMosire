@@ -65,6 +65,9 @@ payload = {"action":"finished","stopReason":"<枚举名>","turns":N,"toolCalls":
 - 语义：等到**终态**或超时返回。返回体：`status` + 终局字段（有则带）+ `waitedMillis`。**超时不是错误**（返回当前 `status`，模型自己决定再等还是 kill）。
 - 实现：把 `awaitDead` 的轮询骨架升成公开口 `awaitTerminal(instanceId, timeoutMillis)`（100 ms 轮询，**不占锁**），`awaitDead` 保留为它的特例（kill 路径继续用）。
 - 判据：**A 块的 `subtree` 判定**（能否等一个实例 = 能不能管它），`main` 看全部。
+- **单次等待上限 `MAX_WAIT_MILLIS = 30_000`（2026-09-14 用户裁决，替换"服务端不设上限"的旧口径）**：
+  - `timeoutMs > MAX_WAIT_MILLIS` ⇒ `INVALID_ARGUMENTS`，消息写明**上限值**与**替代做法**（分几次等 / 用 `list_sub_agents` 轮询）。**不静默截断**——截断 = 悄悄改掉模型给的预算（模型会以为自己等了 120 s），本项目禁止。
+  - 为什么必须有：子体路径上本工具经**父侧 MCP 服务器**调用，客户端单次请求超时默认 **60 s**（`McpToolSource.DEFAULT_REQUEST_TIMEOUT` / `McpServerLinkConfig.requestTimeout`）；一个 120 s 的等待会先撞传输超时，把"超时不是错误"变成"超时是错误"。**另一条路径也指望不上**：`AgentPipeline` 的回合时间预算只在回合循环顶部检查，单次工具调用在途阻塞多久都不会被它打断（旧 javadoc"封顶的是流水线自己的回合/时间预算"因此不成立，已删）。上限取 **30 s**（= 请求超时的一半）：既安全落在超时内侧，又不让单次调用吃掉整个回合预算。判据 = 边界值 30000 仍正常返回 + 30001 被拒且**没发生等待**（夹具：门闩钉住的子体——真等的话只能在预算耗尽后返回）。
 
 ### 2.6 `kill` 与 `list` 的终局可见
 
@@ -74,6 +77,8 @@ payload = {"action":"finished","stopReason":"<枚举名>","turns":N,"toolCalls":
 ### 2.7 `close()` 由深到浅
 
 `close()` 现在按 `instances.values()` 的 `HashMap` 序遍历（**无序**）。改为按 `lineagePath` 段数**降序**（深的先关；`lineagePath` 为空的老记录排在**最后**，不与深层抢序）。理由：先关子孙再关祖辈，别让"祖辈先死 ⇒ 子孙的父侧链路断在半路"。仍是 `terminate(id)` 同一路径，异常吞成日志（既有口径）。
+
+**序由静态纯函数 `SubagentManager.shutdownOrder(Map)` 给出**（2026-09-14）：`close()` 只负责"按序调 `terminate` + 关 launcher"。抽出来是因为**次序判据必须是确定性的**——`instances` 是 `HashMap`，靠 `close()` 里"真实并发谁先收到关停"判序，遇到"排序被删"这种变异有 ≈2.9%（1/C(7,3)）的概率**偶然全对**（评审连跑 9 次未复现）；纯函数版同一输入必得同一序。空 `lineagePath` 的深度记 **-1**（不是 0），这样它排在所有已知深度之后。
 
 ---
 
@@ -95,8 +100,12 @@ payload = {"action":"finished","stopReason":"<枚举名>","turns":N,"toolCalls":
    - 子体**正常跑完** ⇒ 父侧 `FINISHED` + `stopReason=FINISHED`（**不是** FAILED）；
    - 子体**被杀/异常**（无终局事件）⇒ 父侧 `FAILED`/`KILLED`，模型可见面**能区分**"跑完了"与"没留下记录"。
 4. **`wait` 三态**：等到终态（有 stopReason）/ 超时（返回当前 status，**不报错**）/ 判据外（不同血脉 ⇒ `SUBTREE_DENIED`）。
-5. **`close()` 顺序**：两个实例（父 + 孙）都活着时 `close()` ⇒ **孙先于父**收到关停（变异：改回无序 ⇒ 用例转红）。
+5. **`close()` 顺序**：两个实例（父 + 孙）都活着时 `close()` ⇒ **孙先于父**收到关停。
+   - **确定性判据 = `shutdownOrder` 纯函数用例**（同一输入必得同一序：深层→浅层→空 path；变异：去掉 `reversed()` / 空 path 记 0 / 去掉终态过滤 ⇒ 转红）。
+   - 走完整 `close()` 链的集成用例保留，但**它的判别是概率性的**（`HashMap` 序下"排序被删"约 2.9% 概率偶然全对）——别再把它当成这张表的判据。
 6. **退出码透出**：`exitCode()` 拿不到时**不编 0**（`OptionalInt.empty()` ⇒ 事件里不写键）。
+7. **kill 的第三条口径**（2026-09-14 补）：句柄 `close()` 不死（`IgnoreCloseLauncher` 夹具）⇒ 确认窗口结束仍 `TERMINATING`，文案 = "已发出…尚未确认"，**不含"已终止"**，且不推进成 `KILLED`（变异：把该分支文案换成 KILLED 那句 ⇒ 转红）。
+8. **`wait` 的上限边界**（2026-09-14 补）：`timeoutMs = MAX_WAIT_MILLIS` 仍正常返回当前状态（超时不是错误）；`MAX_WAIT_MILLIS + 1` ⇒ `INVALID_ARGUMENTS` 且**没发生等待**（变异：删掉上限检查 ⇒ 前一条用例在预算耗尽后拿到 `ok`，转红）。
 
 ## 五、风险
 

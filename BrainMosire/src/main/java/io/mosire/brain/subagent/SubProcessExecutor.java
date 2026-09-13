@@ -148,7 +148,7 @@ public final class SubProcessExecutor implements AgentExecutor {
    * <数据根>/subagents}），读侧就按同一处取，<b>不给第二份真相</b>： 自身库 = {@code <childDataDir>/<实例
    * id>/events.db}；{@code read_agent_context} 的子库根 = {@code
    * childDataDir}（实例的数据目录一律由<b>本进程</b>这个根派生——子体的 {@code spawn_sub_agent} 经父侧编排执行，孙代也在同一个根下落库， 与
-   * {@code SubagentOrchestrationTools.childDbPath} 的 {@code <root>/<id>/events.db} 口径逐字对齐）。
+   * {@code SubagentManager.childDbPath} 的 {@code <root>/<id>/events.db} 口径逐字对齐）。
    *
    * <p><b>边界（不许含糊）</b>：这里<b>只</b>有这三键，补的是"子体读得到"。bash 三件套等其它工具的配置<b>不</b>在此注入——它们在这条缝上仍拿到空 config ⇒
    * 各自的缺省口径（{@code BashToolConfig.fromToolConfig} 对空表有安全缺省；<b>但</b>部署侧配的 {@code tools.bash.*}

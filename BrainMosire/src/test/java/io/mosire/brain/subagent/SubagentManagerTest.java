@@ -745,6 +745,79 @@ class SubagentManagerTest {
   }
 
   /**
+   * §2.1 兼容口径（⑦ 微分支）：老库的 {@code action=finished} 事件<b>没有</b> {@code stopReason} 键 ⇒
+   * <b>整条记录不认</b>（按"未留下终局记录" 处理），而不是"认得一半"（拿它去填 turns/toolCalls）。
+   *
+   * <p>判别性：把"必须带 {@code stopReason}"这条判据删掉 ⇒ 状态变 FINISHED、reason 消失 ⇒ 断言转红；只把判据挪到"turns 非空"上 ⇒
+   * {@code doesNotContainKey("turns")} 转红。
+   */
+  @Test
+  void legacyFinishedEventWithoutStopReasonIsNotATerminalRecord() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    InProcessExecutor executor =
+        new InProcessExecutor(
+            (childId, config) ->
+                writeChildTerminalRecordPayload(
+                    childId, "{\"action\":\"finished\",\"turns\":4,\"toolCalls\":2}"));
+    SubagentManager manager =
+        manager(store(), executor, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+    String id = spawned.instanceId();
+
+    awaitStatus(manager, id, SubagentStatus.FAILED);
+    assertThat(lifecycleActions(id)).containsExactly("configured", "spawning", "running", "failed");
+    assertThat(payloadOf(lifecycleEvents(id).get(3)))
+        .containsEntry("reason", "未留下终局记录")
+        .doesNotContainKey("stopReason")
+        .as("老事件的计数器也不许漏进来：整条不认，不是'认得一半'")
+        .doesNotContainKey("turns");
+    assertThat(manager.terminalOutcome(id))
+        .hasValueSatisfying(outcome -> assertThat(outcome.hasStopReason()).isFalse());
+  }
+
+  /**
+   * §2.4 / §四.6 的"不编 0"落在<b>读数侧</b>（⑦ 微分支）：终局记录里 {@code turns} 是非数字（坏 payload / 外部写入）⇒ {@code null}
+   * 且事件里不写这个键；同一记录里的 {@code toolCalls} 照常取到——一个字段坏不牵连整条记录（坏的是键，不是记录）。
+   *
+   * <p>判别性：把 {@code intField} 换成 {@code payload.path(key).asInt()}（Jackson 对非数字返回 0）⇒ {@code turns}
+   * 断言转红。
+   */
+  @Test
+  void nonNumericCountersAreNullNotZero() throws Exception {
+    AgentTemplate template = template("reader", Set.of("read"), Set.of(), true, false, false);
+    write(template);
+    InProcessExecutor executor =
+        new InProcessExecutor(
+            (childId, config) ->
+                writeChildTerminalRecordPayload(
+                    childId,
+                    "{\"action\":\"finished\",\"stopReason\":\"TURN_LIMIT\",\"turns\":\"四个\",\"toolCalls\":3}"));
+    SubagentManager manager =
+        manager(store(), executor, parentConfig(), AgentPermissionSet.system(), 0);
+
+    SubagentInstance spawned =
+        manager.spawn(new SubagentLaunchRequest("reader", "目标", null, null, null, null));
+    String id = spawned.instanceId();
+
+    awaitStatus(manager, id, SubagentStatus.FINISHED);
+    assertThat(payloadOf(lifecycleEvents(id).get(3)))
+        .containsEntry("stopReason", "TURN_LIMIT")
+        .containsEntry("toolCalls", 3)
+        .as("非数字的 turns ⇒ 不写键（写 0 = 把'读不出'伪装成'没跑过'）")
+        .doesNotContainKey("turns");
+    assertThat(manager.terminalOutcome(id))
+        .hasValueSatisfying(
+            outcome -> {
+              assertThat(outcome.stopReason()).isEqualTo("TURN_LIMIT");
+              assertThat(outcome.turns()).as("非数字 ⇒ null").isNull();
+              assertThat(outcome.toolCalls()).isEqualTo(3);
+            });
+  }
+
+  /**
    * 诊断实现自身抛异常（最恶劣形态）⇒ 观测线程照样收束状态：诊断是日志面，不许把状态机带停。
    *
    * <p>判别性：去掉 {@code diagnosticsOf} 的 try/catch，观测线程在投递退出事实时死掉 ⇒ 实例永远停在 RUNNING ⇒ 本用例超时变红。
@@ -767,8 +840,11 @@ class SubagentManagerTest {
   /**
    * §2.7 / §四.5：{@code close()} <b>由深到浅</b>——父 + 孙都在管时，孙先收到关停（别让"祖辈先死 ⇒ 子孙的父侧链路断在半路"）。
    *
-   * <p>判别性：把排序去掉（回到 {@code HashMap} 遍历序）⇒ 断言转红。构造上让"偶然对"几乎不可能：7 个实例里 3 个是深层（深度 2）， 无序序把它们全排在前的概率 =
-   * 1/C(7,3) ≈ 3%。
+   * <p><b>判别性（如实标注，2026-09-14）</b>：本用例走的是完整 close() 链（装配层 + 真实并发），断言"关停序列按深度降序"。它对"排序被去掉"的判别是
+   * <b>概率性</b>的：{@code instances} 是 {@code HashMap}，把排序去掉后 3 个深层实例恰好被哈希序排到前面的概率 ≈ 1/C(7,3) ≈
+   * 2.9%（评审实测：连跑 9 次未复现）⇒ <b>确定性判据在</b> {@link
+   * #shutdownOrderIsDeepestFirstAndLegacyLast}（同一输入必得同一输出）。 本用例保留的价值是把"close()
+   * 真的按那个序关、且一个不漏"钉在装配面上。
    */
   @Test
   void closeTerminatesDeepestFirst() throws Exception {
@@ -822,6 +898,32 @@ class SubagentManagerTest {
     assertThat(depths)
         .as("关停顺序按血缘段数降序（深的先关）: " + launcher.closeOrder())
         .isSortedAccordingTo(java.util.Comparator.reverseOrder());
+  }
+
+  /**
+   * §2.7 的<b>确定性判据</b>（2026-09-14，替换"概率性判别"）：{@link SubagentManager#shutdownOrder}
+   * 是静态纯函数，输入同一组实例必得同一序—— 深层先、浅层后、{@code lineagePath} 为空的老记录（深度
+   * -1）<b>最后</b>、终态实例不入序、同深度保持登记序（稳定排序）。
+   *
+   * <p>判别性：去掉 {@code .reversed()} ⇒ 序反转，转红；把空 path 的深度写成 0（而非 -1）⇒ 老记录插到浅层之前，转红；把 {@code
+   * lineagePath} 用 {@code split("/").length} 之类的"顺手实现"改掉 ⇒ 空串会算成 1 段，同样转红；把终态过滤去掉 ⇒ 转红。
+   */
+  @Test
+  void shutdownOrderIsDeepestFirstAndLegacyLast() {
+    Map<String, SubagentInstance> instances = new LinkedHashMap<>();
+    instances.put("shallow-1", instance("shallow-1", "main/shallow-1", SubagentStatus.RUNNING));
+    instances.put("deep-a", instance("deep-a", "main/a1/deep-a", SubagentStatus.RUNNING));
+    instances.put("legacy", instance("legacy", "", SubagentStatus.RUNNING)); // 老记录：段数未知
+    instances.put("deep-b", instance("deep-b", "main/a1/deep-b", SubagentStatus.RUNNING));
+    instances.put(
+        "already-done", instance("already-done", "main/a1/done", SubagentStatus.FINISHED));
+    instances.put("null-path", instance("null-path", null, SubagentStatus.TERMINATING));
+
+    assertThat(SubagentManager.shutdownOrder(instances))
+        .as("深层先、浅层后、空 path 最后、终态不进序、同深度保持登记序")
+        .containsExactly("deep-a", "deep-b", "shallow-1", "legacy", "null-path");
+
+    assertThat(SubagentManager.shutdownOrder(Map.of())).as("空表 ⇒ 空序（防空列表恒真的假通过）").isEmpty();
   }
 
   @Test
@@ -1313,6 +1415,36 @@ class SubagentManagerTest {
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("子库终局记录写入失败: " + instanceId, e);
     }
+  }
+
+  /** 原始终局记录写入（⑦ 老库/坏字段用例要写"不全"的 payload——{@code writeChildTerminalRecord} 写不出缺键形态）。 */
+  private void writeChildTerminalRecordPayload(String instanceId, String payloadJson) {
+    Path dir = childDataRoot().resolve(instanceId);
+    try {
+      Files.createDirectories(dir);
+      try (SqliteEventStore child = SqliteEventStore.open(dir.resolve("events.db"))) {
+        child.append(
+            io.mosire.agentlib.event.EventWrite.of(
+                EventTypes.AGENT_LIFECYCLE, instanceId, payloadJson, instanceId));
+      }
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("子库终局记录写入失败: " + instanceId, e);
+    }
+  }
+
+  /** 实例快照（只给关停排序用例造输入：血缘路径/状态是唯二被 {@link SubagentManager#shutdownOrder} 读到的字段）。 */
+  private static SubagentInstance instance(String id, String lineagePath, SubagentStatus status) {
+    return new SubagentInstance(
+        id,
+        "reader",
+        "目标",
+        AgentConfig.builder(id).build(),
+        AgentPermissionSet.builder(AccessToken.DEFAULT).build(),
+        CommandMode.LIMITED,
+        1,
+        status,
+        "",
+        lineagePath);
   }
 
   private static AgentConfig parentConfig() {

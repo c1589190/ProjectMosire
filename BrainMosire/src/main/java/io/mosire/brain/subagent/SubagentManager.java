@@ -121,8 +121,8 @@ public final class SubagentManager implements AutoCloseable {
    * 子 Agent 数据根（{@code <dataDir>/subagents}）——父侧读<b>子库终局记录</b>的路径源（设计 §2.3 的判据）。
    *
    * <p>与 {@link AgentCommand#childDataDir()} 同源（子体的 {@code --data-dir} 就是它底下的 {@code <实例 id>}），
-   * 路径再由本类拼成 {@code <root>/<实例id>/events.db}——与 {@code SubagentOrchestrationTools.childDbPath}、
-   * {@code AgentContextReader} 的口径逐字一致（不给第二份真相）。
+   * 路径再由本类拼成 {@code <root>/<实例id>/events.db}——拼装规则只有一份（{@link #childDbPath(Path, String)}，工具面
+   * {@code read_agent_context} 也调它），与 {@code AgentContextReader} 的口径逐字一致（不给第二份真相）。
    *
    * <p><b>{@code null} = 装配层没注入</b>（既有夹具/离线形态）⇒ 读不到任何终局记录 ⇒ 一律按"未留下终局记录"处理（fail-closed：宁可
    * 报异常终局，也不假装子体交代过）。生产装配（{@code App.wireSubagents}）必注入。
@@ -483,8 +483,9 @@ public final class SubagentManager implements AutoCloseable {
    * <p>语义：子进程的生命周期归 SubprocessManager/Main（红线 5），这里的"清理"是编排收尾——逐个 terminate +
    * 通知启动缝释放自身资源，进程级兜底（宽限强杀）由 SubprocessManager 侧承担。
    *
-   * <p><b>顺序由深到浅</b>（设计 §2.7）：按 {@code lineagePath} 段数降序关停，{@code lineagePath} 为空的老记录排<b>最后</b>。
-   * 仍是同一条 {@link #terminate(String)} 路径，异常吞成日志（既有口径）——顺序只是"谁先谁后"，不改任何终态语义。
+   * <p><b>顺序由深到浅</b>（设计 §2.7）：按 {@code lineagePath} 段数降序关停，{@code lineagePath} 为空的老记录排<b>最后</b>。 序由
+   * {@link #shutdownOrder(Map)} 给出（静态纯函数，可确定性单测）；仍是同一条 {@link #terminate(String)} 路径，
+   * 异常吞成日志（既有口径）——顺序只是"谁先谁后"，不改任何终态语义。
    */
   @Override
   public void close() {
@@ -498,16 +499,7 @@ public final class SubagentManager implements AutoCloseable {
     }
     List<String> live;
     synchronized (lock) {
-      live =
-          instances.values().stream()
-              .filter(i -> !i.status().isFinal())
-              // 由深到浅（设计 §2.7）：先关子孙再关祖辈，别让"祖辈先死 ⇒ 子孙的父侧链路断在半路"。
-              // lineagePath 为空的老记录段数记 -1 ⇒ 排在最后，不与深层抢序（它们没有可信的深度可言）
-              .sorted(
-                  Comparator.comparingInt((SubagentInstance i) -> lineageDepth(i.lineagePath()))
-                      .reversed())
-              .map(SubagentInstance::instanceId)
-              .toList();
+      live = shutdownOrder(instances);
     }
     for (String id : live) {
       try {
@@ -521,6 +513,28 @@ public final class SubagentManager implements AutoCloseable {
     } catch (RuntimeException e) {
       LOG.warn("launcher 关闭异常", e);
     }
+  }
+
+  /**
+   * 关停次序（设计 §2.7）：<b>由深到浅</b>——先关子孙再关祖辈，别让"祖辈先死 ⇒ 子孙的父侧链路断在半路"；{@code lineagePath} 为空的老记录（深度记
+   * {@code -1}）排<b>最后</b>，不与深层抢序（它们没有可信的深度可言）。
+   *
+   * <p><b>为什么抽成静态纯函数</b>：次序只由 {@code lineagePath} 决定，拿 {@code close()}
+   * 里"真实并发谁先收到终止"去判序是<b>概率性</b>判别 （三个同深实例的正确序只占 C(7,3) 之一，评审实测理论逃逸 ≈2.9%）。本函数的判据是"给定这组实例，返回的 id
+   * 序"——同一输入必得同一输出， 顺序错了必转红。
+   *
+   * <p>只过滤终态（终态实例不再关）与 {@link #close()} 逐字同口径；{@link java.util.stream.Stream#sorted} 是<b>稳定</b>排序，
+   * 同深度保持<b>传入 Map 的迭代序</b>——生产侧的 {@code instances} 是 {@code HashMap} ⇒
+   * 同深度之间<b>没有</b>定义序（本函数不额外定义它）； 测试用 {@code LinkedHashMap} 喂输入，把这个"同深度保持迭代序"的性质钉成确定性的。
+   */
+  static List<String> shutdownOrder(Map<String, SubagentInstance> instances) {
+    return instances.values().stream()
+        .filter(i -> !i.status().isFinal())
+        .sorted(
+            Comparator.comparingInt((SubagentInstance i) -> lineageDepth(i.lineagePath()))
+                .reversed())
+        .map(SubagentInstance::instanceId)
+        .toList();
   }
 
   // ---- 内部：守卫与派生 ----
@@ -569,7 +583,7 @@ public final class SubagentManager implements AutoCloseable {
   }
 
   /**
-   * 血缘段数（{@code main/a1/a1-1} ⇒ 3）：只服务 {@link #close()} 的"由深到浅"排序。
+   * 血缘段数（{@code main/a1/a1-1} ⇒ 3）：只服务 {@link #shutdownOrder(Map)}（= {@link #close()} 的"由深到浅"排序）。
    *
    * <p>空串（老记录/父身份解析不出）记 {@code -1}——它是"深度未知"，必须排在所有已知深度之后（设计 §2.7："不与深层抢序"）， 而不是被当成"第 0 层"（那会把它排到段数
    * 1 之前）。
@@ -1279,6 +1293,14 @@ public final class SubagentManager implements AutoCloseable {
                 SubagentStatus.KILLED,
                 terminalPayload(current, "killed", null, outcome));
           }
+          // 设计 §2.3 表第 4 行（SPAWNING 退出 ⇒ FAILED "subagent 退出于确认存活之前"）。
+          // <b>本分支今天不可达，是防御分支，刻意保留</b>（2026-09-14 复核，非"删掉凑覆盖"）——退出事实只有两个
+          // 投递口，各自都到不了早期状态：①armWatch/watchExit 只在 RUNNING 转换之后才挂（见 spawn:388，且 RUNNING
+          // 转换撞终态时走 catch 分支、不挂观测）；②terminate 的 awaitDead 路径只在状态已到 TERMINATING 之后调它
+          // （SPAWNING 那条走 kill-before-running，同锁内先转 FAILED 并 return，根本不投递退出事实）。
+          // CONFIGURED 则被 spawn 的同锁两转换封窗、对外不可观测。
+          // 保留的理由：万一将来出现新的退出事实来源（新执行器/新的状态路径），这里必须按规则 4 记 FAILED，
+          // 而不是让退出事实落到别处被静默吞掉。它同时是 `EXIT_BEFORE_RUNNING_REASON` 的唯一引用点。
           default -> {
             abnormal = true;
             transition(
@@ -1301,7 +1323,8 @@ public final class SubagentManager implements AutoCloseable {
    * <p>读取口径（只读、不建表、不迁移）：
    *
    * <ul>
-   *   <li>路径 = {@code <childDataRoot>/<实例 id>/events.db}（与子进程的 {@code --data-dir} 同源）；
+   *   <li>路径 = {@code <childDataRoot>/<实例 id>/events.db}（与子进程的 {@code --data-dir} 同源），拼装统一走 {@link
+   *       #childDbPath(Path, String)}——越根 id 在那里被挡，本方法按"没留下终局记录"收（fail-closed，不读根外文件）；
    *   <li>库不存在 / 未注入根 / 读失败 ⇒ {@code empty}（并按"未留下终局记录"处理，读失败只在父侧日志留痕，不进模型面）；
    *   <li><b>兼容老库</b>：事件必须<b>带</b> {@code stopReason} 键才认——老事件（无该键）⇒ 按"未留下终局记录"处理，<b>不编造</b>；
    *   <li>{@code turns}/{@code toolCalls} 缺失 ⇒ {@code null}（不填 0）。
@@ -1311,7 +1334,15 @@ public final class SubagentManager implements AutoCloseable {
     if (childDataRoot == null) {
       return Optional.empty(); // 装配层没注入根：读不到就等于没留下（fail-closed），不猜路径
     }
-    Path db = childDataRoot.resolve(instanceId).resolve("events.db");
+    Path db;
+    try {
+      // 路径拼装与越根防护<b>只此一份</b>（childDbPath）：本方法与 read_agent_context 是同一个口径的两个读侧，
+      // 两处各拼一遍路径正是"同族缺陷温床"（2026-09-14 收敛）。越根 ⇒ 当"没留下终局记录"（fail-closed，不读根外文件）。
+      db = childDbPath(childDataRoot, instanceId);
+    } catch (RuntimeException e) {
+      LOG.warn("子 Agent 终局记录路径越出子库根（按未留下终局记录处理）: id={}", instanceId, e);
+      return Optional.empty();
+    }
     if (!Files.isRegularFile(db)) {
       return Optional.empty();
     }
@@ -1344,6 +1375,27 @@ public final class SubagentManager implements AutoCloseable {
       LOG.warn("子 Agent 终局记录读取失败（按未留下终局记录处理）: id={} db={}", instanceId, db, e);
       return Optional.empty();
     }
+  }
+
+  /**
+   * 子库路径：{@code <root>/<instanceId>/events.db}（与装配层交给子进程的 {@code --data-dir} 同源），并挡掉越出根目录的 id。
+   *
+   * <p><b>为什么放在这里、且只有这一份</b>（2026-09-14 收敛）：拼路径的规则是"子库布局"这一件事，之前两处实现（本类的 {@code
+   * readChildTerminalRecord} 与 {@code
+   * SubagentOrchestrationTools.read_agent_context}）已经分叉——后者有越根防护、前者没有。
+   * 同一口径两处实现是<b>同族缺陷温床</b>（改动只落一处、另一处静默过期），所以收敛成一个包内静态函数，工具侧直接调它。 模板 id 由模板文件给出，不排除被人为写成 {@code
+   * ../..}；判定层只认"已知实例"，这里是<b>纵深防御</b>。
+   *
+   * @throws IllegalStateException id 归一化后不在根目录之下（调用方按各自的 fail-closed 口径处理：工具面 {@code
+   *     CONTEXT_UNAVAILABLE}，终局判定按"未留下终局记录"）
+   */
+  static Path childDbPath(Path root, String instanceId) {
+    Path normalizedRoot = root.normalize();
+    Path dir = normalizedRoot.resolve(instanceId).normalize();
+    if (!dir.startsWith(normalizedRoot)) {
+      throw new IllegalStateException("实例 id 越出子库根目录: " + instanceId);
+    }
+    return dir.resolve("events.db");
   }
 
   /** 终局事件 payload：终局字段<b>有才写</b>（{@link TerminalOutcome#fields()}）。 */

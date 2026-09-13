@@ -65,7 +65,7 @@ class PipeMcpClientTransportTest {
       } finally {
         client.closeGracefully();
       }
-      // 客户端优雅关闭 → 传输停摆 → whenClosed 完成（父侧靠它感知链接断开）
+      // 客户端优雅关闭 → 传输停摆 → whenClosed 完成（测试面观测点；§2.2"即退"后生产代码已无调用方，见传输类注释）
       assertThat(transport.whenClosed().get(5, TimeUnit.SECONDS)).isNull();
     }
   }

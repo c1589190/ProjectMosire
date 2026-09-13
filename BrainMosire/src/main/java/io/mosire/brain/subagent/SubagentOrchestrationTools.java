@@ -68,6 +68,25 @@ public final class SubagentOrchestrationTools {
   /** §2.5：等一个实例进入终态（或超时返回当前状态）——"等取口"的取。 */
   public static final String WAIT_SUB_AGENT = "wait_sub_agent";
 
+  /**
+   * {@code wait_sub_agent} 的<b>单次等待上限</b>（毫秒，2026-09-14 裁决，设计 §2.5）。
+   *
+   * <p><b>为什么必须有上限</b>：子体路径上这个工具是经<b>父侧 MCP 服务器</b>调用的（{@code AgentToMcpServer} 的 {@code
+   * tools/call}），而 MCP 客户端对请求有传输层超时——默认 <b>60 s</b>（{@code McpToolSource} 的 {@code
+   * DEFAULT_REQUEST_TIMEOUT}，与 {@link io.mosire.agentlib.mcp.McpServerLinkConfig#requestTimeout()}
+   * 的缺省同值）。 一个 {@code timeoutMs=120000} 的等待会在 60 s 处变成<b>传输错误</b>，把设计承诺的"超时不是错误"变成"超时是错误"。
+   *
+   * <p><b>另一条路径（主 Agent 经管线直呼）也指望不上</b>：{@code AgentPipeline} 的回合时间预算只在<b>回合循环顶部</b>检查 （{@code
+   * TIME_BUDGET} 决策点在循环头，见该类的 {@code while} 体），单次工具调用在途阻塞多久都不会被它打断——所以"封顶的是流水线的回合/时间预算"
+   * 这句话<b>不成立</b>（旧 javadoc 的错误口径，2026-09-14 由评审实证后删除），上限必须由本工具自己给。
+   *
+   * <p>取 <b>30 s</b>（= MCP 请求超时 60 s 的一半）的理由：①安全落在请求超时内侧，两条路径上"等待到时"都仍是<b>正常返回</b>；
+   * ②单次工具调用不该吃掉整个回合预算（{@code AgentConfig.timeBudget} 与回合/工具调用硬顶都按秒级算），30 s 既够一次"等它收尾"的常规等待，
+   * 又不会把一次误用变成整轮的静默挂死。要等更久 ⇒ <b>分次等</b>（模型自己续）或 {@code list_sub_agents} 轮询——<b>不静默截断</b>（截断 =
+   * 悄悄改掉模型的意图，本项目禁止）。
+   */
+  public static final long MAX_WAIT_MILLIS = 30_000L;
+
   /** 注册排序（名字字典序）：kill / list / read / spawn / wait——测试与目录稳定。 */
   public static List<AgentTool> of(SubagentManager manager) {
     return List.of(kill(manager), list(manager), read(manager), spawn(manager), wait(manager));
@@ -293,13 +312,20 @@ public final class SubagentOrchestrationTools {
    * 同一判定点； main 看全部。判定细节（哪个 path 越界）只进日志。
    *
    * <p><b>等待期间不占锁</b>：{@link SubagentManager#awaitTerminal} 每 100 ms 只短暂取锁读快照——关停路径的 10s 宽限等待
-   * 不会把编排核心锁住。服务端<b>不设</b>超时上限（设计未定）：模型给的就是它的等待预算，封顶的是流水线自己的回合/时间预算。
+   * 不会把编排核心锁住。
+   *
+   * <p><b>单次等待有上限</b>（{@link #MAX_WAIT_MILLIS} = 30 s，2026-09-14 裁决，设计 §2.5）：超限是 {@code
+   * INVALID_ARGUMENTS}，<b>不静默截断</b>（截断 = 悄悄改掉模型给的时间预算），要等更久就分次等或用 {@code list} 轮询。上限必须存在且落在 MCP
+   * 请求超时（默认 60 s）<b>内侧</b>——否则子体经父侧 MCP 桥等待时会先撞上传输超时， 把"超时不是错误"变成"超时是错误"。
    */
   static AgentTool wait(SubagentManager manager) {
     return tool(
         WAIT_SUB_AGENT,
         "等一个子 Agent 进入终态（或超时返回当前状态；超时不报错）。终态时附终局字段：stopReason/turns/toolCalls/exitCode（有则带）；"
-            + "没有 stopReason = 异常退出（未留下终局记录）。只能等自己子树内的实例。",
+            + "没有 stopReason = 异常退出（未留下终局记录）。timeoutMs 上限 "
+            + MAX_WAIT_MILLIS
+            + " 毫秒，超过会被拒（INVALID_ARGUMENTS）——要等更久请分几次等，或用 list_sub_agents 轮询。"
+            + "只能等自己子树内的实例。",
         Map.of(
             "type",
             "object",
@@ -308,7 +334,13 @@ public final class SubagentOrchestrationTools {
                 "instanceId",
                 Map.of("type", "string", "description", "子 Agent 实例 id（见 list_sub_agents）"),
                 "timeoutMs",
-                Map.of("type", "integer", "description", "最长等待毫秒（到点返回当前状态，不是错误）")),
+                Map.of(
+                    "type",
+                    "integer",
+                    "description",
+                    "最长等待毫秒，0 ≤ timeoutMs ≤ "
+                        + MAX_WAIT_MILLIS
+                        + "（到点返回当前状态，不是错误；超过上限直接拒，不截断——要等更久就分次等）")),
             "required",
             List.of("instanceId", "timeoutMs")),
         // §2.5：DEFAULT 级 + 非敏感 + 非破坏 + 可外发（只读等待；判据是血缘判定，不是身份级别）
@@ -329,6 +361,20 @@ public final class SubagentOrchestrationTools {
           }
           if (timeoutMs < 0) {
             return ToolResult.error("INVALID_ARGUMENTS", "timeoutMs 不能为负: " + timeoutMs);
+          }
+          // 上限（设计 §2.5，2026-09-14 裁决）：超限即拒，<b>不静默截断</b>——截断等于悄悄改掉模型给的预算，
+          // 模型会以为自己等了 120 s（实际只等 30 s）而做出错误的下一步判断。拒掉 + 明说上限值与替代做法，
+          // 模型面才有机会自己改主意（分次等 / list 轮询）。
+          if (timeoutMs > MAX_WAIT_MILLIS) {
+            return ToolResult.error(
+                "INVALID_ARGUMENTS",
+                "timeoutMs 超过单次等待上限 "
+                    + MAX_WAIT_MILLIS
+                    + " 毫秒（给定: "
+                    + timeoutMs
+                    + "）。上限存在是为了让'等待到时'始终是正常返回："
+                    + "子体路径上本工具的调用经父侧 MCP 链路，单次请求超时默认 60 秒，"
+                    + "更长的等待会先撞传输超时、变成传输错误。要等更久请分几次等，或用 list_sub_agents 轮询。");
           }
           // 判定收敛在 ContextAccessJudge（能力位 wait_sub_agent + subtree；细节进日志，"这一类被拒"进模型面）
           ContextAccessJudge.Decision decision =
@@ -481,7 +527,8 @@ public final class SubagentOrchestrationTools {
               agentId = String.valueOf(selfId);
             } else {
               Path root = requiredPath(config, AgentContextReader.CONFIG_SUBAGENTS_ROOT, "子库根目录");
-              dbPath = childDbPath(root, target);
+              // 拼装规则只有一份（含越根防护）：SubagentManager.childDbPath——与父侧的终局记录读侧同源
+              dbPath = SubagentManager.childDbPath(root, target);
               agentId = target;
               instance = manager.get(target).orElse(null);
             }
@@ -498,19 +545,6 @@ public final class SubagentOrchestrationTools {
             return ToolResult.error("CONTEXT_UNAVAILABLE", e.getMessage());
           }
         });
-  }
-
-  /**
-   * 子库路径：{@code <root>/<instanceId>/events.db}（与装配层交给子进程的 {@code --data-dir} 同源）， 并挡掉越出根目录的 id（模板
-   * id 由模板文件给出，不排除被人为写成 {@code ../..}；判定层只认"已知实例"， 这里是纵深防御）。
-   */
-  static Path childDbPath(Path root, String instanceId) {
-    Path normalizedRoot = root.normalize();
-    Path dir = normalizedRoot.resolve(instanceId).normalize();
-    if (!dir.startsWith(normalizedRoot)) {
-      throw new IllegalStateException("实例 id 越出子库根目录: " + instanceId);
-    }
-    return dir.resolve("events.db");
   }
 
   private static Path requiredPath(Map<String, Object> config, String key, String hint) {

@@ -146,10 +146,10 @@ class ReadAgentContextToolTest {
 
     // 纵深防御：即便判定被绕过，路径拼接本身也挡越界 id（本用例直接对拼接函数判别）
     Path root = f.root();
-    assertThat(SubagentOrchestrationTools.childDbPath(root, "reader-abc123"))
+    assertThat(SubagentManager.childDbPath(root, "reader-abc123"))
         .isEqualTo(root.resolve("reader-abc123").resolve("events.db"));
     for (String evil : List.of("..", "../main", "a/../../b", "reader-abc/../../..")) {
-      assertThatThrownBy(() -> SubagentOrchestrationTools.childDbPath(root, evil))
+      assertThatThrownBy(() -> SubagentManager.childDbPath(root, evil))
           .as("id=%s 应被挡", evil)
           .isInstanceOf(IllegalStateException.class)
           .hasMessageContaining("越出子库根目录");

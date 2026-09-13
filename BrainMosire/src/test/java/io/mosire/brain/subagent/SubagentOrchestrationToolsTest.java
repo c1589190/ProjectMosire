@@ -24,6 +24,7 @@ import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -307,6 +308,116 @@ class SubagentOrchestrationToolsTest {
   }
 
   /**
+   * §2.5 的单次等待上限（必改 2，2026-09-14 裁决）：{@code timeoutMs > MAX_WAIT_MILLIS} ⇒ {@code
+   * INVALID_ARGUMENTS}， 消息里写明<b>上限值</b>与<b>替代做法</b>；是<b>拒</b>不是<b>静默截断</b>（截断 =
+   * 悄悄改掉模型给的预算，模型会以为自己等了 120 s）。
+   *
+   * <p><b>"没等"本身就是判据的一半</b>：夹具的子体被门闩钉住、永不收尾——若这次调用真的等过，它只可能在预算（30001 ms）耗尽之后才返回 {@code
+   * ok(RUNNING)}。所以"错误码 + 亚秒返回 + 状态未推进"三点合起来才是"没等"的判别面；只断言错误码说不出"等没等"。
+   *
+   * <p>判别性：删掉上限检查 ⇒ 本用例在 ~30 s 后拿到 {@code ok(RUNNING)} ⇒ 转红（变异自证形态见本轮报告）。
+   */
+  @Test
+  void waitToolRejectsTimeoutBeyondCapWithoutWaiting() throws Exception {
+    CountDownLatch blocked = new CountDownLatch(1);
+    Fixture f =
+        fixture(systemParent(), new InProcessExecutor((instanceId, config) -> blocked.await()));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult spawn =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "长任务")));
+    String childId = (String) okBody(spawn).get("instanceId");
+
+    long started = System.nanoTime();
+    ToolResult rejected =
+        guard.execute(
+            registry,
+            "wait_sub_agent",
+            context(
+                Map.of(
+                    "instanceId",
+                    childId,
+                    "timeoutMs",
+                    SubagentOrchestrationTools.MAX_WAIT_MILLIS + 1)));
+    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+    assertThat(rejected.success()).isFalse();
+    assertThat(rejected.code()).isEqualTo("INVALID_ARGUMENTS");
+    assertThat(rejected.message())
+        .contains(String.valueOf(SubagentOrchestrationTools.MAX_WAIT_MILLIS))
+        .contains("分几次等")
+        .contains("list_sub_agents");
+    assertThat(elapsedMillis).as("没等：真等的话夹具要等满 30001 ms 才会返回").isLessThan(5_000L);
+    assertThat(f.manager().get(childId).orElseThrow().status().name())
+        .as("状态未被推进（没发生等待）")
+        .isEqualTo("RUNNING");
+    blocked.countDown();
+    f.close();
+  }
+
+  /**
+   * 上限的<b>边界</b>（必改 2）：{@code timeoutMs = MAX_WAIT_MILLIS}（30000）仍然合法，且"超时不是错误"的红线在边界上不破——
+   * 非终态实例到点<b>正常返回</b>当前状态（ok + waitedMillis），不是错误码。本用例真等满 30 s：这正是判据要求的代价。
+   *
+   * <p>判别性：把上限判成 {@code >=}（边界值也被拒）⇒ 本用例转红；把"到时"实现成 error（"等不到就报错"的直觉改法）⇒ {@link #okBody} 转红。
+   */
+  @Test
+  void waitToolCapBoundaryTimesOutAsNormalReturn() throws Exception {
+    CountDownLatch blocked = new CountDownLatch(1);
+    Fixture f =
+        fixture(systemParent(), new InProcessExecutor((instanceId, config) -> blocked.await()));
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult spawn =
+        guard.execute(
+            registry, "spawn_sub_agent", context(Map.of("templateId", "reader", "goal", "长任务")));
+    String childId = (String) okBody(spawn).get("instanceId");
+
+    ToolResult waited =
+        guard.execute(
+            registry,
+            "wait_sub_agent",
+            context(
+                Map.of(
+                    "instanceId",
+                    childId,
+                    "timeoutMs",
+                    SubagentOrchestrationTools.MAX_WAIT_MILLIS)));
+
+    Map<String, Object> body = okBody(waited); // 成功结果：边界值合法、超时不是错误
+    assertThat(body)
+        .containsEntry("status", "RUNNING")
+        .doesNotContainKey("stopReason")
+        .doesNotContainKey("exitCode");
+    assertThat(((Number) body.get("waitedMillis")).longValue())
+        .as("真把边界预算等完了（不是立刻返回）")
+        .isGreaterThanOrEqualTo(SubagentOrchestrationTools.MAX_WAIT_MILLIS - 1_000L);
+    blocked.countDown();
+    f.close();
+  }
+
+  /**
+   * 上限必须留在 MCP 请求超时<b>内侧</b>（必改 2 的理由本身要有判据）：子体路径上这个工具经父侧 MCP 服务器调用，客户端单次请求超时默认 60 s （{@code
+   * McpToolSource.DEFAULT_REQUEST_TIMEOUT} 与 {@link
+   * io.mosire.agentlib.mcp.McpServerLinkConfig#requestTimeout()} 缺省同值）； 上限一旦 ≥ 它，"等待到时"就会先撞传输超时 ⇒
+   * 设计承诺的"超时不是错误"在子体路径上失效。
+   *
+   * <p>判别性：把 {@code MAX_WAIT_MILLIS} 抬到 60 s 以上 ⇒ 转红。
+   */
+  @Test
+  void maxWaitStaysInsideMcpRequestTimeout() {
+    Duration requestTimeout =
+        new io.mosire.agentlib.mcp.McpServerLinkConfig("guard", "cmd", null, null, null, null)
+            .requestTimeout();
+    assertThat(Duration.ofMillis(SubagentOrchestrationTools.MAX_WAIT_MILLIS))
+        .as("单次等待上限必须在 MCP 请求超时内侧（否则'等待到时'变成传输错误）")
+        .isLessThan(requestTimeout);
+  }
+
+  /**
    * §四.4 的第三态 + 能力位：{@code wait} 的判据是 A 块的血缘判定（能力位 + subtree）—— <b>兄弟分支等不了</b>（两边 path 都能解析出，只是不在同一
    * subtree），<b>父等得了自己的子</b>；能力位缺则 {@code DENIED}。
    *
@@ -473,6 +584,57 @@ class SubagentOrchestrationToolsTest {
 
     f.close();
     finished.close();
+  }
+
+  /**
+   * §2.6 的第三条口径（必改 1，2026-09-14）：<b>确认窗口结束、句柄仍活</b> ⇒ 状态停在 {@code TERMINATING}，kill 必须照实说"已发出终止请求，
+   * 尚未确认"，<b>不许谎报"已终止"</b>——三条口径里只有它没被判据钉住，而它恰是"不谎报"红线的所在。
+   *
+   * <p>夹具 = {@link IgnoreCloseLauncher}：句柄 {@code close()} 只记次数、不置死（真实形态：三层关停发出后子进程还活着、宽限内不死），于是
+   * {@code awaitDead(KILL_CONFIRM_MILLIS)} 走满 10 s 也等不到死亡 ⇒ 终止观测<b>不</b>收束成
+   * KILLED。同一条路径也是"父侧不谎报"的结构保证： 状态机宁可停在 TERMINATING，也不把"已请求"说成"已完成"。
+   *
+   * <p>判别性：把 {@code case TERMINATING} 的文案换成 {@code case KILLED} 那句（"已终止…"）⇒ 文案断言转红；把"窗口到点"直接记
+   * KILLED ⇒ status/stopReason 断言转红。
+   */
+  @Test
+  void killReportsStillTerminatingWhenConfirmWindowEndsAlive() throws Exception {
+    IgnoreCloseLauncher launcher = new IgnoreCloseLauncher();
+    Fixture f = fixture(systemParent(), launcher);
+    ToolRegistry registry = registryOf(f.manager());
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+
+    ToolResult spawn =
+        guard.execute(
+            registry,
+            "spawn_sub_agent",
+            context(Map.of("templateId", "reader", "goal", "关不掉的长任务")));
+    String childId = (String) okBody(spawn).get("instanceId");
+
+    long started = System.nanoTime();
+    ToolResult killed =
+        guard.execute(registry, "kill_sub_agent", context(Map.of("instanceId", childId)));
+    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+    Map<String, Object> body = okBody(killed);
+    assertThat(body)
+        .as("窗口到点仍活 ⇒ 停在 TERMINATING（不许推进成 KILLED）")
+        .containsEntry("status", "TERMINATING")
+        .doesNotContainKey("stopReason");
+    assertThat(body.get("message").toString())
+        .contains("尚未确认")
+        .contains("TERMINATING")
+        .contains(childId)
+        .as("红线：不谎报'已终止'")
+        .doesNotContain("已终止");
+    assertThat(elapsedMillis)
+        .as("真等完了确认窗口（不是立刻返回当前状态）")
+        .isGreaterThanOrEqualTo(SubagentManager.KILL_CONFIRM_MILLIS - 1_000L);
+    assertThat(launcher.closeCalls()).as("三层关停入口被调到（句柄 close 恰好一次）").isEqualTo(1);
+    assertThat(f.manager().get(childId).orElseThrow().status().name())
+        .as("Manager 侧状态与工具面回显一致")
+        .isEqualTo("TERMINATING");
+    f.close();
   }
 
   /**
@@ -988,6 +1150,41 @@ class SubagentOrchestrationToolsTest {
 
   // ---- fixtures ----
 
+  /**
+   * "句柄 {@code close()} 不死" launcher（必改 1 的夹具，2026-09-14）：关闭只记次数、存活恒为真——用来把 kill 的 <b>TERMINATING
+   * 确认窗口</b>钉在确定性构造上（真实形态：三层关停发完、子进程仍未死）。
+   *
+   * <p>反面：任何"窗口到点就报 KILLED"的实现都会在这个夹具下暴露（状态推进没有事实依据）。{@code closeCalls} 同时证明三层关停入口真被调到，
+   * 而不是"压根没试过关"。
+   */
+  private static final class IgnoreCloseLauncher implements SubagentLauncher {
+
+    private final java.util.concurrent.atomic.AtomicInteger closeCalls =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    int closeCalls() {
+      return closeCalls.get();
+    }
+
+    @Override
+    public LaunchedSubagent launch(SubagentInstance instance) {
+      return new LaunchedSubagent() {
+        @Override
+        public boolean isAlive() {
+          return true; // 永远活着：确认窗口内不会有"已退出"事实
+        }
+
+        @Override
+        public void close() {
+          closeCalls.incrementAndGet();
+        }
+      };
+    }
+
+    @Override
+    public void close() {}
+  }
+
   /** 管理器 + 事件库 + 总线（测试自建并注入，便于直接查事件）。 */
   private static final class Fixture implements AutoCloseable {
     private final SqliteEventStore store;
@@ -1034,12 +1231,13 @@ class SubagentOrchestrationToolsTest {
     }
   }
 
-  private Fixture fixture(AgentPermissionSet parentPermissions, InProcessExecutor executor) {
-    return fixture(parentPermissions, executor, SubagentLimits.defaults());
+  /** 执行体缝是 {@link SubagentLauncher}（InProcessExecutor 只是其一）："句柄 close() 不死"这类夹具经它注入。 */
+  private Fixture fixture(AgentPermissionSet parentPermissions, SubagentLauncher launcher) {
+    return fixture(parentPermissions, launcher, SubagentLimits.defaults());
   }
 
   private Fixture fixture(
-      AgentPermissionSet parentPermissions, InProcessExecutor executor, SubagentLimits limits) {
+      AgentPermissionSet parentPermissions, SubagentLauncher launcher, SubagentLimits limits) {
     writeTemplate("reader", Set.of("echo"), "只读问候子 Agent");
     AgentTemplateStore store = new AgentTemplateStore(templateDir());
     store.load();
@@ -1055,7 +1253,7 @@ class SubagentOrchestrationToolsTest {
     SubagentManager manager =
         new SubagentManager(
             store,
-            executor == null ? new InProcessExecutor() : executor,
+            launcher == null ? new InProcessExecutor() : launcher,
             events,
             bus,
             AgentConfig.builder("main").build(),
