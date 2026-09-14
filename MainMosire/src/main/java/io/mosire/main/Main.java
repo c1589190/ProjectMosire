@@ -1,6 +1,7 @@
 package io.mosire.main;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.config.ConfigException;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
@@ -19,6 +20,9 @@ import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
 import io.mosire.main.app.ContextReport;
 import io.mosire.main.app.FakeLlmScript;
+import io.mosire.main.setup.LlmSetupWizard;
+import io.mosire.main.setup.SetupLlmRouter;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -101,6 +105,9 @@ public final class Main {
             config = withAguiPort(config, Integer.parseInt(requireValue(args, ++i)));
         case "--debug-port" ->
             config = withDebugPort(config, Integer.parseInt(requireValue(args, ++i)));
+        case "--setup" -> config = withSetup(config, true);
+        case "--setup-port" ->
+            config = withSetupPort(config, Integer.parseInt(requireValue(args, ++i)));
         case "--templates-dir" ->
             config = withTemplatesDir(config, Path.of(requireValue(args, ++i)));
         case "--fake" -> fake = true;
@@ -115,13 +122,23 @@ public final class Main {
       throw new IllegalArgumentException("--fake 与 --fake-script 不能同时指定");
     }
     // W5：离线 LLM 显式声明面（smoke.sh 断言"断网可测"）；三期 S1-A1：以上开关都不给时一律真模型（缺配置/缺密钥响亮失败，不退化）
+    // 配置引导（设计-配置引导.md D1）：真模型路径 + 无配置 + 交互终端 ⇒ 先走向导，写盘后再启动
+    if (!fake
+        && fakeScript == null
+        && !config.demo()
+        && !config.setup()
+        && !offerLlmSetupWizard(config)) {
+      return 2;
+    }
     App app = startApp(config, fake, fakeScript);
     // stdout 保留给 MCP stdio 流（主 Agent 工具面默认在此暴露），用户可见消息走 stderr
     // S4-B2：审批面端口（恒 loopback）。approval.http=false 时整段不打印——0 不是合法端口，不拿它冒充"已启用"
     int approvalPort = app.approvalPort();
     String approvals = approvalPort == 0 ? "" : " approvals=http://127.0.0.1:" + approvalPort;
+    int setupPort = app.setupPort();
+    String setup = setupPort == 0 ? "" : " setup=http://127.0.0.1:" + setupPort;
     System.err.printf(
-        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%s%n",
+        "Mosire v%s 已启动: admin=http://127.0.0.1:%d a2a=http://%s:%d agui=http://%s:%d debug=http://127.0.0.1:%d%s%s%s%s%n",
         Version.VERSION,
         app.boundPort(),
         config.a2aHost(),
@@ -130,10 +147,52 @@ public final class Main {
         app.aguiPort(),
         app.debugPort(),
         approvals,
+        setup,
         config.demo() ? "（demo 模式）" : "",
         config.templatesDir() != null ? " 子 Agent 编排=已启用" : "");
     app.awaitTermination();
     return 0;
+  }
+
+  /**
+   * CLI 配置引导入口（设计 D1）：真模型路径 + 路由装配失败 + 交互终端三条件同时满足才进向导； 其余形态（脚本/CI/`--setup`）原样返回—— 缺配置时的响亮失败由
+   * {@code realLlm} 照常抛出（D24 不回退）。
+   *
+   * @return true = 可以继续启动（本就配置齐全，或向导已写好配置）；false = 用户在向导里放弃（调用方以非零码结束， 不让进程在无 LLM 的状态下"成功"起来）
+   */
+  private static boolean offerLlmSetupWizard(BootConfig config) {
+    boolean unconfigured = false;
+    try {
+      FileConfigStore store = new FileConfigStore(config.dataDir());
+      LlmRouteLoader.load(store, LlmRouteLoader.routeName(store, AgentIdentity.MAIN_ID));
+    } catch (ConfigException unconfiguredRoute) {
+      unconfigured = true;
+    }
+    if (!unconfigured) {
+      return true;
+    }
+    java.io.Console console = System.console();
+    if (console == null) {
+      return true; // 非交互形态：不进向导，缺配置的响亮失败照常发生（D24）
+    }
+    System.err.println();
+    boolean configured;
+    try {
+      configured =
+          new LlmSetupWizard()
+              .run(
+                  config.dataDir(),
+                  prompt -> console.readLine("%s", prompt),
+                  prompt -> console.readPassword("%s", prompt),
+                  System.err);
+    } catch (IOException terminalFailure) {
+      System.err.println("配置引导读终端失败：" + terminalFailure.getMessage());
+      return false;
+    }
+    if (!configured) {
+      System.err.println("未配置 LLM，退出（可重跑 run 进向导，或用 --setup 经 HTTP 引导）。");
+    }
+    return configured;
   }
 
   /**
@@ -183,7 +242,9 @@ public final class Main {
         ? FakeLlmScript.parse(fakeScript)
         : fake
             ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY))
-            : config.demo() ? null : realLlm(config.dataDir());
+            : config.demo()
+                ? null
+                : config.setup() ? SetupLlmRouter.unconfigured() : realLlm(config.dataDir());
   }
 
   /**
@@ -275,7 +336,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withDataDir(BootConfig config, Path dataDir) {
@@ -291,7 +354,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withDemo(BootConfig config, boolean demo) {
@@ -307,7 +372,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withDemoMessage(BootConfig config, String message) {
@@ -323,7 +390,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withMcpLinks(BootConfig config, Path mcpLinks) {
@@ -339,7 +408,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withMcpExpose(BootConfig config, boolean mcpExpose) {
@@ -355,7 +426,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withA2aAddress(BootConfig config, String a2aAddress) {
@@ -371,7 +444,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withA2aPort(BootConfig config, int a2aPort) {
@@ -387,7 +462,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withTemplatesDir(BootConfig config, Path templatesDir) {
@@ -403,7 +480,9 @@ public final class Main {
         templatesDir,
         config.aguiHost(),
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withAguiAddress(BootConfig config, String aguiAddress) {
@@ -419,7 +498,9 @@ public final class Main {
         config.templatesDir(),
         aguiAddress,
         config.aguiPort(),
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withAguiPort(BootConfig config, int aguiPort) {
@@ -435,7 +516,9 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         aguiPort,
-        config.debugPort());
+        config.debugPort(),
+        config.setup(),
+        config.setupPort());
   }
 
   private static BootConfig withDebugPort(BootConfig config, int debugPort) {
@@ -451,7 +534,45 @@ public final class Main {
         config.templatesDir(),
         config.aguiHost(),
         config.aguiPort(),
-        debugPort);
+        debugPort,
+        config.setup(),
+        config.setupPort());
+  }
+
+  private static BootConfig withSetup(BootConfig config, boolean setup) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort(),
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort(),
+        config.debugPort(),
+        setup,
+        config.setupPort());
+  }
+
+  private static BootConfig withSetupPort(BootConfig config, int setupPort) {
+    return new BootConfig(
+        config.port(),
+        config.dataDir(),
+        config.demo(),
+        config.demoMessage(),
+        config.mcpLinks(),
+        config.mcpExpose(),
+        config.a2aHost(),
+        config.a2aPort(),
+        config.templatesDir(),
+        config.aguiHost(),
+        config.aguiPort(),
+        config.debugPort(),
+        config.setup(),
+        setupPort);
   }
 
   private static int health() {

@@ -74,6 +74,8 @@ import io.mosire.main.gateway.agui.AgUiHttpServer;
 import io.mosire.main.gateway.agui.AgUiSessionRegistry;
 import io.mosire.main.gateway.debug.DebugChatHttpServer;
 import io.mosire.main.gateway.debug.DebugChatService;
+import io.mosire.main.setup.SetupHttpServer;
+import io.mosire.main.setup.SetupLlmRouter;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
@@ -206,6 +208,15 @@ public final class App implements AutoCloseable {
   /** HTTP 审批面在编排器侧的那条通道（S4-B2；{@code approval.http=false} 时恒不可用）。 */
   private final HttpApprovalChannel approvalHttpChannel;
 
+  /**
+   * 配置引导面（{@code --setup}；未开旗标时 {@code null}）：{@code GET /api/setup/status} + {@code POST
+   * /api/setup/llm}（探测 → 写盘 → 热切换，见 {@code 设计-配置引导.md} D4~D6）。
+   *
+   * <p>装配条件是<b>两连</b>：{@code config.setup()} 且注入的 LLM 是 {@link SetupLlmRouter}（未配置态）—— 防止"带 {@code
+   * --setup} 却给了 {@code --fake}"之类的组合把引导面架在假模型上（那样 status 会谎报可引导）。
+   */
+  private final SetupHttpServer setupServer;
+
   private final CountDownLatch terminated = new CountDownLatch(1);
   private volatile boolean closed;
 
@@ -302,6 +313,7 @@ public final class App implements AutoCloseable {
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
     PluginToolSource pluginTools = null;
+    SetupHttpServer setupServer = null;
     try {
       AgentConfig agentConfig =
           AgentConfig.builder("main")
@@ -327,6 +339,13 @@ public final class App implements AutoCloseable {
       // S6：LLM 的装配点<b>上移</b>到审批装配之前——上级判定闸（SuperiorJudgeGate）要用同一个客户端跑一次性判定。
       // 供应商客户端由 Main.selectLlm 经 llmOverride 注入（生产 = 真模型；App.start 直调无覆盖 = 离线骨架）。
       LlmClient llm = scriptedLlm(config, llmOverride);
+      // 配置引导面（设计 D4）：仅 --setup 且注入的是未配置态路由器时装配（防 --setup --fake 组合谎报可引导）
+      if (config.setup() && llmOverride instanceof SetupLlmRouter router) {
+        setupServer = SetupHttpServer.start(config.setupPort(), config.dataDir(), router);
+        LOG.info(
+            "配置引导面已装配：http://127.0.0.1:{}（GET /api/setup/status，POST /api/setup/llm）",
+            setupServer.port());
+      }
       // S6：主 Agent 的<b>实时档位</b>——配置 {@code commands.mode} 给初值（缺省 FULL = 本功能引入前的行为），
       // 运行时经 HTTP 断点（GET/POST /api/commands/mode）可改。读方每次现读：主 Agent 自己的工具调用装配处
       // （AgentPipeline 建 ToolContext 时）、上级判定闸的"本级是不是完全权限"、派生子 Agent 时的档位单调性守卫。
@@ -506,6 +525,7 @@ public final class App implements AutoCloseable {
               subagentManager,
               subagentProcesses,
               pluginTools,
+              setupServer,
               approvalServer,
               approvalTtyChannel,
               approvalHttpChannel);
@@ -562,6 +582,9 @@ public final class App implements AutoCloseable {
       }
       if (pluginTools != null) {
         pluginTools.close();
+      }
+      if (setupServer != null) {
+        setupServer.close();
       }
       closeLinks(links);
       // 事件存储最后关（与 App.close 的口径一致：其余组件仍可能向它写事件时不得先关它）
@@ -879,6 +902,7 @@ public final class App implements AutoCloseable {
       SubagentManager subagentManager,
       SubprocessManager subagentProcesses,
       PluginToolSource pluginTools,
+      SetupHttpServer setupServer,
       ApprovalHttpServer approvalServer,
       TtyApprovalChannel approvalTtyChannel,
       HttpApprovalChannel approvalHttpChannel) {
@@ -899,6 +923,7 @@ public final class App implements AutoCloseable {
     this.subagentManager = subagentManager;
     this.subagentProcesses = subagentProcesses;
     this.pluginTools = pluginTools;
+    this.setupServer = setupServer;
     this.approvalServer = approvalServer;
     this.approvalTtyChannel = approvalTtyChannel;
     this.approvalHttpChannel = approvalHttpChannel;
@@ -958,6 +983,15 @@ public final class App implements AutoCloseable {
   }
 
   /**
+   * 配置引导面实际监听端口（{@code --setup} 时有效；恒绑 127.0.0.1）。
+   *
+   * <p>返回 {@code 0} 表示本进程没有引导面——0 不是合法端口，不与"真的绑在 0"混淆（同 {@link #approvalPort()} 口径）。
+   */
+  public int setupPort() {
+    return setupServer == null ? 0 : setupServer.port();
+  }
+
+  /**
    * 优雅关停（计划 §5.1）：A2A 任务服务先行（合成 FAILED 让在订阅的客户端收到终态——必须赶在 HTTP 服务断连之前）→ A2A 网关关闭 （停止接入）→ 网关 drain →
    * MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接 bridge.close（整组下架工具）→ source.close（回收子进程）→ 子
    * Agent 编排（逐个终止 + launcher 关闭）→ 子进程管理器兜底收割 → 运行时 → 会话存储（P3-3 开的那个）→ 事件存储 checkpoint。
@@ -1013,6 +1047,13 @@ public final class App implements AutoCloseable {
         () -> {
           if (pluginTools != null) {
             pluginTools.close();
+          }
+        });
+    closeQuietly(
+        "配置引导面",
+        () -> {
+          if (setupServer != null) {
+            setupServer.close();
           }
         });
     closeQuietly(

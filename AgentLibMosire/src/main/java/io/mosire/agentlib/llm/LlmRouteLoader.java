@@ -71,6 +71,17 @@ public final class LlmRouteLoader {
   private LlmRouteLoader() {}
 
   /**
+   * 路由名合法性（{@link #SAFE_NAME} 的公开判别面）：配置引导（CLI 向导 / HTTP setup 端点）在<b>写入前</b>用它拦下 非法名字——写侧校验与
+   * {@link #load} 读侧的 {@code normalizeName} 同源，两处不各造一份正则。
+   *
+   * @param routeName 待检名字（null = 非法）
+   * @return true = 可作为 {@code llm.routes.<name>} 的名字段写入
+   */
+  public static boolean isValidRouteName(String routeName) {
+    return routeName != null && SAFE_NAME.matcher(routeName).matches();
+  }
+
+  /**
    * 读默认路由（= {@link #load(ConfigStore, String) load(store, "default")}）。保留此单参形态：既有调用点与用例的语义逐字不变。
    *
    * @param store 配置存储（本进程配置根上的实例，如 {@code new FileConfigStore(dataDir)}）

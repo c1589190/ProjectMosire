@@ -14,7 +14,9 @@ import java.util.regex.Pattern;
  * <p>规则（deny-by-default，与 {@link PermissionChecker} 的白名单口径一致）：
  *
  * <ol>
- *   <li>{@code runtime.*} / {@code keys.*}：仅 {@link AccessToken#SYSTEM} 可写；
+ *   <li>{@code runtime.*} / {@code keys.*} / {@code llm.*}：仅 {@link AccessToken#SYSTEM} 可写（{@code
+ *       llm.*} 为配置引导扩容，2026-09-14：宿主引导（CLI 向导 / HTTP setup 端点）以运行时自身身份写路由与密钥引用， 权限面与 {@code keys.*}
+ *       同族——LLM 供应商配置与密钥同敏感级，不向 Agent 身份开放）；
  *   <li>{@code agents.<id>.*}：要求身份 ≥ {@link AccessToken#DEFAULT}（GUEST 拒绝）且 {@code id equals
  *       ownerId}；{@link AccessToken#SYSTEM} 例外放行——运行时自身可管理任意 Agent 配置，是"身份级别足够"的上界；
  *   <li>其余前缀 / 不合规键（空键、空段、{@code .}/{@code ..} 段、非法 id 字符）：默认拒绝。
@@ -48,7 +50,7 @@ public final class ConfigAuth {
     if (key == null || key.isBlank()) {
       return Optional.of("配置键为空");
     }
-    if (key.startsWith("keys.") || key.startsWith("runtime.")) {
+    if (key.startsWith("keys.") || key.startsWith("runtime.") || key.startsWith("llm.")) {
       String rest = key.substring(key.indexOf('.') + 1);
       if (!validSegments(rest)) {
         return Optional.of("配置键段不合法（不得为空、. 或 ..）");
@@ -83,7 +85,8 @@ public final class ConfigAuth {
       }
       return Optional.empty();
     }
-    return Optional.of("键前缀不在可写范围（deny-by-default：仅 agents.<id>.* / runtime.* / keys.* 可写）");
+    return Optional.of(
+        "键前缀不在可写范围（deny-by-default：仅 agents.<id>.* / runtime.* / keys.* / llm.* 可写）");
   }
 
   /**
