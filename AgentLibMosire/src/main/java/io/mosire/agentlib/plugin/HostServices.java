@@ -1,5 +1,6 @@
 package io.mosire.agentlib.plugin;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.config.ConfigStore;
 import java.util.Optional;
 
@@ -26,6 +27,11 @@ import java.util.Optional;
  *
  * <p>为什么记录类型而不是接口：宿主服务面<b>只会增字段、不会多实现</b>，且"注入什么"应当一眼可见（一个 record 的构造式就是全部服务面的清单）。
  */
+@SuppressFBWarnings(
+    value = "EI_EXPOSE_REP",
+    justification =
+        "ConfigStore 本体按设计 §D5 交给插件（宿主与插件同进程同权限——红线 4，接口句柄不新增实际能力；"
+            + "插件据此在装载期解析自己的配置节）。防御性拷贝既不可能（接口类型）也无意义（要共享的就是宿主那一份实时配置），属设计意图而非泄漏。")
 public record HostServices(ConfigStore config) {
 
   /**

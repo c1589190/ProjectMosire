@@ -16,6 +16,7 @@
     <module>AgentLibMosire</module>
     <module>BrainMosire</module>
     <module>MainMosire</module>
+    <module>BashPluginMosire</module>
   </modules>
 
   <properties>

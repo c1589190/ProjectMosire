@@ -37,6 +37,15 @@
       <version>4.10.4</version>
       <scope>provided</scope>
     </dependency>
+    <!-- bash 插件（工作束四 D7/D8）：provided ⇒ shade 不把它吸进 fat jar（硬规则可验证：
+         unzip -l target/mosire.jar | grep -i bash 应为 0 命中）；宿主代码零 bash 类引用——
+         本依赖只服务 reactor 有序 + dependency-plugin 把插件 JAR 拷到 target/plugins/ -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>bash-plugin-mosire</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
     <!-- AdminREST JSON（版本由根 pom jackson-bom 管理） -->
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
@@ -116,6 +125,27 @@
                   </excludes>
                 </filter>
               </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- 默认打包的另一半（工作束四 D7）：把 bash 插件 JAR 拷到 target/plugins/ ⇒ 从仓库根
+           java -jar MainMosire/target/mosire.jar 时 <jar 目录>/plugins 正好命中 D4.3 的缺省解析。
+           prepare-package + 声明在 shade 之后：插件 JAR 由 reactor 先行产出（provided 依赖保证构建顺序）。 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+        <executions>
+          <execution>
+            <id>copy-bash-plugin</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>copy-dependencies</goal>
+            </goals>
+            <configuration>
+              <includeArtifactIds>bash-plugin-mosire</includeArtifactIds>
+              <outputDirectory>${project.build.directory}/plugins</outputDirectory>
             </configuration>
           </execution>
         </executions>

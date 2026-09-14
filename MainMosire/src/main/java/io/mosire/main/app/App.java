@@ -1,5 +1,7 @@
 package io.mosire.main.app;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ApprovalConfig;
 import io.mosire.agentlib.approval.ApprovalConfigLoader;
@@ -9,6 +11,7 @@ import io.mosire.agentlib.approval.ConfirmGate;
 import io.mosire.agentlib.approval.LlmSuperiorJudgement;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
+import io.mosire.agentlib.config.ConfigStore;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
@@ -31,6 +34,9 @@ import io.mosire.agentlib.permission.CommandModeLoader;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
+import io.mosire.agentlib.plugin.HostServices;
+import io.mosire.agentlib.plugin.PluginListener;
+import io.mosire.agentlib.plugin.PluginToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
@@ -41,6 +47,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
+import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.TurnResult;
 import io.mosire.brain.subagent.AgentCommand;
 import io.mosire.brain.subagent.AgentContextReader;
@@ -51,9 +58,6 @@ import io.mosire.brain.subagent.SubagentLimits;
 import io.mosire.brain.subagent.SubagentLimitsLoader;
 import io.mosire.brain.subagent.SubagentManager;
 import io.mosire.brain.subagent.SubagentOrchestrationTools;
-import io.mosire.brain.tools.BashToolConfig;
-import io.mosire.brain.tools.BashToolConfigLoader;
-import io.mosire.brain.tools.ShellTool;
 import io.mosire.brain.tools.WorkingDirsLoader;
 import io.mosire.main.Version;
 import io.mosire.main.approval.ApprovalHttpServer;
@@ -72,12 +76,14 @@ import io.mosire.main.gateway.debug.DebugChatHttpServer;
 import io.mosire.main.gateway.debug.DebugChatService;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -179,6 +185,14 @@ public final class App implements AutoCloseable {
   private final SubprocessManager subagentProcesses;
 
   /**
+   * 插件面（工作束四）：{@code null} = 未装配（插件目录未启用/不存在——"没装插件"是正常部署态，设计 D4.4）。
+   *
+   * <p>非 null 时持有 {@link PluginToolSource}：它装载的插件工具已登记进全局工具目录，生命周期归本类（close = 逐插件 摘工具 + 调插件 {@code
+   * close()} + 卸载类加载器）。
+   */
+  private final PluginToolSource pluginTools;
+
+  /**
    * 审批 HTTP 面（S4-B2）：{@code null} = 未启用（{@code approval.http=false}）。
    *
    * <p>它与 {@link #approvalHttpChannel} 是同一个面的两面——server 是"人的入口"，channel 是"编排器的等待口"，两者共享 {@code App}
@@ -260,11 +274,6 @@ public final class App implements AutoCloseable {
       // start()，主 catch 够不着——就地回收前面已打开的两条连接（回收口径同主 catch，且用 quiet 关闭保证原异常原样上抛
       // ——失败原因不被"关闭也失败"顶掉）。
       tools.registerAll(extraTools == null ? List.of() : extraTools);
-      // S4-C：bash 给主 Agent（`ShellTool` 二期早已写好、从未注册）。主 Agent 是 system() 权限集 ⇒ spec() 的
-      // sensitive+destructive 位天然放行（用户裁决"全功能"）；子体拿不到它——出厂模板 allowedTools 不含 bash（下放归 S5）。
-      // 它未标 noExport ⇒ 会进 MCP 外发面（有意的：子体的白名单挡着，启动日志会报出实际外发面）。
-      // 基准工作目录 = 进程 CWD（工具的缺省构造语义，见 ShellTool 类 javadoc）；命令的三档分流与落账脱敏在工具内。
-      tools.register(new ShellTool());
       // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
       links = wireMcpLinks(config.mcpLinks(), tools);
     } catch (RuntimeException e) {
@@ -292,6 +301,7 @@ public final class App implements AutoCloseable {
     ExecutorService chatExecutor = null;
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
+    PluginToolSource pluginTools = null;
     try {
       AgentConfig agentConfig =
           AgentConfig.builder("main")
@@ -304,9 +314,13 @@ public final class App implements AutoCloseable {
       //   同一进程内只能有一个 PendingApprovals（两通道必须看到同一 id，H8 判据）：它由本装配层建、逐层当参数传下去，
       //   不设任何静态/全局单例。
       FileConfigStore configStore = new FileConfigStore(config.dataDir());
+      // 工作束四（插件化）：bash 工具的唯一供给路径 = PF4J 插件（PluginToolSource）。
+      // 主 Agent 是 system() 权限集 ⇒ spec() 的 sensitive+destructive 位天然放行（用户裁决"全功能"）；
+      // 子体拿不到它——出厂模板 allowedTools 不含 bash（S5 的裁决面）。工具未标 noExport ⇒ 会进 MCP 外发面
+      // （有意的：子体的白名单挡着，启动日志会报出实际外发面）。bash 的 tools.bash.* 配置由插件在 init 里
+      // 装载期校验（坏值 ⇒ 装载失败 ⇒ 启动响亮失败），宿主不再读它（D5：宿主不认识 bash 的配置 schema）。
+      pluginTools = wirePlugins(configStore, tools, events);
       ApprovalConfig approvalConfig = ApprovalConfigLoader.load(configStore);
-      // S4-C：bash 工具配置（追加清单 + 落账口径）同一处读——两者的共同点是"启动期读、项存在但值非法即响亮失败"
-      BashToolConfig bashConfig = BashToolConfigLoader.load(configStore);
       PendingApprovals pendingApprovals = new PendingApprovals();
       approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
       approvalHttpChannel = new HttpApprovalChannel(pendingApprovals);
@@ -403,7 +417,7 @@ public final class App implements AutoCloseable {
               : null;
       // D30：工具自身配置经 ToolContext.config 注入（运行时缝，不走构造器全局）——read_agent_context 据此定位
       // 子库根（与 subagentCommand 的 --data-dir 同源）与自身事件库；键名归 Brain（AgentContextReader 常量）
-      // S4-C：bash 工具的三项配置也走这条缝（键 = 配置里的完整点分路径，见 BashToolConfig）
+      // bash 的 tools.bash.* 不再走这条缝：插件在 init 里经 HostServices 装载期读定（设计 D5），宿主零 bash schema
       Map<String, Object> toolConfig = new LinkedHashMap<>();
       toolConfig.put(
           AgentContextReader.CONFIG_SUBAGENTS_ROOT,
@@ -412,7 +426,6 @@ public final class App implements AutoCloseable {
           AgentContextReader.CONFIG_SELF_EVENTS_DB,
           config.dataDir().resolve("events.db").toString());
       toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
-      toolConfig.putAll(bashConfig.toToolConfig());
       // S6：档位持有者经同一个运行时缝下发（AgentPipeline 建调用上下文时现读它定主 Agent 的身份/档位）
       toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
       toolConfig = Map.copyOf(toolConfig);
@@ -492,6 +505,7 @@ public final class App implements AutoCloseable {
               debugChatServer,
               subagentManager,
               subagentProcesses,
+              pluginTools,
               approvalServer,
               approvalTtyChannel,
               approvalHttpChannel);
@@ -545,6 +559,9 @@ public final class App implements AutoCloseable {
       }
       if (subagentProcesses != null) {
         subagentProcesses.close();
+      }
+      if (pluginTools != null) {
+        pluginTools.close();
       }
       closeLinks(links);
       // 事件存储最后关（与 App.close 的口径一致：其余组件仍可能向它写事件时不得先关它）
@@ -652,6 +669,156 @@ public final class App implements AutoCloseable {
     return new McpLinks(List.copyOf(sources), List.copyOf(bridges));
   }
 
+  /**
+   * 插件面装配（工作束四，设计 D4）：解析插件目录 → 装载其中的插件 JAR → 落启动行；生命周期事件经 {@link PluginListener} 写入事件库（{@code
+   * plugin.lifecycle}，D6）。
+   *
+   * <p>返回 {@code null} = 未装配（开关关闭 / 缺省目录不存在——"没装插件"是正常部署态，记一行日志即可）；<b>显式 {@code plugins.dir}
+   * 指向缺失目录不在此列</b>：那是硬要求落空 ⇒ 经 {@link PluginToolSource} 构造器响亮失败（语义见 {@link #resolvePluginsDir}）。任一
+   * JAR 装载失败经 {@link PluginToolSource.PluginLoadException} 原样上抛 = 启动响亮失败（D4.5），
+   * 半装配的本源在冒泡前就地回收（回收自身失败只告警，不顶掉原失败）。
+   *
+   * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装载失败原样冒泡（绝不静默跳过，D4.5）正是本方法的契约——由 {@code start}
+   * 的既有装配失败路径统一回收资源后呈现（同 {@code start} 的 fail-fast 语义，无更窄类型）。
+   */
+  @SuppressFBWarnings("THROWS_METHOD_THROWS_RUNTIMEEXCEPTION")
+  private static PluginToolSource wirePlugins(
+      ConfigStore configStore, ToolRegistry tools, EventStore events) {
+    PluginDirResolution resolution = resolvePluginsDir(configStore, codeLocation());
+    if (resolution.dir() == null) {
+      LOG.info("插件面：未启用（{}）", resolution.skipReason());
+      return null;
+    }
+    PluginToolSource plugins =
+        new PluginToolSource(
+            resolution.dir(), tools, pluginLifecycleSink(events), new HostServices(configStore));
+    try {
+      List<String> loaded = plugins.loadAll();
+      // 启动行（D4 的可观测锚点，照"审批面已装配"范式）：装载态与版本取自 PluginStatus，工具名按 sourceId 从目录反查
+      List<PluginToolSource.PluginStatus> started =
+          plugins.list().stream()
+              .filter(status -> status.state() == PluginListener.State.STARTED)
+              .toList();
+      List<String> toolNames =
+          started.stream()
+              .flatMap(status -> tools.listBySource(status.sourceId()).stream())
+              .map(AgentTool::name)
+              .toList();
+      LOG.info(
+          "插件面已装配：dir={} 装载={} 个 [{}] 工具 {} 个 [{}]",
+          resolution.dir(),
+          loaded.size(),
+          String.join(
+              ", ",
+              started.stream().map(status -> status.pluginId() + "@" + status.version()).toList()),
+          toolNames.size(),
+          String.join(", ", toolNames));
+      return plugins;
+    } catch (RuntimeException failure) {
+      try {
+        plugins.close();
+      } catch (RuntimeException cleanupFailure) {
+        // 回收失败不得顶掉原失败：PluginLoadException 点名坏 JAR 的诊断信息是 D4.5"响亮失败"的本体
+        LOG.warn("插件面回收失败（原失败照常上抛）", cleanupFailure);
+      }
+      throw failure;
+    }
+  }
+
+  /** 宿主侧的 {@link PluginListener} 落库实现（D6）：每次状态变更写一条 {@code plugin.lifecycle}；失败只告警不回滚。 */
+  private static PluginListener pluginLifecycleSink(EventStore events) {
+    return (pluginId, version, state) -> {
+      try {
+        events.append(
+            EventWrite.of(
+                EventTypes.PLUGIN_LIFECYCLE,
+                MAIN_CONVERSATION_ID,
+                pluginPayload(pluginId, version, state),
+                ""));
+      } catch (RuntimeException failure) {
+        LOG.warn("plugin.lifecycle 落库失败（不影响装载） pluginId={} state={}", pluginId, state, failure);
+      }
+    };
+  }
+
+  /**
+   * {@code plugin.lifecycle} 的 payload（字段顺序 pluginId → version → state； Jackson 序列化失败 = 装配缺陷，响亮）。
+   */
+  private static String pluginPayload(String pluginId, String version, PluginListener.State state) {
+    try {
+      Map<String, String> payload = new LinkedHashMap<>();
+      payload.put("pluginId", pluginId);
+      payload.put("version", version);
+      payload.put("state", state.name());
+      return PLUGIN_PAYLOAD.writeValueAsString(payload);
+    } catch (IOException e) {
+      throw new IllegalStateException("plugin.lifecycle payload 序列化失败", e);
+    }
+  }
+
+  /** 插件目录解析结果：{@code dir == null} ⇒ 不装载（原因见 {@code skipReason}，原样进启动日志）。 */
+  record PluginDirResolution(Path dir, String skipReason) {
+
+    static PluginDirResolution skip(String reason) {
+      return new PluginDirResolution(null, reason);
+    }
+  }
+
+  /**
+   * 插件目录解析（设计 D4，纯函数便于单测）：{@code plugins.enabled=false} ⇒ 不装载（缺省 {@code true}）； {@code plugins.dir}
+   * ⇒ 用它（相对路径按进程 cwd 绝对化）；否则仅当<b>真 jar 启动</b>（代码位置是文件）时缺省 = {@code <jar 目录>/plugins}（与 D7
+   * 的产物布局正好命中）。开发/测试的 classes 形态<b>不推导缺省目录</b>——从 {@code target/classes} 出发算父目录会命中 {@code
+   * target/plugins}（打包产物），让测试面随打包状态漂移（2026-09-14 实测踩坑：AppMcpLinkTest 的子进程因此意外装载
+   * bash）。要在这类形态启用插件请显式配 {@code plugins.dir}。键存在但值非法 ⇒ 响亮失败——本仓"配置项存在但值非法 ⇒ 启动响亮失败"的统一口径，不静默回退。
+   *
+   * <p><b>显式目录缺失 ≠ 缺省目录缺失（D4.4 的两读，此处定死）</b>：缺省目录不存在 = "没装插件"的正常部署态（软跳过）； 显式 {@code plugins.dir}
+   * 指向缺失目录 = <b>硬要求落空</b> ⇒ 返回该路径、由 {@link PluginToolSource} 构造器响亮失败——
+   * 用户点名了位置而那里什么都没有，静默跳过会得到"看起来配了、其实没生效"的部署。
+   */
+  static PluginDirResolution resolvePluginsDir(ConfigStore configStore, Path codeLocation) {
+    Optional<JsonNode> enabled = configStore.get(PLUGINS_SECTION, PLUGINS_ENABLED_KEY);
+    if (enabled.isPresent() && !enabled.get().isNull()) {
+      JsonNode value = enabled.get();
+      if (!value.isBoolean()) {
+        throw new IllegalStateException(
+            "配置不可用：" + PLUGINS_SECTION + "." + PLUGINS_ENABLED_KEY + " 必须是布尔（实际值: " + value + "）");
+      }
+      if (!value.asBoolean()) {
+        return PluginDirResolution.skip(PLUGINS_SECTION + "." + PLUGINS_ENABLED_KEY + "=false");
+      }
+    }
+    Optional<JsonNode> dir = configStore.get(PLUGINS_SECTION, PLUGINS_DIR_KEY);
+    if (dir.isPresent() && !dir.get().isNull()) {
+      JsonNode value = dir.get();
+      if (!value.isTextual() || value.asText().isBlank()) {
+        throw new IllegalStateException(
+            "配置不可用：" + PLUGINS_SECTION + "." + PLUGINS_DIR_KEY + " 必须是非空白路径文本（实际值: " + value + "）");
+      }
+      return new PluginDirResolution(Path.of(value.asText()).toAbsolutePath(), null);
+    }
+    if (codeLocation == null || !Files.isRegularFile(codeLocation)) {
+      return PluginDirResolution.skip("非 jar 启动（开发/测试形态），无缺省插件目录（要启用请配置 plugins.dir）");
+    }
+    Path codeParent = codeLocation.toAbsolutePath().getParent();
+    if (codeParent == null) {
+      return PluginDirResolution.skip("代码位置无父目录，缺省插件目录无从推导（要启用请配置 plugins.dir）");
+    }
+    Path defaultDir = codeParent.resolve("plugins");
+    if (!Files.isDirectory(defaultDir)) {
+      return PluginDirResolution.skip("目录不存在: " + defaultDir);
+    }
+    return new PluginDirResolution(defaultDir, null);
+  }
+
+  /** 本类代码位置（真进程 = mosire.jar；测试/开发 = target/classes；取不到 = null）。 */
+  private static Path codeLocation() {
+    try {
+      return Path.of(App.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+    } catch (RuntimeException | URISyntaxException e) {
+      return null;
+    }
+  }
+
   private static void runDemo(App app, AgentRuntime runtime, String message) {
     TurnResult result = runtime.chat(message);
     LOG.info(
@@ -711,6 +878,7 @@ public final class App implements AutoCloseable {
       DebugChatHttpServer debugChatServer,
       SubagentManager subagentManager,
       SubprocessManager subagentProcesses,
+      PluginToolSource pluginTools,
       ApprovalHttpServer approvalServer,
       TtyApprovalChannel approvalTtyChannel,
       HttpApprovalChannel approvalHttpChannel) {
@@ -730,6 +898,7 @@ public final class App implements AutoCloseable {
     this.debugChatServer = debugChatServer;
     this.subagentManager = subagentManager;
     this.subagentProcesses = subagentProcesses;
+    this.pluginTools = pluginTools;
     this.approvalServer = approvalServer;
     this.approvalTtyChannel = approvalTtyChannel;
     this.approvalHttpChannel = approvalHttpChannel;
@@ -840,6 +1009,13 @@ public final class App implements AutoCloseable {
         });
     closeQuietly("MCP 链接", () -> closeLinks(new McpLinks(mcpSources, mcpBridges)));
     closeQuietly(
+        "插件面",
+        () -> {
+          if (pluginTools != null) {
+            pluginTools.close();
+          }
+        });
+    closeQuietly(
         "子 Agent 编排",
         () -> {
           if (subagentManager != null) {
@@ -888,6 +1064,18 @@ public final class App implements AutoCloseable {
 
   /** 审批事件的类型前缀（B1 的 {@code ApprovalEventTypes} 只有两个常量，这里按前缀收口，不复制一份类型表）。 */
   private static final String APPROVAL_EVENT_PREFIX = "approval.";
+
+  /** 配置段名与键名（设计 D4 的解析顺序输入；值非法一律响亮失败，同 {@code commands.mode} 那套口径）。 */
+  private static final String PLUGINS_SECTION = "plugins";
+
+  /** 开关键：{@code plugins.enabled=false} ⇒ 不装载（缺省 {@code true}）。 */
+  private static final String PLUGINS_ENABLED_KEY = "enabled";
+
+  /** 显式目录键：{@code plugins.dir} ⇒ 用它；缺省 = 代码位置（jar）同目录下的 {@code plugins/}。 */
+  private static final String PLUGINS_DIR_KEY = "dir";
+
+  /** {@code plugin.lifecycle} 事件的 payload 组装（Jackson 仅用于这一处序列化；字段顺序 pluginId→version→state）。 */
+  private static final ObjectMapper PLUGIN_PAYLOAD = new ObjectMapper();
 
   /** 单项资源关闭：异常只记日志（继续执行后续关闭——close 链不因单项失败中断）。 */
   private static void closeQuietly(String what, Runnable closer) {

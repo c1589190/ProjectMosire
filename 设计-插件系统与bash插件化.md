@@ -205,8 +205,12 @@ MainMosire/pom.xml
 ## 七 风险与诚实边界
 
 1. **PF4J 的 `PluginClassLoader` 不是安全边界**（既有红线 4）：插件与宿主同 JVM 同权限。
-2. **`plugins.dir` 的默认值依赖"从 jar 启动"**：`-cp MainMosire/target/classes` 这类调试启动解析到
-   `target/classes/plugins`（不存在 ⇒ 未启用）。⇒ 此类启动请显式配 `plugins.dir`（写进 README/本设计即可）。
+2. **`plugins.dir` 的默认值只在"真 jar 启动"时推导**（2026-09-14 实现修正，取代本节初版的预言）：缺省 =
+   代码位置（**文件**形态，即 jar）同目录下的 `plugins/`；`-cp MainMosire/target/classes` 这类 classes 形态
+   **不推导缺省目录**——初版预言"解析到 `target/classes/plugins`"算错了父目录（从 classes 出发是 `target/plugins`，
+   即打包产物），会让测试子进程随打包状态意外装载插件（实测踩坑：`AppMcpLinkTest`）。⇒ classes 形态要启用插件请显式配
+   `plugins.dir`。另：**显式 `plugins.dir` 指向缺失目录 = 响亮失败**（硬要求落空），与缺省目录不存在（软跳过）不同——
+   两读在 `App.resolvePluginsDir` 的 javadoc 定死。
 3. **装载失败 = 启动失败**（D4.5）：运维上"放错一个 JAR 就起不来"是**有意的响亮**；排障靠启动行与异常文本
    （含 JAR 文件名与原因）。
 4. **搬迁的机械风险**：8+8 个文件的包名/import 改动是"编译期可见"的，但**测试夹具里的相对路径与临时目录假设**

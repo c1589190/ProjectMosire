@@ -67,6 +67,17 @@ public final class EventTypes {
    */
   public static final String APPROVAL_DECIDED = "approval.decided";
 
+  /**
+   * 插件生命周期（插件系统接线，2026-09-14；词汇约定见 AgentLib {@code PluginListener} 的 javadoc——事件字符串
+   * 只在本表与宿主装配处出现）。payload: {@code {"pluginId","version","state"}}——{@code state} ∈ {@code
+   * STARTED|STOPPED|FAILED}；描述符阶段失败的 {@code pluginId} 退化为 JAR 文件名、{@code version} 为空串 （标识口径见 {@code
+   * PluginListener#onStateChanged}）。
+   *
+   * <p>装配点在 {@code App.wirePlugins}（宿主把 {@code PluginListener} 回调落库）；AG-UI 翻译层对未映射类型 已是"记 debug
+   * 并忽略"，不新增映射（设计 D6）。
+   */
+  public static final String PLUGIN_LIFECYCLE = "plugin.lifecycle";
+
   private EventTypes() {
     throw new AssertionError("No instances");
   }
