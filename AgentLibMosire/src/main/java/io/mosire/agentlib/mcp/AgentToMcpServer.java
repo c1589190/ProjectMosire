@@ -357,6 +357,10 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolCallAuthorizer authorizer) {
     Objects.requireNonNull(include, "include");
     Objects.requireNonNull(authorizer, "authorizer");
+    // 显式宣告 tools.listChanged=true（本计划唯一被批准的行为变更）：不设则走 SDK 自动派生路径，
+    // ToolCapabilities.listChanged 为 null，addTool/removeTool 拆箱 NPE 被 ToolRegistry 的 catch 吞掉，
+    // notifications/tools/list_changed 永不触达。只设 tools 位，logging 由 McpAsyncServer 构造补。
+    spec.capabilities(McpSchema.ServerCapabilities.builder().tools(true).build());
     spec.serverInfo(serverName, serverVersion);
     for (AgentTool tool : registry.list()) {
       if (!exportable(tool, include)) {
