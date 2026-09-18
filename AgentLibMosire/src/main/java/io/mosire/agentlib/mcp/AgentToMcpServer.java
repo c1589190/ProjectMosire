@@ -1,5 +1,6 @@
 package io.mosire.agentlib.mcp;
 
+import com.sun.net.httpserver.HttpServer;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.modelcontextprotocol.server.McpServer;
 import io.modelcontextprotocol.server.McpServerFeatures;
@@ -17,10 +18,16 @@ import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -64,6 +71,26 @@ public final class AgentToMcpServer implements AutoCloseable {
 
   /** 空实现兜底：在 startWith 的赋值前任何 close() 都是安全的（UwF 告警解除）。 */
   private AutoCloseable registrySubscription = () -> {};
+
+  /**
+   * 本实例挂载的 {@link HttpServer}（HTTP 形态才有；stdio 形态保持 {@code null}）。caller-owned 与 owned 共用：{@link
+   * #boundPort()} 与 {@link #close()} 都读它区分"有没有 HTTP 面"。
+   */
+  private HttpServer httpServer;
+
+  /** 本实例注册的 HTTP context 路径（{@link #close()} 时 {@code removeContext}）；stdio 形态为 {@code null}。 */
+  private String httpPath;
+
+  /**
+   * owned 形态自建的 executor（caller-owned 形态保持 {@code null}）。
+   *
+   * <p><b>为什么用"非 null"而不是独立布尔表示 owned</b>：owned 的两个资源（server 与 executor）总是成对出现，少一个字段就少一处
+   * "忘了同步"的机会——{@link #close()} 只看它决定要不要 {@code stop}/{@code shutdown}。
+   *
+   * <p><b>硬约束</b>：caller-owned 形态下这个字段恒为 null，故 {@code close()} 绝不 {@code shutdown} 调用方的线程池 （见设计文档
+   * §二：{@code HttpServer.stop} 不关用户传进来的 executor，顺手关它会静默拆掉调用方共享的池）。
+   */
+  private ExecutorService ownedExecutor;
 
   /**
    * 以默认 GUEST 调用身份启动（标准 stdio）。
@@ -339,6 +366,173 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
+   * 启动（HTTP，<b>caller-owned</b>）：把本 server 挂到<b>调用方持有</b>的 {@link HttpServer} 上（需求书点名的形态）。
+   *
+   * <p><b>生命周期所有权</b>：本方法<b>不</b> {@code start()}、<b>不</b> {@code stop()} 传入的 server，也<b>不</b> 关它的
+   * executor——{@link #close()} <b>只</b>做两件事：取消 Registry 订阅、{@code removeContext(path)}。调用方在 {@code
+   * close()} 之后仍可继续用同一台 server 服务它自己注册的其它 context（判别性用例见 {@code AgentToMcpServerStartHttpTest} 的
+   * caller-owned 一组）。<b>为什么这条必须写死</b>：{@code HttpServer.stop(int)} 只停服务、不会关用户传进来的 {@code
+   * Executor}；实现里若顺手 {@code shutdown()} 会静默拆掉调用方共享的线程池（表现是调用方其它模块的请求突然全部挂起），
+   * 且这种失败没有任何用例会红——除非像本类这样把所有权显式分开。
+   *
+   * <p><b>executor 告警</b>：若该 server 未设置自定义 executor（{@link HttpServer#getExecutor()} 为 {@code
+   * null}）， 记 {@code WARN}——默认 executor 是<b>单线程</b>的，将来 GET 监听流停驻（parked）时会与后续 POST 互锁。调用方应在传入前
+   * {@code setExecutor(Executors.newVirtualThreadPerTaskExecutor())}。
+   *
+   * <p><b>装配顺序硬约束</b>：先 {@code McpServer.sync(provider).build()}（SDK 在 build 时注入 {@code
+   * sessionFactory}），再 {@code createContext(path, provider::handle)}——顺序反了的话首个 {@code initialize}
+   * 会撞 null factory（provider 回 500）。本方法内部已按此顺序，调用方只需保证 server 在客户端连接前已 {@code start()}；server 已
+   * start 后再 {@code createContext} 同样可用。
+   *
+   * <p><b>authorizer 形参必填</b>：本入口<b>不</b>提供缺省，<b>不得</b>静默退化为 {@link ToolCallAuthorizer#standard()}。
+   * 理由：{@code standard()} 不带 {@link io.mosire.agentlib.approval.ApprovalCoordinator}，遇到工具自报的 {@link
+   * io.mosire.agentlib.approval.ToolGate.Ask} 会 fail-closed 直接 {@code APPROVAL_DENIED}——这是对的
+   * fail-closed， 但把它当成"网络暴露面"的隐式默认，等于让审批路径在外部面上静默失效（外部调用者只会看到"审批被拒"，而不是"你根本没装配审批"）。 要审批就显式装配带
+   * coordinator 的 authorizer；不审批也要显式选一个（哪怕就是 {@code standard()}）。
+   *
+   * @param server 调用方持有并已（或即将）{@code start()} 的 HTTP server；本类不接管其生命周期
+   * @param path MCP 端点路径（如 {@code /mcp}）；{@code createContext} 是前缀匹配，provider 内部做精确守卫
+   * @param registry 待暴露的工具注册表（持有引用，后续变更实时同步）
+   * @param serverName MCP server 自报名称
+   * @param serverVersion MCP server 自报版本
+   * @param caller 经 MCP 到达的 {@code tools/call} 所使用的执行身份（建链时绑定，客户端改不了）
+   * @param authorizer 工具调用唯一入口（<b>必填</b>，见上文；审批闸等横切判定都在其中）
+   * @since 0.1.0
+   */
+  public static AgentToMcpServer startHttp(
+      HttpServer server,
+      String path,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer) {
+    Objects.requireNonNull(server, "server");
+    Objects.requireNonNull(path, "path");
+    Objects.requireNonNull(authorizer, "authorizer");
+    if (server.getExecutor() == null) {
+      LOG.warn(
+          "caller-owned HttpServer 未设置自定义 executor：默认单线程 executor 会与 parked GET 监听流互锁，"
+              + "请在传入前 setExecutor(Executors.newVirtualThreadPerTaskExecutor())。path={}",
+          path);
+    }
+    JdkHttpStreamableServerTransportProvider provider =
+        new JdkHttpStreamableServerTransportProvider(path);
+    // 顺序硬约束：先 build（SDK 在 build 时注入 sessionFactory），再 createContext。
+    AgentToMcpServer self =
+        startWith(registry, serverName, serverVersion, caller, provider, name -> true, authorizer);
+    server.createContext(path, provider::handle);
+    self.httpServer = server;
+    self.httpPath = path;
+    return self;
+  }
+
+  /**
+   * 启动（HTTP，<b>owned</b>）：自建 {@link HttpServer} 与虚拟线程 executor 并绑定 {@code host:port}，生命周期归本对象。
+   *
+   * <p><b>生命周期所有权</b>：{@link #close()} 依序 ①取消 Registry 订阅 → ②{@code server.close()}（级联 provider
+   * {@code closeGracefully()}，逐个关会话）→ ③{@code HttpServer.stop(0)} → ④{@code
+   * executor.shutdown()}。②→③ 顺序不能颠倒：先让 provider 把每个会话的 listening stream 有序收掉，再停 server；反了会把停驻线程强断在
+   * {@code latch.await()} 上，SSE 客户端看到裸断连。
+   *
+   * <p><b>host 非回环 = 显式 opt-in + 响亮告警</b>：默认由便捷重载绑 {@code 127.0.0.1}。显式传入非回环 host 本身<b>就是</b>
+   * opt-in（调用方必须点名），但本面<b>无鉴权、无 TLS</b>——任何能连到该地址的人都能列举并调用工具、读取并替人答复审批。故非回环时记 {@code
+   * WARN}，把风险说在启动日志里，而不是让人以为"默认就是安全的"。要对外提供服务必须先有鉴权，那是另一个包的事。
+   *
+   * <p><b>authorizer 形参必填</b>：同 {@link #startHttp(HttpServer, String, ToolRegistry, String, String,
+   * ToolContext, ToolCallAuthorizer)}，不得静默退化为 {@link ToolCallAuthorizer#standard()}。
+   *
+   * @param host 绑定地址（非回环须显式点名并接受无鉴权风险）
+   * @param port 端口；{@code 0} = 由系统分配，实际端口用 {@link #boundPort()} 读回
+   * @param path MCP 端点路径（如 {@code /mcp}）
+   * @param registry 待暴露的工具注册表（持有引用，后续变更实时同步）
+   * @param serverName MCP server 自报名称
+   * @param serverVersion MCP server 自报版本
+   * @param caller 经 MCP 到达的 {@code tools/call} 所使用的执行身份（建链时绑定，客户端改不了）
+   * @param authorizer 工具调用唯一入口（<b>必填</b>）
+   * @since 0.1.0
+   */
+  public static AgentToMcpServer startHttp(
+      String host,
+      int port,
+      String path,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer) {
+    Objects.requireNonNull(host, "host");
+    Objects.requireNonNull(path, "path");
+    Objects.requireNonNull(authorizer, "authorizer");
+    if (!isLoopback(host)) {
+      LOG.warn(
+          "MCP HTTP 面绑定非回环地址 {}（无鉴权、无 TLS）：任何能连到该地址的人都能列举并调用工具。" + "仅在你已在本机/网络层另有隔离时这样做。path={}",
+          host,
+          path);
+    }
+    ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    HttpServer server;
+    try {
+      server = HttpServer.create(new InetSocketAddress(host, port), 0);
+    } catch (IOException e) {
+      executor.shutdownNow();
+      throw new IllegalStateException("MCP HTTP 面启动失败 host=" + host + " port=" + port, e);
+    }
+    server.setExecutor(executor);
+    try {
+      JdkHttpStreamableServerTransportProvider provider =
+          new JdkHttpStreamableServerTransportProvider(path);
+      AgentToMcpServer self =
+          startWith(
+              registry, serverName, serverVersion, caller, provider, name -> true, authorizer);
+      server.createContext(path, provider::handle);
+      server.start();
+      self.httpServer = server;
+      self.httpPath = path;
+      self.ownedExecutor = executor;
+      return self;
+    } catch (RuntimeException e) {
+      // 装配半途失败：把自建资源收干净，不留半死的监听端口/线程池
+      server.stop(0);
+      executor.shutdownNow();
+      throw new IllegalStateException("MCP HTTP 面装配失败 host=" + host + " port=" + port, e);
+    }
+  }
+
+  /**
+   * 启动（HTTP，<b>owned</b>，便捷重载）：host 缺省 {@code 127.0.0.1}（回环，无鉴权基线下的安全缺省）；其余语义见 {@link
+   * #startHttp(String, int, String, ToolRegistry, String, String, ToolContext,
+   * ToolCallAuthorizer)}。
+   *
+   * @param port 端口；{@code 0} = 由系统分配
+   * @param path MCP 端点路径
+   * @since 0.1.0
+   */
+  public static AgentToMcpServer startHttp(
+      int port,
+      String path,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer) {
+    return startHttp(
+        "127.0.0.1", port, path, registry, serverName, serverVersion, caller, authorizer);
+  }
+
+  /** 绑定地址是否回环：{@code localhost} 与解析出的回环地址为真；解析不了按非回环处理（宁多告警不漏）。 */
+  private static boolean isLoopback(String host) {
+    if ("localhost".equalsIgnoreCase(host)) {
+      return true;
+    }
+    try {
+      return InetAddress.getByName(host).isLoopbackAddress();
+    } catch (UnknownHostException e) {
+      return false;
+    }
+  }
+
+  /**
    * 两条 transport 路径<b>共用</b>的装配段：{@code serverInfo} → 逐工具 {@code toolCall} → {@code build}，再挂
    * Registry 订阅、按实际外发面记日志。
    *
@@ -502,6 +696,33 @@ public final class AgentToMcpServer implements AutoCloseable {
     return server.listTools().stream().map(McpSchema.Tool::name).toList();
   }
 
+  /**
+   * 本实例挂载的 HTTP server 实际绑定端口（{@code port=0} 时由系统分配，装配层取它记日志/回传）；stdio 形态没有端口。
+   *
+   * @throws IllegalStateException 本实例不是 HTTP 形态
+   */
+  public int boundPort() {
+    HttpServer server = httpServer;
+    if (server == null) {
+      throw new IllegalStateException("本实例不是 HTTP 形态，没有端口（stdio）");
+    }
+    return server.getAddress().getPort();
+  }
+
+  /**
+   * 关闭本 server 并按其<b>所有权形态</b>收尾（次序见设计文档 §二）。
+   *
+   * <p>两条形态共有的头两步：①取消 Registry 订阅 → ②{@code server.close()}（级联 provider {@code closeGracefully()}，让
+   * parked GET 监听流有序收尾）。之后按形态分岔：
+   *
+   * <ul>
+   *   <li><b>caller-owned</b>（{@code ownedExecutor == null}）：只 {@code
+   *       removeContext(path)}，<b>永不</b> {@code stop()} 调用方的 server、<b>永不</b> {@code shutdown()}
+   *       调用方的 executor；
+   *   <li><b>owned</b>：{@code HttpServer.stop(0)} + {@code executor.shutdown()}。②必须在 {@code
+   *       stop(0)} 之前——先 stop 会把停驻线程强断在 latch 上，SSE 客户端看到裸断连。
+   * </ul>
+   */
   @Override
   public void close() {
     try {
@@ -510,5 +731,21 @@ public final class AgentToMcpServer implements AutoCloseable {
       LOG.warn("取消 Registry 订阅失败", e);
     }
     server.close();
+    HttpServer http = httpServer;
+    if (http == null) {
+      return;
+    }
+    try {
+      http.removeContext(httpPath);
+    } catch (RuntimeException e) {
+      LOG.warn("移除 MCP context 失败: path={}", httpPath, e);
+    }
+    ExecutorService executor = ownedExecutor;
+    if (executor == null) {
+      // caller-owned：到此为止，绝不碰调用方的 server/executor
+      return;
+    }
+    http.stop(0);
+    executor.shutdown();
   }
 }
