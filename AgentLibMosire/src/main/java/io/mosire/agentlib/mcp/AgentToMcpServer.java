@@ -185,8 +185,35 @@ public final class AgentToMcpServer implements AutoCloseable {
         authorizer);
   }
 
-  /** 供测试注入自定义 transport（如管道流）；语义与默认 stdio 相同。 */
-  static AgentToMcpServer startWith(
+  /**
+   * 启动（注入单会话/stdio 族 transport 的最小形态）：语义与 {@link #start(ToolRegistry, String, String, ToolContext)}
+   * 相同，只是底层 transport 由调用方提供（如进程内管道流对）。
+   *
+   * <p><b>正式 API 契约</b>（三个 stdio 族 {@code startWith} 重载共用；以下逐条为准）：
+   *
+   * <ol>
+   *   <li><b>调用者身份在建链时绑定</b>：{@code caller} 逐字决定 {@code tools/call} 的执行身份——MCP 客户端只能决定 {@code
+   *       arguments}，<b>给不出也改不了</b>"这是哪个 Agent、按哪一档办"（身份由建链方注入，见 {@code handleCall} 的上下文拼装）；
+   *   <li><b>暴露过滤器</b>：本重载默认全量（{@code name -> true}）。带 {@code include} 的重载只暴露命中者，初始注册与 Registry
+   *       变更同步（{@code sync}）<b>同源</b>使用该谓词；谓词在 server 生命周期内应保持<b>纯函数</b>（其判定会被初始注册与每次同步反复取用）；
+   *   <li><b>{@code tools/call} 的唯一入口</b>：一切调用经 {@link ToolCallAuthorizer}（审批闸、资源判定等横切判定都在其中，S4
+   *       判定点统一），本重载默认 {@link ToolCallAuthorizer#standard()}；
+   *   <li><b>动态同步承诺</b>：订阅 {@link ToolRegistry#onChange}，Registry 的增删会增量同步到暴露面；带 {@link
+   *       ToolSpec#noExport()} 的工具<b>永不外发</b>（初始注册与增量同步同一暴露判定）；
+   *   <li><b>参数类型限于单会话/stdio 族</b>：形参为 {@link McpServerTransportProvider}。streamable HTTP
+   *       provider（{@link McpStreamableServerTransportProvider}）是它的<b>兄弟</b>接口，请走 streamable 注入口（后续
+   *       {@code startHttp}）；若某实现类同时实现两者而 误传到这里，抛可读 {@link IllegalArgumentException}（守卫见方法体首部），绝不泄漏
+   *       {@link ClassCastException}。
+   * </ol>
+   *
+   * @param registry 待暴露的工具注册表（持有引用，后续变更实时同步）
+   * @param serverName MCP server 自报名称（{@code serverInfo}）
+   * @param serverVersion MCP server 自报版本
+   * @param caller 经 MCP 到达的 {@code tools/call} 所使用的执行身份（建链时绑定，客户端改不了）
+   * @param transport 单会话/stdio 族 transport（如 {@code StdioServerTransportProvider}）
+   * @since 0.1.0
+   */
+  public static AgentToMcpServer startWith(
       ToolRegistry registry,
       String serverName,
       String serverVersion,
@@ -196,10 +223,18 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
-   * 供测试注入自定义 transport 并带暴露过滤器；语义与 {@link #startWith(ToolRegistry, String, String, ToolContext,
-   * McpServerTransportProvider)} 相同，仅初始注册与后续同步均以 {@code include} 收窄暴露面。
+   * 启动（注入单会话/stdio 族 transport + 暴露过滤器）：语义与 {@link #startWith(ToolRegistry, String, String,
+   * ToolContext, McpServerTransportProvider)} 相同，仅初始注册与后续同步均以 {@code include} 收窄暴露面。
+   *
+   * <p>契约要点（完整版见 5 参重载）：①{@code caller} 身份在建链时绑定，MCP 客户端给不出也改不了；②{@code include}
+   * 命中才暴露，谓词应为纯函数；③{@code tools/call} 一律经默认 {@link ToolCallAuthorizer#standard()}（唯一入口）； ④订阅 {@link
+   * ToolRegistry#onChange}，增删增量同步，{@link ToolSpec#noExport()} 的工具永不外发；⑤形参限单会话/stdio 族
+   * transport，streamable HTTP provider 误传抛 {@link IllegalArgumentException}。
+   *
+   * @param include 工具名过滤器（命中才暴露；谓词在 server 生命周期内应保持纯函数）
+   * @since 0.1.0
    */
-  static AgentToMcpServer startWith(
+  public static AgentToMcpServer startWith(
       ToolRegistry registry,
       String serverName,
       String serverVersion,
@@ -217,13 +252,18 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
-   * 全参形态：注入 transport、暴露过滤器与<b>工具调用入口</b>（前两者见上一重载；{@code authorizer} 决定 {@code tools/call} 的执行语义）。
+   * 启动（注入单会话/stdio 族 transport + 暴露过滤器 + 自定义工具调用入口）：全参形态，前两者的语义分别同上两个重载；{@code authorizer} 决定
+   * {@code tools/call} 的执行语义。
    *
-   * <p>本重载只接受单会话/stdio 族 transport（{@link McpServerTransportProvider}）。streamable HTTP provider
-   * 是它的<b>兄弟</b>接口 （两者都只继承 {@code McpServerTransportProviderBase}，互不继承），正常分派靠重载静态分派（见 streamable
-   * 重载）；若某个实现类同时实现两者而 被传到这里，运行期必须给出可读拒绝而不是走到错误分派——守卫见方法体首部。
+   * <p>契约要点（完整版见 5 参重载）：①{@code caller} 身份在建链时绑定，MCP 客户端给不出也改不了；②{@code include}
+   * 命中才暴露，谓词应为纯函数；③{@code authorizer} 是 {@code tools/call} 的<b>唯一入口</b>（审批闸等横切判定都在其中）； ④订阅 {@link
+   * ToolRegistry#onChange}，增删增量同步，{@link ToolSpec#noExport()} 的工具永不外发；⑤形参限单会话/stdio 族
+   * transport，streamable HTTP provider 误传抛 {@link IllegalArgumentException}。
+   *
+   * @param authorizer 工具调用唯一入口（审批闸等横切判定都在其中）
+   * @since 0.1.0
    */
-  static AgentToMcpServer startWith(
+  public static AgentToMcpServer startWith(
       ToolRegistry registry,
       String serverName,
       String serverVersion,
