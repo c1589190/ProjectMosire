@@ -126,6 +126,8 @@ owned 形态的 ②→③ 顺序不能颠倒：先 `server.close()` 让 provider
 | 请求体上限 | 有（默认与 SDK 同量级，见 §1.1 的 413） | 不做流式解析；超限直接 413。 |
 | 探活 | GET 长连周期写 `: ping` 注释行 | SSE 注释帧不产生事件，只保活；周期可配。 |
 
+**行为变更记账（本变更集唯一一处）**：`AgentToMcpServer` 现显式声明工具能力 `McpSchema.ServerCapabilities.builder().tools(true).build()`，故所有 MCP 路径都对外广播 `tools.listChanged=true`。原因是 SDK 的 `ToolCapabilities.listChanged` 默认为装箱 `null`，`McpAsyncServer.addTool/removeTool` 对其拆箱会在**每次注册变更**抛 NPE，而该异常被 `ToolRegistry.notifyChanged` 吞掉，导致 `notifications/tools/list_changed` 永远不可达。除此之外，本变更集不改动任何协议行为（安全边界、路由、鉴权均同表上各项）。
+
 ---
 
 ## 五 A3 裁决：审批端点沿用 MainMosire 既有路径

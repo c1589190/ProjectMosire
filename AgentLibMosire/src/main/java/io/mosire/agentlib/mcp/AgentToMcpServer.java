@@ -1,6 +1,7 @@
 package io.mosire.agentlib.mcp;
 
 import com.sun.net.httpserver.HttpServer;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.modelcontextprotocol.server.McpServer;
 import io.modelcontextprotocol.server.McpServerFeatures;
@@ -399,6 +400,11 @@ public final class AgentToMcpServer implements AutoCloseable {
    * @param authorizer 工具调用唯一入口（<b>必填</b>，见上文；审批闸等横切判定都在其中）
    * @since 0.1.0
    */
+  @SuppressFBWarnings(
+      value = "THROWS_METHOD_THROWS_RUNTIMEEXCEPTION",
+      justification =
+          "createContext 抛错时先把已 build 的 SDK server 与 Registry 订阅收干净，再原样重抛调用方本会看到的异常（"
+              + "不改变调用方既有 catch 语义）；显式重抛 RuntimeException 是此处设计意图，非缺陷。")
   public static AgentToMcpServer startHttp(
       HttpServer server,
       String path,
@@ -421,7 +427,13 @@ public final class AgentToMcpServer implements AutoCloseable {
     // 顺序硬约束：先 build（SDK 在 build 时注入 sessionFactory），再 createContext。
     AgentToMcpServer self =
         startWith(registry, serverName, serverVersion, caller, provider, name -> true, authorizer);
-    server.createContext(path, provider::handle);
+    try {
+      server.createContext(path, provider::handle);
+    } catch (RuntimeException e) {
+      // createContext 失败：已 build 的 SDK server 与 Registry 订阅会泄漏，先收干净再抛。
+      self.close();
+      throw e;
+    }
     self.httpServer = server;
     self.httpPath = path;
     return self;
@@ -730,22 +742,23 @@ public final class AgentToMcpServer implements AutoCloseable {
     } catch (Exception e) {
       LOG.warn("取消 Registry 订阅失败", e);
     }
-    server.close();
     HttpServer http = httpServer;
-    if (http == null) {
-      return;
-    }
-    try {
-      http.removeContext(httpPath);
-    } catch (RuntimeException e) {
-      LOG.warn("移除 MCP context 失败: path={}", httpPath, e);
-    }
     ExecutorService executor = ownedExecutor;
-    if (executor == null) {
-      // caller-owned：到此为止，绝不碰调用方的 server/executor
-      return;
+    try {
+      server.close();
+    } finally {
+      // server.close() 抛错也不能跳过收尾，否则端口/线程池泄漏；次序仍是 removeContext → stop → shutdown。
+      if (http != null) {
+        try {
+          http.removeContext(httpPath);
+        } catch (RuntimeException e) {
+          LOG.warn("移除 MCP context 失败: path={}", httpPath, e);
+        }
+        if (executor != null) {
+          http.stop(0);
+          executor.shutdown();
+        }
+      }
     }
-    http.stop(0);
-    executor.shutdown();
   }
 }

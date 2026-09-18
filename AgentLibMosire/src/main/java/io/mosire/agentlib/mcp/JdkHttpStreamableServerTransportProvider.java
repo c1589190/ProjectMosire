@@ -21,6 +21,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -73,9 +74,6 @@ final class JdkHttpStreamableServerTransportProvider
 
   private static final Logger LOG =
       LoggerFactory.getLogger(JdkHttpStreamableServerTransportProvider.class);
-
-  /** 默认端点路径（与 SDK servlet 参考实现一致）。 */
-  static final String DEFAULT_PATH = "/mcp";
 
   /** 请求体上限：16 MiB（与 SDK 参考实现的 {@code DEFAULT_REQUEST_MAX_SIZE} 同量级）。 */
   private static final int MAX_REQUEST_BYTES = 16 * 1024 * 1024;
@@ -378,8 +376,9 @@ final class JdkHttpStreamableServerTransportProvider
       McpStreamableServerSession.McpStreamableServerSessionInit init =
           factory.startSession(initializeRequest);
       sessionId = init.session().getId();
-      sessions.put(sessionId, init.session());
       McpSchema.InitializeResult initResult = init.initResult().block();
+      // block() 成功后才入表：block() 抛错则会话不会残留在表中，也就无孤儿可清。
+      sessions.put(sessionId, init.session());
       String json =
           jsonMapper.writeValueAsString(McpSchema.JSONRPCResponse.result(request.id(), initResult));
       responseBytes = json.getBytes(StandardCharsets.UTF_8);
@@ -511,9 +510,17 @@ final class JdkHttpStreamableServerTransportProvider
 
     /** 启动周期 {@code : ping} 探活（仅 GET 监听流调用）。写失败 ⇒ {@link #close()}。 */
     void startHeartbeat() {
-      heartbeat =
-          heartbeatScheduler.scheduleAtFixedRate(
-              this::ping, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
+      try {
+        heartbeat =
+            heartbeatScheduler.scheduleAtFixedRate(
+                this::ping,
+                HEARTBEAT_INTERVAL_SECONDS,
+                HEARTBEAT_INTERVAL_SECONDS,
+                TimeUnit.SECONDS);
+      } catch (RejectedExecutionException e) {
+        // closeGracefully() 已关了调度器：transport 已收尾，无需探活（幂等 no-op）。
+        LOG.debug("MCP SSE 探活调度被拒（transport 已关闭）: session={}", sessionId);
+      }
     }
 
     private void ping() {
