@@ -8,6 +8,7 @@ import io.modelcontextprotocol.server.McpSyncServerExchange;
 import io.modelcontextprotocol.server.transport.StdioServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpServerTransportProvider;
+import io.modelcontextprotocol.spec.McpStreamableServerTransportProvider;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ToolSpec;
@@ -217,6 +218,10 @@ public final class AgentToMcpServer implements AutoCloseable {
 
   /**
    * 全参形态：注入 transport、暴露过滤器与<b>工具调用入口</b>（前两者见上一重载；{@code authorizer} 决定 {@code tools/call} 的执行语义）。
+   *
+   * <p>本重载只接受单会话/stdio 族 transport（{@link McpServerTransportProvider}）。streamable HTTP provider
+   * 是它的<b>兄弟</b>接口 （两者都只继承 {@code McpServerTransportProviderBase}，互不继承），正常分派靠重载静态分派（见 streamable
+   * 重载）；若某个实现类同时实现两者而 被传到这里，运行期必须给出可读拒绝而不是走到错误分派——守卫见方法体首部。
    */
   static AgentToMcpServer startWith(
       ToolRegistry registry,
@@ -226,12 +231,93 @@ public final class AgentToMcpServer implements AutoCloseable {
       McpServerTransportProvider transport,
       Predicate<String> include,
       ToolCallAuthorizer authorizer) {
+    // 兄弟接口误传守卫：抛可读中文 IllegalArgumentException，绝不让 ClassCastException 从 SDK 内部泄漏（改造前强转的隐患）。
+    if (transport instanceof McpStreamableServerTransportProvider) {
+      throw new IllegalArgumentException(
+          "该重载只接受单会话/stdio 族 transport（McpServerTransportProvider）；streamable HTTP provider 请用 streamable 注入口");
+    }
+    return assemble(
+        McpServer.sync(transport),
+        "stdio",
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        include,
+        authorizer);
+  }
+
+  /** streamable HTTP 注入口（供后续 HTTP 传输接线）；语义与 stdio 家族相同，仅底层 transport 不同。 */
+  static AgentToMcpServer startWith(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      McpStreamableServerTransportProvider transport) {
+    return startWith(registry, serverName, serverVersion, caller, transport, name -> true);
+  }
+
+  /** streamable 注入口（带暴露过滤器）；语义与 stdio 家族的 6 参重载相同，仅底层 transport 不同。 */
+  static AgentToMcpServer startWith(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      McpStreamableServerTransportProvider transport,
+      Predicate<String> include) {
+    return startWith(
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        transport,
+        include,
+        ToolCallAuthorizer.standard());
+  }
+
+  /**
+   * streamable HTTP 全参注入口：注入 transport、暴露过滤器与工具调用入口；注册循环 / Registry 订阅 / 外发面日志与 stdio
+   * 家族<b>共用同一段</b> 实现（见 {@link #assemble}）。
+   */
+  static AgentToMcpServer startWith(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      McpStreamableServerTransportProvider transport,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer) {
+    return assemble(
+        McpServer.sync(transport),
+        "streamable",
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        include,
+        authorizer);
+  }
+
+  /**
+   * 两条 transport 路径<b>共用</b>的装配段：{@code serverInfo} → 逐工具 {@code toolCall} → {@code build}，再挂
+   * Registry 订阅、按实际外发面记日志。
+   *
+   * <p>为什么通配 {@code SyncSpecification<?>} 就够：{@code serverInfo}/{@code toolCall} 都返回基类 {@code
+   * SyncSpecification<S>}（不是自型 {@code S}），{@code build()} 签名也不含 {@code S}，故无需自型泛型参数；这也让 streamable
+   * 与单会话 两条链能收进同一个 helper，避免复制粘贴。
+   */
+  private static AgentToMcpServer assemble(
+      McpServer.SyncSpecification<?> spec,
+      String transportLabel,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer) {
     Objects.requireNonNull(include, "include");
     Objects.requireNonNull(authorizer, "authorizer");
-    // sync() 声明返回 Self 型链（serverInfo/toolCall 声明为 SyncSpecification<S>），末端缩窄为 S 实例
-    McpServer.SingleSessionSyncSpecification spec =
-        (McpServer.SingleSessionSyncSpecification)
-            McpServer.sync(transport).serverInfo(serverName, serverVersion);
+    spec.serverInfo(serverName, serverVersion);
     for (AgentTool tool : registry.list()) {
       if (!exportable(tool, include)) {
         continue;
@@ -250,7 +336,8 @@ public final class AgentToMcpServer implements AutoCloseable {
     List<String> withheld =
         registry.list().stream().map(AgentTool::name).filter(n -> !exported.contains(n)).toList();
     LOG.info(
-        "MCP stdio server 已启动: name={} version={} 外发工具 {} 个 {}；Registry 共 {} 个，未外发 {} 个 {}",
+        "MCP {} server 已启动: name={} version={} 外发工具 {} 个 {}；Registry 共 {} 个，未外发 {} 个 {}",
+        transportLabel,
         serverName,
         serverVersion,
         exported.size(),
