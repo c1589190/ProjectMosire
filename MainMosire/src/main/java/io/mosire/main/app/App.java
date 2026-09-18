@@ -6,8 +6,10 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ApprovalConfig;
 import io.mosire.agentlib.approval.ApprovalConfigLoader;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
 import io.mosire.agentlib.approval.AutoApproveGate;
 import io.mosire.agentlib.approval.ConfirmGate;
+import io.mosire.agentlib.approval.HttpApprovalChannel;
 import io.mosire.agentlib.approval.LlmSuperiorJudgement;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
@@ -60,8 +62,7 @@ import io.mosire.brain.subagent.SubagentManager;
 import io.mosire.brain.subagent.SubagentOrchestrationTools;
 import io.mosire.brain.tools.WorkingDirsLoader;
 import io.mosire.main.Version;
-import io.mosire.main.approval.ApprovalHttpServer;
-import io.mosire.main.approval.HttpApprovalChannel;
+import io.mosire.main.approval.CommandModeHttpHandler;
 import io.mosire.main.approval.TtyApprovalChannel;
 import io.mosire.main.gateway.AdminHttpServer;
 import io.mosire.main.gateway.StatusSnapshot;
@@ -197,10 +198,12 @@ public final class App implements AutoCloseable {
   /**
    * 审批 HTTP 面（S4-B2）：{@code null} = 未启用（{@code approval.http=false}）。
    *
-   * <p>它与 {@link #approvalHttpChannel} 是同一个面的两面——server 是"人的入口"，channel 是"编排器的等待口"，两者共享 {@code App}
-   * 里那<b>唯一</b>一份 {@code PendingApprovals}。
+   * <p>迁移后（设计 §七 P1-C）用 AgentLib 的通用件 {@link ApprovalHttpEndpoint}——Main 只负责装配与 {@code
+   * /api/commands/mode} 薄包装（{@link CommandModeHttpHandler}）。它与 {@link #approvalHttpChannel}
+   * 是同一个面的两面——server 是"人的入口"，channel 是"编排器的等待口"，两者共享 {@code App} 里那<b>唯一</b>一份 {@code
+   * PendingApprovals}。
    */
-  private final ApprovalHttpServer approvalServer;
+  private final ApprovalHttpEndpoint approvalServer;
 
   /** tty 审批通道（S4-B2）：无控制终端时 {@code available()==false}（装配照做，可用性由它自己如实报）。 */
   private final TtyApprovalChannel approvalTtyChannel;
@@ -306,7 +309,7 @@ public final class App implements AutoCloseable {
     DebugChatService debugChatService = null;
     DebugChatHttpServer debugChatServer = null;
     // S4-B2：审批面资源声明在 try 之外（同其余网关口径）——装配中途失败时 catch 里要回收已起的那部分
-    ApprovalHttpServer approvalServer = null;
+    ApprovalHttpEndpoint approvalServer = null;
     TtyApprovalChannel approvalTtyChannel = null;
     HttpApprovalChannel approvalHttpChannel = null;
     ExecutorService chatExecutor = null;
@@ -386,8 +389,11 @@ public final class App implements AutoCloseable {
           ToolCallAuthorizer.of(new ToolExecutionGuard(), approvalCoordinator);
       if (approvalConfig.http()) {
         approvalServer =
-            ApprovalHttpServer.start(
-                approvalConfig.httpPort(), pendingApprovals, approvalCoordinator, commandMode);
+            ApprovalHttpEndpoint.start(
+                approvalConfig.httpPort(), pendingApprovals, approvalCoordinator);
+        // S6 档位端点挂在<b>同一台</b> server、同一端口上（AgentLib 通用件只做审批；档位逻辑留 Main 薄包装，
+        // 不另起第二台 server——设计 §五 A3 裁决）。
+        CommandModeHttpHandler.register(approvalServer, commandMode);
         // HTTP 面真的绑定成功了才算可用通道（"配置说要开"不等于"端口在监听"）
         approvalHttpChannel.markUp();
       }
@@ -903,7 +909,7 @@ public final class App implements AutoCloseable {
       SubprocessManager subagentProcesses,
       PluginToolSource pluginTools,
       SetupHttpServer setupServer,
-      ApprovalHttpServer approvalServer,
+      ApprovalHttpEndpoint approvalServer,
       TtyApprovalChannel approvalTtyChannel,
       HttpApprovalChannel approvalHttpChannel) {
     this.events = events;
