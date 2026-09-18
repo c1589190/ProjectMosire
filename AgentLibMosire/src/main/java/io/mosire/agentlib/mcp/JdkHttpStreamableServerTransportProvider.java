@@ -17,7 +17,13 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,9 +36,9 @@ import reactor.core.publisher.Mono;
  * {@code HttpServer} + 零框架"的既有形态不符。本类只把 SDK 的 {@link McpStreamableServerSession} 会话机缝到 JDK 的 HTTP
  * 交换上：路由与生命周期由 SDK 管，HTTP 外壳（verb→session→{@code Mcp-Session-Id}）由本类负责。
  *
- * <p><b>本类只做 POST 面 + SSE 帧 + 会话 + DELETE</b>（todo 5 的范围）：GET 监听流（长连 + 停驻 + 探活）属 todo 7， 本类对 GET 一律
- * 405——官方 client 收到 405 会退化为 request-response 模式（不建长连），故 POST 三连可独立跑通。 对 {@code startHttp}
- * 工厂与公开注入口属 todo 8，本类保持包私有。
+ * <p><b>本类做 POST 面 + SSE 帧 + 会话 + DELETE + GET 监听流</b>：GET（长连 + 停驻 + 探活）把官方 client 的 out-of-band
+ * 通知通道打开，{@code notifications/tools/list_changed} 才真正送达。 对 {@code startHttp} 工厂与公开注入口属 todo
+ * 8，本类保持包私有。
  *
  * <p><b>verb→session 路由（写死，见设计文档 §一）</b>：
  *
@@ -41,8 +47,11 @@ import reactor.core.publisher.Mono;
  *   <li>POST {@code initialize}（唯一豁免会话头的 POST）：{@code sessionFactory.startSession(...)} → 会话入表 →
  *       200 + {@code Mcp-Session-Id} + {@code application/json}；
  *   <li>POST 普通 request（会话命中）：{@code session.responseStream(req, transport)} → 200 + {@code
- *       text/event-stream}（chunked）；<b>handler 必须等该 Mono 完成再返回</b>——{@code handle()} 返回即关连接，
- *       订阅即返回会让客户端读到截断的 SSE；
+ *       text/event-stream}（chunked）；<b>handler 必须等该 Mono 完成再返回</b>——实现按"handler 返回即收尾交换"的框架
+ *       契约保守处理（JDK 21 实测 chunked exchange 不在返回时自动关，见设计文档 §一，但不依赖该未承诺行为）；
+ *   <li>GET（会话命中 + {@code Accept} 含 {@code text/event-stream}）：{@code
+ *       session.listeningStream(transport)} → 200 + {@code text/event-stream}（chunked 长连）→ handler
+ *       <b>停驻</b>在 latch 上，由 transport 的 {@code close()} 唤醒；周期写 {@code : ping} 注释探活（写失败即 close）；
  *   <li>POST notification / response（会话命中）：{@code session.accept(...)} ⇒ 202；
  *   <li>DELETE（会话命中）：{@code session.delete()} + 出表 ⇒ 200；
  *   <li>无会话头 ⇒ 400；未知会话 ⇒ 404；方法不在 GET/POST/DELETE ⇒ 405 + {@code Allow}。
@@ -54,7 +63,7 @@ import reactor.core.publisher.Mono;
  *
  * <p><b>线程与编码</b>：写侧用 {@link ReentrantLock}（非 {@code synchronized}——Java 21 虚拟线程下 {@code
  * synchronized} 会 pin 住载体线程）；所有字节显式 {@link StandardCharsets#UTF_8}。调用方必须给 {@code HttpServer} 装虚拟线程
- * executor（默认单线程 executor 会与将来的 parked GET 互锁，见设计文档 §四）。
+ * executor（默认单线程 executor 会与 parked GET 互锁，见设计文档 §四）。
  *
  * <p>本类不拥有 {@code HttpServer}：{@code createContext(path, this::handle)} 由调用方装配，{@link
  * #closeGracefully()} 只关会话，不 {@code stop()} 调用方的 server（生命周期所有权在 todo 8 的 {@code startHttp} 层定）。
@@ -88,6 +97,27 @@ final class JdkHttpStreamableServerTransportProvider
   private final ConcurrentHashMap<String, McpStreamableServerSession> sessions =
       new ConcurrentHashMap<>();
 
+  /**
+   * 当前 parked 的 GET 监听流 transport 集合。用于两件事：①测试/诊断观测活跃监听流数；②{@code closeGracefully()}
+   * 兜底唤醒那些"注册晚于会话遍历"的竞态流（会话自身的关闭路径已能覆盖绝大多数）。
+   */
+  private final Set<ExchangeTransport> activeListenings = ConcurrentHashMap.newKeySet();
+
+  /**
+   * SSE 探活调度器（daemon，单线程）。仅在有 GET 监听流时被调度；{@code closeGracefully()} 统一关闭。daemon 标记保证即使调用方 忘记关闭也不会阻止
+   * JVM 退出。
+   */
+  private final ScheduledExecutorService heartbeatScheduler =
+      Executors.newSingleThreadScheduledExecutor(
+          runnable -> {
+            Thread thread = new Thread(runnable, "mcp-sse-heartbeat");
+            thread.setDaemon(true);
+            return thread;
+          });
+
+  /** SSE 探活周期（秒）：GET 长连每周期写一行 {@code : ping} 注释，探测静默断开。 */
+  private static final long HEARTBEAT_INTERVAL_SECONDS = 30L;
+
   /** 关闭标志：置真后所有请求 503（会话先被优雅关闭，见 {@link #closeGracefully()}）。 */
   private volatile boolean closing;
 
@@ -109,48 +139,53 @@ final class JdkHttpStreamableServerTransportProvider
   }
 
   /**
-   * 向所有活动会话广播通知。每个会话单独 try/catch：单会话失败只记日志、不阻断其余（未建 GET 监听流时 {@code sendNotification} 会抛 {@code
-   * IllegalStateException}，属标准行为）。
+   * 向所有活动会话广播通知。每个会话单独 try/catch：单会话失败只记日志、不阻断其余。
    *
-   * <p>本 todo 为最小实现；通知送达的完整语义（逐会话捕获 + 与 todo 7 的 GET 流配合）在 todo 7 收口。
+   * <p><b>为什么单会话失败必须捕获而不是冒泡</b>：未建 GET 监听流时 {@code listeningStreamRef} 是 {@code
+   * MissingMcpTransportSession}，其 {@code sendNotification} 返回 {@code
+   * Mono.error(IllegalStateException)}——即<b>抛错而非静默丢弃</b>。 若让异常冒泡，一个没开监听流的会话就会打断整轮广播，其余会话再也收不到
+   * {@code notifications/tools/list_changed}。
    */
   @Override
   public Mono<Void> notifyClients(String method, Object params) {
-    if (sessions.isEmpty()) {
-      return Mono.empty();
-    }
     return Mono.fromRunnable(
-        () ->
-            sessions
-                .values()
-                .forEach(
-                    session -> {
-                      try {
-                        session.sendNotification(method, params).block();
-                      } catch (Exception e) {
-                        LOG.info(
-                            "MCP 通知发送失败: session={} method={} err={}",
-                            session.getId(),
-                            method,
-                            e.getMessage());
-                      }
-                    }));
-  }
-
-  /** 向单个会话发通知；会话不存在返回 {@code Mono.empty()}（不是错误）。 */
-  @Override
-  public Mono<Void> notifyClient(String sessionId, String method, Object params) {
-    return Mono.defer(
         () -> {
-          McpStreamableServerSession session = sessions.get(sessionId);
-          if (session == null) {
-            return Mono.empty();
+          for (McpStreamableServerSession session : sessions.values()) {
+            try {
+              session.sendNotification(method, params).block();
+            } catch (Exception e) {
+              LOG.info(
+                  "MCP 通知发送失败（单会话已跳过）: session={} method={} err={}",
+                  session.getId(),
+                  method,
+                  e.getMessage());
+            }
           }
-          return session.sendNotification(method, params);
         });
   }
 
-  /** 优雅关闭：置 {@code closing}，逐个关会话（单个失败只记日志），清空会话表。 */
+  /** 向单个会话发通知；会话不存在返回 {@code Mono.empty()}（不是错误）；发送失败同样捕获、不冒泡。 */
+  @Override
+  public Mono<Void> notifyClient(String sessionId, String method, Object params) {
+    return Mono.fromRunnable(
+        () -> {
+          McpStreamableServerSession session = sessions.get(sessionId);
+          if (session == null) {
+            return;
+          }
+          try {
+            session.sendNotification(method, params).block();
+          } catch (Exception e) {
+            LOG.info(
+                "MCP 单会话通知发送失败（已捕获）: session={} method={} err={}",
+                sessionId,
+                method,
+                e.getMessage());
+          }
+        });
+  }
+
+  /** 优雅关闭：置 {@code closing}，逐个关会话（单个失败只记日志），清空会话表，兜底唤醒全部 parked GET，停掉探活调度器。 */
   @Override
   public Mono<Void> closeGracefully() {
     return Mono.fromRunnable(
@@ -167,6 +202,9 @@ final class JdkHttpStreamableServerTransportProvider
                     }
                   });
           sessions.clear();
+          // 兜底：会话遍历可能漏掉"注册晚于遍历"的监听流；显式关掉每个 active transport 以唤醒其 parked handler。
+          activeListenings.forEach(ExchangeTransport::close);
+          heartbeatScheduler.shutdownNow();
         });
   }
 
@@ -198,13 +236,56 @@ final class JdkHttpStreamableServerTransportProvider
   }
 
   /**
-   * GET 占位：todo 5 不实现监听流（todo 7）。返回 405 让官方 client 退化为 request-response 模式——这是 SDK client 明确定义的
-   * 分支（{@code HttpClientStreamableHttpTransport} 见 405 即 {@code Flux.empty()}），不会污染会话。
+   * GET 监听流：官方 client 在 initialize 后自动发起（{@code Accept: text/event-stream} + {@code
+   * Mcp-Session-Id}）， 用于接收 out-of-band 通知/服务端请求。建立 SSE 200 chunked 后 handler <b>停驻</b>在 {@link
+   * ExchangeTransport#awaitClosed()} 上，直到 transport 的 {@code close()}（会话关闭 / 写失败 / {@code
+   * closeGracefully()} 兜底）唤醒。
+   *
+   * <p>停驻是<b>保守做法</b>：JDK 21 实测 chunked exchange 不在 {@code handle()} 返回时自动关（见设计文档 §一），但依赖该未承诺
+   * 行为不可取——park+latch 在"自动关"与"不自动关"两种 JDK 行为下都正确。
    */
   private void handleGet(HttpExchange exchange) throws IOException {
-    exchange.getResponseHeaders().set("Allow", "POST, DELETE");
-    exchange.sendResponseHeaders(405, -1);
-    exchange.close();
+    String accept = exchange.getRequestHeaders().getFirst(ACCEPT);
+    if (accept == null || !accept.contains(TEXT_EVENT_STREAM)) {
+      sendError(exchange, 400, "Accept 必须包含 text/event-stream");
+      return;
+    }
+    String sessionId = exchange.getRequestHeaders().getFirst(HttpHeaders.MCP_SESSION_ID);
+    if (sessionId == null || sessionId.isBlank()) {
+      sendError(exchange, 400, "缺少 Mcp-Session-Id 会话头");
+      return;
+    }
+    McpStreamableServerSession session = sessions.get(sessionId);
+    if (session == null) {
+      sendError(exchange, 404, "未知会话: " + sessionId);
+      return;
+    }
+
+    exchange.getResponseHeaders().set("Content-Type", TEXT_EVENT_STREAM + "; charset=utf-8");
+    exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+    exchange.sendResponseHeaders(200, 0);
+
+    ExchangeTransport transport = new ExchangeTransport(exchange, sessionId);
+    activeListenings.add(transport);
+    try {
+      session.listeningStream(transport);
+      // 注册后再看一次 closing：若 closeGracefully 已开始（会话遍历可能已跑过），立刻收尾，避免 parked 线程泄漏。
+      if (closing) {
+        return;
+      }
+      transport.startHeartbeat();
+      transport.awaitClosed();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } finally {
+      activeListenings.remove(transport);
+      transport.close();
+    }
+  }
+
+  /** 当前 parked 的 GET 监听流数（测试/诊断观测用；正常为 0 或 1）。 */
+  int activeListeningStreamCount() {
+    return activeListenings.size();
   }
 
   /** POST：body 上限 → Accept 合格性 → 反序列化 → initialize / 会话路由。 */
@@ -397,8 +478,8 @@ final class JdkHttpStreamableServerTransportProvider
   }
 
   /**
-   * 单个 SSE 流（POST 请求的应答流）的传输实现：<b>只实现 5 个方法</b>（{@code sendMessage}×2 / {@code unmarshalFrom} /
-   * {@code close} / {@code closeGracefully}）。
+   * 单个 SSE 流的传输实现（POST 应答流 / GET 监听流）：<b>只实现 5 个方法</b>（{@code sendMessage}×2 / {@code
+   * unmarshalFrom} / {@code close} / {@code closeGracefully}）。
    *
    * <p>写侧用 {@link ReentrantLock} 串行化：SDK 的会话机可能从多个线程触发写（响应、通知、服务端请求），SSE 帧必须原子。 每次写完 {@code
    * flush()} 后 {@code checkError()}——{@link PrintWriter} 吞 IO 异常，不查它会把"客户端已断开"当成发送成功。
@@ -409,7 +490,11 @@ final class JdkHttpStreamableServerTransportProvider
     private final String sessionId;
     private final PrintWriter writer;
     private final ReentrantLock lock = new ReentrantLock();
+    private final CountDownLatch closedLatch = new CountDownLatch(1);
     private volatile boolean closed;
+
+    /** GET 监听流的心跳任务句柄；POST 应答流不启动心跳，保持 null。 */
+    private volatile ScheduledFuture<?> heartbeat;
 
     ExchangeTransport(HttpExchange exchange, String sessionId) {
       this.exchange = exchange;
@@ -417,6 +502,47 @@ final class JdkHttpStreamableServerTransportProvider
       this.writer =
           new PrintWriter(
               new OutputStreamWriter(exchange.getResponseBody(), StandardCharsets.UTF_8));
+    }
+
+    /** 停驻 GET handler：阻塞到 {@link #close()} 倒数 latch（会话关闭 / 写失败 / 服务端收尾）。 */
+    void awaitClosed() throws InterruptedException {
+      closedLatch.await();
+    }
+
+    /** 启动周期 {@code : ping} 探活（仅 GET 监听流调用）。写失败 ⇒ {@link #close()}。 */
+    void startHeartbeat() {
+      heartbeat =
+          heartbeatScheduler.scheduleAtFixedRate(
+              this::ping, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    private void ping() {
+      if (closed) {
+        return;
+      }
+      try {
+        writeComment(": ping\n\n");
+      } catch (IOException e) {
+        LOG.debug("MCP SSE 探活写失败（客户端可能已断开）: session={} err={}", sessionId, e.getMessage());
+        close();
+      }
+    }
+
+    /** SSE 注释帧（不产生事件，只保活）；与 {@link #sendMessage} 共用同一把写锁保证帧原子。 */
+    private void writeComment(String comment) throws IOException {
+      lock.lock();
+      try {
+        if (closed) {
+          return;
+        }
+        writer.write(comment);
+        writer.flush();
+        if (writer.checkError()) {
+          throw new IOException("Client disconnected");
+        }
+      } finally {
+        lock.unlock();
+      }
     }
 
     @Override
@@ -482,6 +608,12 @@ final class JdkHttpStreamableServerTransportProvider
           return;
         }
         closed = true;
+        ScheduledFuture<?> hb = heartbeat;
+        if (hb != null) {
+          hb.cancel(false);
+        }
+        // 先唤醒 parked GET handler，再关交换——两者都在锁内，handler 的 finally 会幂等地再次 close()。
+        closedLatch.countDown();
         writer.flush();
         exchange.close();
       } catch (RuntimeException e) {

@@ -36,7 +36,7 @@
 | POST 普通 request | `Mcp-Session-Id` 命中 `sessions` | `session.responseStream(request, exchangeTransport)` | 200 + `text/event-stream`（SSE 帧 `id:` / `event: message` / `data:` + 空行 + flush；请求处理完 transport 自关） |
 | POST notification | 会话命中 | `session.accept(notification)` | 202 |
 | POST response | 会话命中 | `session.accept(response)` | 202 |
-| GET | 会话命中 + `Accept` 含 `text/event-stream` | `session.listeningStream(exchangeTransport)`，然后**停驻 handler 线程**（`CountDownLatch`，由 transport 的 `close()` 倒数） | 200 + `text/event-stream`（长连，周期 `: ping` 注释探活） |
+| GET | 会话命中 + `Accept` 含 `text/event-stream` | `session.listeningStream(exchangeTransport)`，然后**停驻 handler 线程**（`CountDownLatch`，由 transport 的 `close()` 倒数）；**实测 JDK 21 不会在 `handle()` 返回时自动关 chunked exchange，但实现仍保守 park（双重保险）** | 200 + `text/event-stream`（长连，周期 `: ping` 注释探活） |
 | DELETE | 会话命中 | `session.delete()` + `sessions.remove(id)` | 200 |
 | 路径不精确等于 `path` | — | — | 404（**注意**：`createContext` 是**前缀**匹配，必须显式精确守卫，见 §1.3） |
 | 方法不在 GET/POST/DELETE | — | — | 405 + `Allow` 头 |
@@ -70,7 +70,7 @@
 ### 1.3 三条易错点（每条都配判别性用例）
 
 1. **`createContext` 是前缀匹配**：`createContext("/mcp", ...)` 会同时接住 `/mcp/extra`。路由表要求"路径不精确等于 `path` ⇒ 404"，因此 handler 第一句必须是 `exchange.getRequestURI().getPath()` 与 `path` 的**逐字相等**判定，不相等直接 404。变异：删掉该守卫 ⇒ `/mcp/x` 得到 200 而非 404，用例转红。
-2. **GET 必须停驻线程**：JDK `HttpServer` 没有 servlet 的 `AsyncContext`；handler 方法一旦返回，`HttpServer` 就会收尾这次交换。因此 GET 建立 listening stream 后必须阻塞在 `CountDownLatch.await()` 上，由该 transport 的 `close()` 负责 `countDown()` 并关闭响应体。变异：把停驻换成"注册后立刻返回" ⇒ 客户端 GET 立刻 EOF，长连用例转红。
+2. **GET 必须停驻线程**：JDK `HttpServer` 没有 servlet 的 `AsyncContext`。**实测口径**（`.omo/evidence/agentlib-simos-m5-extension/task-5-transport-core.txt`）：JDK 21 对 chunked exchange **不会**在 `handle()` 返回时自动关——handler 返回后交换仍开着，直到异步线程显式 `close()`。但"返回即收尾"是 servlet/`startAsync` 一类的框架契约、也是 JDK 未承诺的实现细节，依赖它不可取；故 GET 建立 listening stream 后**仍保守停驻**在 `CountDownLatch.await()` 上，由该 transport 的 `close()` 负责 `countDown()` 并关闭响应体——park+latch 在"自动关"与"不自动关"两种行为下都正确（双重保险）。变异：去掉 `close()` 里的 `countDown()` ⇒ parked handler 永不退出，活跃监听流计数不归零、长连用例由 `@Timeout` 兜底转红。
 3. **`initialize` 是唯一的会话创建点**：只有 POST `initialize` 调 `sessionFactory.startSession`；任何其它请求都不允许"顺手建会话"。变异：让普通 POST 也能建会话 ⇒ "无会话头的普通 POST"用例得到 200 而非 400，转红。
 
 ### 1.4 会话头的读写口径
@@ -92,7 +92,7 @@
 
 **硬约束**：`HttpServer.stop(int delay)` 只停服务、**不会**关用户传进来的 `Executor`。因此 caller-owned 形态下若实现里顺手调了 `executor.shutdown()`，会**静默拆掉调用方共享的线程池**（表现是调用方其它模块的请求突然全部挂起）。这条单独写进代码注释与本文。
 
-owned 形态的 ②→③ 顺序不能颠倒：先 `server.close()` 让 provider 有机会 `closeGracefully()` 把每个会话的 listening stream 收掉（唤醒 §1.3 停驻的 handler 线程），再 `stop(0)`；若先 `stop(0)`，停驻线程会被强制中断在 `latch.await()` 上，SSE 客户端看到的是裸断连而不是有序收尾。
+owned 形态的 ②→③ 顺序不能颠倒：先 `server.close()` 让 provider 有机会 `closeGracefully()` 把每个会话的 listening stream 收掉（唤醒 §1.3 停驻的 handler 线程），再 `stop(0)`；若先 `stop(0)`，停驻线程会被强制中断在 `latch.await()` 上，SSE 客户端看到的是裸断连而不是有序收尾。这条不因 §1.3 的实测口径而改变：即便 JDK 21 不在 handler 返回时自动关交换，`stop(0)` 仍会中断停驻线程、丢弃未收尾的连接——有序收尾只能靠先 `closeGracefully()` 唤醒 parked handler。
 
 ---
 
