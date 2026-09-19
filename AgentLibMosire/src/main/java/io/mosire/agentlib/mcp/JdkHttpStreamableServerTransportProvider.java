@@ -372,7 +372,7 @@ final class JdkHttpStreamableServerTransportProvider
     byte[] responseBytes;
     try {
       McpSchema.InitializeRequest initializeRequest =
-          jsonMapper.convertValue(request.params(), new TypeRef<McpSchema.InitializeRequest>() {});
+          jsonMapper.convertValue(request.params(), new InitializeRequestType());
       McpStreamableServerSession.McpStreamableServerSessionInit init =
           factory.startSession(initializeRequest);
       sessionId = init.session().getId();
@@ -475,6 +475,9 @@ final class JdkHttpStreamableServerTransportProvider
   private static final class PayloadTooLargeException extends IOException {
     private static final long serialVersionUID = 1L;
   }
+
+  /** 命名静态类型：以具体子类固化 {@link TypeRef} 的泛型捕获，替代匿名内部类（消除 SIC_INNER_SHOULD_BE_STATIC_ANON）。 */
+  private static final class InitializeRequestType extends TypeRef<McpSchema.InitializeRequest> {}
 
   /**
    * 单个 SSE 流的传输实现（POST 应答流 / GET 监听流）：<b>只实现 5 个方法</b>（{@code sendMessage}×2 / {@code
