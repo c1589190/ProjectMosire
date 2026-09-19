@@ -86,6 +86,12 @@ public final class SubagentManager implements AutoCloseable {
   private static final long EXIT_POLL_MILLIS = 100L;
 
   /**
+   * close() 对观测线程的有界 join 上限：中断后 sleep 中的线程即时退场；卡在子库 IO 的线程给足本地盘余量。 超时未退不无限等（关停链必须有限时），余下投递由
+   * watchExit 的兜底捕获降级为 WARN。
+   */
+  private static final long WATCHER_JOIN_MILLIS = 5_000L;
+
+  /**
    * kill 终态确认宽限（进程三层关停内已等过一次，这里只做收尾确认）。
    *
    * <p>§2.6 起也供 {@code kill_sub_agent} 工具复用：工具在 {@code kill()} 之外只补"这一段预算的剩余部分"（见 {@code
@@ -489,14 +495,20 @@ public final class SubagentManager implements AutoCloseable {
    */
   @Override
   public void close() {
+    List<Thread> toStop;
     synchronized (lock) {
       if (closed) {
         return;
       }
       closed = true;
       watchers.forEach(Thread::interrupt);
+      toStop = List.copyOf(watchers);
       watchers.clear();
     }
+    // 关停竞态收束（2026-09-14 退出观测风暴修复）：事件库在本 manager.close 之后才关（App 关停链），
+    // 而 watchExit 的投递可能正走在子库 IO/锁等待中途——interrupt 只打断 sleep，打不断 IO。
+    // join（有界）保证"已在投递途中"的观测线程把终局事件写进仍打开的事件库，而不是撞上已关闭的连接裸崩。
+    joinWatchers(toStop);
     List<String> live;
     synchronized (lock) {
       live = shutdownOrder(instances);
@@ -512,6 +524,22 @@ public final class SubagentManager implements AutoCloseable {
       launcher.close();
     } catch (RuntimeException e) {
       LOG.warn("launcher 关闭异常", e);
+    }
+  }
+
+  /** 逐个有界等待观测线程退场；超时未退的交由 watchExit 的兜底捕获（残余竞态不再裸崩刷栈）。 */
+  private void joinWatchers(List<Thread> watchers) {
+    for (Thread watcher : watchers) {
+      try {
+        watcher.join(WATCHER_JOIN_MILLIS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      if (watcher.isAlive()) {
+        LOG.warn(
+            "退出观测线程 {} 未在 {}ms 内收束（疑似卡在子库 IO），余下投递交给兜底捕获", watcher.getName(), WATCHER_JOIN_MILLIS);
+      }
     }
   }
 
