@@ -25,6 +25,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
@@ -34,6 +35,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
@@ -43,13 +45,33 @@ import org.junit.jupiter.api.io.TempDir;
  * <p><b>夹具为什么带会话库</b>：本类要断言的正是"消息落在<b>哪个</b>会话名下"——没有 {@link SqliteConversationStore}
  * 就看不见"在途回合的尾部有没有被算进新会话"这个失败模式（它是重置被错误地放在 HTTP 线程上执行时唯一会红的地方）。 装配照生产：事件库与会话库<b>同一文件</b>，主 Agent 走带
  * store 的构造，初始会话 id 为 {@code "main"}。
+ *
+ * <p><b>为什么全程带超时</b>：本类曾把整场构建<b>永久挂住</b>（不是失败，是挂着不退）——2026-09-22 实测形态是 IDE 的 m2e 构建器与 Maven 抢同一个
+ * {@code target/}，服务端 handler 依赖的类被删掉又重建、handler 线程先死，而客户端这边 {@code send()}
+ * 既无连接超时也无请求超时，于是等一个永远不来的响应。两道超时各管一段（同 {@code JdkHttpStreamableListeningStreamTest} 用例③的结论）：请求级
+ * {@code timeout} 管"连上了但不回话"，类级 {@code @Timeout} 兜住其余一切阻塞点（轮询、关停路径）。缺了它们，同类事故只会以"卡死"而非"失败"的面目出现。
  */
+@Timeout(60)
 class DebugChatSessionHttpTest {
 
   private static final ObjectMapper JSON = new ObjectMapper();
 
   /** 生产装配里的初始会话 id（{@code App.MAIN_CONVERSATION_ID}——测试不复用 App 常量以免把断言绑到演示路径上）。 */
   private static final String MAIN_CONVERSATION_ID = "main";
+
+  /**
+   * 建连超时。<b>只</b>保护连接建立这一步：服务端收下请求却不发响应头时它一点忙都帮不上（半开形态已由 {@code
+   * JdkHttpStreamableListeningStreamTest} 用例③实证），那种情况只有请求级 {@link #REQUEST_TIMEOUT} 能解。两道都要有。
+   */
+  private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(5);
+
+  /**
+   * 请求级超时——真正能解"永久挂住"的那一道。
+   *
+   * <p>取 10 秒：正常路径上每个请求都是本机回环 + 内存夹具，实测毫秒级；而夹具自身的逻辑等待上限是 15 秒（{@code awaitTerminalOverHttp} /
+   * {@code awaitConversationId}），故 10 秒既保证"真出问题必在逻辑等待之前炸"，又给内存紧张的机器留足余量。
+   */
+  private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
 
   @TempDir Path tempDir;
 
@@ -64,7 +86,7 @@ class DebugChatSessionHttpTest {
     final ExecutorService chatExecutor;
     final DebugChatService service;
     final DebugChatHttpServer server;
-    final HttpClient client = HttpClient.newHttpClient();
+    final HttpClient client = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
 
     Fixture(LlmClient llm, Path dataDir) {
       this.db = dataDir.resolve("events.db");
@@ -99,6 +121,7 @@ class DebugChatSessionHttpTest {
     HttpResponse<String> post(String path, String jsonBody) throws Exception {
       return client.send(
           HttpRequest.newBuilder(URI.create(base() + path))
+              .timeout(REQUEST_TIMEOUT)
               .header("Content-Type", "application/json")
               .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
               .build(),
@@ -107,7 +130,7 @@ class DebugChatSessionHttpTest {
 
     HttpResponse<String> get(String path) throws Exception {
       return client.send(
-          HttpRequest.newBuilder(URI.create(base() + path)).GET().build(),
+          HttpRequest.newBuilder(URI.create(base() + path)).timeout(REQUEST_TIMEOUT).GET().build(),
           HttpResponse.BodyHandlers.ofString());
     }
 
@@ -255,6 +278,7 @@ class DebugChatSessionHttpTest {
       HttpResponse<String> put =
           fixture.client.send(
               HttpRequest.newBuilder(URI.create(fixture.base() + "/api/chat/session"))
+                  .timeout(REQUEST_TIMEOUT)
                   .PUT(HttpRequest.BodyPublishers.noBody())
                   .build(),
               HttpResponse.BodyHandlers.ofString());
