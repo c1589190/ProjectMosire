@@ -48,7 +48,7 @@ public interface ConfigStore {
    *
    * @param prefix 键前缀
    * @param key 前缀下的键（点分可嵌套）
-   * @param value 值（非 null；本任务不含删除语义）
+   * @param value 值（非 null；删除请走 {@link #remove}——本接口不接受用 JSON null 表达删除）
    * @param permissions 调用者权限集（其 {@code grantedToken} 参与前缀授权；null 视为无身份 → 拒绝）
    * @param ownerId 调用者<b>自报</b>的归属 agent id（非 Agent 调用方——如运行时自身——传 null）。 本接口只做"键归属 ≟
    *     自报归属"的比对，验证调用者真实身份是上层（工具调用上下文）的职责
@@ -70,6 +70,46 @@ public interface ConfigStore {
       String prefix,
       String key,
       JsonNode value,
+      AgentPermissionSet permissions,
+      String ownerId,
+      JsonNode schemaNode);
+
+  /**
+   * 删除一个键（CRUD 的 D——provider 配置页必需：能增能改不能删，等于逼用户手改 JSON 文件）。
+   *
+   * <p><b>流程与 {@link #put(String, String, JsonNode, AgentPermissionSet, String, String)}
+   * 逐字同源</b>（前缀授权 → 从目标文件摘除 → 写前 schema 校验 → 原子写 → 读回校验 → 失败回滚 → 落盘后回调）：删除是<b>另一种写</b>，
+   * 没有理由走一条更弱的路径。schema 照传照校验——删掉一个 schema 要求的必填键，应当在落盘前被拦下，而不是等下一次读的人炸 （到那时已经查不出"是谁删的"了）。
+   *
+   * <p><b>键本就不存在 = 无操作</b>（幂等：文件不被触碰、不回调、不抛）。DELETE 的语义是"确保它不在"， 重复点删除按钮、或两个进程先后删同一条，都不该失败。这与
+   * {@link #put} 拒绝 JSON null 不矛盾： 那是"别用 put 表达删除"，这里是"删除这个动作"本身。
+   *
+   * <p><b>沿途被删空的对象会一并摘掉</b>：删 {@code llm.routes.glm} 后若 {@code llm.routes} 空了，不会留下一具 {@code
+   * "routes": {}} 的空壳（配置页渲染原始 JSON 时不该显示出已经不存在的分组）。整份文档被删空时<b>文件本身保留</b> （写成 {@code
+   * {}}——空对象就是合法空配置；文件在不在是另一层语义：权限、备份、路径）。
+   *
+   * <p><b>删不掉根</b>：{@code prefix + "." + key} 必须至少含一段合法键（空键、空段、{@code .}/{@code ..} 段一律 {@code
+   * E_PREFIX_DENIED}）：删除的对象永远是"某个键"，不是"这个文件"。
+   *
+   * @param prefix 键前缀
+   * @param key 前缀下的键（点分可嵌套）
+   * @param permissions 调用者权限集（与 {@link #put} 同一套前缀授权；null 视为无身份 → 拒绝）
+   * @param ownerId 调用者<b>自报</b>的归属 agent id（非 Agent 调用方传 null）
+   * @param schemaFile schema 文件名（相对 schema 目录解析）或绝对路径；语义与 {@link #put} 的同名参数一致
+   * @throws ConfigException {@code E_PREFIX_DENIED}（越权/非法键）、{@code E_SCHEMA_INVALID}（删除后不满足 schema：
+   *     未落盘或已回滚）、{@code E_SCHEMA_UNAVAILABLE}、{@code E_CONFIG_IO}（I/O 或回滚失败）、 {@code
+   *     E_CONFIG_CORRUPT}（既有文件损坏）
+   */
+  void remove(
+      String prefix, String key, AgentPermissionSet permissions, String ownerId, String schemaFile);
+
+  /**
+   * 同 {@link #remove(String, String, AgentPermissionSet, String, String)}，但 schema 以内联 {@link
+   * JsonNode} 给出。
+   */
+  void remove(
+      String prefix,
+      String key,
       AgentPermissionSet permissions,
       String ownerId,
       JsonNode schemaNode);

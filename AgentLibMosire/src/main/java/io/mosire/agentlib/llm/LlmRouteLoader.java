@@ -3,6 +3,7 @@ package io.mosire.agentlib.llm;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.mosire.agentlib.config.ConfigException;
 import io.mosire.agentlib.config.ConfigStore;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -15,6 +16,20 @@ import java.util.regex.Pattern;
  * llm.credentialsRef}（= 名为 {@value #DEFAULT_ROUTE_NAME} 的路由），或<b>具名路由表</b> {@code
  * llm.routes.<name>.{baseUrl,model,credentialsRef}}（多 provider 并存，2026-09-14）。
  *
+ * <p><b>一条路由条目的完整键表</b>（具名形态；扁平形态把同样的键直接挂在 {@code llm} 下）：
+ *
+ * <pre>{@code
+ * "llm": { "routes": { "<name>": {
+ *     "baseUrl":         "https://api.deepseek.com/v1",  // 必填；API 根，不含 /chat/completions
+ *     "model":           "deepseek-chat",                // 必填
+ *     "credentialsRef":  "keys.deepseek",                // 选填；见 ConfigApiKeySource
+ *     "protocol":        "openai-compatible",            // 选填；见 LlmProtocol（A3②）
+ *     "timeoutMs":       120000,                         // 选填；单次调用整体读取超时（A3①）
+ *     "connectTimeoutMs": 10000,                         // 选填；建连超时
+ *     "capabilities":    { "toolCalling": true, "maxContext": 65536 }  // 选填；见 ModelCapabilities
+ * } } }
+ * }</pre>
+ *
  * <p><b>缺必填 → 响亮</b>（D24）：{@code baseUrl} 与 {@code model} 缺失（或不是非空文本）抛 {@link
  * #E_LLM_CONFIG_MISSING}，消息点名缺的是<b>哪个键</b>（{@code llm.baseUrl} / {@code
  * llm.routes.glm.model}）——两类缺配置必须可分辨， 否则"配错了哪一项"只能靠猜。
@@ -25,8 +40,10 @@ import java.util.regex.Pattern;
  * <p><b>点名了一条不存在的路由 → 响亮且可分辨</b>：{@link #E_LLM_ROUTE_UNKNOWN}（消息带请求的名字 + 可用名字），
  * <b>绝不</b>静默回落到另一条路由——"名字写错"与"配置没写"是两种修法，运维要能一眼分开。
  *
- * <p>本类<b>不</b>校验 {@code baseUrl} 是否是合法 URL：URL 解析失败由 {@link OpenAICompatibleLlmClient} 在构造期响亮抛出（
- * {@code URI.create}），在此重复一遍只会得到两条不一致的失败文案。
+ * <p>本类<b>不</b>校验 {@code baseUrl} 是否是合法 URL、也不查它的形态：URL 解析失败与"把补全端点当根写进来"两种情况都由 {@link
+ * OpenAICompatibleLlmClient} 在构造期响亮抛出（{@code URI.create} / 端点形态守卫），在此重复一遍只会得到两条不一致的失败文案。 {@code
+ * baseUrl} 的语义（API 根 → 客户端自行拼 {@code /chat/completions}，{@code /v1} 要谁写）见 {@link ModelRoute} 的
+ * Javadoc。
  *
  * <p><b>路由表是全局的，按 agent 只能选名字</b>（{@link #routeName}）：端点与密钥形态属运维面，不属 agent 自选面。
  */
@@ -38,12 +55,27 @@ public final class LlmRouteLoader {
   /** 点名的路由不在 {@code llm.routes} 表里（或名字非法、或没有路由表却点了非 default 的名）。 */
   public static final String E_LLM_ROUTE_UNKNOWN = "E_LLM_ROUTE_UNKNOWN";
 
+  /** {@code protocol} 写了一个本库不实现的方言——修法是"换一个受支持的方言"，与"少了必填项"的修法不同，故单列一码。 */
+  public static final String E_LLM_PROTOCOL_UNKNOWN = "E_LLM_PROTOCOL_UNKNOWN";
+
   /** 配置树里承载 LLM 路由的段。 */
   private static final String SECTION = "llm";
 
   private static final String KEY_BASE_URL = "baseUrl";
   private static final String KEY_MODEL = "model";
   private static final String KEY_CREDENTIALS_REF = "credentialsRef";
+
+  /** 单次调用的整体读取超时（毫秒）——A3①：超时是 provider 的属性，故住在路由条目里。 */
+  private static final String KEY_TIMEOUT_MS = "timeoutMs";
+
+  /** 建连超时（毫秒）。 */
+  private static final String KEY_CONNECT_TIMEOUT_MS = "connectTimeoutMs";
+
+  /** 协议/方言（A3②）。 */
+  private static final String KEY_PROTOCOL = "protocol";
+
+  /** 模型能力描述（{@link ModelCapabilities}，供 {@link ModelProvider} 登记用）。 */
+  private static final String KEY_CAPABILITIES = "capabilities";
 
   /** 选哪条路由（可选，默认 {@value #DEFAULT_ROUTE_NAME}）；也用于按 agent 覆盖（见 {@link #routeName}）。 */
   private static final String KEY_ROUTE = "route";
@@ -126,9 +158,29 @@ public final class LlmRouteLoader {
           name,
           required(store, prefix, KEY_BASE_URL),
           required(store, prefix, KEY_MODEL),
-          credentialsRef(store, prefix));
+          credentialsRef(store, prefix),
+          transport(store, prefix));
     }
     return flatOrDefault(store, name);
+  }
+
+  /**
+   * 读一条路由的<b>能力描述</b>（{@link ModelCapabilities}）：{@code llm.routes.<name>.capabilities.*} （扁平形态则是
+   * {@code llm.capabilities.*}）。
+   *
+   * <p>缺席 = {@link ModelCapabilities#defaults()}（保守全关），与 {@code credentialsRef} 同一口径；<b>存在但形态不对</b>
+   * 一律响亮——把"配错了"读成"没配"会让路由悄悄按保守能力跑，"模型明明支持工具调用却不用"这类现象极难归因。
+   *
+   * <p>为什么归 {@link LlmRouteLoader} 而不是装配器：能力与 baseUrl/model 同住一个配置节点，读法（含错误码与消息口径）必须与 {@link #load}
+   * 同源——两处各读一遍同一个节点，迟早会读成两种口径。
+   */
+  public static ModelCapabilities capabilities(ConfigStore store, String routeName) {
+    Objects.requireNonNull(store, "store");
+    String name = normalizeName(routeName);
+    Optional<JsonNode> named = namedRouteNode(store, name);
+    // 与 load 同一条解析路径：具名条目住在 llm.routes.<name>，扁平形态住在 llm
+    String prefix = named.isPresent() ? SECTION + "." + KEY_ROUTES + "." + name : SECTION;
+    return capabilitiesAt(store, prefix);
   }
 
   /**
@@ -159,7 +211,14 @@ public final class LlmRouteLoader {
     return textAt(store, SECTION, KEY_ROUTE).orElse(DEFAULT_ROUTE_NAME);
   }
 
-  /** 已登记的路由名（升序；含扁平形态隐含的 {@value #DEFAULT_ROUTE_NAME}，若它在场）。错误消息用。 */
+  /**
+   * 已登记的路由名（升序；含扁平形态隐含的 {@value #DEFAULT_ROUTE_NAME}，若它在场）。
+   *
+   * <p><b>这是"配置里有哪些 provider"的权威枚举入口</b>（A4 ②）：{@link LlmRouteAssembler#provider} 与 错误消息都走它。
+   * 它<b>只列名字、不校验内容</b>——配置页"先看到全部（含写坏的那条）、再逐条报错"要的正是这个语义：一条路由 写坏了，用户还得先看见它，才谈得上去修它。
+   *
+   * <p>与 {@link LlmRouteAssembler#provider} 的分工是刻意的：<b>枚举要给全，装配要全对</b>（装配遇到坏路由一律 响亮失败，而不是让它悄悄缺席）。
+   */
   public static List<String> availableNames(ConfigStore store) {
     Objects.requireNonNull(store, "store");
     List<String> names = new ArrayList<>();
@@ -209,7 +268,8 @@ public final class LlmRouteLoader {
         name,
         required(store, SECTION, KEY_BASE_URL),
         required(store, SECTION, KEY_MODEL),
-        credentialsRef(store, SECTION));
+        credentialsRef(store, SECTION),
+        transport(store, SECTION));
   }
 
   /** 是否有<b>非空</b>路由表（决定"默认路由取不到"该报哪个码：路由不存在 vs 配置整个没写）。 */
@@ -279,6 +339,121 @@ public final class LlmRouteLoader {
           "LLM 路由配置不可用：" + prefix + "." + key + " 缺失或不是非空文本（请检查配置根的 config.json）");
     }
     return value.asText();
+  }
+
+  /**
+   * 接法（A3①②）：协议 + 两个超时。
+   *
+   * <p>三个键<b>都可缺席</b>，缺席即用 {@link LlmTransport} 的默认值——"没配超时"是常态，不是错误。反之，<b>写了但不合法一律 响亮</b>（见 {@link
+   * #protocol} / {@link #millis}）：把"配错了"读成"没配"，会让用户以为自己的约束生效了。
+   */
+  private static LlmTransport transport(ConfigStore store, String prefix) {
+    return new LlmTransport(
+        protocol(store, prefix),
+        millis(store, prefix, KEY_CONNECT_TIMEOUT_MS, LlmTransport.DEFAULT_CONNECT_TIMEOUT),
+        millis(store, prefix, KEY_TIMEOUT_MS, LlmTransport.DEFAULT_READ_TIMEOUT));
+  }
+
+  /**
+   * 协议/方言（A3②）：缺席 = {@link LlmProtocol#OPENAI_COMPATIBLE}（今天唯一的实现，也是既有配置的事实取值）； 写了但不认识 = {@link
+   * #E_LLM_PROTOCOL_UNKNOWN}，<b>不回落默认</b>。
+   *
+   * <p><b>消息不回显该键的原文</b>：配置值原则上不外显（{@link ConfigException} 的消息契约）——GUI 里挨着的就是密钥输入框，
+   * 贴错字段并非假想；方言名本身不敏感，但"能不能回显"按值分类要靠人来判，不如一律不回显。
+   */
+  private static LlmProtocol protocol(ConfigStore store, String prefix) {
+    JsonNode value = store.get(prefix, KEY_PROTOCOL).orElse(null);
+    if (value == null || value.isNull()) {
+      return LlmProtocol.OPENAI_COMPATIBLE;
+    }
+    if (!value.isTextual() || value.asText().isBlank()) {
+      throw new ConfigException(
+          E_LLM_CONFIG_MISSING, "LLM 路由配置不可用：" + prefix + "." + KEY_PROTOCOL + " 必须是非空文本");
+    }
+    try {
+      return LlmProtocol.of(value.asText());
+    } catch (IllegalArgumentException unknown) {
+      throw new ConfigException(
+          E_LLM_PROTOCOL_UNKNOWN,
+          "LLM 路由配置不可用："
+              + prefix
+              + "."
+              + KEY_PROTOCOL
+              + " 是未知的协议/方言（当前只实现 "
+              + LlmProtocol.OPENAI_COMPATIBLE
+              + "；原文不外显）");
+    }
+  }
+
+  /**
+   * 毫秒超时键：缺席 = 默认值；存在但不是正整数 → 响亮（<b>不回落默认</b>——"配错了"不能看起来像"没配"）。
+   *
+   * <p>零与负数在这里被拒：{@code 0} 在 {@link Duration} 里是合法值、在 {@code HttpRequest#timeout} 里却是"立刻超时"，
+   * 放行只会得到一个"每次都超时"的配置。
+   */
+  private static Duration millis(ConfigStore store, String prefix, String key, Duration fallback) {
+    JsonNode value = store.get(prefix, key).orElse(null);
+    if (value == null || value.isNull()) {
+      return fallback;
+    }
+    if (!value.isNumber() || !value.canConvertToLong() || value.asLong() <= 0) {
+      throw new ConfigException(
+          E_LLM_CONFIG_MISSING, "LLM 路由配置不可用：" + prefix + "." + key + " 必须是正整数毫秒数（缺席才表示用默认超时）");
+    }
+    return Duration.ofMillis(value.asLong());
+  }
+
+  /**
+   * 能力描述：整块缺席 = {@link ModelCapabilities#defaults()}（保守全关）；出现任何形态不对的键 → 响亮。
+   *
+   * <p>键名<b>就是</b> {@link ModelCapabilities} 的组件名（{@code toolCalling}/{@code
+   * parallelToolCalls}/{@code reasoning}/{@code promptCaching}/{@code maxContext}/{@code
+   * maxOutput}）——不另立一套命名，读代码的人不必做一次翻译。
+   */
+  private static ModelCapabilities capabilitiesAt(ConfigStore store, String prefix) {
+    JsonNode node = store.get(prefix, KEY_CAPABILITIES).orElse(null);
+    if (node == null || node.isNull()) {
+      return ModelCapabilities.defaults();
+    }
+    if (!node.isObject()) {
+      throw new ConfigException(
+          E_LLM_CONFIG_MISSING,
+          "LLM 路由配置不可用：" + prefix + "." + KEY_CAPABILITIES + " 必须是对象（能力名 → 布尔/数值）");
+    }
+    String caps = prefix + "." + KEY_CAPABILITIES;
+    return new ModelCapabilities(
+        boolAt(store, caps, "toolCalling"),
+        boolAt(store, caps, "parallelToolCalls"),
+        boolAt(store, caps, "reasoning"),
+        boolAt(store, caps, "promptCaching"),
+        countAt(store, caps, "maxContext"),
+        countAt(store, caps, "maxOutput"));
+  }
+
+  /** 能力布尔项：缺席 = false（= {@link ModelCapabilities#defaults()} 的口径）；存在但非布尔 → 响亮。 */
+  private static boolean boolAt(ConfigStore store, String prefix, String key) {
+    JsonNode value = store.get(prefix, key).orElse(null);
+    if (value == null || value.isNull()) {
+      return false;
+    }
+    if (!value.isBoolean()) {
+      throw new ConfigException(
+          E_LLM_CONFIG_MISSING, "LLM 路由配置不可用：" + prefix + "." + key + " 必须是布尔值 true/false");
+    }
+    return value.asBoolean();
+  }
+
+  /** 能力数值项（{@code maxContext}/{@code maxOutput}）：缺席 = 0（未知）；存在但不是非负整数 → 响亮。 */
+  private static int countAt(ConfigStore store, String prefix, String key) {
+    JsonNode value = store.get(prefix, key).orElse(null);
+    if (value == null || value.isNull()) {
+      return 0;
+    }
+    if (!value.isIntegralNumber() || value.asLong() < 0 || value.asLong() > Integer.MAX_VALUE) {
+      throw new ConfigException(
+          E_LLM_CONFIG_MISSING, "LLM 路由配置不可用：" + prefix + "." + key + " 必须是非负整数（0 = 未知）");
+    }
+    return value.asInt();
   }
 
   /** 可选引用：缺失/JSON null = 匿名（空串）；存在但非文本 = 响亮（不许把配错当成匿名）。 */

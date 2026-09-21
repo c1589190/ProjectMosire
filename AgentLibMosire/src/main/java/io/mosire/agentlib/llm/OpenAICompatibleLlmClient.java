@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -75,6 +76,10 @@ import org.slf4j.LoggerFactory;
  *       <b>默认不下发</b>；不发该键，四个 token 字段恒为 {@link LlmResponse#UNKNOWN_TOKENS}（-1），而 {@link
  *       LlmQuota#record} 把负值夹成 0 → <b>本地配额账本静默失效</b> （"配额超限 → {@code StopReason.QUOTA}"这条验收路径在真实
  *       OpenAI 上不可达）。DeepSeek 等供应商原生默认带 usage， 不发也"看起来正常"——这正是必须显式发的原因。该键对忽略未知字段的供应商无副作用。
+ *   <li><b>{@code reasoning_content}（思维链）被显式处理，绝不静默丢弃</b>（A1）：它单独累计进 {@link
+ *       LlmResponse#reasoning()}； 当正文为空、无工具调用而思维链非空时，把思维链作为正文交回并标记 {@link
+ *       LlmResponse.ReasoningDisposition#FOLDED} ——否则调用方读到的就是空文本（"LLM 明明答了，我们读到空"，实测于推理模型 + 小
+ *       {@code max_tokens}）。折叠规则与 不折叠的理由见 {@link LlmResponse}。
  *   <li>{@code data: [DONE]} 为终止符：见到即停止读取并返回（其后内容一概不再解析、不再报错）。
  *   <li>流在 {@code [DONE]} 之前 EOF = 响应被截断 → {@link LlmException}（宁可响亮失败，也不静默交回半截响应）。
  * </ul>
@@ -84,11 +89,11 @@ import org.slf4j.LoggerFactory;
  */
 public final class OpenAICompatibleLlmClient implements LlmClient {
 
-  /** 默认连接超时（与供应商建连的上限）。 */
-  public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+  /** 默认连接超时（与供应商建连的上限）。权威定义在 {@link LlmTransport}——超时归路由数据（A3①），此处保留常量仅为兼容既有引用。 */
+  public static final Duration DEFAULT_CONNECT_TIMEOUT = LlmTransport.DEFAULT_CONNECT_TIMEOUT;
 
-  /** 默认读取超时：一次 {@code chat} 从发起到拿到完整响应的硬上限（含流式读取）。 */
-  public static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(60);
+  /** 默认读取超时：一次 {@code chat} 从发起到拿到完整响应的硬上限（含流式读取）。权威定义见 {@link LlmTransport}。 */
+  public static final Duration DEFAULT_READ_TIMEOUT = LlmTransport.DEFAULT_READ_TIMEOUT;
 
   private static final Logger LOG = LoggerFactory.getLogger(OpenAICompatibleLlmClient.class);
 
@@ -142,18 +147,29 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     }
   }
 
-  /** 缺省组装：匿名、默认超时。 */
+  /** 缺省组装：匿名、按路由声明的接法（{@link ModelRoute#transport()}）。 */
   public OpenAICompatibleLlmClient(ModelRoute route) {
     this(route, ApiKeySource.none());
   }
 
-  /** 注入取密钥 SPI（默认超时）。 */
+  /** 注入取密钥 SPI；超时/协议取<b>路由自己声明的接法</b>（A3①：超时是 provider 的属性，不是调用方的属性）。 */
   public OpenAICompatibleLlmClient(ModelRoute route, ApiKeySource apiKeySource) {
-    this(route, apiKeySource, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT);
+    this(route, apiKeySource, Objects.requireNonNull(route, "route").transport());
+  }
+
+  /** 显式指定接法（覆盖路由声明；协议不一致时响亮拒绝）。 */
+  public OpenAICompatibleLlmClient(
+      ModelRoute route, ApiKeySource apiKeySource, LlmTransport transport) {
+    this(
+        route,
+        apiKeySource,
+        Objects.requireNonNull(transport, "transport").connectTimeout(),
+        transport.readTimeout(),
+        transport.protocol());
   }
 
   /**
-   * 全参组装。
+   * 全参组装（既有签名，逐字保留）。
    *
    * @param route 模型路由（{@code baseUrl} 是 API 根，如 {@code https://api.deepseek.com/v1}；本类在其后拼 {@code
    *     /chat/completions}）
@@ -163,8 +179,23 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    */
   public OpenAICompatibleLlmClient(
       ModelRoute route, ApiKeySource apiKeySource, Duration connectTimeout, Duration readTimeout) {
+    this(
+        route,
+        apiKeySource,
+        connectTimeout,
+        readTimeout,
+        Objects.requireNonNull(route, "route").transport().protocol());
+  }
+
+  private OpenAICompatibleLlmClient(
+      ModelRoute route,
+      ApiKeySource apiKeySource,
+      Duration connectTimeout,
+      Duration readTimeout,
+      LlmProtocol protocol) {
     this.route = Objects.requireNonNull(route, "route");
     this.apiKeySource = Objects.requireNonNull(apiKeySource, "apiKeySource");
+    requireOpenAiCompatible(protocol);
     positive(connectTimeout, "connectTimeout");
     this.readTimeout = positive(readTimeout, "readTimeout");
     this.chatCompletionsUri = chatCompletionsUri(route.baseUrl());
@@ -174,6 +205,24 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
             // 不跟随重定向：避免把 Authorization 头带到另一个源（宁可让调用方看见真实的重定向响应）
             .followRedirects(HttpClient.Redirect.NEVER)
             .build();
+  }
+
+  /**
+   * 方言守卫：本类只实现 {@link LlmProtocol#OPENAI_COMPATIBLE}。
+   *
+   * <p>拿别的方言来构造本类属调用方编程错误，响亮拒绝——静默按 OpenAI 协议发出去，用户会以为"我配的 Ollama 原生生效了"，而请求
+   * 其实发去了另一个端点/另一种结构（这类"悄悄走错协议"的排查成本极高）。
+   */
+  private static void requireOpenAiCompatible(LlmProtocol protocol) {
+    if (protocol != LlmProtocol.OPENAI_COMPATIBLE) {
+      throw new IllegalArgumentException(
+          OpenAICompatibleLlmClient.class.getSimpleName()
+              + " 只实现 "
+              + LlmProtocol.OPENAI_COMPATIBLE
+              + " 方言，收到 "
+              + protocol
+              + "（换方言要换实现，见 LlmProtocol 的说明）");
+    }
   }
 
   /** 本实例绑定的路由（只读）。 */
@@ -219,13 +268,15 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       LlmException failure =
           new LlmException(
               "LLM 调用超时：" + readTimeout.toMillis() + "ms 内未拿到完整响应（连接/响应头/SSE 流，供应商未在期限内完成）",
+              LlmException.Kind.TIMEOUT,
               timeout);
       closeQuietly(bodyRef.get(), failure);
       throw failure;
     } catch (InterruptedException interrupted) {
       outcome.cancel(true);
       Thread.currentThread().interrupt();
-      LlmException failure = new LlmException("LLM 调用被中断", interrupted);
+      LlmException failure =
+          new LlmException("LLM 调用被中断", LlmException.Kind.CANCELLED, interrupted);
       closeQuietly(bodyRef.get(), failure);
       throw failure;
     } catch (ExecutionException wrapped) {
@@ -276,11 +327,23 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     try {
       return apiKeySource.apiKey().map(String::trim).filter(key -> !key.isEmpty()).orElse("");
     } catch (RuntimeException keyFetchFailure) {
-      throw new LlmException("取密钥失败（详见 cause：宿主侧密钥解析异常，消息不外显，以免泄漏凭据）", keyFetchFailure);
+      throw new LlmException(
+          "取密钥失败（详见 cause：宿主侧密钥解析异常，消息不外显，以免泄漏凭据）", LlmException.Kind.CONFIG, keyFetchFailure);
     }
   }
 
-  /** 把任意失败归类成契约允许的 {@link LlmException}（不吞错、不重试、不泄漏敏感值）。 */
+  /**
+   * 把任意失败归类成契约允许的 {@link LlmException}（不吞错、不重试、不泄漏敏感值）。
+   *
+   * <p>分类的取法（B3）：能<b>确定</b>的才给具体 {@code Kind}——超时给 {@link LlmException.Kind#TIMEOUT}、中断给 {@link
+   * LlmException.Kind#CANCELLED}、{@link IOException} 家族给 {@link LlmException.Kind#TRANSPORT}；其余一律落到
+   * {@link LlmException.Kind#INTERNAL}，<b>不猜</b>。"不确定就判该炸"是有意的保守：悄悄重试一个没分类的失败，会把它从日志里抹掉。
+   *
+   * <p><b>为什么 {@code IOException} 整族都算 TRANSPORT</b>：能走到这里的 I/O 异常只有两类来源——连不上（连接被拒/DNS/路由/TLS）与
+   * 连上了但读挂（连接重置/意外断流）。两者都是<b>链路</b>出了问题，与供应商是否健康无关，重试/降级都说得通。刻意与"流在 {@code [DONE]} 之前干净地
+   * EOF"分开：那是协议违约（{@link LlmException.Kind#PROTOCOL}），在 {@link Accumulator#truncatedStream}
+   * 里分类，不走本方法。
+   */
   private static LlmException asLlmException(Throwable cause) {
     if (cause instanceof Error error) {
       throw error;
@@ -289,14 +352,20 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       return llm;
     }
     if (cause instanceof HttpTimeoutException || cause instanceof TimeoutException) {
-      return new LlmException("LLM 请求超时（连接或响应头未在期限内到达）", cause);
+      return new LlmException("LLM 请求超时（连接或响应头未在期限内到达）", LlmException.Kind.TIMEOUT, cause);
+    }
+    if (cause instanceof IOException) {
+      String detail = cause.getClass().getSimpleName();
+      return new LlmException(
+          "LLM 链路失败（" + detail + safeDetail(cause) + "）", LlmException.Kind.TRANSPORT, cause);
     }
     if (cause instanceof InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-      return new LlmException("LLM 调用被中断", interrupted);
+      return new LlmException("LLM 调用被中断", LlmException.Kind.CANCELLED, interrupted);
     }
     String detail = cause == null ? "未知原因" : cause.getClass().getSimpleName();
-    return new LlmException("LLM 调用失败（" + detail + safeDetail(cause) + "）", cause);
+    return new LlmException(
+        "LLM 调用失败（" + detail + safeDetail(cause) + "）", LlmException.Kind.INTERNAL, cause);
   }
 
   /** 附带的诊断文本：抹掉 URL（{@code baseUrl} 里可能内嵌凭据/查询串）后折叠截断——密钥绝不进异常消息。 */
@@ -314,8 +383,9 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    */
   private static LlmException providerFailure(HttpResponse<InputStream> response, String apiKey) {
     int status = response.statusCode();
+    LlmException.Kind kind = kindOfStatus(status);
     String prefix = "LLM 供应商返回 HTTP " + status + statusHint(status);
-    LlmException plain = new LlmException(prefix);
+    LlmException plain = new LlmException(prefix, kind);
     String excerpt;
     try (InputStream body = response.body()) {
       String raw = new String(body.readNBytes(MAX_ERROR_BODY_BYTES), StandardCharsets.UTF_8);
@@ -325,7 +395,31 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       plain.addSuppressed(unreadable);
       excerpt = "";
     }
-    return excerpt.isEmpty() ? plain : new LlmException(prefix + ": " + excerpt, plain);
+    return excerpt.isEmpty() ? plain : new LlmException(prefix + ": " + excerpt, kind, plain);
+  }
+
+  /**
+   * HTTP 状态 → 失败分类（B3）。分类只看状态码类别，<b>不求解析供应商的错误体</b>：各家错误体结构不一（{@code error.code}/{@code
+   * error.type}/{@code code} 都有），从自由文本里猜分类等于造一个没人维护的映射表；状态码是协议层的权威。
+   */
+  private static LlmException.Kind kindOfStatus(int status) {
+    if (status == 429) {
+      return LlmException.Kind.RATE_LIMIT;
+    }
+    if (status == 401 || status == 403) {
+      return LlmException.Kind.AUTH;
+    }
+    if (status >= 500) {
+      return LlmException.Kind.PROVIDER_ERROR;
+    }
+    if (status >= 400) {
+      return LlmException.Kind.REQUEST_REJECTED;
+    }
+    if (status >= 300) {
+      // 3xx：本客户端不跟随重定向（避免把 Authorization 带到另一个源）⇒ 这是"baseUrl 配错了"，不是供应商在抖
+      return LlmException.Kind.CONFIG;
+    }
+    return LlmException.Kind.INTERNAL;
   }
 
   /** 状态码的非敏感人话提示（只描述类别，不含任何请求/密钥内容）。 */
@@ -337,10 +431,17 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       return "（鉴权失败：密钥未配置或不匹配；本消息不含密钥值）";
     }
     if (status == 404) {
-      return "（端点或模型不存在）";
+      // A3③ 的落地：404 最容易被误读成"模型名写错了"，而实际最常见的根因是 baseUrl 少了 /v1 前缀
+      return "（端点或模型不存在——请先检查 baseUrl：多数供应商要带 /v1 前缀，"
+          + "且 baseUrl 必须是 API 根、不含 "
+          + CHAT_COMPLETIONS_PATH
+          + "，本客户端会在其后自行拼接该路径）";
     }
     if (status >= 500) {
       return "（供应商内部错误）";
+    }
+    if (status >= 300 && status < 400) {
+      return "（被重定向：本客户端不跟随重定向——请把 baseUrl 直接写成最终地址）";
     }
     return "";
   }
@@ -393,6 +494,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     root.put("stream", true);
     // 显式索要 usage：见方法 Javadoc。放在 stream 之后、messages 之前（无协议要求，只为可读）
     root.putObject("stream_options").put("include_usage", true);
+    applySampling(root, request.sampling());
     ArrayNode messages = root.putArray("messages");
     for (LlmMessage message : request.messages()) {
       appendMessage(messages, message);
@@ -409,6 +511,26 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       }
     }
     return JSON.writeValueAsBytes(root);
+  }
+
+  /**
+   * 写入采样参数（A2）：{@code temperature} / {@code max_tokens} 平铺在顶层，{@code extraBody} 的键原样透传。
+   *
+   * <p><b>{@code null} = 不发该键</b>（不是发 0）：供应商的"没设"就是"用我自己的默认值"，发一个 0 会改变它的行为（温度 0 是
+   * "贪心解码"，与"用供应商默认"完全是两回事）。{@code maxTokens} 同理——发 0 会被多数供应商当非法参数直接 400。
+   *
+   * <p>透传不覆盖协议键：{@link Sampling} 的构造期已把 {@link Sampling#RESERVED_KEYS} 挡在外面，故此处的 {@code set} 不可能
+   * 覆盖上面刚写下的 {@code model}/{@code stream}/{@code stream_options}，也不会与 {@code temperature}/{@code
+   * max_tokens} 打架。
+   */
+  private static void applySampling(ObjectNode root, Sampling sampling) {
+    if (sampling.temperature() != null) {
+      root.put("temperature", sampling.temperature().doubleValue());
+    }
+    if (sampling.maxTokens() != null) {
+      root.put("max_tokens", sampling.maxTokens().intValue());
+    }
+    sampling.extraBody().forEach((key, value) -> root.set(key, JSON.valueToTree(value)));
   }
 
   /**
@@ -492,6 +614,11 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     private final String apiKey;
     private final StringBuilder text = new StringBuilder();
 
+    /**
+     * 思维链累计（{@code reasoning_content}/{@code reasoning}），永不丢失：无论是否折叠进正文，原文都进 {@link LlmResponse}。
+     */
+    private final StringBuilder reasoning = new StringBuilder();
+
     /** 按 OpenAI 的 {@code index} 分桶——不同工具调用的分片允许交错到达。 */
     private final Map<Integer, ToolCallBuffer> calls = new TreeMap<>();
 
@@ -531,7 +658,9 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         return JSON.readTree(payload);
       } catch (IOException malformed) {
         throw new LlmException(
-            "SSE data 帧不是合法 JSON（供应商协议违约）: " + scrub(oneLine(payload)), malformed);
+            "SSE data 帧不是合法 JSON（供应商协议违约）: " + scrub(oneLine(payload)),
+            LlmException.Kind.PROTOCOL,
+            malformed);
       }
     }
 
@@ -541,7 +670,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         String detail =
             oneLine(
                 error.isObject() ? error.path("message").asText(error.toString()) : error.asText());
-        throw new LlmException("LLM 供应商在流中返回错误: " + scrub(detail));
+        // 流内错误按 PROVIDER_ERROR 分类：这是供应商**主动**报的故障（限流、超长、内容策略），不是协议违约——
+        // 刻意不去解析供应商自由文本里的错误码（见 kindOfStatus 的理由）
+        throw new LlmException(
+            "LLM 供应商在流中返回错误: " + scrub(detail), LlmException.Kind.PROVIDER_ERROR);
       }
       if (model == null && chunk.path("model").isTextual()) {
         model = chunk.path("model").asText();
@@ -571,14 +703,33 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     }
 
     /**
-     * 吃一个 delta：文本逐块追加；tool_calls 的分片按 index 归桶，{@code arguments} 跨 chunk 拼接。
+     * 吃一个 delta：文本逐块追加；思维链单独累计；tool_calls 的分片按 index 归桶，{@code arguments} 跨 chunk 拼接。
      *
-     * <p>{@code reasoning_content}（思维链）与 {@code role} 有意忽略——前者不属回答内容，后者由请求侧决定。
+     * <p><b>{@code reasoning_content} 不再被忽略</b>（A1：simos 实测 provider {@code deepseek-flash}
+     * 是推理模型，{@code max_tokens=16} 时 {@code content=""}、内容全在 {@code reasoning_content}——静默丢掉就等于"LLM
+     * 明明答了，我们读到空"）。 它<b>单独累计</b>、<b>不</b>直接混进正文：混进去会让正文不再等于"模型的回答"，而正文是要回填进下一轮对话历史的。折叠与否是 {@link
+     * #toResponse} 的判断，有明确规则（见 {@link LlmResponse.ReasoningDisposition}）。
+     *
+     * <p>{@code reasoning}（不带 {@code _content}）是 OpenRouter 一系的同义字段，一并吃——两种写法在各自生态里都是既成事实，
+     * 只认一种会让换个网关就重踩同一个坑。<b>但同一 delta 里只吃一个</b>（{@code reasoning_content} 优先）：两个键同时出现是网关照抄一份
+     * 的形态，都吃就等于把思维链算两遍。
+     *
+     * <p>{@code role} 仍有意忽略：它由请求侧决定，回显没有信息量。
      */
     private void applyDelta(JsonNode delta) {
       JsonNode content = delta.path("content");
       if (content.isTextual()) {
         text.append(content.asText());
+      }
+      JsonNode reasoningDelta = delta.path("reasoning_content");
+      if (!reasoningDelta.isTextual()) {
+        // 同义字段（OpenRouter 一系）只在正统字段缺席时兜底：**同一 delta 里两个键同时出现**的形态是见过的
+        // （网关把字段镜像一份），两个都吃会把思维链追加两遍——它一旦折叠进正文，正文也就重复了一遍，而这是
+        // **安静地错**（D24）。跨 delta 交替用两种写法仍然照吃：那才是"换个网关"的真实形态。
+        reasoningDelta = delta.path("reasoning");
+      }
+      if (reasoningDelta.isTextual()) {
+        reasoning.append(reasoningDelta.asText());
       }
       for (JsonNode call : delta.path("tool_calls")) {
         int index = call.path("index").asInt(0);
@@ -607,11 +758,25 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         throw new LlmException(
             "SSE 流是空完成：只见到终止符 data: [DONE]、没有任何内容帧（供应商未产出任何内容与 usage，Content-Type="
                 + contentType
-                + "）——不予采信空响应（见本方法 Javadoc）");
+                + "）——不予采信空响应（见本方法 Javadoc）",
+            LlmException.Kind.PROTOCOL);
       }
+      String reasoningText = reasoning.toString();
       List<ContentPart> parts = new ArrayList<>();
-      if (!text.isEmpty()) {
-        parts.add(new ContentPart.Text(text.toString()));
+      LlmResponse.ReasoningDisposition disposition;
+      if (text.isEmpty() && calls.isEmpty() && !reasoningText.isEmpty()) {
+        // 降级形态（A1）：模型只产出了思维链。若不折叠，交回的就是空文本——那正是"看起来像没输出"的极难排查的失败。
+        // 有工具调用时**不**走这里：那种情况下模型的意图在工具调用里，把思维链当正文会污染事实。
+        parts.add(new ContentPart.Text(reasoningText));
+        disposition = LlmResponse.ReasoningDisposition.FOLDED;
+      } else {
+        if (!text.isEmpty()) {
+          parts.add(new ContentPart.Text(text.toString()));
+        }
+        disposition =
+            reasoningText.isEmpty()
+                ? LlmResponse.ReasoningDisposition.ABSENT
+                : LlmResponse.ReasoningDisposition.SEPARATE;
       }
       for (ToolCallBuffer buffer : calls.values()) {
         parts.add(buffer.toToolCall());
@@ -622,7 +787,9 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
           inputTokens,
           outputTokens,
           cacheReadTokens,
-          cacheWriteTokens);
+          cacheWriteTokens,
+          reasoningText,
+          disposition);
     }
 
     /** 没等到 {@code [DONE]} 就 EOF：流被截断，响亮失败而不是交回半截响应。 */
@@ -631,7 +798,8 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         return notSseStream(contentType);
       }
       return new LlmException(
-          "SSE 流在 data: [DONE] 之前结束（响应被截断：已收到 " + dataChunks + " 个 data 帧）——不予采信半截响应");
+          "SSE 流在 data: [DONE] 之前结束（响应被截断：已收到 " + dataChunks + " 个 data 帧）——不予采信半截响应",
+          LlmException.Kind.PROTOCOL);
     }
 
     /**
@@ -643,7 +811,8 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       return new LlmException(
           "SSE 响应没有任何 data 帧，也没见到终止符 data: [DONE]（不是 OpenAI 兼容的流式响应？Content-Type="
               + contentType
-              + "）");
+              + "）",
+          LlmException.Kind.PROTOCOL);
     }
 
     /** 误回显的密钥一律抹掉（本类只在此处对供应商文本做净化）。 */
@@ -685,7 +854,8 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     ContentPart.ToolCall toToolCall() {
       if (id == null || name == null) {
         throw new LlmException(
-            "SSE 的 tool_calls 缺少 id 或 name（index=" + index + "）：供应商协议违约，无法构造工具调用");
+            "SSE 的 tool_calls 缺少 id 或 name（index=" + index + "）：供应商协议违约，无法构造工具调用",
+            LlmException.Kind.PROTOCOL);
       }
       return new ContentPart.ToolCall(id, name, argumentsOf(name));
     }
@@ -699,17 +869,21 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       } catch (IOException malformed) {
         throw new LlmException(
             "tool_calls 的 arguments 不是合法 JSON（tool=" + toolName + "，多为分片拼接不完整）: " + oneLine(json),
+            LlmException.Kind.PROTOCOL,
             malformed);
       }
       if (!node.isObject()) {
-        throw new LlmException("tool_calls 的 arguments 必须是 JSON 对象（tool=" + toolName + "）");
+        throw new LlmException(
+            "tool_calls 的 arguments 必须是 JSON 对象（tool=" + toolName + "）",
+            LlmException.Kind.PROTOCOL);
       }
       if (containsNull(node)) {
         // ContentPart.ToolCall 的不可变快照（Map.copyOf）不接受 null 值——这里抢先响亮报错，不让裸 NPE 逃出去
         throw new LlmException(
             "tool_calls 的 arguments 含 JSON null（ContentPart.ToolCall 不接受 null 值，tool="
                 + toolName
-                + "）");
+                + "）",
+            LlmException.Kind.PROTOCOL);
       }
       return JSON.convertValue(node, ARGUMENTS_TYPE);
     }
@@ -767,13 +941,38 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    * @throws IllegalArgumentException {@code baseUrl} 拼不出合法 URI（消息不含 baseUrl 原文）
    */
   private static URI chatCompletionsUri(String baseUrl) {
+    String root = stripTrailingSlashes(baseUrl);
+    rejectEndpointAsBaseUrl(root);
     try {
-      return URI.create(stripTrailingSlashes(baseUrl) + CHAT_COMPLETIONS_PATH);
+      return URI.create(root + CHAT_COMPLETIONS_PATH);
     } catch (IllegalArgumentException malformed) {
       throw new IllegalArgumentException(
           "模型路由 baseUrl 非法：拼不出合法的补全端点 URI（原因类型 "
               + reasonType(malformed)
               + "；原文不外显，以免泄漏 URL 中可能内嵌的凭据或查询串）");
+    }
+  }
+
+  /**
+   * baseUrl 形态守卫（A3③：把"根"与"端点"混了是必踩的坑，故在构造期响亮拦下）。
+   *
+   * <p>把补全端点整个写进 {@code baseUrl}（{@code …/v1/chat/completions}）时，本类会拼成 {@code
+   * …/v1/chat/completions/chat/completions}——发出去是一个 404，而 404 的文案（"端点或模型不存在"）指向模型名，指向不到根因，
+   * 排查会绕远路。<b>不静默纠正</b>（自动去掉后缀/自动补 {@code /v1}）：用户配置里写的就是"我以为的根"，替它改掉等于让配置与事实 长期不一致。
+   *
+   * <p><b>消息不含 {@code baseUrl} 原文</b>（与 {@link #chatCompletionsUri} 同一条凭据安全契约：根里可能内嵌 {@code
+   * user:token@}）。
+   */
+  private static void rejectEndpointAsBaseUrl(String root) {
+    String lower = root.toLowerCase(Locale.ROOT);
+    if (lower.endsWith(CHAT_COMPLETIONS_PATH)) {
+      throw new IllegalArgumentException(
+          "模型路由 baseUrl 指向的不是 API 根，而是补全端点本身（末尾是 "
+              + CHAT_COMPLETIONS_PATH
+              + "）：本类会在 baseUrl 之后自行拼接该路径，此处若已包含，拼出来就多一层"
+              + "（原文不外显，以免泄漏 URL 中可能内嵌的凭据或查询串）。请去掉末尾的 "
+              + CHAT_COMPLETIONS_PATH
+              + "，只保留 API 根（如 https://api.deepseek.com/v1）");
     }
   }
 

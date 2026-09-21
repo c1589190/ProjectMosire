@@ -16,6 +16,11 @@ import java.util.regex.Pattern;
  * #E_REF_FORM_UNSUPPORTED}）：读环境变量取密钥是 T18 R2 明令禁止的第二条密钥通路。收窄发生在<b>本实现</b>，故 {@code ModelRoute}
  * 的措辞<b>不</b>因此修改（它描述的是记录本身的取值域， 不是每个实现的保证）。
  *
+ * <p><b>真要用环境变量 / 密钥文件怎么办（A5 裁决给出的逃生口）</b>：<b>不要</b>来改本类，直接实现 {@link
+ * OpenAICompatibleLlmClient.ApiKeySource}——它是官方 SPI，构造 {@link OpenAICompatibleLlmClient}
+ * 时注入，"密钥从哪来"与 "怎么发请求"因此是解耦的。宿主自己实现 ENV / FILE / KMS 形态时唯一<b>不可协商</b>的约束：<b>密钥值绝不进日志、异常、事件、argv、
+ * stdio</b>（读配置时只打印路径与长度）。AgentLib 自身只做 {@code keys.*}（见上一段的 T18 R2 理由）， 其余形态是宿主的自由，但那条约束跟着走。
+ *
  * <p><b>绝不静默返回空</b>（D24）：引用空白 = <b>有意的匿名</b>调用（本地部署如 Ollama，正常路径，不是错误）；引用是 {@code keys.<name>}
  * 但配置里没有可用值 = 响亮抛（{@link #E_KEY_MISSING}）；引用是别的形态 = 响亮抛（{@link
  * #E_REF_FORM_UNSUPPORTED}）。让"配错了"看起来像"匿名部署"是本类最要避免的失败。

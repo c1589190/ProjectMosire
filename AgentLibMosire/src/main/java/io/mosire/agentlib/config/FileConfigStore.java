@@ -3,6 +3,7 @@ package io.mosire.agentlib.config;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 import com.networknt.schema.Error;
@@ -201,6 +202,88 @@ public class FileConfigStore implements ConfigStore {
         Objects.requireNonNull(schemaNode, "schemaNode"));
   }
 
+  @Override
+  public void remove(
+      String prefix,
+      String key,
+      AgentPermissionSet permissions,
+      String ownerId,
+      String schemaFile) {
+    removeInternal(
+        prefix, key, permissions, ownerId, Objects.requireNonNull(schemaFile, "schemaFile"), null);
+  }
+
+  @Override
+  public void remove(
+      String prefix,
+      String key,
+      AgentPermissionSet permissions,
+      String ownerId,
+      JsonNode schemaNode) {
+    removeInternal(
+        prefix, key, permissions, ownerId, null, Objects.requireNonNull(schemaNode, "schemaNode"));
+  }
+
+  private void removeInternal(
+      String prefix,
+      String key,
+      AgentPermissionSet permissions,
+      String ownerId,
+      String schemaFile,
+      JsonNode schemaNode) {
+    Objects.requireNonNull(prefix, "prefix");
+    Objects.requireNonNull(key, "key");
+    AccessToken token = permissions == null ? null : permissions.grantedToken();
+    String fullKey = prefix + "." + key;
+
+    // 前缀授权（与 put 同一判定，含"删不掉根"：空键/空段在这里被拒）；拒绝时文件不被触碰
+    Optional<String> denial = ConfigAuth.writeDenialReason(token, ownerId, fullKey);
+    if (denial.isPresent()) {
+      throw new ConfigException(ConfigException.E_PREFIX_DENIED, denial.get());
+    }
+
+    // 落盘位置与授权判定用同一解析（与 putInternal 同源）
+    Path target;
+    List<String> segments;
+    Optional<String> agentId = ConfigAuth.agentIdOf(fullKey);
+    if (agentId.isPresent()) {
+      target = agentFile(agentId.get());
+      segments = splitSegments(key);
+    } else {
+      target = globalFile();
+      segments = splitSegments(fullKey);
+    }
+
+    Schema schema =
+        schemaNode != null ? compileSchemaNode(schemaNode, null) : compileSchemaFile(schemaFile);
+
+    lock.lock();
+    try {
+      ObjectNode current = readObjectOrNew(target);
+      JsonNode oldValue = nodeAt(current, segments); // 文件层旧值（env 不参与）
+      if (oldValue == null) {
+        // 键本就不存在 = 无操作：不写盘、不回调、不抛（DELETE 的语义是"确保它不在"，见接口 Javadoc）
+        return;
+      }
+
+      ObjectNode merged = (ObjectNode) current.deepCopy();
+      deleteAtPath(merged, segments);
+
+      validatePreWrite(schema, merged, schemaFile, schemaNode);
+      commit(
+          target,
+          merged,
+          schema,
+          schemaFile,
+          schemaNode,
+          fullKey,
+          oldValue,
+          NullNode.getInstance()); // 删除：监听器拿到空节点（与写入共用同一个回调）
+    } finally {
+      lock.unlock();
+    }
+  }
+
   private void putInternal(
       String prefix,
       String key,
@@ -213,7 +296,7 @@ public class FileConfigStore implements ConfigStore {
     Objects.requireNonNull(key, "key");
     Objects.requireNonNull(value, "value");
     if (value.isNull() || value.isMissingNode()) {
-      throw new IllegalArgumentException("value 不得为 null/MissingNode（本任务不含删除语义）");
+      throw new IllegalArgumentException("value 不得为 null/MissingNode（删除请用 remove，不借 null 表达删除）");
     }
     AccessToken token = permissions == null ? null : permissions.grantedToken();
     String fullKey = prefix + "." + key;
@@ -248,54 +331,80 @@ public class FileConfigStore implements ConfigStore {
       ObjectNode merged = (ObjectNode) current.deepCopy();
       setAtPath(merged, segments, value.deepCopy());
 
-      List<Error> preWriteErrors = validationErrors(schema, merged);
-      if (!preWriteErrors.isEmpty()) {
-        // 写前校验失败：磁盘未被触碰（R6-1 的逐字节未变由此保证——先校验后动盘）
-        throw new ConfigException(
-            ConfigException.E_SCHEMA_INVALID,
-            "写入前校验未通过（未落盘）: " + summarizeErrors(preWriteErrors, schemaFile, schemaNode));
-      }
+      // 写前校验失败：磁盘未被触碰（R6-1 的逐字节未变由此保证——先校验后动盘）
+      validatePreWrite(schema, merged, schemaFile, schemaNode);
 
-      atomicWrite(target, serialize(merged));
-
-      // 读回校验：重新解析 + schema 再校验；失败 → 回滚 + 响亮抛出
-      byte[] onDisk;
-      try {
-        onDisk = Files.readAllBytes(target);
-      } catch (IOException e) {
-        rollback(target);
-        throw new ConfigException(ConfigException.E_CONFIG_IO, "写入后读回失败（写入已回滚）: " + target, e);
-      }
-      ObjectNode readBack;
-      try {
-        readBack = parseObject(onDisk, target);
-      } catch (ConfigException e) {
-        rollback(target);
-        throw new ConfigException(e.code(), e.getMessage() + "（写入已回滚）", e);
-      }
-      List<Error> readBackErrors;
-      try {
-        readBackErrors = validationErrors(schema, readBack);
-      } catch (RuntimeException e) {
-        rollback(target);
-        throw new ConfigException(
-            ConfigException.E_SCHEMA_UNAVAILABLE, "读回校验失败（写入已回滚）: " + target, e);
-      }
-      if (!readBackErrors.isEmpty()) {
-        rollback(target);
-        throw new ConfigException(
-            ConfigException.E_SCHEMA_INVALID,
-            "读回校验未通过（写入已回滚）: " + summarizeErrors(readBackErrors, schemaFile, schemaNode));
-      }
-
-      // 落盘成功后回调（先写后播）；监听器异常只记日志、不回滚
-      try {
-        listener.onChanged(fullKey, oldValue, value);
-      } catch (RuntimeException e) {
-        LOG.warn("配置变更监听器异常（忽略，写入不回滚）: key={}", fullKey, e);
-      }
+      commit(target, merged, schema, schemaFile, schemaNode, fullKey, oldValue, value);
     } finally {
       lock.unlock();
+    }
+  }
+
+  /** 写前校验：不通过即抛 {@code E_SCHEMA_INVALID}，此时<b>磁盘逐字节未变</b>（先校验后动盘）。put 与 remove 共用。 */
+  private static void validatePreWrite(
+      Schema schema, ObjectNode merged, String schemaFile, JsonNode schemaNode) {
+    List<Error> preWriteErrors = validationErrors(schema, merged);
+    if (!preWriteErrors.isEmpty()) {
+      throw new ConfigException(
+          ConfigException.E_SCHEMA_INVALID,
+          "写入前校验未通过（未落盘）: " + summarizeErrors(preWriteErrors, schemaFile, schemaNode));
+    }
+  }
+
+  /**
+   * 落盘 + 确认（put 与 remove <b>共用的同一段尾巴</b>，逐字同源）：原子写 → 读回重解析 + schema 再校验 → 失败回滚并响亮抛出 → 成功后回调监听器。
+   *
+   * <p>抽成一段是因为"删除"与"写入"在这条路径上<b>没有任何理由不同</b>：两者都是把一份完整文档原子替换到盘上，
+   * 都要防"写坏了却没察觉"。两份拷贝迟早会分叉（改了一处忘了另一处），而那正是配置损坏最容易钻进来的缝。
+   *
+   * @param newValue 给监听器的"变更后是什么"：put 传调用方给的值；删除传 JSON 空节点（见 {@link ConfigListener#onChanged}）
+   */
+  private void commit(
+      Path target,
+      ObjectNode merged,
+      Schema schema,
+      String schemaFile,
+      JsonNode schemaNode,
+      String fullKey,
+      JsonNode oldValue,
+      JsonNode newValue) {
+    atomicWrite(target, serialize(merged));
+
+    // 读回校验：重新解析 + schema 再校验；失败 → 回滚 + 响亮抛出
+    byte[] onDisk;
+    try {
+      onDisk = Files.readAllBytes(target);
+    } catch (IOException e) {
+      rollback(target);
+      throw new ConfigException(ConfigException.E_CONFIG_IO, "写入后读回失败（写入已回滚）: " + target, e);
+    }
+    ObjectNode readBack;
+    try {
+      readBack = parseObject(onDisk, target);
+    } catch (ConfigException e) {
+      rollback(target);
+      throw new ConfigException(e.code(), e.getMessage() + "（写入已回滚）", e);
+    }
+    List<Error> readBackErrors;
+    try {
+      readBackErrors = validationErrors(schema, readBack);
+    } catch (RuntimeException e) {
+      rollback(target);
+      throw new ConfigException(
+          ConfigException.E_SCHEMA_UNAVAILABLE, "读回校验失败（写入已回滚）: " + target, e);
+    }
+    if (!readBackErrors.isEmpty()) {
+      rollback(target);
+      throw new ConfigException(
+          ConfigException.E_SCHEMA_INVALID,
+          "读回校验未通过（写入已回滚）: " + summarizeErrors(readBackErrors, schemaFile, schemaNode));
+    }
+
+    // 落盘成功后回调（先写后播）；监听器异常只记日志、不回滚
+    try {
+      listener.onChanged(fullKey, oldValue, newValue);
+    } catch (RuntimeException e) {
+      LOG.warn("配置变更监听器异常（忽略，写入不回滚）: key={}", fullKey, e);
     }
   }
 
@@ -585,6 +694,36 @@ public class FileConfigStore implements ConfigStore {
       current = (ObjectNode) next;
     }
     current.set(segments.get(segments.size() - 1), value);
+  }
+
+  /**
+   * 按点分键段摘除节点，并<b>顺路摘掉被删空的对象</b>（返回是否真的删掉了东西）。
+   *
+   * <p><b>为什么顺路摘空壳</b>：删 {@code llm.routes.glm} 之后若留下 {@code "routes": {}}，配置页渲染原始 JSON
+   * 时会显示一个已经不存在的分组——用户删了却看见它还在，只能再删一次，而那一删是"键不存在"的无操作，界面上 表现为删除按钮时灵时不灵。空对象在这里一律按"这个分组不存在"处理。
+   *
+   * <p>中途遇到非对象（{@code "a"} 是字符串却要删 {@code "a.b"}）→ 视为该键不存在，不做任何改动（与 {@link #nodeAt}
+   * 的读侧口径一致：读不到的东西，删也删不动）。
+   */
+  private static boolean deleteAtPath(ObjectNode root, List<String> segments) {
+    return deleteAt(root, segments, 0);
+  }
+
+  private static boolean deleteAt(ObjectNode current, List<String> segments, int index) {
+    String segment = segments.get(index);
+    if (index == segments.size() - 1) {
+      return current.remove(segment) != null;
+    }
+    JsonNode next = current.get(segment);
+    if (!(next instanceof ObjectNode)) {
+      return false;
+    }
+    ObjectNode child = (ObjectNode) next;
+    boolean removed = deleteAt(child, segments, index + 1);
+    if (removed && child.size() == 0) {
+      current.remove(segment); // 空壳一并摘掉：文件里留下的都该是"确实存在的东西"
+    }
+    return removed;
   }
 
   /** 点分键分段；limit -1 保留尾随空段（"x." → ["x",""]），读侧 nodeAt 对空段一律视为不存在。 */
