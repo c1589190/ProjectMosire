@@ -12,10 +12,13 @@ import java.util.Optional;
  * caching）仅供应商支持时才有值：缓存命中读计 {@code cacheReadTokens}、写入缓存计 {@code cacheWriteTokens}，缺失同样填 {@code
  * -1}（不编造 0，否则 token 经济会把免费命中算成真实消耗）。
  *
- * <p><b>思维链（A1：{@code reasoning_content}）</b>——本记录对"推理模型答了但我们读到空"这个实测坑的正面回答：
+ * <p><b>思维链（A1 读到、A6 回传：{@code reasoning_content}）</b>——本记录对"推理模型答了但我们读到空"这个实测坑的正面回答，以及
+ * 对"多轮对话里供应商要求把思维链带回来"这个实测坑的正面回答：
  *
  * <ul>
  *   <li>{@link #reasoning()}：思维链原文，<b>独立字段</b>，未下发 = 空串。它<b>永不丢失</b>：无论是否折叠进正文，原文都在这儿。
+ *   <li><b>它还同时挂在助手消息上</b>（{@link LlmMessage#reasoning()}）：构造期自动挂。于是"把这条消息追加进对话历史"这种最普通的
+ *       消费方式，天然就把思维链带回了下一轮请求（A6）。<b>挂的是消息的 reasoning 分量，不是正文</b>——正文仍只含 content。
  *   <li>{@link #reasoningDisposition()}：本次到底是"没有思维链"、"思维链与正文并存"还是"思维链被折叠进了正文"。这是一个
  *       <b>可观测标记</b>——调用方（与日志/事件）不必靠"正文里怎么有段怪话"去猜。
  * </ul>
@@ -49,7 +52,10 @@ public record LlmResponse(
     /** 供应商没下发思维链（非推理模型，或本次没产出）。 */
     ABSENT,
 
-    /** 思维链与正文并存：它在 {@link #reasoning()} 里，<b>没有</b>混进 {@link #assistantMessage()}。 */
+    /**
+     * 思维链与正文并存：它在 {@link #reasoning()} 里，<b>没有</b>混进 {@link #assistantMessage()} 的<b>正文</b>（正文只含
+     * content）。
+     */
     SEPARATE,
 
     /**
@@ -74,6 +80,13 @@ public record LlmResponse(
               + ", disposition="
               + reasoningDisposition
               + "）");
+    }
+    // A6：把思维链**挂回助手消息**——消费方"把上一条 assistant 原样追加进历史"（simos DecisionAgentRunner、
+    // brain AgentPipeline 都是这一行）于是天然把它回传给供应商，零改动。不挂的话，多轮对话的第二轮会被思考模式的
+    // 供应商拒掉（实测 400：reasoning_content must be passed back）。
+    // ★ 反向不做（不因 reasoning 为空而抹掉消息自带的思维链）：那是调用方放进来的事实，删掉等于篡改它的输入。
+    if (!reasoning.isEmpty()) {
+      assistantMessage = assistantMessage.withReasoning(reasoning);
     }
   }
 

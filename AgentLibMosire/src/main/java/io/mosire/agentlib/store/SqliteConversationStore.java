@@ -50,9 +50,10 @@ import java.util.Optional;
  * 类"首个非 system 消息必须是 user"的严格供应商因此会拒收这种形状。这是刻意的取舍（改成 {@code user} 只会把风险从"首条非 user"换成"可能连续两条
  * user"，更差）；摘要在请求里的最终形态（例如合并进 system 段）属于后续压缩接线的设计空间，本类只负责按上述形态存取。
  *
- * <p><b>消息内容编码</b>（内部格式，随本类演进）：一条消息 = 一行，{@code role} 单列 + {@code content} 列存分片数组的 JSON（每个分片带
- * {@code type} 判别符：{@code text}/{@code tool_call}/{@code tool_result}）。手写这层判别符而不用 Jackson
- * 的类型元信息，是为了让格式显式、可读、不依赖实体类上的注解。
+ * <p><b>消息内容编码</b>（内部格式，随本类演进）：一条消息 = 一行，{@code role} 单列 + {@code content} 列存 {@code {role,
+ * parts[], reasoning?}} 的 JSON（{@code parts} 里每个分片带 {@code type} 判别符：{@code text}/{@code
+ * tool_call}/{@code tool_result}）。手写这层判别符而不用 Jackson 的类型元信息，是为了让格式显式、可读、不依赖实体类上的注解。 {@code
+ * reasoning}（A6 的思维链）<b>只在非空时写</b>，缺键按空串读——改版前的行因此照常可读（见 {@link #encode}/{@link #decodeReasoning}）。
  *
  * <p>表在会话 id 上无外键约束：会话行由首次 {@code append}/{@code compact} 自动建（{@code INSERT OR IGNORE}），
  * 因此本类不需要调用方先"创建会话"。
@@ -66,6 +67,10 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
 
   private static final String FIELD_ROLE = "role";
   private static final String FIELD_PARTS = "parts";
+
+  /** 思维链（A6）：<b>只在非空时写出</b>，见 {@link #encode}。 */
+  private static final String FIELD_REASONING = "reasoning";
+
   private static final String FIELD_TYPE = "type";
   private static final String FIELD_TEXT = "text";
   private static final String FIELD_ID = "id";
@@ -371,9 +376,22 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
     return LlmMessage.assistant(List.of(new ContentPart.Text(summary)));
   }
 
+  /**
+   * 把一条消息编成落盘 JSON：{@code {role, parts[], reasoning?}}。
+   *
+   * <p><b>思维链（A6）只在非空时写</b>：这条格式早在思维链之前就落过盘了，而"没有思维链"是最普遍的一条路径——让它<b>逐字节保持原样</b>
+   * （而不是恒写一个空串键），既省了无谓的库体积，也让"本改动对既有消息零影响"成为可断言的字节级事实（见 {@code
+   * ReasoningEchoBackTest.persistedJsonCarriesReasoningKeyOnlyWhenThereIsOne}）。
+   *
+   * <p><b>不写进 {@code parts}</b>：思维链不是"内容分片"（它不参与正文，也不该被拼进正文），且在供应商线格式里它是 {@code content}
+   * 的兄弟键。放独立字段与 {@link LlmMessage#reasoning()} 的形状一一对应。
+   */
   private static String encode(LlmMessage message) {
     ObjectNode root = JSON.createObjectNode();
     root.put(FIELD_ROLE, message.role());
+    if (message.hasReasoning()) {
+      root.put(FIELD_REASONING, message.reasoning());
+    }
     ArrayNode parts = root.putArray(FIELD_PARTS);
     for (ContentPart part : message.content()) {
       ObjectNode node = parts.addObject();
@@ -429,7 +447,18 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
         default -> throw new IllegalStateException("未知会话消息分片类型: " + type);
       }
     }
-    return new LlmMessage(role, content);
+    return new LlmMessage(role, content, decodeReasoning(root));
+  }
+
+  /**
+   * 取出思维链：<b>缺键、{@code null}、非文本一律按"没有思维链"收口成空串</b>。
+   *
+   * <p>为什么缺键必须是合法输入：改版前的行里根本没有这个键，而它们是要继续读的（升级后第一次打开老库就走这里）。判 {@code isTextual()} 而不是直接 {@code
+   * asText()} 的理由同前——老档/手改库里出现 {@code "reasoning": null} 不该让整条会话读不开。
+   */
+  private static String decodeReasoning(JsonNode root) {
+    JsonNode value = root.get(FIELD_REASONING);
+    return value != null && value.isTextual() ? value.textValue() : "";
   }
 
   private static String requiredText(JsonNode node, String field) {

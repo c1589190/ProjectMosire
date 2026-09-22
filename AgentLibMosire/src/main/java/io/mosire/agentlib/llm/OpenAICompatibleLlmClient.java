@@ -538,6 +538,13 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    *
    * <p>工具结果按 OpenAI 协议是<b>独立消息</b>（{@code role:tool} + {@code tool_call_id}），故一条消息里的多个 {@link
    * ContentPart.ToolResult} 会展开成多条；其余角色只产出一条消息（文本分片拼成一个字符串）。
+   *
+   * <p><b>{@code reasoning_content} 的发送规则（A6：有才发）</b>——assistant 消息带着思维链时，把它作为 {@code content}
+   * 的<b>兄弟键</b>发出去（思考模式的供应商要求上一轮的思维链原样回来，否则多轮对话第二轮即 400）。
+   *
+   * <p>反过来，<b>没有思维链的消息一个字节都不多写</b>：{@code null}/空串都不写该键。<b>刻意不写"空值占位"</b>——不认这个字段的供应商
+   * 收到一个它没见过的键（哪怕是空串）是纯风险，而绝大多数请求（user/system/tool 消息、非推理模型的全部消息）本来就没有思维链。
+   * 这也是本类"绝不静默"的同一枚硬币的另一面：<b>该发的不许丢，不该发的不许塞</b>。
    */
   private static void appendMessage(ArrayNode messages, LlmMessage message) {
     List<ContentPart.ToolResult> results = new ArrayList<>();
@@ -570,6 +577,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       node.putNull("content");
     } else {
       node.put("content", "");
+    }
+    // A6：有思维链才发该键（空串 = 没有思维链，见 LlmMessage 的类注）
+    if (message.hasReasoning()) {
+      node.put("reasoning_content", message.reasoning());
     }
     if (!calls.isEmpty()) {
       ArrayNode toolCalls = node.putArray("tool_calls");
