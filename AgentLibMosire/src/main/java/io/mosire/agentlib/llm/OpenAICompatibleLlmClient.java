@@ -17,6 +17,7 @@ import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -118,6 +119,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
 
   private final ModelRoute route;
   private final ApiKeySource apiKeySource;
+
+  /** 资产解析 SPI：{@link ContentPart.Image} 的字节来源（{@link ToolAssetResolver#none()} = 不认任何资产）。 */
+  private final ToolAssetResolver assetResolver;
+
   private final HttpClient http;
   private final Duration readTimeout;
   private final URI chatCompletionsUri;
@@ -154,18 +159,39 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
 
   /** 注入取密钥 SPI；超时/协议取<b>路由自己声明的接法</b>（A3①：超时是 provider 的属性，不是调用方的属性）。 */
   public OpenAICompatibleLlmClient(ModelRoute route, ApiKeySource apiKeySource) {
-    this(route, apiKeySource, Objects.requireNonNull(route, "route").transport());
+    this(route, apiKeySource, ToolAssetResolver.none());
+  }
+
+  /**
+   * 注入取密钥 SPI 与资产解析 SPI：消息里带 {@link ContentPart.Image}（引用式图片分片）时，发送侧按它把 {@code assetId} 解析成 字节并拼
+   * data-URI。
+   *
+   * <p>{@link ToolAssetResolver#none()} = 不认任何资产 ⇒ 消息里出现图片分片会<b>响亮失败</b>（不静默丢图）。
+   */
+  public OpenAICompatibleLlmClient(
+      ModelRoute route, ApiKeySource apiKeySource, ToolAssetResolver assetResolver) {
+    this(route, apiKeySource, Objects.requireNonNull(route, "route").transport(), assetResolver);
   }
 
   /** 显式指定接法（覆盖路由声明；协议不一致时响亮拒绝）。 */
   public OpenAICompatibleLlmClient(
       ModelRoute route, ApiKeySource apiKeySource, LlmTransport transport) {
+    this(route, apiKeySource, transport, ToolAssetResolver.none());
+  }
+
+  /** 显式指定接法 + 资产解析 SPI（组合语义见 3 参构造）。 */
+  public OpenAICompatibleLlmClient(
+      ModelRoute route,
+      ApiKeySource apiKeySource,
+      LlmTransport transport,
+      ToolAssetResolver assetResolver) {
     this(
         route,
         apiKeySource,
         Objects.requireNonNull(transport, "transport").connectTimeout(),
         transport.readTimeout(),
-        transport.protocol());
+        transport.protocol(),
+        assetResolver);
   }
 
   /**
@@ -179,12 +205,23 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    */
   public OpenAICompatibleLlmClient(
       ModelRoute route, ApiKeySource apiKeySource, Duration connectTimeout, Duration readTimeout) {
+    this(route, apiKeySource, connectTimeout, readTimeout, ToolAssetResolver.none());
+  }
+
+  /** 全参组装 + 资产解析 SPI（组合语义见 3 参构造）。 */
+  public OpenAICompatibleLlmClient(
+      ModelRoute route,
+      ApiKeySource apiKeySource,
+      Duration connectTimeout,
+      Duration readTimeout,
+      ToolAssetResolver assetResolver) {
     this(
         route,
         apiKeySource,
         connectTimeout,
         readTimeout,
-        Objects.requireNonNull(route, "route").transport().protocol());
+        Objects.requireNonNull(route, "route").transport().protocol(),
+        assetResolver);
   }
 
   private OpenAICompatibleLlmClient(
@@ -192,9 +229,11 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       ApiKeySource apiKeySource,
       Duration connectTimeout,
       Duration readTimeout,
-      LlmProtocol protocol) {
+      LlmProtocol protocol,
+      ToolAssetResolver assetResolver) {
     this.route = Objects.requireNonNull(route, "route");
     this.apiKeySource = Objects.requireNonNull(apiKeySource, "apiKeySource");
+    this.assetResolver = Objects.requireNonNull(assetResolver, "assetResolver");
     requireOpenAiCompatible(protocol);
     positive(connectTimeout, "connectTimeout");
     this.readTimeout = positive(readTimeout, "readTimeout");
@@ -546,20 +585,27 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    * 收到一个它没见过的键（哪怕是空串）是纯风险，而绝大多数请求（user/system/tool 消息、非推理模型的全部消息）本来就没有思维链。
    * 这也是本类"绝不静默"的同一枚硬币的另一面：<b>该发的不许丢，不该发的不许塞</b>。
    */
-  private static void appendMessage(ArrayNode messages, LlmMessage message) {
+  private void appendMessage(ArrayNode messages, LlmMessage message) {
     List<ContentPart.ToolResult> results = new ArrayList<>();
     StringBuilder text = new StringBuilder();
     List<ContentPart.ToolCall> calls = new ArrayList<>();
+    List<ContentPart.Image> images = new ArrayList<>();
     for (ContentPart part : message.content()) {
-      if (part instanceof ContentPart.Text textPart) {
-        text.append(textPart.text());
-      } else if (part instanceof ContentPart.ToolResult result) {
-        results.add(result);
-      } else if (part instanceof ContentPart.ToolCall call) {
-        calls.add(call);
+      // ★ 穷举 switch（不是 instanceof 链）：ContentPart 是密封接口，将来新增分片类型**这里编译不过**。
+      //   用 instanceof 链的版本会把新分片静默丢掉——"以为发了、其实没发"是本类最不能接受的失败形态（见类 Javadoc）。
+      switch (part) {
+        case ContentPart.Text textPart -> text.append(textPart.text());
+        case ContentPart.ToolResult result -> results.add(result);
+        case ContentPart.ToolCall call -> calls.add(call);
+        case ContentPart.Image image -> images.add(image);
       }
     }
     if (!results.isEmpty()) {
+      // tool 角色的 content 只接受字符串（OpenAI 兼容线）；要附图请另发一条 user 消息（见 ContentPart.Image 类注）
+      if (!images.isEmpty()) {
+        throw new LlmException(
+            "tool 角色的消息不接受图片分片（tool 消息 content 只接受字符串）：请把图片放进一条 user 消息", LlmException.Kind.CONFIG);
+      }
       for (ContentPart.ToolResult result : results) {
         ObjectNode tool = messages.addObject();
         tool.put("role", LlmMessage.ROLE_TOOL);
@@ -571,12 +617,34 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
     }
     ObjectNode node = messages.addObject();
     node.put("role", message.role());
-    if (!text.isEmpty()) {
-      node.put("content", text.toString());
-    } else if (!calls.isEmpty()) {
-      node.putNull("content");
+    if (images.isEmpty()) {
+      // 纯文本路径：逐字节维持既有形态（不因为支持图片而改掉既有请求形状）
+      if (!text.isEmpty()) {
+        node.put("content", text.toString());
+      } else if (!calls.isEmpty()) {
+        node.putNull("content");
+      } else {
+        node.put("content", "");
+      }
     } else {
-      node.put("content", "");
+      // 带图路径：content 从字符串改成数组（OpenAI 兼容线的多模态形态）。
+      // 合法角色只有 user/assistant——system 带图属调用方编程错误，响亮拒绝而不是发出去让供应商猜。
+      if (!LlmMessage.ROLE_USER.equals(message.role())
+          && !LlmMessage.ROLE_ASSISTANT.equals(message.role())) {
+        throw new LlmException(
+            "图片分片只对 user/assistant 角色合法，收到角色: " + message.role(), LlmException.Kind.CONFIG);
+      }
+      ArrayNode content = node.putArray("content");
+      if (!text.isEmpty()) {
+        ObjectNode textPart = content.addObject();
+        textPart.put("type", "text");
+        textPart.put("text", text.toString());
+      }
+      for (ContentPart.Image image : images) {
+        ObjectNode imagePart = content.addObject();
+        imagePart.put("type", "image_url");
+        imagePart.putObject("image_url").put("url", dataUriOf(image));
+      }
     }
     // A6：有思维链才发该键（空串 = 没有思维链，见 LlmMessage 的类注）
     if (message.hasReasoning()) {
@@ -593,6 +661,37 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         function.put("arguments", JSON.valueToTree(call.arguments()).toString());
       }
     }
+  }
+
+  /**
+   * 图片分片 → data-URI（{@code data:<mime>;base64,<...>}）：字节<b>此刻</b>从 {@link ToolAssetResolver} 取。
+   *
+   * <p>★ <b>两种不一致都响亮</b>：① 资产解析不到（宿主没给或已过期）；② 解析出来的媒体类型与分片声明不符——两份真相打架时宁可当场停，
+   * 也不要发一张与声明不符的图（模型/供应商按声明解释字节，错配等于喂垃圾）。绝不静默丢图。
+   */
+  private String dataUriOf(ContentPart.Image image) {
+    ToolAsset asset =
+        assetResolver
+            .resolve(image.assetId())
+            .orElseThrow(
+                () ->
+                    new LlmException(
+                        "图片资产不可解析（宿主未提供或已过期）: " + image.assetId(), LlmException.Kind.CONFIG));
+    if (!asset.mediaType().equals(image.mediaType())) {
+      throw new LlmException(
+          "图片资产的媒体类型与分片声明不一致：分片声明 "
+              + image.mediaType()
+              + "，资产实际 "
+              + asset.mediaType()
+              + "（assetId="
+              + image.assetId()
+              + "）",
+          LlmException.Kind.CONFIG);
+    }
+    return "data:"
+        + asset.mediaType()
+        + ";base64,"
+        + Base64.getEncoder().encodeToString(asset.bytes());
   }
 
   /**

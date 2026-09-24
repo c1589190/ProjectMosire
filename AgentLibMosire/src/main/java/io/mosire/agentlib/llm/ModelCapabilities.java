@@ -11,11 +11,12 @@ public record ModelCapabilities(
     boolean parallelToolCalls,
     boolean reasoning,
     boolean promptCaching,
+    boolean vision,
     int maxContext,
     int maxOutput) {
 
   /** 保守默认：能力全关、上下文/输出上限未知（0）。 */
   public static ModelCapabilities defaults() {
-    return new ModelCapabilities(false, false, false, false, 0, 0);
+    return new ModelCapabilities(false, false, false, false, false, 0, 0);
   }
 }

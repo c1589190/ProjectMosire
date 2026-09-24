@@ -52,8 +52,9 @@ import java.util.Optional;
  *
  * <p><b>消息内容编码</b>（内部格式，随本类演进）：一条消息 = 一行，{@code role} 单列 + {@code content} 列存 {@code {role,
  * parts[], reasoning?}} 的 JSON（{@code parts} 里每个分片带 {@code type} 判别符：{@code text}/{@code
- * tool_call}/{@code tool_result}）。手写这层判别符而不用 Jackson 的类型元信息，是为了让格式显式、可读、不依赖实体类上的注解。 {@code
- * reasoning}（A6 的思维链）<b>只在非空时写</b>，缺键按空串读——改版前的行因此照常可读（见 {@link #encode}/{@link #decodeReasoning}）。
+ * tool_call}/{@code tool_result}/{@code image}）。手写这层判别符而不用 Jackson 的类型元信息，是为了让格式显式、可读、不依赖实体类上的注解。
+ * {@code reasoning}（A6 的思维链）<b>只在非空时写</b>，缺键按空串读——改版前的行因此照常可读（见 {@link #encode}/{@link
+ * #decodeReasoning}）。
  *
  * <p>表在会话 id 上无外键约束：会话行由首次 {@code append}/{@code compact} 自动建（{@code INSERT OR IGNORE}），
  * 因此本类不需要调用方先"创建会话"。
@@ -80,9 +81,15 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
   private static final String FIELD_CONTENT = "content";
   private static final String FIELD_ERROR = "error";
 
+  /** 图片分片（{@link ContentPart.Image}）：媒体类型 + 资产引用——**字节不落库**（见 Image 的类注）。 */
+  private static final String FIELD_MEDIA_TYPE = "mediaType";
+
+  private static final String FIELD_ASSET_ID = "assetId";
+
   private static final String TYPE_TEXT = "text";
   private static final String TYPE_TOOL_CALL = "tool_call";
   private static final String TYPE_TOOL_RESULT = "tool_result";
+  private static final String TYPE_IMAGE = "image";
 
   private static final String CONVERSATIONS_DDL =
       """
@@ -415,6 +422,13 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
           node.put(FIELD_CONTENT, result.content());
           node.put(FIELD_ERROR, result.error());
         }
+        case ContentPart.Image image -> {
+          // ★ 只落"媒体类型 + 资产引用"，**字节不落库**：图片动辄几百 KB，内联进会话行会让库体积与回放成本双双失控
+          //   （字节由宿主的 ToolAssetResolver 在发送那一刻解析；解析不到时发送侧响亮报错，不静默丢图）。
+          node.put(FIELD_TYPE, TYPE_IMAGE);
+          node.put(FIELD_MEDIA_TYPE, image.mediaType());
+          node.put(FIELD_ASSET_ID, image.assetId());
+        }
       }
     }
     return write(root);
@@ -444,6 +458,10 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
                     requiredText(node, FIELD_NAME),
                     nullableText(node, FIELD_CONTENT),
                     nullableText(node, FIELD_ERROR)));
+        case TYPE_IMAGE ->
+            content.add(
+                new ContentPart.Image(
+                    requiredText(node, FIELD_MEDIA_TYPE), requiredText(node, FIELD_ASSET_ID)));
         default -> throw new IllegalStateException("未知会话消息分片类型: " + type);
       }
     }

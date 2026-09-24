@@ -72,11 +72,32 @@ public final class LlmRouteAssembler {
    */
   public static LlmClient client(
       ModelRoute route, OpenAICompatibleLlmClient.ApiKeySource keySource) {
+    return client(route, keySource, ToolAssetResolver.none());
+  }
+
+  /**
+   * 与 {@link #client(ModelRoute, OpenAICompatibleLlmClient.ApiKeySource)} 同一条装配，另给一个 {@link
+   * ToolAssetResolver}：消息里带 {@link ContentPart.Image}（引用式图片分片）时，发送侧按它解析字节。
+   *
+   * <p>给 resolver 的调用方 = 工件（图片资产）的宿主；不给的路径传 {@link ToolAssetResolver#none()}——此时消息里若真出现图片分片，
+   * 发送侧会<b>响亮报错</b>（而不是把图静默丢掉，见 resolver 的类注）。
+   *
+   * @param route 待装配的路由
+   * @param keySource 取密钥的 SPI（空 = 匿名调用）
+   * @param assetResolver 资产解析 SPI（{@link ToolAssetResolver#none()} = 不认任何资产）
+   * @return 按该路由装配好的客户端（此方法<b>不发请求</b>）
+   * @throws IllegalArgumentException {@code baseUrl} 不是合法根，或路由声明的协议本库未实现
+   */
+  public static LlmClient client(
+      ModelRoute route,
+      OpenAICompatibleLlmClient.ApiKeySource keySource,
+      ToolAssetResolver assetResolver) {
     Objects.requireNonNull(route, "route");
     Objects.requireNonNull(keySource, "keySource");
+    Objects.requireNonNull(assetResolver, "assetResolver");
     // switch 表达式 + 无 default：新增方言时**这里编译不过**（而不是运行时悄悄按 OpenAI 协议发出去）
     return switch (route.transport().protocol()) {
-      case OPENAI_COMPATIBLE -> new OpenAICompatibleLlmClient(route, keySource);
+      case OPENAI_COMPATIBLE -> new OpenAICompatibleLlmClient(route, keySource, assetResolver);
     };
   }
 

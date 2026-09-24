@@ -68,6 +68,26 @@ class ConversationStoreTest {
     }
   }
 
+  /**
+   * 图片分片按<b>引用</b>往返：读回来的 {@link ContentPart.Image} 与写进去的逐字段相同（媒体类型 + 资产 id）。
+   *
+   * <p>★ "字节不落库"由<b>类型</b>结构保证（{@code Image} 根本没有字节字段，见其类注），所以本用例只钉"引用往返"——
+   * 但这一步必须有：编解码里任何一个字段写丢/写错，模型下一轮就再也拿不到那张图。
+   */
+  @Test
+  void imagePartsRoundTripByReference() {
+    LlmMessage withImage =
+        new LlmMessage(
+            LlmMessage.ROLE_USER,
+            List.of(new ContentPart.Text("看这张图"), new ContentPart.Image("image/png", "asset-1")));
+
+    try (SqliteConversationStore store = SqliteConversationStore.open(db())) {
+      store.append(CONV, withImage);
+
+      assertThat(store.load(CONV)).containsExactly(withImage);
+    }
+  }
+
   @Test
   void loadUnknownConversationIsEmptyAndConversationsAreIsolated() {
     try (SqliteConversationStore store = SqliteConversationStore.open(db())) {

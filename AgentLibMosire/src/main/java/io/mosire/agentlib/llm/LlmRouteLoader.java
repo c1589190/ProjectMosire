@@ -407,8 +407,8 @@ public final class LlmRouteLoader {
    * 能力描述：整块缺席 = {@link ModelCapabilities#defaults()}（保守全关）；出现任何形态不对的键 → 响亮。
    *
    * <p>键名<b>就是</b> {@link ModelCapabilities} 的组件名（{@code toolCalling}/{@code
-   * parallelToolCalls}/{@code reasoning}/{@code promptCaching}/{@code maxContext}/{@code
-   * maxOutput}）——不另立一套命名，读代码的人不必做一次翻译。
+   * parallelToolCalls}/{@code reasoning}/{@code promptCaching}/{@code vision}/{@code
+   * maxContext}/{@code maxOutput}）——不另立一套命名，读代码的人不必做一次翻译。
    */
   private static ModelCapabilities capabilitiesAt(ConfigStore store, String prefix) {
     JsonNode node = store.get(prefix, KEY_CAPABILITIES).orElse(null);
@@ -426,6 +426,7 @@ public final class LlmRouteLoader {
         boolAt(store, caps, "parallelToolCalls"),
         boolAt(store, caps, "reasoning"),
         boolAt(store, caps, "promptCaching"),
+        boolAt(store, caps, "vision"),
         countAt(store, caps, "maxContext"),
         countAt(store, caps, "maxOutput"));
   }

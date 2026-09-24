@@ -11,7 +11,7 @@ class ModelProviderTest {
   void registerThenResolveReturnsRouteAndCapabilities() {
     ModelProvider provider = new ModelProvider();
     ModelRoute route = ModelRoute.of("main", "https://api.example.com/v1", "gpt-x", "keys.openai");
-    ModelCapabilities caps = new ModelCapabilities(true, true, true, true, 200_000, 8_192);
+    ModelCapabilities caps = new ModelCapabilities(true, true, true, true, false, 200_000, 8_192);
 
     provider.register(route, caps);
 
@@ -38,7 +38,7 @@ class ModelProviderTest {
     ModelRoute second = ModelRoute.of("main", "https://new.example.com", "m2", "");
     ModelCapabilities replaced = ModelCapabilities.defaults();
 
-    provider.register(first, new ModelCapabilities(true, false, false, false, 1, 1));
+    provider.register(first, new ModelCapabilities(true, false, false, false, false, 1, 1));
     provider.register(second, replaced);
 
     assertThat(provider.size()).isEqualTo(1);

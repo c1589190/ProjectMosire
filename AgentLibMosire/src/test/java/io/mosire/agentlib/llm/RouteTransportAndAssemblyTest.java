@@ -200,6 +200,22 @@ class RouteTransportAndAssemblyTest {
         .isEqualTo(ModelCapabilities.defaults());
   }
 
+  /**
+   * 视觉能力（图片输入）：声明 {@code vision:true} 要读到 true——调用方的能力门控（发图 vs 回落字符图）就靠它。
+   *
+   * <p>判别性：把 {@code capabilitiesAt} 里的 {@code boolAt(..., "vision")} 换成常量 {@code false}，本用例必红；
+   * 反过来漏改 {@link ModelCapabilities} 的组件顺序（vision 与别的布尔位串位）也会红——单独立一条就是为了让这个位有一个"自己的名字"。
+   */
+  @Test
+  void 视觉能力按配置读出() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"deepseek\":"
+            + routeJson("http://127.0.0.1:9/v1", ",\"capabilities\":{\"vision\":true}")
+            + "}}}");
+
+    assertThat(LlmRouteLoader.capabilities(store(), "deepseek").vision()).isTrue();
+  }
+
   @Test
   void 能力描述形态不对要响亮() throws IOException {
     writeConfig(
