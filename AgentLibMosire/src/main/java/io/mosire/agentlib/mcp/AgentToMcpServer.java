@@ -11,6 +11,8 @@ import io.modelcontextprotocol.server.transport.StdioServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpServerTransportProvider;
 import io.modelcontextprotocol.spec.McpStreamableServerTransportProvider;
+import io.mosire.agentlib.llm.ToolAsset;
+import io.mosire.agentlib.llm.ToolAssetResolver;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ToolSpec;
@@ -23,6 +25,8 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -69,6 +73,12 @@ public final class AgentToMcpServer implements AutoCloseable {
    * 类注释）。默认 = {@link ToolCallAuthorizer#standard()}（仅三要素判定）。
    */
   private final ToolCallAuthorizer authorizer;
+
+  /**
+   * 资产解析 SPI：{@link ToolResult#assetDocIds()} 指向的<b>图片</b>资产会在结果里以 {@link McpSchema.ImageContent}
+   * 出站（MCP 客户端的模型据此"看图"）。{@link ToolAssetResolver#none()} = 不认任何资产（图片引用被跳过，文本结果照旧）。
+   */
+  private final ToolAssetResolver assetResolver;
 
   /** 空实现兜底：在 startWith 的赋值前任何 close() 都是安全的（UwF 告警解除）。 */
   private AutoCloseable registrySubscription = () -> {};
@@ -312,7 +322,8 @@ public final class AgentToMcpServer implements AutoCloseable {
         serverVersion,
         caller,
         include,
-        authorizer);
+        authorizer,
+        ToolAssetResolver.none());
   }
 
   /** streamable HTTP 注入口（供后续 HTTP 传输接线）；语义与 stdio 家族相同，仅底层 transport 不同。 */
@@ -355,6 +366,29 @@ public final class AgentToMcpServer implements AutoCloseable {
       McpStreamableServerTransportProvider transport,
       Predicate<String> include,
       ToolCallAuthorizer authorizer) {
+    return startWith(
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        transport,
+        include,
+        authorizer,
+        ToolAssetResolver.none());
+  }
+
+  /**
+   * streamable HTTP 全参注入口 + 资产解析 SPI（图片资产以 {@code ImageContent} 出站；语义见 {@link ToolAssetResolver}）。
+   */
+  static AgentToMcpServer startWith(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      McpStreamableServerTransportProvider transport,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer,
+      ToolAssetResolver assetResolver) {
     return assemble(
         McpServer.sync(transport),
         "streamable",
@@ -363,7 +397,8 @@ public final class AgentToMcpServer implements AutoCloseable {
         serverVersion,
         caller,
         include,
-        authorizer);
+        authorizer,
+        assetResolver);
   }
 
   /**
@@ -473,9 +508,40 @@ public final class AgentToMcpServer implements AutoCloseable {
       String serverVersion,
       ToolContext caller,
       ToolCallAuthorizer authorizer) {
+    return startHttp(
+        host,
+        port,
+        path,
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        authorizer,
+        ToolAssetResolver.none());
+  }
+
+  /**
+   * 同 {@link #startHttp(String, int, String, ToolRegistry, String, String, ToolContext,
+   * ToolCallAuthorizer)}，另注入<b>资产解析 SPI</b>：工具结果里 {@link ToolResult#assetDocIds()} 指向的图片资产 会在
+   * {@code tools/call} 结果里以 {@code ImageContent} 出站（外部 agent 的模型据此"看图"）。
+   *
+   * @param assetResolver 资产解析 SPI（{@link ToolAssetResolver#none()} = 不认任何资产，只出文本）
+   * @since 0.1.0
+   */
+  public static AgentToMcpServer startHttp(
+      String host,
+      int port,
+      String path,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer,
+      ToolAssetResolver assetResolver) {
     Objects.requireNonNull(host, "host");
     Objects.requireNonNull(path, "path");
     Objects.requireNonNull(authorizer, "authorizer");
+    Objects.requireNonNull(assetResolver, "assetResolver");
     if (!isLoopback(host)) {
       LOG.warn(
           "MCP HTTP 面绑定非回环地址 {}（无鉴权、无 TLS）：任何能连到该地址的人都能列举并调用工具。" + "仅在你已在本机/网络层另有隔离时这样做。path={}",
@@ -496,7 +562,14 @@ public final class AgentToMcpServer implements AutoCloseable {
           new JdkHttpStreamableServerTransportProvider(path);
       AgentToMcpServer self =
           startWith(
-              registry, serverName, serverVersion, caller, provider, name -> true, authorizer);
+              registry,
+              serverName,
+              serverVersion,
+              caller,
+              provider,
+              name -> true,
+              authorizer,
+              assetResolver);
       server.createContext(path, provider::handle);
       server.start();
       self.httpServer = server;
@@ -560,9 +633,11 @@ public final class AgentToMcpServer implements AutoCloseable {
       String serverVersion,
       ToolContext caller,
       Predicate<String> include,
-      ToolCallAuthorizer authorizer) {
+      ToolCallAuthorizer authorizer,
+      ToolAssetResolver assetResolver) {
     Objects.requireNonNull(include, "include");
     Objects.requireNonNull(authorizer, "authorizer");
+    Objects.requireNonNull(assetResolver, "assetResolver");
     // 显式宣告 tools.listChanged=true（本计划唯一被批准的行为变更）：不设则走 SDK 自动派生路径，
     // ToolCapabilities.listChanged 为 null，addTool/removeTool 拆箱 NPE 被 ToolRegistry 的 catch 吞掉，
     // notifications/tools/list_changed 永不触达。只设 tools 位，logging 由 McpAsyncServer 构造补。
@@ -574,10 +649,11 @@ public final class AgentToMcpServer implements AutoCloseable {
       }
       spec.toolCall(
           toMcpTool(tool),
-          (exchange, request) -> handleCall(registry, caller, authorizer, request));
+          (exchange, request) -> handleCall(registry, caller, authorizer, assetResolver, request));
     }
     McpSyncServer server = spec.build();
-    AgentToMcpServer self = new AgentToMcpServer(registry, caller, server, include, authorizer);
+    AgentToMcpServer self =
+        new AgentToMcpServer(registry, caller, server, include, authorizer, assetResolver);
     // 先建对象再订阅（lambda 捕获 self）；订阅前错过的变化由 sync 的幂等 diff 兜底
     self.registrySubscription = registry.onChange(self::sync);
     // 日志口径 = **实际外发面**（{@code server.listTools()}，与客户端 tools/list 同源），不是 {@code registry.size()}：
@@ -603,12 +679,14 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolContext caller,
       McpSyncServer server,
       Predicate<String> include,
-      ToolCallAuthorizer authorizer) {
+      ToolCallAuthorizer authorizer,
+      ToolAssetResolver assetResolver) {
     this.registry = registry;
     this.caller = caller;
     this.server = server;
     this.include = include;
     this.authorizer = authorizer;
+    this.assetResolver = assetResolver;
   }
 
   /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）；可外发且命中的才在暴露面内。 */
@@ -650,7 +728,7 @@ public final class AgentToMcpServer implements AutoCloseable {
 
   private McpSchema.CallToolResult handle(
       McpSyncServerExchange exchange, McpSchema.CallToolRequest request) {
-    return handleCall(registry, caller, authorizer, request);
+    return handleCall(registry, caller, authorizer, assetResolver, request);
   }
 
   /**
@@ -664,6 +742,7 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolRegistry registry,
       ToolContext caller,
       ToolCallAuthorizer authorizer,
+      ToolAssetResolver assetResolver,
       McpSchema.CallToolRequest request) {
     if (registry.find(request.name()).isEmpty()) {
       return error("工具不存在: " + request.name());
@@ -678,7 +757,7 @@ public final class AgentToMcpServer implements AutoCloseable {
             caller.config(),
             request.arguments() == null ? Map.of() : request.arguments(),
             caller.identity());
-    return toCallToolResult(authorizer.execute(registry, request.name(), context));
+    return toCallToolResult(authorizer.execute(registry, request.name(), context), assetResolver);
   }
 
   /** AgentTool → MCP Tool（schema 直传；null 值由 SDK 序列化容忍——参考 McpToolAdapter 的反向说明）。 */
@@ -691,10 +770,43 @@ public final class AgentToMcpServer implements AutoCloseable {
   /**
    * ToolResult → CallToolResult（文本内容；isError 映射保持与 {@link McpToolSource#map} 一致）。 错误码经 {@link
    * McpWireCode} 带内透传（MCP 协议本身没有码字段，此约定仅 mosire 间生效）。
+   *
+   * <p>缺省不带资产解析器：等价于 {@link #toCallToolResult(ToolResult, ToolAssetResolver)} 传 {@link
+   * ToolAssetResolver#none()}——图片资产被跳过（文本结果照旧），供只需文本面的调用方/测试用。
    */
   static McpSchema.CallToolResult toCallToolResult(ToolResult result) {
-    McpSchema.TextContent content = new McpSchema.TextContent(McpWireCode.encode(result));
-    return McpSchema.CallToolResult.builder(List.of(content)).isError(!result.success()).build();
+    return toCallToolResult(result, ToolAssetResolver.none());
+  }
+
+  /**
+   * ToolResult → CallToolResult（<b>文本 + 可选图片</b>）：文本内容永远在（{@link McpWireCode} 带内码）， 另把 {@link
+   * ToolResult#assetDocIds()} 里能解析成 {@code image/*} 的资产各追加一个 {@link McpSchema.ImageContent} ——MCP
+   * 客户端的模型据此"看图"（这是"世界渲染成图喂给 LLM"在 MCP 面的出口）。
+   *
+   * <p>★ 三条边界说清：① 非图片资产（如溢出的文本 docId）<b>不</b>出图片块，它们由别的面消费；② 解析不到的 id 记 {@code WARN}
+   * 并跳过——**文本结果仍然有效**，若在这里硬失败会让"图片暂不可用"升级成"工具调用失败"（工件过期是常态，见 {@link ToolAssetResolver}）；③
+   * 失败结果（{@code isError}）只出文本——错误面不该夹带图片。
+   */
+  static McpSchema.CallToolResult toCallToolResult(
+      ToolResult result, ToolAssetResolver assetResolver) {
+    List<McpSchema.Content> contents = new ArrayList<>();
+    contents.add(new McpSchema.TextContent(McpWireCode.encode(result)));
+    if (result.success()) {
+      for (String assetId : result.assetDocIds()) {
+        ToolAsset asset = assetResolver.resolve(assetId).orElse(null);
+        if (asset == null) {
+          LOG.warn("工具结果的资产引用解析不到，图片块已跳过: {}", assetId);
+          continue;
+        }
+        if (!asset.mediaType().startsWith("image/")) {
+          continue;
+        }
+        contents.add(
+            new McpSchema.ImageContent(
+                null, Base64.getEncoder().encodeToString(asset.bytes()), asset.mediaType()));
+      }
+    }
+    return McpSchema.CallToolResult.builder(contents).isError(!result.success()).build();
   }
 
   private static McpSchema.CallToolResult error(String message) {

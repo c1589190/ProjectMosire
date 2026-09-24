@@ -22,6 +22,7 @@ import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.ToolGate;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
+import io.mosire.agentlib.llm.ToolAssetResolver;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ToolSpec;
@@ -149,6 +150,7 @@ class AgentToMcpServerStartHttpTest {
               ToolRegistry.class,
               ToolContext.class,
               ToolCallAuthorizer.class,
+              ToolAssetResolver.class,
               McpSchema.CallToolRequest.class);
       handleCall.setAccessible(true);
       McpSchema.CallToolResult bare =
@@ -158,6 +160,7 @@ class AgentToMcpServerStartHttpTest {
                   registry,
                   guest(),
                   plainAuthorizer(),
+                  ToolAssetResolver.none(),
                   new McpSchema.CallToolRequest("ghost", Map.of()));
       assertThat(bare.isError()).isTrue();
       assertThat(wireText(bare))

@@ -262,9 +262,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
         result.content() == null
             ? ""
             : result.content().stream()
-                .map(
-                    content ->
-                        content instanceof McpSchema.TextContent t ? t.text() : content.toString())
+                .map(McpToolSource::contentToText)
                 .collect(Collectors.joining("\n"));
     if (Boolean.TRUE.equals(result.isError())) {
       // 带内错误码（mosire 间约定）：无标记 → 通用码，见 McpWireCode；原样解码，绝不截断
@@ -272,6 +270,22 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
       return ToolResult.error(codeAndMessage[0], codeAndMessage[1]);
     }
     return ToolResult.ok(ToolResultTruncator.truncate(text, maxOutputChars));
+  }
+
+  /**
+   * 一块 MCP 内容 → 文本：{@link McpSchema.TextContent} 原样取文本；{@link McpSchema.ImageContent}
+   * 折成<b>有界的一句话</b> （媒体类型 + base64 字符数），<b>绝不要把 base64 原样拼进文本</b>——那是几百 KB 的 token 炸弹，而这条文本会直接进 LLM
+   * 上下文（图片本体走的是另一条路：图片分片/资产，见 {@code ContentPart.Image}）。其余类型保持 {@code toString()} 的既有行为。
+   */
+  private static String contentToText(McpSchema.Content content) {
+    if (content instanceof McpSchema.TextContent text) {
+      return text.text();
+    }
+    if (content instanceof McpSchema.ImageContent image) {
+      String data = image.data() == null ? "" : image.data();
+      return "[图片 " + image.mimeType() + "：" + data.length() + " 个 base64 字符，正文已省略]";
+    }
+    return content.toString();
   }
 
   private synchronized McpSyncClient requireConnected() {

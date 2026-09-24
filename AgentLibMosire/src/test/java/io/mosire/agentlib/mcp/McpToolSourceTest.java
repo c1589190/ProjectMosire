@@ -49,6 +49,28 @@ class McpToolSourceTest {
     assertThat(result.message()).isEqualTo("echo:hi"); // 参数经 ToolContext 传入调用方
   }
 
+  /**
+   * 图片块折成<b>有界的一句话</b>：base64 正文绝不拼进文本（那是几百 KB 的 token 炸弹，而这条文本会直接进 LLM 上下文；图片本体 走的是图片分片/资产那条路）。
+   *
+   * <p>判别性：把 {@code contentToText} 的 image 分支去掉（回落到 {@code toString()}）⇒ 文本里会带上完整 base64，本用例必红。
+   */
+  @Test
+  void imageContentFoldsIntoABoundedNoteInsteadOfDumpingBase64() {
+    String base64 = java.util.Base64.getEncoder().encodeToString(new byte[] {1, 2, 3, 4});
+    McpSchema.CallToolResult result =
+        McpSchema.CallToolResult.builder(
+                List.of(
+                    McpSchema.TextContent.builder("视图如下").build(),
+                    new McpSchema.ImageContent(null, base64, "image/png")))
+            .isError(false)
+            .build();
+
+    ToolResult mapped = McpToolSource.map(result);
+
+    assertThat(mapped.message()).contains("视图如下").contains("image/png");
+    assertThat(mapped.message()).as("base64 正文不得进文本").doesNotContain(base64);
+  }
+
   @Test
   void mapsMcpCallToolResultToToolResult() {
     McpSchema.CallToolResult ok =
