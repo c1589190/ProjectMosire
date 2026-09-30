@@ -219,7 +219,7 @@ class MainRealLlmTest {
 
     assertThat(failure.getMessage())
         .as("正向：失败必须发生在连接阶段（取密钥已成功，不是取密钥阶段失败）")
-        .startsWith("LLM 调用失败（")
+        .startsWith("LLM 链路失败（")
         .contains("ConnectException");
     assertThat(allMessages(failure))
         .as("密钥已从传入的配置根解析成功——失败只能发生在连接阶段")
@@ -258,7 +258,7 @@ class MainRealLlmTest {
     LlmException failure = chatFailure(client);
     assertThat(failure.getMessage())
         .as("正向：被点名那条的密钥在场 ⇒ 必须走到连接阶段（落到扁平路由的实现止步于取密钥）")
-        .startsWith("LLM 调用失败（")
+        .startsWith("LLM 链路失败（")
         .contains("ConnectException");
     assertThat(allMessages(failure))
         .as("不得报出扁平路由那条缺失的引用")

@@ -426,6 +426,9 @@ public final class Compactor {
           result.name().length()
               + (result.content() == null ? 0 : result.content().length())
               + (result.error() == null ? 0 : result.error().length());
+      // 图片分片只带引用（字节不落库/不落消息），token 估算只计媒体类型与资产 id 的少量字符；
+      // 真正的大块 base64 在发送侧才解析，不该按图片字节数进这里的上下文预算。
+      case ContentPart.Image image -> image.mediaType().length() + image.assetId().length();
     };
   }
 }
