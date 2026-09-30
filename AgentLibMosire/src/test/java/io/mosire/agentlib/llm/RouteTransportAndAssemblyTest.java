@@ -216,6 +216,48 @@ class RouteTransportAndAssemblyTest {
     assertThat(LlmRouteLoader.capabilities(store(), "deepseek").vision()).isTrue();
   }
 
+  /**
+   * A6 修复版的思考模式回传位：{@code capabilities.echoReasoningContent=true} 必须同时进入能力描述与 {@link
+   * LlmTransport}（发送侧真正用的那个值）。
+   *
+   * <p>只改一边的失效形态很隐蔽：页面显示"已开"但线上仍缺键，或反过来在线级塞了不认该字段的供应商。
+   */
+  @Test
+  void 思考模式回传位按配置读出并进入路由接法() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"deepseek\":"
+            + routeJson(
+                "http://127.0.0.1:9/v1",
+                ",\"capabilities\":{\"reasoning\":true,\"echoReasoningContent\":true}")
+            + "}}}");
+
+    ModelRoute route = LlmRouteLoader.load(store(), "deepseek");
+    ModelCapabilities caps = LlmRouteLoader.capabilities(store(), "deepseek");
+
+    assertThat(route.transport().echoReasoningContent()).as("LlmTransport 是发送侧权威值").isTrue();
+    assertThat(caps.echoReasoningContent()).as("能力描述与接法必须同源，配置页看到的 bit 就是线上生效的 bit").isTrue();
+  }
+
+  /** 回传位缺席 = false；存在但非布尔 = 响亮，不回落默认（与其它能力位同一口径）。 */
+  @Test
+  void 思考模式回传位缺席保守关且非布尔响亮() throws IOException {
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"deepseek\":" + routeJson("http://127.0.0.1:9/v1", "") + "}}}");
+    assertThat(LlmRouteLoader.load(store(), "deepseek").transport().echoReasoningContent())
+        .isFalse();
+
+    writeConfig(
+        "{\"llm\":{\"routes\":{\"deepseek\":"
+            + routeJson(
+                "http://127.0.0.1:9/v1", ",\"capabilities\":{\"echoReasoningContent\":\"yes\"}")
+            + "}}}");
+
+    ConfigException rejected =
+        catchThrowableOfType(() -> LlmRouteLoader.load(store(), "deepseek"), ConfigException.class);
+    assertThat(rejected).isNotNull();
+    assertThat(rejected.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+  }
+
   @Test
   void 能力描述形态不对要响亮() throws IOException {
     writeConfig(

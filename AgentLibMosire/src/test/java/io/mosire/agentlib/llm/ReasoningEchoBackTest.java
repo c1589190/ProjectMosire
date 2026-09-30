@@ -25,14 +25,24 @@ import org.junit.jupiter.api.io.TempDir;
  *
  * <p><b>为什么要有这一层</b>（simos 侧真 provider 实测，非推断）：决策人多轮对话跑第二轮时，思考模式的供应商回 {@code HTTP 400: The
  * "reasoning_content" in the thinking mode must be passed back to the
- * API.}——第一轮没有历史所以不撞，<b>只有多轮才暴露</b>。 A1 已经把"读到"做全了（{@link LlmResponse#reasoning()}），但当时 {@link
- * LlmMessage} 里<b>没有承载它的位置</b>，发送侧自然也发不出去 ⇒ 缺口在"回传"这一环，本类逐条钉住它。
+ * API.}——第一轮没有历史所以不撞，<b>只有多轮才暴露</b>。 A1 已经把"读到"做全了（{@link LlmResponse#reasoning()}），但第一版 {@link
+ * LlmMessage} 把"没有该字段"与"字段存在但为空"合并成一个空串：模型某次收口没产思维链时，历史 assistant 消息在线上缺键，第二轮再 400。修复后由路由能力位 +
+ * {@link LlmMessage.ReasoningState} 三态共同把两个方向分开，本类逐条钉住它。
+ *
+ * <p><b>两个可分辨方向</b>：
+ *
+ * <ul>
+ *   <li><b>思考路由</b>（{@link LlmTransport#echoReasoningContent()} = true）：assistant
+ *       消息<b>恒发</b>该键；没有思维链内容时发 {@code ""}，且解析层用 {@link LlmMessage.ReasoningState#EMPTY}
+ *       把"供应商明确发过空串"这个事实带回历史。
+ *   <li><b>非思考路由</b>（false）：维持"有思维链正文才发"；没有任何内容时该键<b>完全不出现</b>（不是空串——给不认该字段的供应商塞空字段是自找 400）。
+ * </ul>
  *
  * <p><b>三个可观测面</b>（都不靠读代码确认）：
  *
  * <ol>
  *   <li><b>发送侧</b>：{@code jdk.httpserver} 假端点捕获的<b>真实请求体</b>里，assistant 消息有没有 {@code
- *       reasoning_content}，以及 <b>没有思维链时那个键必须完全不出现</b>（不是空串——给别的供应商塞空字段是自找 400）。
+ *       reasoning_content}，以及它是否按路由能力位分成"恒发（思考）"与"有才发（非思考）"两种形态。
  *   <li><b>响应侧</b>：{@link LlmResponse#assistantMessage()} 自己就带着思维链，于是消费方那句"把上一条 assistant 原样追加进历史"
  *       <b>零改动</b>即可回传。
  *   <li><b>存储侧</b>：历史是要落盘、下一 tick 再读回来的（simos 的 {@code conversations.load} 正是这条路）⇒ 存储不往返，
@@ -91,11 +101,14 @@ class ReasoningEchoBackTest {
   }
 
   /**
-   * <b>反面对照</b>（与上一条同等重要）：没有思维链的消息，{@code reasoning_content} 这个键<b>根本不出现</b>——不是空串、也不是 {@code
+   * <b>非思考路由的反面对照</b>（与上一条同等重要）：没有思维链的消息，{@code reasoning_content} 这个键<b>根本不出现</b>——不是空串、也不是 {@code
    * null}。给不支持该字段的供应商塞一个空值，是另一种自找 400；两个方向都要有判据，否则"实现成恒发"照样全绿。
+   *
+   * <p>本用例的夹具默认路由（{@link FakeChatEndpoint#client(String)}）就是非思考路由；思考路由的恒发行为由下一条钉住。两者必须同时存在。
    */
   @Test
-  void omitsReasoningContentFieldEntirelyWhenMessageHasNoReasoning() throws IOException {
+  void nonThinkingRouteOmitsReasoningContentFieldEntirelyWhenMessageHasNoReasoning()
+      throws IOException {
     endpoint.sayJson(contentFrame("在的")).done();
 
     endpoint
@@ -111,6 +124,55 @@ class ReasoningEchoBackTest {
     assertThat(messages.path(1).has("reasoning_content")).isFalse();
     // 反面对照的对照：这条消息本身确实发出去了（否则"键不存在"可能只是因为压根没这条消息）
     assertThat(messages.path(1).path("content").asText()).isEqualTo("在的");
+  }
+
+  /**
+   * <b>思考路由的正面判据</b>：assistant 消息没有思维链正文时，请求体里也必须出现 {@code reasoning_content}，且值为空串。
+   *
+   * <p>只钉"有才发"会让非思考供应商安全，却让思考模式多轮在第二次请求缺键 400；本用例与上一条一起把"发/不发"两侧都钉死在路由能力位上。
+   */
+  @Test
+  void thinkingRouteSendsEmptyReasoningContentForAssistantWithoutReasoningContent()
+      throws IOException {
+    endpoint.sayJson(contentFrame("在的")).done();
+
+    endpoint
+        .client(ROUTE_MODEL, true)
+        .chat(
+            LlmRequest.ofMessages(
+                List.of(
+                    LlmMessage.user("在吗"),
+                    LlmMessage.assistant(List.of(new ContentPart.Text("在的"))))));
+
+    JsonNode messages = endpoint.requestJson(0).path("messages");
+    assertThat(messages.path(0).has("reasoning_content"))
+        .as("user 消息不是模型产出，思考路由也不得给它塞 reasoning_content")
+        .isFalse();
+    JsonNode assistant = messages.path(1);
+    assertThat(assistant.path("reasoning_content").isTextual())
+        .as("思考路由的 assistant 消息必须带该键（内容为空就发空串）")
+        .isTrue();
+    assertThat(assistant.path("reasoning_content").asText()).isEmpty();
+  }
+
+  /**
+   * 消息本身显式带 {@code ReasoningState.EMPTY} 时，即使路由不是思考模式，也要把"键存在但为空"这个事实发出去。
+   *
+   * <p>它是存储回放/手工构造路径的守卫：调用方既然明确说了"这条消息有该字段"，发送侧就不能按默认的"空 = 没有"把它吞掉。
+   */
+  @Test
+  void explicitEmptyReasoningStateIsSentEvenOnNonThinkingRoute() throws IOException {
+    endpoint.sayJson(contentFrame("继续")).done();
+
+    LlmMessage explicitEmpty =
+        LlmMessage.assistantEchoingEmptyReasoning(List.of(new ContentPart.Text("收口")));
+    endpoint
+        .client(ROUTE_MODEL)
+        .chat(LlmRequest.ofMessages(List.of(LlmMessage.user("继续"), explicitEmpty)));
+
+    JsonNode assistant = endpoint.requestJson(0).path("messages").path(1);
+    assertThat(assistant.path("reasoning_content").isTextual()).isTrue();
+    assertThat(assistant.path("reasoning_content").asText()).isEmpty();
   }
 
   // ---------- ② 回归 pin：真实体感的那一轮（第二轮 400） ----------
@@ -145,6 +207,40 @@ class ReasoningEchoBackTest {
     assertThat(echoed.path("tool_calls")).hasSize(1);
   }
 
+  /**
+   * <b>本缺陷的最直接回归 pin</b>：第一轮响应<b>完全没有</b> {@code reasoning_content}（模型收口时没产思维链），消费方仍只是把
+   * assistantMessage 原样追加；在思考路由上，第二轮请求的 assistant 消息必须带该键且值为空串。
+   *
+   * <p>这正是 2026-09-30 真 provider 报 400 的形态：第一版 A6 只在有思维链正文时写键，模型某次收口无思维链时历史缺键，第二次 LLM 调用即挂。
+   * 这里用工具调用响应覆盖"assistant 消息有 tool_calls 但没有 reasoning_content"的形态。
+   */
+  @Test
+  void thinkingRouteEchoesEmptyReasoningContentOnSecondTurnWhenFirstResponseHadNone()
+      throws IOException {
+    OpenAICompatibleLlmClient client = endpoint.client(ROUTE_MODEL, true);
+    endpoint.sayJson(toolCallFrame("call_9", "echo", "{}")).done();
+
+    LlmResponse first = client.chat(LlmRequest.ofMessages(List.of(LlmMessage.user("调一下"))));
+    assertThat(first.reasoningState()).isEqualTo(LlmMessage.ReasoningState.ABSENT);
+    assertThat(first.assistantMessage().hasReasoningField()).isFalse();
+
+    List<LlmMessage> history = new ArrayList<>();
+    history.add(LlmMessage.user("调一下"));
+    history.add(first.assistantMessage());
+    history.add(LlmMessage.tool(new ContentPart.ToolResult("call_9", "echo", "echo: ok", null)));
+
+    endpoint.sayJson(contentFrame("处理完了")).done();
+    client.chat(LlmRequest.ofMessages(List.copyOf(history)));
+
+    JsonNode echoed = endpoint.requestJson(1).path("messages").path(1);
+    assertThat(echoed.path("role").asText()).isEqualTo(LlmMessage.ROLE_ASSISTANT);
+    assertThat(echoed.path("reasoning_content").isTextual())
+        .as("思考路由下历史 assistant 消息缺该键就是复现 400 的缺口")
+        .isTrue();
+    assertThat(echoed.path("reasoning_content").asText()).isEmpty();
+    assertThat(echoed.path("tool_calls")).hasSize(1);
+  }
+
   // ---------- ③ 响应侧：assistantMessage 自带思维链 ----------
 
   /** {@code SEPARATE}：正文与思维链并存时，assistant 消息也带着思维链（与 {@link LlmResponse#reasoning()} 同一份原文）。 */
@@ -172,7 +268,7 @@ class ReasoningEchoBackTest {
     assertThat(response.textPart()).contains("额度全花在思考上了");
   }
 
-  /** 供应商没下发思维链 ⇒ assistant 消息的 reasoning 是<b>空串</b>（不是 null：调用方不该在这里吃 NPE）。 */
+  /** 供应商没下发思维链 ⇒ assistant 消息的 reasoning 是<b>空串</b>（不是 null：调用方不该在这里吃 NPE），三态是 {@code ABSENT}。 */
   @Test
   void responseAssistantMessageHasEmptyReasoningWhenVendorSentNone() {
     endpoint.sayJson(contentFrame("普通模型的普通回答")).done();
@@ -180,6 +276,25 @@ class ReasoningEchoBackTest {
     LlmResponse response = endpoint.client(ROUTE_MODEL).chat(oneUserTurn());
 
     assertThat(response.assistantMessage().reasoning()).isNotNull().isEmpty();
+    assertThat(response.reasoningState()).isEqualTo(LlmMessage.ReasoningState.ABSENT);
+    assertThat(response.assistantMessage().hasReasoningField()).isFalse();
+    assertThat(response.reasoningDisposition()).isEqualTo(LlmResponse.ReasoningDisposition.ABSENT);
+  }
+
+  /**
+   * 供应商<b>明确下发了空 {@code reasoning_content}</b> ⇒ 三态必须是 {@code EMPTY}，不能与"压根没下发"合并。
+   *
+   * <p>这是 A6 修复版的数据模型底线：没有这个区分，存储往返与下一次请求都补不回"键曾经存在"的事实。
+   */
+  @Test
+  void responseAssistantMessageHasExplicitEmptyReasoningStateWhenVendorSentEmptyField() {
+    endpoint.sayJson(reasoningContentFrame("")).sayJson(contentFrame("普通回答")).done();
+
+    LlmResponse response = endpoint.client(ROUTE_MODEL).chat(oneUserTurn());
+
+    assertThat(response.assistantMessage().reasoning()).isEmpty();
+    assertThat(response.reasoningState()).isEqualTo(LlmMessage.ReasoningState.EMPTY);
+    assertThat(response.assistantMessage().hasReasoningField()).isTrue();
     assertThat(response.reasoningDisposition()).isEqualTo(LlmResponse.ReasoningDisposition.ABSENT);
   }
 
@@ -195,9 +310,12 @@ class ReasoningEchoBackTest {
     LlmMessage toolResult = LlmMessage.tool(new ContentPart.ToolResult("c", "n", "ok", null));
 
     assertThat(fromTwoArg.reasoning()).isEmpty();
+    assertThat(fromTwoArg.reasoningState()).isEqualTo(LlmMessage.ReasoningState.ABSENT);
     assertThat(LlmMessage.system("s").reasoning()).isEmpty();
     assertThat(LlmMessage.user("u").reasoning()).isEmpty();
     assertThat(LlmMessage.assistant(List.of(new ContentPart.Text("a"))).reasoning()).isEmpty();
+    assertThat(LlmMessage.assistant(List.of(new ContentPart.Text("a"))).reasoningState())
+        .isEqualTo(LlmMessage.ReasoningState.ABSENT);
     assertThat(toolResult.reasoning()).isEmpty();
     // 老调用点的其余语义不变
     assertThat(fromTwoArg.role()).isEqualTo("assistant");
@@ -212,6 +330,7 @@ class ReasoningEchoBackTest {
     LlmMessage withReasoning = base.withReasoning("想了一下");
 
     assertThat(withReasoning.reasoning()).isEqualTo("想了一下");
+    assertThat(withReasoning.reasoningState()).isEqualTo(LlmMessage.ReasoningState.TEXT);
     assertThat(withReasoning.role()).isEqualTo(base.role());
     assertThat(withReasoning.content()).isEqualTo(base.content());
     assertThat(base.reasoning()).isEmpty();
@@ -222,8 +341,13 @@ class ReasoningEchoBackTest {
   void normalizesNullReasoningToEmptyString() {
     assertThat(new LlmMessage("assistant", List.of(new ContentPart.Text("t")), null).reasoning())
         .isEmpty();
+    assertThat(
+            new LlmMessage("assistant", List.of(new ContentPart.Text("t")), null).reasoningState())
+        .isEqualTo(LlmMessage.ReasoningState.ABSENT);
     assertThat(LlmMessage.assistant(List.of(new ContentPart.Text("t")), null).reasoning())
         .isEmpty();
+    assertThat(LlmMessage.assistant(List.of(new ContentPart.Text("t")), null).reasoningState())
+        .isEqualTo(LlmMessage.ReasoningState.ABSENT);
   }
 
   // ---------- ⑤ 存储侧：历史落盘再读回，思维链还在 ----------
@@ -237,27 +361,38 @@ class ReasoningEchoBackTest {
     LlmMessage withReasoning =
         LlmMessage.assistant(
             List.of(new ContentPart.ToolCall("c-1", "echo", Map.of("text", "hi"))), "先想：调 echo");
+    LlmMessage explicitEmpty =
+        LlmMessage.assistantEchoingEmptyReasoning(List.of(new ContentPart.Text("空思维链但键在")));
     LlmMessage withoutReasoning = LlmMessage.assistant(List.of(new ContentPart.Text("完事")));
 
     try (SqliteConversationStore store = SqliteConversationStore.open(db())) {
       store.append(CONV, withReasoning);
+      store.append(CONV, explicitEmpty);
       store.append(CONV, withoutReasoning);
 
-      assertThat(store.load(CONV)).containsExactly(withReasoning, withoutReasoning);
+      List<LlmMessage> loaded = store.load(CONV);
+      assertThat(loaded).containsExactly(withReasoning, explicitEmpty, withoutReasoning);
+      assertThat(loaded.get(1).reasoningState()).isEqualTo(LlmMessage.ReasoningState.EMPTY);
+      assertThat(loaded.get(1).hasReasoningField()).isTrue();
+      assertThat(loaded.get(2).reasoningState()).isEqualTo(LlmMessage.ReasoningState.ABSENT);
+      assertThat(loaded.get(2).hasReasoningField()).isFalse();
     }
   }
 
   /**
-   * 落盘形态（直接读 {@code messages.content} 列的字节）：<b>有</b>思维链才写 {@code reasoning} 键，没有就<b>一个字节都不动</b>。
+   * 落盘形态（直接读 {@code messages.content} 列的字节）：<b>字段存在</b>就写 {@code reasoning} 键（有正文写原文、显式空串写 {@code
+   * ""}），字段缺席才<b>一个字节都不动</b>。
    *
-   * <p>为什么"没有就不写"值得单独钉：本改动动的是已经落盘的格式，若实现成"恒写空串"，则所有既有消息的落盘字节都会变——而它们在语义上
-   * 什么都没变。让"无思维链"这条最普遍的路径逐字不变，是兼容性里最便宜、也最容易悄悄丢掉的一条。
+   * <p>为什么"缺席不写"值得单独钉：本改动动的是已经落盘的格式，若实现成"恒写空串"，则所有既有消息的落盘字节都会变——而它们在语义上
+   * 什么都没变。让"无该字段"这条最普遍的路径逐字不变，是兼容性里最便宜、也最容易悄悄丢掉的一条；同时"显式空串"又必须有独立可分辨的落盘形态。
    */
   @Test
-  void persistedJsonCarriesReasoningKeyOnlyWhenThereIsOne() throws Exception {
+  void persistedJsonCarriesReasoningKeyExactlyWhenTheFieldExists() throws Exception {
     Path db = db();
     try (SqliteConversationStore store = SqliteConversationStore.open(db)) {
       store.append(CONV, LlmMessage.assistant(List.of(new ContentPart.Text("有思维链")), "先想：想过了"));
+      store.append(
+          CONV, LlmMessage.assistantEchoingEmptyReasoning(List.of(new ContentPart.Text("显式空思维链"))));
       store.append(CONV, LlmMessage.assistant(List.of(new ContentPart.Text("没有思维链"))));
     }
 
@@ -274,9 +409,12 @@ class ReasoningEchoBackTest {
       }
     }
 
-    assertThat(encoded).hasSize(2);
+    assertThat(encoded).hasSize(3);
     assertThat(encoded.get(0)).contains("\"reasoning\":\"先想：想过了\"");
-    assertThat(encoded.get(1)).doesNotContain("reasoning");
+    assertThat(encoded.get(1))
+        .as("显式空串必须落成 reasoning 键（存在但空），不能与缺席合并")
+        .contains("\"reasoning\":\"\"");
+    assertThat(encoded.get(2)).doesNotContain("reasoning");
   }
 
   /**
@@ -312,6 +450,7 @@ class ReasoningEchoBackTest {
       assertThat(loaded.get(1).role()).isEqualTo(LlmMessage.ROLE_ASSISTANT);
       assertThat(loaded.get(1).content()).containsExactly(new ContentPart.Text("老档的回答"));
       assertThat(loaded.get(1).reasoning()).isEmpty();
+      assertThat(loaded.get(1).reasoningState()).isEqualTo(LlmMessage.ReasoningState.ABSENT);
     }
   }
 

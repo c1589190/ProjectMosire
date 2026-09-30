@@ -53,8 +53,8 @@ import java.util.Optional;
  * <p><b>消息内容编码</b>（内部格式，随本类演进）：一条消息 = 一行，{@code role} 单列 + {@code content} 列存 {@code {role,
  * parts[], reasoning?}} 的 JSON（{@code parts} 里每个分片带 {@code type} 判别符：{@code text}/{@code
  * tool_call}/{@code tool_result}/{@code image}）。手写这层判别符而不用 Jackson 的类型元信息，是为了让格式显式、可读、不依赖实体类上的注解。
- * {@code reasoning}（A6 的思维链）<b>只在非空时写</b>，缺键按空串读——改版前的行因此照常可读（见 {@link #encode}/{@link
- * #decodeReasoning}）。
+ * {@code reasoning}（A6 的思维链）<b>在“字段存在”时写</b>：有正文写原文，显式空串也写空串，字段压根缺席才不写；缺键按 {@code ABSENT}
+ * 读——改版前的行因此照常可读（见 {@link #encode}/{@link #decodeReasoning}）。
  *
  * <p>表在会话 id 上无外键约束：会话行由首次 {@code append}/{@code compact} 自动建（{@code INSERT OR IGNORE}），
  * 因此本类不需要调用方先"创建会话"。
@@ -69,7 +69,7 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
   private static final String FIELD_ROLE = "role";
   private static final String FIELD_PARTS = "parts";
 
-  /** 思维链（A6）：<b>只在非空时写出</b>，见 {@link #encode}。 */
+  /** 思维链（A6 修复版）：字段存在就写出（含显式空串），缺席才省略，见 {@link #encode}。 */
   private static final String FIELD_REASONING = "reasoning";
 
   private static final String FIELD_TYPE = "type";
@@ -386,9 +386,12 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
   /**
    * 把一条消息编成落盘 JSON：{@code {role, parts[], reasoning?}}。
    *
-   * <p><b>思维链（A6）只在非空时写</b>：这条格式早在思维链之前就落过盘了，而"没有思维链"是最普遍的一条路径——让它<b>逐字节保持原样</b>
-   * （而不是恒写一个空串键），既省了无谓的库体积，也让"本改动对既有消息零影响"成为可断言的字节级事实（见 {@code
-   * ReasoningEchoBackTest.persistedJsonCarriesReasoningKeyOnlyWhenThereIsOne}）。
+   * <p><b>思维链（A6 修复版）按“字段是否存在”写</b>：{@code ABSENT} 不写任何字节；{@code EMPTY} 写 {@code
+   * "reasoning":""}；{@code TEXT} 写原文。第一版只在非空时写，无法在存储往返里保住“键存在但为空”这一事实——而 DeepSeek thinking 模式要求历史
+   * assistant 消息把空 {@code reasoning_content} 原样带回，丢掉的正是下一轮 400 的根因。
+   *
+   * <p>“没有该字段”仍是最普遍的路径：让老消息的落盘字节<b>逐字节保持原样</b>（而不是给它们补一个空串键），既省无谓库体积，也让 “本改动对既有消息零影响”成为可断言的字节级事实（见
+   * {@code ReasoningEchoBackTest.persistedJsonCarriesReasoningKeyExactlyWhenTheFieldExists}）。
    *
    * <p><b>不写进 {@code parts}</b>：思维链不是"内容分片"（它不参与正文，也不该被拼进正文），且在供应商线格式里它是 {@code content}
    * 的兄弟键。放独立字段与 {@link LlmMessage#reasoning()} 的形状一一对应。
@@ -396,7 +399,7 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
   private static String encode(LlmMessage message) {
     ObjectNode root = JSON.createObjectNode();
     root.put(FIELD_ROLE, message.role());
-    if (message.hasReasoning()) {
+    if (message.hasReasoningField()) {
       root.put(FIELD_REASONING, message.reasoning());
     }
     ArrayNode parts = root.putArray(FIELD_PARTS);
@@ -465,18 +468,30 @@ public final class SqliteConversationStore implements ConversationStore, AutoClo
         default -> throw new IllegalStateException("未知会话消息分片类型: " + type);
       }
     }
-    return new LlmMessage(role, content, decodeReasoning(root));
+    DecodedReasoning reasoning = decodeReasoning(root);
+    return new LlmMessage(role, content, reasoning.text(), reasoning.state());
   }
 
+  /** 存储层解码出的思维链：原文 + 三态（两者必须互证，构造 {@link LlmMessage} 时由它兜底校验）。 */
+  private record DecodedReasoning(String text, LlmMessage.ReasoningState state) {}
+
   /**
-   * 取出思维链：<b>缺键、{@code null}、非文本一律按"没有思维链"收口成空串</b>。
+   * 取出思维链三态：<b>缺键、{@code null}、非文本一律按“字段缺席”（{@code ABSENT}）收口</b>；文本则为 {@code TEXT}/{@code EMPTY}。
    *
    * <p>为什么缺键必须是合法输入：改版前的行里根本没有这个键，而它们是要继续读的（升级后第一次打开老库就走这里）。判 {@code isTextual()} 而不是直接 {@code
    * asText()} 的理由同前——老档/手改库里出现 {@code "reasoning": null} 不该让整条会话读不开。
+   *
+   * <p>文本空串与缺键刻意分开：前者是“曾经发生过、要原样回传”的事实，后者是“从未有过”。存储往返若把两者合并，思考模式的多轮修复就只在单进程内成立， 下一 tick
+   * 从库里读回历史时又会缺键。
    */
-  private static String decodeReasoning(JsonNode root) {
+  private static DecodedReasoning decodeReasoning(JsonNode root) {
     JsonNode value = root.get(FIELD_REASONING);
-    return value != null && value.isTextual() ? value.textValue() : "";
+    if (value == null || value.isNull() || !value.isTextual()) {
+      return new DecodedReasoning("", LlmMessage.ReasoningState.ABSENT);
+    }
+    String text = value.textValue();
+    return new DecodedReasoning(
+        text, text.isEmpty() ? LlmMessage.ReasoningState.EMPTY : LlmMessage.ReasoningState.TEXT);
   }
 
   private static String requiredText(JsonNode node, String field) {

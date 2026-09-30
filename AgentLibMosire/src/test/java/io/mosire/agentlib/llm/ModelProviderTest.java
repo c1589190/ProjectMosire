@@ -27,6 +27,9 @@ class ModelProviderTest {
     assertThat(provider.resolve("missing")).isEmpty();
     // 未注册模型的能力查询必须可空安全：返回保守全关的 defaults，调用方无需判空
     assertThat(provider.capabilities("missing")).isEqualTo(ModelCapabilities.defaults());
+    assertThat(ModelCapabilities.defaults().echoReasoningContent())
+        .as("A6 修复版的新能力位默认关闭，老调用点行为不变")
+        .isFalse();
     assertThat(provider.size()).isZero();
   }
 

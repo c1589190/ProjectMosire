@@ -123,6 +123,14 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
   /** 资产解析 SPI：{@link ContentPart.Image} 的字节来源（{@link ToolAssetResolver#none()} = 不认任何资产）。 */
   private final ToolAssetResolver assetResolver;
 
+  /**
+   * 思考模式回传位（A6 修复版）：{@code true} = 对每条 assistant 消息恒发 {@code reasoning_content}（无内容发空串）。
+   *
+   * <p>它来自 {@link ModelRoute#transport()}，在构造期定死——发送行为必须与 {@link #route()} 的声明一致，不能在每次 {@code chat}
+   * 时再读一遍别的配置（那会造出"同一个客户端一会儿回传、一会儿不回传"的形态）。
+   */
+  private final boolean echoReasoningContent;
+
   private final HttpClient http;
   private final Duration readTimeout;
   private final URI chatCompletionsUri;
@@ -191,6 +199,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         Objects.requireNonNull(transport, "transport").connectTimeout(),
         transport.readTimeout(),
         transport.protocol(),
+        transport.echoReasoningContent(),
         assetResolver);
   }
 
@@ -221,6 +230,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         connectTimeout,
         readTimeout,
         Objects.requireNonNull(route, "route").transport().protocol(),
+        Objects.requireNonNull(route, "route").transport().echoReasoningContent(),
         assetResolver);
   }
 
@@ -230,10 +240,12 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       Duration connectTimeout,
       Duration readTimeout,
       LlmProtocol protocol,
+      boolean echoReasoningContent,
       ToolAssetResolver assetResolver) {
     this.route = Objects.requireNonNull(route, "route");
     this.apiKeySource = Objects.requireNonNull(apiKeySource, "apiKeySource");
     this.assetResolver = Objects.requireNonNull(assetResolver, "assetResolver");
+    this.echoReasoningContent = echoReasoningContent;
     requireOpenAiCompatible(protocol);
     positive(connectTimeout, "connectTimeout");
     this.readTimeout = positive(readTimeout, "readTimeout");
@@ -578,12 +590,19 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    * <p>工具结果按 OpenAI 协议是<b>独立消息</b>（{@code role:tool} + {@code tool_call_id}），故一条消息里的多个 {@link
    * ContentPart.ToolResult} 会展开成多条；其余角色只产出一条消息（文本分片拼成一个字符串）。
    *
-   * <p><b>{@code reasoning_content} 的发送规则（A6：有才发）</b>——assistant 消息带着思维链时，把它作为 {@code content}
-   * 的<b>兄弟键</b>发出去（思考模式的供应商要求上一轮的思维链原样回来，否则多轮对话第二轮即 400）。
+   * <p><b>{@code reasoning_content} 的发送规则（A6 修复版）必须分路由</b>：
    *
-   * <p>反过来，<b>没有思维链的消息一个字节都不多写</b>：{@code null}/空串都不写该键。<b>刻意不写"空值占位"</b>——不认这个字段的供应商
-   * 收到一个它没见过的键（哪怕是空串）是纯风险，而绝大多数请求（user/system/tool 消息、非推理模型的全部消息）本来就没有思维链。
-   * 这也是本类"绝不静默"的同一枚硬币的另一面：<b>该发的不许丢，不该发的不许塞</b>。
+   * <ul>
+   *   <li><b>普通/非思考路由</b>（{@code route.transport().echoReasoningContent() ==
+   *       false}）：维持历史行为——assistant 消息带思维链正文（{@link LlmMessage.ReasoningState#TEXT}）才发该键；{@link
+   *       LlmMessage.ReasoningState#ABSENT}/{@link LlmMessage.ReasoningState#EMPTY}
+   *       一个字节都不写。给不认该字段的供应商塞 未知键（哪怕空串）是纯风险。
+   *   <li><b>思考路由</b>（{@code echoReasoningContent == true}）：对<b>每条</b> assistant 消息恒发该键；没有思维链内容时发
+   *       {@code ""}（{@link LlmMessage.ReasoningState#EMPTY} 也发 {@code ""}）。DeepSeek 等 thinking
+   *       模式网关要求历史 assistant 消息必须带该字段，缺键直接 400；第一版"有才发"正是在"上一轮收口无思维链"时留下缺键的洞。
+   * </ul>
+   *
+   * <p>user/system/tool 消息永远不发该键：它不是模型的产出，塞进去只会污染请求形态。这也是本类"绝不静默"的同一枚硬币的另一面： <b>该发的不许丢，不该发的不许塞</b>。
    */
   private void appendMessage(ArrayNode messages, LlmMessage message) {
     List<ContentPart.ToolResult> results = new ArrayList<>();
@@ -646,8 +665,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
         imagePart.putObject("image_url").put("url", dataUriOf(image));
       }
     }
-    // A6：有思维链才发该键（空串 = 没有思维链，见 LlmMessage 的类注）
-    if (message.hasReasoning()) {
+    // A6 修复版：thinking 路由对 assistant 恒发（无内容发空串）；其余路由维持"有正文才发"。
+    // 消息自身显式带着"键存在但空"（EMPTY）时也发——那是调用方/存储如实带回来的事实，不该被这里抹掉。
+    boolean assistant = LlmMessage.ROLE_ASSISTANT.equals(message.role());
+    if (message.hasReasoningField() || (assistant && echoReasoningContent)) {
       node.put("reasoning_content", message.reasoning());
     }
     if (!calls.isEmpty()) {
@@ -728,6 +749,14 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
      * 思维链累计（{@code reasoning_content}/{@code reasoning}），永不丢失：无论是否折叠进正文，原文都进 {@link LlmResponse}。
      */
     private final StringBuilder reasoning = new StringBuilder();
+
+    /**
+     * 供应商是否在本流里明确给过 {@code reasoning_content}/{@code reasoning} 键（含空串/null）。
+     *
+     * <p>它把“字段存在但为空”与“字段压根缺席”分开：思考模式要求历史 assistant 消息把上一轮的该字段（哪怕是空串）原样带回，
+     * 只用一个空串累加器会把这两种态合并，导致下一轮再次缺键。
+     */
+    private boolean reasoningFieldSeen;
 
     /** 按 OpenAI 的 {@code index} 分桶——不同工具调用的分片允许交错到达。 */
     private final Map<Integer, ToolCallBuffer> calls = new TreeMap<>();
@@ -825,20 +854,31 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
      * 的形态，都吃就等于把思维链算两遍。
      *
      * <p>{@code role} 仍有意忽略：它由请求侧决定，回显没有信息量。
+     *
+     * <p><b>字段存在性也要累计</b>：思考模式要求历史里的 assistant 消息把该键原样带回；供应商明确发过 {@code "reasoning_content":""}
+     * 与整个流都没发过该键，在本方法里必须留下不同的事实（后者才是第一版 A6 缺键 400 的源头）。
      */
     private void applyDelta(JsonNode delta) {
       JsonNode content = delta.path("content");
       if (content.isTextual()) {
         text.append(content.asText());
       }
-      JsonNode reasoningDelta = delta.path("reasoning_content");
-      if (!reasoningDelta.isTextual()) {
-        // 同义字段（OpenRouter 一系）只在正统字段缺席时兜底：**同一 delta 里两个键同时出现**的形态是见过的
+      JsonNode primaryReasoning = delta.get("reasoning_content");
+      JsonNode aliasReasoning = delta.get("reasoning");
+      if (primaryReasoning != null || aliasReasoning != null) {
+        reasoningFieldSeen = true;
+      }
+      JsonNode reasoningDelta = primaryReasoning;
+      if (reasoningDelta == null
+          || (!reasoningDelta.isTextual()
+              && aliasReasoning != null
+              && aliasReasoning.isTextual())) {
+        // 同义字段（OpenRouter 一系）只在正统字段缺席/非文本时兜底：**同一 delta 里两个键同时出现**的形态是见过的
         // （网关把字段镜像一份），两个都吃会把思维链追加两遍——它一旦折叠进正文，正文也就重复了一遍，而这是
         // **安静地错**（D24）。跨 delta 交替用两种写法仍然照吃：那才是"换个网关"的真实形态。
-        reasoningDelta = delta.path("reasoning");
+        reasoningDelta = aliasReasoning;
       }
-      if (reasoningDelta.isTextual()) {
+      if (reasoningDelta != null && reasoningDelta.isTextual()) {
         reasoning.append(reasoningDelta.asText());
       }
       for (JsonNode call : delta.path("tool_calls")) {
@@ -891,8 +931,14 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       for (ToolCallBuffer buffer : calls.values()) {
         parts.add(buffer.toToolCall());
       }
+      LlmMessage.ReasoningState reasoningState =
+          reasoningText.isEmpty()
+              ? (reasoningFieldSeen
+                  ? LlmMessage.ReasoningState.EMPTY
+                  : LlmMessage.ReasoningState.ABSENT)
+              : LlmMessage.ReasoningState.TEXT;
       return new LlmResponse(
-          LlmMessage.assistant(parts),
+          LlmMessage.assistant(parts, reasoningText, reasoningState),
           model == null ? fallbackModel : model,
           inputTokens,
           outputTokens,

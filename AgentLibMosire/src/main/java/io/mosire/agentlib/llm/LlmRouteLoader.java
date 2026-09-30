@@ -26,7 +26,8 @@ import java.util.regex.Pattern;
  *     "protocol":        "openai-compatible",            // 选填；见 LlmProtocol（A3②）
  *     "timeoutMs":       120000,                         // 选填；单次调用整体读取超时（A3①）
  *     "connectTimeoutMs": 10000,                         // 选填；建连超时
- *     "capabilities":    { "toolCalling": true, "maxContext": 65536 }  // 选填；见 ModelCapabilities
+ *     "capabilities":    { "toolCalling": true, "maxContext": 65536,
+ *                          "echoReasoningContent": true } // 选填；见 ModelCapabilities
  * } } }
  * }</pre>
  *
@@ -76,6 +77,14 @@ public final class LlmRouteLoader {
 
   /** 模型能力描述（{@link ModelCapabilities}，供 {@link ModelProvider} 登记用）。 */
   private static final String KEY_CAPABILITIES = "capabilities";
+
+  /**
+   * 思考模式回传位（A6 修复版）的配置键：住在 {@code capabilities} 块里。
+   *
+   * <p>它的语义是"发送侧是否对每条 assistant 消息恒发 {@code reasoning_content}"——放在能力块里是因为它是路由/模型能力的一部分
+   * （不是采样参数、也不是某条消息的属性），并让 {@code simos.llm.providers} 的掩码视图天然能显示它。
+   */
+  private static final String KEY_ECHO_REASONING_CONTENT = "echoReasoningContent";
 
   /** 选哪条路由（可选，默认 {@value #DEFAULT_ROUTE_NAME}）；也用于按 agent 覆盖（见 {@link #routeName}）。 */
   private static final String KEY_ROUTE = "route";
@@ -342,16 +351,18 @@ public final class LlmRouteLoader {
   }
 
   /**
-   * 接法（A3①②）：协议 + 两个超时。
+   * 接法（A3①② + A6 修复版）：协议 + 两个超时 + 思考模式回传位。
    *
-   * <p>三个键<b>都可缺席</b>，缺席即用 {@link LlmTransport} 的默认值——"没配超时"是常态，不是错误。反之，<b>写了但不合法一律 响亮</b>（见 {@link
-   * #protocol} / {@link #millis}）：把"配错了"读成"没配"，会让用户以为自己的约束生效了。
+   * <p>四个键<b>都可缺席</b>，缺席即用 {@link LlmTransport} 的默认值——"没配超时/没配思考模式"是常态，不是错误。反之，<b>写了但不合法一律 响亮</b>（见
+   * {@link #protocol} / {@link #millis} / {@link
+   * #echoReasoningContentAt}）：把"配错了"读成"没配"，会让用户以为自己的约束生效了。
    */
   private static LlmTransport transport(ConfigStore store, String prefix) {
     return new LlmTransport(
         protocol(store, prefix),
         millis(store, prefix, KEY_CONNECT_TIMEOUT_MS, LlmTransport.DEFAULT_CONNECT_TIMEOUT),
-        millis(store, prefix, KEY_TIMEOUT_MS, LlmTransport.DEFAULT_READ_TIMEOUT));
+        millis(store, prefix, KEY_TIMEOUT_MS, LlmTransport.DEFAULT_READ_TIMEOUT),
+        echoReasoningContentAt(store, prefix));
   }
 
   /**
@@ -408,17 +419,15 @@ public final class LlmRouteLoader {
    *
    * <p>键名<b>就是</b> {@link ModelCapabilities} 的组件名（{@code toolCalling}/{@code
    * parallelToolCalls}/{@code reasoning}/{@code promptCaching}/{@code vision}/{@code
-   * maxContext}/{@code maxOutput}）——不另立一套命名，读代码的人不必做一次翻译。
+   * maxContext}/{@code maxOutput}/{@code echoReasoningContent}）——不另立一套命名，读代码的人不必做一次翻译。
+   *
+   * <p>{@code echoReasoningContent} 与 {@link #transport(ConfigStore, String)} 读的是同一个配置键：能力页展示的 bit
+   * 与发送侧真正生效的 bit 必须同源，否则会出现"页面说开着、线上仍缺键"的静默失效。
    */
   private static ModelCapabilities capabilitiesAt(ConfigStore store, String prefix) {
-    JsonNode node = store.get(prefix, KEY_CAPABILITIES).orElse(null);
-    if (node == null || node.isNull()) {
+    JsonNode node = capabilitiesNode(store, prefix);
+    if (node == null) {
       return ModelCapabilities.defaults();
-    }
-    if (!node.isObject()) {
-      throw new ConfigException(
-          E_LLM_CONFIG_MISSING,
-          "LLM 路由配置不可用：" + prefix + "." + KEY_CAPABILITIES + " 必须是对象（能力名 → 布尔/数值）");
     }
     String caps = prefix + "." + KEY_CAPABILITIES;
     return new ModelCapabilities(
@@ -428,7 +437,40 @@ public final class LlmRouteLoader {
         boolAt(store, caps, "promptCaching"),
         boolAt(store, caps, "vision"),
         countAt(store, caps, "maxContext"),
-        countAt(store, caps, "maxOutput"));
+        countAt(store, caps, "maxOutput"),
+        boolAt(store, caps, KEY_ECHO_REASONING_CONTENT));
+  }
+
+  /**
+   * 思考模式回传位：{@code capabilities} 整块缺席 → {@code false}；块内该键缺席 → {@code false}；存在但非布尔 → 响亮。
+   *
+   * <p>它比"模型支持推理"（{@link ModelCapabilities#reasoning()}）更窄：并非所有支持推理的供应商都要求回传空 {@code
+   * reasoning_content}；给不认该字段的普通 OpenAI 兼容端点塞未知键是另一种 400。
+   */
+  private static boolean echoReasoningContentAt(ConfigStore store, String prefix) {
+    if (capabilitiesNode(store, prefix) == null) {
+      return false;
+    }
+    return boolAt(store, prefix + "." + KEY_CAPABILITIES, KEY_ECHO_REASONING_CONTENT);
+  }
+
+  /**
+   * 取 {@code capabilities} 块：缺席/null → {@code null}；存在但不是对象 → {@link #E_LLM_CONFIG_MISSING} 响亮。
+   *
+   * <p>提取成方法是为了让 {@link #transport(ConfigStore, String)} 与 {@link #capabilitiesAt(ConfigStore,
+   * String)} 对"整块形态不对"给出同一句文案——两处各写一份对象校验，迟早会变成两种口径。
+   */
+  private static JsonNode capabilitiesNode(ConfigStore store, String prefix) {
+    JsonNode node = store.get(prefix, KEY_CAPABILITIES).orElse(null);
+    if (node == null || node.isNull()) {
+      return null;
+    }
+    if (!node.isObject()) {
+      throw new ConfigException(
+          E_LLM_CONFIG_MISSING,
+          "LLM 路由配置不可用：" + prefix + "." + KEY_CAPABILITIES + " 必须是对象（能力名 → 布尔/数值）");
+    }
+    return node;
   }
 
   /** 能力布尔项：缺席 = false（= {@link ModelCapabilities#defaults()} 的口径）；存在但非布尔 → 响亮。 */

@@ -126,9 +126,31 @@ final class FakeChatEndpoint implements AutoCloseable {
         readTimeout);
   }
 
-  /** 匿名客户端（不带 {@code Authorization}）、读超时 5s。 */
+  /** 匿名客户端（不带 {@code Authorization}）、读超时 5s、非思考路由（不回传空思维链键）。 */
   OpenAICompatibleLlmClient client(String routeModel) {
-    return client(routeModel, OpenAICompatibleLlmClient.ApiKeySource.none(), Duration.ofSeconds(5));
+    return client(routeModel, false);
+  }
+
+  /**
+   * 匿名客户端，可显式声明思考模式的 {@code echoReasoningContent} 能力位（A6 修复版）。
+   *
+   * <p>思考路由的线级形态与普通路由不同：前者对每条 assistant 消息恒发 {@code reasoning_content}（可为空串），后者只在有正文时才发。
+   * 假端点捕获的请求体是这两种形态唯一的可观测面。
+   */
+  OpenAICompatibleLlmClient client(String routeModel, boolean echoReasoningContent) {
+    ModelRoute route =
+        ModelRoute.of(
+            "test",
+            baseUrl(),
+            routeModel,
+            "keys.fake",
+            new LlmTransport(
+                LlmProtocol.OPENAI_COMPATIBLE,
+                Duration.ofSeconds(2),
+                Duration.ofSeconds(5),
+                echoReasoningContent));
+    return new OpenAICompatibleLlmClient(
+        route, OpenAICompatibleLlmClient.ApiKeySource.none(), ToolAssetResolver.none());
   }
 
   @Override

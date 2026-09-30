@@ -84,7 +84,8 @@ public record LlmResponse(
     // A6：把思维链**挂回助手消息**——消费方"把上一条 assistant 原样追加进历史"（simos DecisionAgentRunner、
     // brain AgentPipeline 都是这一行）于是天然把它回传给供应商，零改动。不挂的话，多轮对话的第二轮会被思考模式的
     // 供应商拒掉（实测 400：reasoning_content must be passed back）。
-    // ★ 反向不做（不因 reasoning 为空而抹掉消息自带的思维链）：那是调用方放进来的事实，删掉等于篡改它的输入。
+    // ★ 反向不做（不因 reasoning 为空而抹掉消息自带的思维链/字段存在性）：那是调用方/解析器放进来的事实，删掉等于篡改它的输入。
+    //   A6 修复版尤其依赖这一点：解析器把"供应商明确发了空串"标成 ReasoningState.EMPTY，本构造器不得把它降级回 ABSENT。
     if (!reasoning.isEmpty()) {
       assistantMessage = assistantMessage.withReasoning(reasoning);
     }
@@ -165,6 +166,16 @@ public record LlmResponse(
         UNKNOWN_TOKENS,
         reasoning,
         ReasoningDisposition.FOLDED);
+  }
+
+  /**
+   * 思维链字段的三态（{@link LlmMessage.ReasoningState} 的直通）。
+   *
+   * <p>{@link LlmMessage.ReasoningState#EMPTY} 不是错误：思考模式供应商确实可能下发 {@code
+   * "reasoning_content":""}，而这个事实必须被带回历史，才能在下一轮原样回传。
+   */
+  public LlmMessage.ReasoningState reasoningState() {
+    return assistantMessage.reasoningState();
   }
 
   /** 取助手消息里的第一条纯文本（无文本则空）。 */
