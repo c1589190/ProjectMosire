@@ -11,11 +11,12 @@ import java.util.Objects;
  * 与跨洋网关的合理超时差一个数量级，配置页要让用户逐 provider 填（simos 侧的 {@code timeoutMs} 就是这个位置）。原先它只在 {@code
  * OpenAICompatibleLlmClient} 的构造器上，结果是“谁能设超时”取决于“谁负责 new 客户端”——配置装配路径反而设不了。
  *
- * <p><b>两个超时各管一段</b>（合起来是一次 {@code chat} 的全过程）：
+ * <p><b>两个超时各管一段</b>（2026-10-01 语义修正：长推理不再按总时长切断）：
  *
  * <ul>
  *   <li>{@code connectTimeout}：与供应商<b>建连</b>的上限（{@link java.net.http.HttpClient} 的 connectTimeout）。
- *   <li>{@code readTimeout}：一次调用的<b>整体</b>硬上限——建连 + 响应头 + 流式读取（含 {@code [DONE]} 之前的阻塞读）全算在内。
+ *   <li>{@code readTimeout}：<b>流空闲超时</b>——进入 SSE 后，两次“读到新数据”的间隔上限；只要 data 帧/SSE
+ *       心跳还在到达，总时长不设上限。reasoning 模型单次生成数分钟是合法形态。<b>注意</b>：它不再是整个交换的总时长上限。
  * </ul>
  *
  * <p><b>{@code echoReasoningContent}</b>（A6 修复版）：思考模式供应商要求历史里的 assistant 消息把上一轮的 {@code
@@ -58,10 +59,15 @@ public record LlmTransport(
         LlmProtocol.OPENAI_COMPATIBLE, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, false);
   }
 
-  /** 只改读取超时（最常见的诉求：给慢供应商放宽整体上限）；思维链回传位保持 {@code false}。 */
+  /** 只改流空闲超时（最常见的诉求：给慢供应商放宽“多久没数据才算死”）；思维链回传位保持 {@code false}。 */
   public static LlmTransport withReadTimeout(Duration readTimeout) {
     return new LlmTransport(
         LlmProtocol.OPENAI_COMPATIBLE, DEFAULT_CONNECT_TIMEOUT, readTimeout, false);
+  }
+
+  /** 流空闲超时的显式别名（与 {@link #readTimeout()} 同一值）：新代码用它表达“只要还在输出就不切”。 */
+  public Duration streamIdleTimeout() {
+    return readTimeout;
   }
 
   /** 换思考模式回传位（其余组件不变）——配置加载与手动装配都用它，避免逐字段抄。 */

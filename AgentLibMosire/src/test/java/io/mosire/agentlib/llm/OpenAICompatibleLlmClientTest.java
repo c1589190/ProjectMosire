@@ -289,6 +289,29 @@ class OpenAICompatibleLlmClientTest {
   }
 
   /**
+   * <b>2026-10-01 核心回归</b>：流总时长超过 {@code readTimeout}，但每个 chunk 间隔都小于它 ⇒ 必须成功。
+   *
+   * <p>旧实现把 {@code readTimeout} 当整个交换的硬上限，长 reasoning 调用在 120s 被总时长切断；本用例用 {@code
+   * readTimeout=200ms} + 20 个间隔 20ms 的 chunk（总时长约 400ms）把"只要还在输出就不切"钉成线级事实。若实现回退成 {@code
+   * outcome.get(readTimeout)} 或把该值继续当总时长，本用例必红。
+   */
+  @Test
+  void keepsLongStreamingResponseAliveWhenChunksKeepArriving() {
+    int frames = 20;
+    for (int i = 0; i < frames; i++) {
+      script.add(sseFrame("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}"));
+    }
+    script.add(DONE_FRAME);
+
+    long startedNanos = System.nanoTime();
+    LlmResponse response = client(ApiKeySource.none(), Duration.ofMillis(200)).chat(oneUserTurn());
+    long elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000L;
+
+    assertThat(response.textPart()).contains("x".repeat(frames));
+    assertThat(elapsedMillis).as("总时长必须允许超过 readTimeout（它现在是流空闲超时，不是总时长）").isGreaterThan(200L);
+  }
+
+  /**
    * 传输层失败（连接被拒）也必须归成 {@link LlmException}：契约要求"失败抛 LlmException"——裸 {@code IOException}/ {@code
    * UncheckedIOException} 逃到 {@link LlmClient} 调用方是违约。端口取自"刚被释放的临时端口"，全离线、快速失败。
    */

@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
  *     "model":           "deepseek-chat",                // 必填
  *     "credentialsRef":  "keys.deepseek",                // 选填；见 ConfigApiKeySource
  *     "protocol":        "openai-compatible",            // 选填；见 LlmProtocol（A3②）
- *     "timeoutMs":       120000,                         // 选填；单次调用整体读取超时（A3①）
+ *     "timeoutMs":       120000,                         // 选填；SSE 流空闲超时（A3①；只要还在输出就不按总时长切）
  *     "connectTimeoutMs": 10000,                         // 选填；建连超时
  *     "capabilities":    { "toolCalling": true, "maxContext": 65536,
  *                          "echoReasoningContent": true } // 选填；见 ModelCapabilities
@@ -66,7 +66,11 @@ public final class LlmRouteLoader {
   private static final String KEY_MODEL = "model";
   private static final String KEY_CREDENTIALS_REF = "credentialsRef";
 
-  /** 单次调用的整体读取超时（毫秒）——A3①：超时是 provider 的属性，故住在路由条目里。 */
+  /**
+   * SSE 流空闲超时（毫秒）——A3① + 2026-10-01：超时是 provider 的属性，故住在路由条目里。
+   *
+   * <p>语义是“连续多久没有新数据才判死”，不是“一次调用总时长上限”：reasoning 模型持续输出时不应被切。
+   */
   private static final String KEY_TIMEOUT_MS = "timeoutMs";
 
   /** 建连超时（毫秒）。 */
@@ -353,8 +357,8 @@ public final class LlmRouteLoader {
   /**
    * 接法（A3①② + A6 修复版）：协议 + 两个超时 + 思考模式回传位。
    *
-   * <p>四个键<b>都可缺席</b>，缺席即用 {@link LlmTransport} 的默认值——"没配超时/没配思考模式"是常态，不是错误。反之，<b>写了但不合法一律 响亮</b>（见
-   * {@link #protocol} / {@link #millis} / {@link
+   * <p>四个键<b>都可缺席</b>，缺席即用 {@link LlmTransport} 的默认值——"没配超时/没配思考模式"是常态，不是错误；{@code timeoutMs}
+   * 配的是<b>流空闲</b>上限，不是总时长。反之，<b>写了但不合法一律 响亮</b>（见 {@link #protocol} / {@link #millis} / {@link
    * #echoReasoningContentAt}）：把"配错了"读成"没配"，会让用户以为自己的约束生效了。
    */
   private static LlmTransport transport(ConfigStore store, String prefix) {

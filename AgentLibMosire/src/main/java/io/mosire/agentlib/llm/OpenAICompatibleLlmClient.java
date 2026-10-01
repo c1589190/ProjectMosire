@@ -26,7 +26,6 @@ import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
@@ -48,9 +47,17 @@ import org.slf4j.LoggerFactory;
  *
  * <p>重试策略（指数退避/按状态码分类/上限）归调用方或后续任务，本类只保证"一次调用 = 一次请求"。
  *
- * <p><b>超时边界</b>：构造期设连接超时；每次调用以 {@code readTimeout} 为整个交换（连接 + 响应头 + 流式读取）的硬上限， 到点抛 {@link
- * LlmException}——<b>绝不无限挂起</b>。JDK 的 {@link HttpRequest#timeout} 只覆盖到"响应头到达"，流式响应体 （{@code [DONE]}
- * 之前的阻塞读）没有超时保护，故实际交换跑在虚拟线程上、调用线程做有界等待（虚拟线程天生守护， 超时后即使读线程仍卡在 socket 上也不会拖住 JVM 退出）。
+ * <p><b>超时边界（2026-10-01 修复：长推理不再被总时长切断）</b>：
+ *
+ * <ul>
+ *   <li>{@code connectTimeout}：与供应商建连的上限。
+ *   <li>{@code readTimeout}：<b>流空闲超时</b>——进入 SSE 后，两个“有新数据”的间隔超过它才判超时；只要 data 帧或 SSE
+ *       心跳持续到达，<b>总时长不设上限</b>（reasoning 模型单次跑几分钟是合法形态）。
+ *   <li>{@link HttpRequest#timeout} 仍用同一个值，负责建连后到响应头到达这一段；到达响应头后由 {@link IdleTimeoutInputStream}
+ *       看守流空闲。
+ *   <li>空闲超时由独立守护看门狗在无数据时关闭响应流，阻塞中的 `read` 以 {@link LlmException}（{@link
+ *       LlmException.Kind#TIMEOUT}，消息带阶段/模型/已空闲毫秒）收口；<b>绝不无限挂起</b>。
+ * </ul>
  *
  * <p><b>供应商错误 vs 本地配额（不得混为一谈）</b>：供应商 429/限流等非 2xx 一律抛 {@link LlmException}（消息带 HTTP 状态 +
  * 非敏感摘要），<b>绝不</b>抛 {@link QuotaExceededException}、<b>绝不</b>映射成 Brain 的 {@code
@@ -93,7 +100,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
   /** 默认连接超时（与供应商建连的上限）。权威定义在 {@link LlmTransport}——超时归路由数据（A3①），此处保留常量仅为兼容既有引用。 */
   public static final Duration DEFAULT_CONNECT_TIMEOUT = LlmTransport.DEFAULT_CONNECT_TIMEOUT;
 
-  /** 默认读取超时：一次 {@code chat} 从发起到拿到完整响应的硬上限（含流式读取）。权威定义见 {@link LlmTransport}。 */
+  /** 默认流空闲超时（兼容旧字段名 {@code readTimeout}）：SSE 两次新数据之间的上限；权威定义见 {@link LlmTransport}。 */
   public static final Duration DEFAULT_READ_TIMEOUT = LlmTransport.DEFAULT_READ_TIMEOUT;
 
   private static final Logger LOG = LoggerFactory.getLogger(OpenAICompatibleLlmClient.class);
@@ -210,7 +217,7 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
    *     /chat/completions}）
    * @param apiKeySource 取密钥 SPI（见 {@link ApiKeySource}）
    * @param connectTimeout 建连超时（必须为正）
-   * @param readTimeout 单次调用的整体读取超时（必须为正）
+   * @param readTimeout 流空闲超时（必须为正；进入 SSE 后连续多久没有新数据才判超时，总时长不设上限）
    */
   public OpenAICompatibleLlmClient(
       ModelRoute route, ApiKeySource apiKeySource, Duration connectTimeout, Duration readTimeout) {
@@ -297,9 +304,10 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
   @Override
   public LlmResponse chat(LlmRequest request) throws LlmException {
     Objects.requireNonNull(request, "request");
-    // 超时边界：整个交换跑在虚拟线程上，调用线程以 readTimeout 为界等待。见类 Javadoc"超时边界"。
+    // 超时边界：交换跑在虚拟线程上；连接/响应头由 HttpClient 的 connectTimeout 与 HttpRequest.timeout 兜底，
+    // SSE 体的“还在不在输出”由 IdleTimeoutInputStream 看守。调用线程不再用总时长做其次等待。
     CompletableFuture<LlmResponse> outcome = new CompletableFuture<>();
-    // 让超时路径能关掉底层响应流（尽量解开仍卡在 read 上的读线程；关不掉也不影响调用方已按时返回）
+    // 中断路径尽量关掉底层响应流（解开仍卡在 read 上的读线程）
     AtomicReference<InputStream> bodyRef = new AtomicReference<>();
     Thread.ofVirtual()
         .name("mosire-llm-sse")
@@ -308,21 +316,12 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
               try {
                 outcome.complete(exchange(request, bodyRef));
               } catch (Throwable failure) {
-                // 连 Error 也要定案：异常路径若漏过，调用方只能白等到超时，真正的原因被掩盖
+                // 连 Error 也要定案：异常路径若漏过，调用方只能白等，真正的原因被掩盖
                 outcome.completeExceptionally(failure);
               }
             });
     try {
-      return outcome.get(readTimeout.toMillis(), TimeUnit.MILLISECONDS);
-    } catch (TimeoutException timeout) {
-      outcome.cancel(true);
-      LlmException failure =
-          new LlmException(
-              "LLM 调用超时：" + readTimeout.toMillis() + "ms 内未拿到完整响应（连接/响应头/SSE 流，供应商未在期限内完成）",
-              LlmException.Kind.TIMEOUT,
-              timeout);
-      closeQuietly(bodyRef.get(), failure);
-      throw failure;
+      return outcome.get();
     } catch (InterruptedException interrupted) {
       outcome.cancel(true);
       Thread.currentThread().interrupt();
@@ -354,15 +353,17 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       throw providerFailure(response, apiKey);
     }
     InputStream body = response.body();
-    bodyRef.set(body);
+    // 流空闲看门狗：只按“两次新数据之间的间隔”判超时，不看总时长——长推理只要还在吐 chunk 就不切。
+    IdleTimeoutInputStream idleBody = new IdleTimeoutInputStream(body, readTimeout, route.model());
+    bodyRef.set(idleBody);
     try {
       return parseSseStream(
-          body,
+          idleBody,
           route.model(),
           response.headers().firstValue("Content-Type").orElse("(未知)"),
           apiKey);
     } finally {
-      closeQuietly(body, null);
+      closeQuietly(idleBody, null);
     }
   }
 
@@ -736,6 +737,139 @@ public final class OpenAICompatibleLlmClient implements LlmClient {
       }
     }
     throw accumulator.truncatedStream(contentType);
+  }
+
+  /**
+   * 流空闲看门狗：包住 SSE 响应体，只按“两次成功读取之间的间隔”判超时。
+   *
+   * <p><b>为什么不按总时长</b>：reasoning 模型的单次补全可能持续数分钟；只要还在产出内容，总时长就不是失败信号。旧实现把 {@code readTimeout}
+   * 当整个交换的硬上限，长推理在 120s 被一刀切断——本类改为：每次从底层流读到任何字节都刷新活动时间，只有连续 {@code readTimeout} 没有新数据时才关流并抛 {@link
+   * LlmException.Kind#TIMEOUT}。
+   *
+   * <p><b>看门狗为什么必须存在</b>：JDK {@link InputStream} 的阻塞读没有超时参数；供应商发完一半帧后不再吐数据时，读线程会永远卡在 socket
+   * 上。看门狗在独立虚拟线程里检查活动时间并 {@code close()} 底层流，把阻塞读逼成异常。
+   *
+   * <p>活动时间在<b>读到字节</b>时刷新，因此 SSE 注释心跳（{@code : ping}）同样算“还在输出”，不要求每个 read 都携带业务帧。
+   */
+  private static final class IdleTimeoutInputStream extends InputStream {
+
+    private final InputStream delegate;
+
+    /** 空闲上限（纳秒）；连续无新数据达到它即判超时。 */
+    private final long idleNanos;
+
+    /** 仅用于超时消息的可观测字段，不含任何密钥。 */
+    private final String model;
+
+    private final Thread watchdog;
+
+    private volatile long lastActivityNanos = System.nanoTime();
+
+    private volatile boolean timedOut;
+
+    private volatile boolean closed;
+
+    IdleTimeoutInputStream(InputStream delegate, Duration idleTimeout, String model) {
+      this.delegate = Objects.requireNonNull(delegate, "delegate");
+      this.idleNanos = Objects.requireNonNull(idleTimeout, "idleTimeout").toNanos();
+      this.model = Objects.requireNonNull(model, "model");
+      if (idleNanos <= 0) {
+        throw new IllegalArgumentException("idleTimeout 必须为正: " + idleTimeout);
+      }
+      // 检查周期取 idle 的 1/4（夹在 1ms..1s）：判超时足够及时，也不会为长超时忙等。
+      long sleepNanos = Math.max(1_000_000L, Math.min(idleNanos / 4, 1_000_000_000L));
+      this.watchdog =
+          Thread.ofVirtual().name("mosire-llm-idle-watchdog").start(() -> watch(sleepNanos));
+    }
+
+    private void watch(long sleepNanos) {
+      while (!closed) {
+        try {
+          Thread.sleep(Duration.ofNanos(sleepNanos));
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        if (System.nanoTime() - lastActivityNanos >= idleNanos) {
+          timedOut = true;
+          closeDelegate();
+          return;
+        }
+      }
+    }
+
+    @Override
+    public int read() throws IOException {
+      int value;
+      try {
+        value = delegate.read();
+      } catch (IOException failure) {
+        if (timedOut) {
+          throw idleTimeoutFailure();
+        }
+        throw failure;
+      }
+      if (value >= 0) {
+        lastActivityNanos = System.nanoTime();
+        return value;
+      }
+      if (timedOut) {
+        throw idleTimeoutFailure();
+      }
+      return -1;
+    }
+
+    @Override
+    public int read(byte[] buffer, int offset, int length) throws IOException {
+      int count;
+      try {
+        count = delegate.read(buffer, offset, length);
+      } catch (IOException failure) {
+        if (timedOut) {
+          throw idleTimeoutFailure();
+        }
+        throw failure;
+      }
+      if (count > 0) {
+        lastActivityNanos = System.nanoTime();
+      } else if (timedOut) {
+        throw idleTimeoutFailure();
+      }
+      return count;
+    }
+
+    @Override
+    public int available() throws IOException {
+      return delegate.available();
+    }
+
+    @Override
+    public void close() throws IOException {
+      closed = true;
+      watchdog.interrupt();
+      delegate.close();
+    }
+
+    /** 空闲超时的统一收口：阶段、模型、空闲毫秒都在消息里，且绝不含密钥。 */
+    private LlmException idleTimeoutFailure() {
+      return new LlmException(
+          "LLM 调用超时：流式响应连续 "
+              + (idleNanos / 1_000_000L)
+              + "ms 没有新数据（阶段=stream-idle，模型="
+              + model
+              + "）——只要 data 帧/心跳持续到达就不会触发；若长推理仍被切断，请检查中转站是否在整段缓冲 SSE，"
+              + "或调高该路由 timeoutMs",
+          LlmException.Kind.TIMEOUT);
+    }
+
+    /** 看门狗关流：失败不掩盖超时定论；读线程会在随后的 read/EOF 上看到 {@code timedOut=true}。 */
+    private void closeDelegate() {
+      try {
+        delegate.close();
+      } catch (IOException ignored) {
+        // 关流失败不改变“已空闲超时”的事实；read 返回 EOF 时仍会按 timedOut 抛 TIMEOUT
+      }
+    }
   }
 
   /** SSE 累加器：把逐行到达的 {@code data:} 帧拼装成一次 {@link LlmResponse}。 */
