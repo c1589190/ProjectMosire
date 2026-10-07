@@ -27,6 +27,32 @@ public record ResourceScopeMap(Map<String, ResourceScope> byNamespace) {
   /** {@code fs} 命名空间（工作目录围栏在这一维上落格）。 */
   public static final String FS = "fs";
 
+  /**
+   * {@code skills} 命名空间：<b>技能可见面</b>（能列出/检索/加载哪些技能的正文）。
+   *
+   * <p>前缀语义即 {@link ResourceScope} 的通用前缀语义，落格的是<b>技能文件系统路径</b>：一个前缀既可以是一个<b>技能文件夹</b>
+   * （该子树里的技能都可见/可编辑），也可以是一个<b>单个 {@code SKILL.md} 文件</b>（只有这一个技能文档）。 之所以两种粒度能共用一套判定：{@code
+   * ResourceScope.contains} 是“段边界包含”，文件路径恰好等于前缀时命中、在其下时也命中。
+   *
+   * <p><b>未表态 ≠ 可见</b>：本命名空间的使用方（技能工具）把工具缺省策略声明为 {@code DENY}，于是“没写过这一项”读作
+   * “看不见任何技能”（fail-closed），这与 {@link ResourceScopeMap} 的“未声明 = 本层不表态，回落下一层”一致—— 回落的那一层（工具缺省）就是
+   * DENY。要“全可见”必须显式写 {@link ResourceScope#unlimited()}。
+   */
+  public static final String SKILLS = "skills";
+
+  /**
+   * {@code skills-edit} 命名空间：<b>技能可编辑面</b>（能在哪些范围内创建/修改 {@code SKILL.md}）。
+   *
+   * <p>与 {@link #SKILLS} 分开两个命名空间而不是一个“读写合一”的作用域，理由有二：
+   *
+   * <ul>
+   *   <li>{@link ResourceScope} 是“区域”而不是“区域 × 操作”，一个命名空间只能表一个面；“可见但不能改”是必须能表达的取值；
+   *   <li>两个命名空间各自独立逐跳求交，且**生效值恒满足 {@code skills-edit ⊆ skills}**（由物化侧求交保证）——
+   *       编辑一个自己看不见的技能没有语义，这个包含关系把它变成结构性的。
+   * </ul>
+   */
+  public static final String SKILLS_EDIT = "skills-edit";
+
   public ResourceScopeMap {
     byNamespace = byNamespace == null ? Map.of() : new LinkedHashMap<>(byNamespace);
     Map<String, ResourceScope> copy = new TreeMap<>();

@@ -17,11 +17,18 @@ import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.mcp.PipeMcpClientTransport;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
+import io.mosire.brain.context.BasicContextAssembler;
+import io.mosire.brain.context.ContextPolicy;
+import io.mosire.brain.context.ContextSources;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.TurnResult;
+import io.mosire.brain.skills.SkillAccess;
+import io.mosire.brain.skills.SkillCatalog;
+import io.mosire.brain.skills.SkillPermissions;
 import io.mosire.brain.subagent.AgentTemplate;
 import io.mosire.brain.subagent.AgentTemplateStore;
 import io.mosire.main.app.BootConfig;
@@ -31,6 +38,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Predicate;
@@ -122,7 +130,13 @@ public final class SubagentProcessMain {
       bus = eventBus;
 
       AgentConfig config = template.toAgentConfig(options.instanceId());
-      AgentPermissionSet permissions = template.toPermissionSet();
+      // 技能两个面（本能力）：模板给基线，父侧 argv 传下来的是**收紧后的生效值**（父级物化过的），
+      // 这里 decode 后与模板求交（withScopes 再把可编辑面夹进可见面）。argv 缺席 ⇒ none（fail-closed，不是“不限”）。
+      AgentPermissionSet permissions =
+          SkillPermissions.withScopes(
+              template.toPermissionSet(),
+              SkillPermissions.decode(options.skillVisible()),
+              SkillPermissions.decode(options.skillEditable()));
       ToolRegistry registry = new ToolRegistry();
       if (options.parentLink()) {
         // 父侧建好的管道 → MCP client（握手/工具目录/调用全经此传输；父侧永远在同一对管道上服务）
@@ -139,8 +153,22 @@ public final class SubagentProcessMain {
           options.configDir() == null
               ? template.scriptedFakeLlm()
               : realLlm(options.configDir(), options.templateId());
+      // 技能目录预注入（每回合的目录档）：只在本进程拿到技能根时接线；扫描失败不拦启动（子体没有可用的目录档就退回
+      // “不预注入”，stderr 留痕）——一个手改坏的技能不该让所有子 Agent 都拉不起来（技能**工具**走父侧链路，
+      // 那时会按 SkillCatalog 的既有语义响亮报错，边界仍在）。
+      BasicContextAssembler assembler = skillAssembler(options, permissions, diagnostics);
       AgentRuntime agent =
-          new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions);
+          assembler == null
+              ? new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions)
+              : new AgentRuntime(
+                  config,
+                  llm,
+                  registry,
+                  new ToolExecutionGuard(),
+                  assembler,
+                  eventStore,
+                  eventBus,
+                  permissions);
       runtime = agent;
       TurnResult result = agent.chat(options.goal());
       diagnostics.println(
@@ -238,6 +266,32 @@ public final class SubagentProcessMain {
     }
   }
 
+  /**
+   * 子体的技能目录预注入装配：{@code --skills-dir} 缺席 ⇒ {@code null}（不接线，行为与接线前逐字一致）。
+   *
+   * <p>可见面取的是本进程权限集（模板 ∩ 父侧 argv）里那个值——<b>不是</b>模板单独说的那份，否则父级收紧过的范围会在 预注入这一侧被放大回去。
+   */
+  private static BasicContextAssembler skillAssembler(
+      Options options, AgentPermissionSet permissions, PrintStream diagnostics) {
+    if (options.skillsDir() == null) {
+      return null;
+    }
+    SkillCatalog catalog = new SkillCatalog();
+    try {
+      // 宽容扫描：坏掉的单个技能只影响它自己（其余技能的目录档照常预注入），坏掉这件事 stderr 留痕
+      SkillCatalog.ScanReport report = catalog.scanTolerant(options.skillsDir());
+      if (!report.broken().isEmpty()) {
+        diagnostics.println("技能目录里有坏技能（本次预注入跳过它们）: " + report.broken());
+      }
+    } catch (RuntimeException e) {
+      diagnostics.println(
+          "技能目录预注入已跳过（根目录不可扫描，技能工具仍可用）: " + options.skillsDir() + " → " + e.getMessage());
+      return null;
+    }
+    SkillAccess access = SkillAccess.of(permissions, catalog, options.skillsDir());
+    return new BasicContextAssembler(ContextPolicy.defaults(), ContextSources.skills(access));
+  }
+
   /** 模板权限集 → 桥同步过滤器：白名单通配（{@code "*"}）不过滤，否则按名命中。 */
   private static Predicate<String> filterFor(AgentPermissionSet permissions) {
     if (permissions.allowedTools().contains(AgentPermissionSet.ALL_TOOLS)) {
@@ -262,6 +316,11 @@ public final class SubagentProcessMain {
    *
    * @param configDir 父的配置根（{@code --config-dir}；null = 离线/测试形态 ⇒ 模板脚本假 LLM）。只放路径——密钥值由本进程自己从 {@code
    *     <configDir>/config.json} 读（D23）
+   * @param skillsDir 技能根目录（{@code --skills-dir}；null = 本子体不做技能目录预注入）。技能<b>工具</b>由父侧 MCP 链路服务，
+   *     这里只为“每回合的可见技能目录档”提供落点
+   * @param skillVisible 可见面（{@code --skill-visible}，可重复；{@code *}/{@code none}/路径，见 {@link
+   *     SkillPermissions#encode}）；空表 = none（fail-closed）
+   * @param skillEditable 可编辑面（{@code --skill-editable}），语义同上
    */
   public record Options(
       String instanceId,
@@ -270,7 +329,32 @@ public final class SubagentProcessMain {
       Path templatesDir,
       Path dataDir,
       boolean parentLink,
-      Path configDir) {
+      Path configDir,
+      Path skillsDir,
+      List<String> skillVisible,
+      List<String> skillEditable) {
+
+    /** 7 参兼容构造（技能面引入之前）：不预注入、两个技能面都取 none。 */
+    public Options(
+        String instanceId,
+        String templateId,
+        String goal,
+        Path templatesDir,
+        Path dataDir,
+        boolean parentLink,
+        Path configDir) {
+      this(
+          instanceId,
+          templateId,
+          goal,
+          templatesDir,
+          dataDir,
+          parentLink,
+          configDir,
+          null,
+          List.of(),
+          List.of());
+    }
 
     public Options {
       if (instanceId == null || instanceId.isBlank()) {
@@ -284,6 +368,9 @@ public final class SubagentProcessMain {
       }
       templatesDir = Objects.requireNonNullElse(templatesDir, BootConfig.DEFAULT_TEMPLATES_DIR);
       dataDir = Objects.requireNonNullElse(dataDir, BootConfig.DEFAULT_DATA_DIR);
+      // 不可变快照；null 与空表同口径（都读作 none —— 缺省方向朝收紧）
+      skillVisible = skillVisible == null ? List.of() : List.copyOf(skillVisible);
+      skillEditable = skillEditable == null ? List.of() : List.copyOf(skillEditable);
     }
   }
 }

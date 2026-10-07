@@ -17,6 +17,7 @@ import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
+import io.mosire.brain.skills.SkillPermissions;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -784,7 +785,143 @@ public final class SubagentManager implements AutoCloseable {
     }
     ResourceScope effectiveFs =
         callerFs.narrowTo(template.workingDirScope()).narrowTo(effective(requested));
-    return callerPermissions.resourceScopes().withNamespace(ResourceScopeMap.FS, effectiveFs);
+
+    // 技能两个面（第 7 维的 skills / skills-edit 命名空间）：与 fs 同一套口径——调用者是真值来源、模板是建议（静默求交）、
+    // 请求是要求（越界响亮拒）。**必须物化**：留空会让子体运行期的技能面回落到“未表态”，而单调性守卫看不见“没表态”的那一层
+    // （S5-A 的构造期常量教训的同一形态）。
+    ResourceScope callerVisible = SkillPermissions.visible(callerPermissions);
+    ResourceScope requestedVisible =
+        requestedSkillScope(
+            template,
+            "allowedSkills",
+            request.allowedSkills(),
+            instanceId,
+            callerId,
+            callerVisible);
+    if (requestedVisible != null && !callerVisible.covers(requestedVisible)) {
+      throw skillDenied(
+          template,
+          instanceId,
+          callerId,
+          "allowedSkills",
+          request.allowedSkills(),
+          callerVisible,
+          true);
+    }
+    ResourceScope effectiveVisible =
+        callerVisible.narrowTo(template.skillVisibleScope()).narrowTo(effective(requestedVisible));
+
+    ResourceScope callerEditable = SkillPermissions.editable(callerPermissions);
+    ResourceScope requestedEditable =
+        requestedSkillScope(
+            template,
+            "editableSkills",
+            request.editableSkills(),
+            instanceId,
+            callerId,
+            callerEditable);
+    if (requestedEditable != null && !callerEditable.covers(requestedEditable)) {
+      throw skillDenied(
+          template,
+          instanceId,
+          callerId,
+          "editableSkills",
+          request.editableSkills(),
+          callerEditable,
+          false);
+    }
+    // 不变式：可编辑面 ⊆ 可见面（求交落成数据，不靠“运行时再问父级”）
+    ResourceScope effectiveEditable =
+        callerEditable
+            .narrowTo(template.skillEditScope())
+            .narrowTo(effective(requestedEditable))
+            .narrowTo(effectiveVisible);
+
+    return callerPermissions
+        .resourceScopes()
+        .withNamespace(ResourceScopeMap.FS, effectiveFs)
+        .withNamespace(ResourceScopeMap.SKILLS, effectiveVisible)
+        .withNamespace(ResourceScopeMap.SKILLS_EDIT, effectiveEditable);
+  }
+
+  /**
+   * 请求面的技能范围（{@code null} = 没提这一嘴 ⇒ 不参与求交；空表 = 显式“一个技能都看不见”）。
+   *
+   * <p>路径归一失败也走 {@link SkillScopeDeniedException}：坏路径与越界同属“这次要的东西不成立”，工具层落同一个码，
+   * 模型改一次就行——不必分辨“写错了”与“要不到”（两者对它的下一步是同一个动作）。
+   */
+  private ResourceScope requestedSkillScope(
+      AgentTemplate template,
+      String field,
+      List<String> paths,
+      String instanceId,
+      String callerId,
+      ResourceScope callerScope) {
+    if (paths == null) {
+      return null;
+    }
+    if (paths.isEmpty()) {
+      return ResourceScope.none();
+    }
+    try {
+      return ResourceScope.ofDirs(paths.stream().map(Path::of).toList());
+    } catch (IllegalArgumentException | UncheckedIOException e) {
+      String message =
+          "子 Agent 技能范围参数无法归一（SKILL_SCOPE_DENIED）: "
+              + field
+              + "="
+              + paths
+              + " 原因="
+              + e.getMessage();
+      emit(
+          EventTypes.PERMISSION_DENIED,
+          callerId,
+          instanceId,
+          Map.of(
+              "template", template.id(),
+              "childId", instanceId,
+              "reason", message,
+              "requestedSkills", paths,
+              "callerSkillScope", callerScope.summary(),
+              "face", field));
+      throw new SkillScopeDeniedException(message);
+    }
+  }
+
+  /** 技能范围越界拒绝：{@code permission.denied} 事件（agent = 被拒的调用者）+ 带需求与可达面的异常。 */
+  private SkillScopeDeniedException skillDenied(
+      AgentTemplate template,
+      String instanceId,
+      String callerId,
+      String field,
+      List<String> requested,
+      ResourceScope callerScope,
+      boolean visibleFace) {
+    String face = visibleFace ? "可见面" : "可编辑面";
+    String message =
+        "子 Agent 技能"
+            + face
+            + "越界（SKILL_SCOPE_DENIED）: 请求 "
+            + field
+            + "="
+            + requested
+            + " 调用者"
+            + face
+            + "可达="
+            + callerScope.summary()
+            + "（请求面是'要求'不是'建议'：超出上级可达面一律拒，任一方都不静默截断）";
+    emit(
+        EventTypes.PERMISSION_DENIED,
+        callerId,
+        instanceId,
+        Map.of(
+            "template", template.id(),
+            "childId", instanceId,
+            "reason", message,
+            "requestedSkills", requested,
+            "callerSkillScope", callerScope.summary(),
+            "face", field));
+    return new SkillScopeDeniedException(message);
   }
 
   /**

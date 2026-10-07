@@ -42,15 +42,24 @@ import io.mosire.agentlib.plugin.PluginToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
+import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
+import io.mosire.brain.context.BasicContextAssembler;
+import io.mosire.brain.context.ContextPolicy;
+import io.mosire.brain.context.ContextSources;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
 import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.TurnResult;
+import io.mosire.brain.skills.SkillAccess;
+import io.mosire.brain.skills.SkillCatalog;
+import io.mosire.brain.skills.SkillPermissions;
+import io.mosire.brain.skills.SkillSettings;
+import io.mosire.brain.skills.SkillTools;
 import io.mosire.brain.subagent.AgentCommand;
 import io.mosire.brain.subagent.AgentContextReader;
 import io.mosire.brain.subagent.AgentTemplateStore;
@@ -139,6 +148,9 @@ public final class App implements AutoCloseable {
 
   /** 子 Agent 链接的父侧 MCP server 自报名（子体按"parent"源名识别——仅日志/审计语义）。 */
   private static final String PARENT_SERVER_NAME = "mosire-parent";
+
+  /** 技能工具的供给源 id（ToolRegistry 的来源归属；供审计与「按源整组卸载」用）。 */
+  private static final String SKILL_TOOL_SOURCE_ID = "skills";
 
   /**
    * 主 Agent 的初始会话 id（P3-3）：恒为 {@code "main"}（= 主 Agent 的 {@code AgentConfig} id，同源）。
@@ -369,6 +381,31 @@ public final class App implements AutoCloseable {
           AgentPermissionSet.system()
               .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, workingDirs));
       LOG.info("主 Agent 工作目录围栏: {}（配置 agents.workingDirs；* = 不限，子体逐跳只减不增）", workingDirs.summary());
+      // ★ 技能能力装配（本能力）：配置读取 → 目录快照 → 主 Agent 的两个技能面 → 工具面注册 → 上下文来源。
+      //   主 Agent 是技能根的所有者：可见面与可编辑面都是配置的根（要收窄就在配置里换根/换 agents 权限，不在代码里另设缺省）。
+      SkillSettings skillSettings =
+          SkillSettings.load(configStore, config.dataDir().resolve("skills"));
+      SkillCatalog skillCatalog = new SkillCatalog(skillSettings.listingBudget());
+      // 宽容扫描 + WARN：坏技能只影响它自己（列表/检索结果的 broken 字段会点名披露，见 SkillTools），
+      // 不把整个 runtime 的启动绑在一个内容文件上；写入路径有校验，正常路径造不出坏文件
+      SkillCatalog.ScanReport scanReport = skillCatalog.scanTolerant(skillSettings.root());
+      if (!scanReport.broken().isEmpty()) {
+        LOG.warn("技能目录里有坏技能（已跳过，工具结果里会披露）: {}", scanReport.broken());
+      }
+      ResourceScope skillRoot = ResourceScope.ofDir(skillSettings.root());
+      permissionSet = SkillPermissions.withScopes(permissionSet, skillRoot, skillRoot);
+      for (AgentTool skillTool : SkillTools.all(skillCatalog, skillSettings.root())) {
+        tools.register(SKILL_TOOL_SOURCE_ID, skillTool);
+      }
+      SkillAccess skillAccess = SkillAccess.of(permissionSet, skillCatalog, skillSettings.root());
+      LOG.info(
+          "技能面已装配: root={} 可见={} 可编辑={} 目录档预算={}字符 预载={} 工具={}",
+          skillSettings.root(),
+          skillRoot.summary(),
+          skillRoot.summary(),
+          skillSettings.listingBudget(),
+          skillSettings.preloaded(),
+          SkillTools.NAMES);
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
@@ -417,7 +454,8 @@ public final class App implements AutoCloseable {
                 subagentConfigDir,
                 approvalAuthorizer,
                 commandMode,
-                subagentLimits);
+                subagentLimits,
+                skillSettings.root());
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
       }
@@ -453,17 +491,35 @@ public final class App implements AutoCloseable {
       toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
       // S6：档位持有者经同一个运行时缝下发（AgentPipeline 建调用上下文时现读它定主 Agent 的身份/档位）
       toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
+      // 技能树遮蔽面（本能力）：文件工具（bash 的 L3 沙箱）据此决定“整棵技能树遮蔽 / 只读暴露”——
+      // 这是技能边界在文件工具一侧的唯一数据入口（判定见 SandboxMask）
+      toolConfig.put(SandboxMask.CONFIG_KEY, List.of(skillSettings.root().toString()));
       toolConfig = Map.copyOf(toolConfig);
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
       // （--demo 恒"零行为变化"是本仓既有约定：它只跑一条脚本回合，没有工具调用面可审批）
+      // 上下文来源：技能目录档 + 预载正文（可见面已在 SkillAccess 内固定为本实例的权限集）
+      BasicContextAssembler assembler =
+          new BasicContextAssembler(
+              ContextPolicy.defaults(),
+              ContextSources.skills(skillAccess, skillSettings.preloaded()));
       AgentRuntime runtime =
           conversations == null
-              ? new AgentRuntime(agentSpec, llm, tools, events, bus, permissionSet, toolConfig)
+              ? new AgentRuntime(
+                  agentSpec,
+                  llm,
+                  tools,
+                  new ToolExecutionGuard(),
+                  assembler,
+                  events,
+                  bus,
+                  permissionSet)
               : new AgentRuntime(
                   agentSpec,
                   llm,
                   tools,
+                  new ToolExecutionGuard(),
+                  assembler,
                   events,
                   bus,
                   permissionSet,
@@ -621,18 +677,20 @@ public final class App implements AutoCloseable {
       Path subagentConfigDir,
       ToolCallAuthorizer authorizer,
       CommandModeHolder commandMode,
-      SubagentLimits limits) {
+      SubagentLimits limits,
+      Path skillsRoot) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
     templateStore.load();
     SubprocessManager processes = new SubprocessManager();
     SubProcessExecutor executor =
         new SubProcessExecutor(
             processes,
-            subagentCommand(config, subagentConfigDir),
+            subagentCommand(config, subagentConfigDir, skillsRoot),
             tools,
             PARENT_SERVER_NAME,
             Version.VERSION,
-            authorizer);
+            authorizer,
+            skillsRoot);
     // S6：父级档位取数缝传的是<b>持有者</b>（现读）——HTTP 断点把主 Agent 降到 LIMITED 后，接着派子 Agent 也拿不到 FULL
     SubagentManager manager =
         new SubagentManager(
@@ -660,7 +718,8 @@ public final class App implements AutoCloseable {
    * <p>S1-A2：{@code subagentConfigDir} 非 null 时追加 {@code --config-dir <该路径>}（子体据此走真模型）。<b>只把路径交给
    * Brain</b>：本方法可见的全部信息里没有任何密钥值（密钥由子进程自己读 {@code <configDir>/config.json}，D23）。
    */
-  private static AgentCommand subagentCommand(BootConfig config, Path subagentConfigDir) {
+  private static AgentCommand subagentCommand(
+      BootConfig config, Path subagentConfigDir, Path skillsRoot) {
     String java = ProcessHandle.current().info().command().filter(c -> !c.isBlank()).orElse("java");
     return new AgentCommand(
         java,
@@ -670,7 +729,8 @@ public final class App implements AutoCloseable {
         config.templatesDir().toString(),
         config.dataDir().resolve("subagents").toString(),
         true,
-        subagentConfigDir == null ? null : subagentConfigDir.toString());
+        subagentConfigDir == null ? null : subagentConfigDir.toString(),
+        skillsRoot == null ? null : skillsRoot.toString());
   }
 
   /**

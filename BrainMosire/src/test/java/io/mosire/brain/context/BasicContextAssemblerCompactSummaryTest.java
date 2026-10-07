@@ -8,6 +8,7 @@ import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
+import io.mosire.brain.skills.SkillTestSupport;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -115,7 +116,8 @@ class BasicContextAssemblerCompactSummaryTest {
     writeSkill("alpha", "第一个技能", "ALPHA-正文");
     SkillCatalog catalog = new SkillCatalog();
     catalog.scan(skillsDir());
-    ContextSources sources = ContextSources.skills(catalog);
+    ContextSources sources =
+        ContextSources.skills(SkillTestSupport.unrestricted(catalog, skillsDir()));
 
     BasicContextAssembler before = new BasicContextAssembler(ContextPolicy.defaults(), sources);
     String beforeText = systemTextOf(before.buildRequest(config(), "干活", List.of(), List.of()));

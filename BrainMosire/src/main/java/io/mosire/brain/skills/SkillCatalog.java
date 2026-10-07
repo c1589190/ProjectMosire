@@ -9,10 +9,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -63,6 +65,9 @@ public final class SkillCatalog {
 
   /** 扫描序元数据快照（不可变；volatile 保证 scan 后其它线程可见新快照而非撕裂的旧状态）。 */
   private volatile List<Skill> snapshot = List.of();
+
+  /** 最近一次宽容扫描里坏掉的技能（{@code scanTolerant} 写、工具面读；volatile 同快照口径）。 */
+  private volatile Map<String, String> broken = Map.of();
 
   /** 使用 {@link #DEFAULT_LISTING_BUDGET}。 */
   public SkillCatalog() {
@@ -121,9 +126,73 @@ public final class SkillCatalog {
     activatedAt.keySet().retainAll(names);
   }
 
+  /**
+   * <b>宽容扫描</b>：与 {@link #scan(Path)} 同序、同快照语义，但<b>单个坏技能不炸整次扫描</b>——它进 {@link #broken()}
+   * 表，由调用方（技能工具）在结果里<b>披露</b>出来。
+   *
+   * <p>为什么需要它：严格扫描的“坏掉即抛”语义适合装配期（fail-fast，坏模板不该带病运行），但工具面是<b>每回合都在用</b>的读路径——
+   * 一个手工改坏的技能文件不该让“列出/检索/加载其余健康技能”全部不可用。<b>宽容 ≠ 静默</b>：坏技能从快照里消失（不会被列出来、 也加载不到），但它的名字与原因进 {@link
+   * #broken()}，工具结果里点名可见；而写入路径的校验保证本进程写不出坏文件。
+   *
+   * <p>目录本身的 I/O 失败（不是子目录内容失败）仍抛 {@link IllegalArgumentException}——那是配置/环境问题，与“某个技能写坏了”不同类。
+   *
+   * @param skillsDir 技能根目录（不存在 = 空目录，与 {@link #scan} 同口径）
+   * @return 本次扫描的报告（成功装载数 + 坏技能表）
+   */
+  public ScanReport scanTolerant(Path skillsDir) {
+    Objects.requireNonNull(skillsDir, "skillsDir");
+    if (!Files.exists(skillsDir)) {
+      snapshot = List.of();
+      broken = Map.of();
+      activatedAt.clear();
+      return new ScanReport(0, Map.of());
+    }
+    if (!Files.isDirectory(skillsDir)) {
+      throw new IllegalArgumentException("技能目录不是目录: " + skillsDir);
+    }
+    List<Skill> loaded = new ArrayList<>();
+    Map<String, String> failures = new LinkedHashMap<>();
+    try (Stream<Path> children = Files.list(skillsDir)) {
+      for (Path child :
+          children.filter(Files::isDirectory).filter(p -> !isHidden(p)).sorted().toList()) {
+        try {
+          loaded.add(SkillLoader.readMetadata(child));
+        } catch (RuntimeException e) {
+          String name = Objects.requireNonNullElse(child.getFileName(), child).toString();
+          String reason = e.getMessage();
+          failures.put(
+              name, reason == null || reason.isBlank() ? e.getClass().getSimpleName() : reason);
+        }
+      }
+    } catch (IOException e) {
+      throw new IllegalArgumentException("技能目录无法扫描: " + skillsDir, e);
+    }
+    snapshot = List.copyOf(loaded);
+    broken = Map.copyOf(failures);
+    Set<String> names = loaded.stream().map(Skill::name).collect(Collectors.toSet());
+    activatedAt.keySet().retainAll(names);
+    return new ScanReport(loaded.size(), broken);
+  }
+
   /** 第一档元数据快照（扫描序）：不含正文——正文只在 {@link #load(String)} 时读。返回列表不可变，可安全共享。 */
   public List<Skill> catalog() {
     return snapshot;
+  }
+
+  /**
+   * 最近一次<b>宽容扫描</b>里坏掉的技能（目录名 → 简短原因）：严格 {@link #scan(Path)} 不清空它——
+   * 两条路径各自维护，避免“严格扫描成功”把上一次的失败痕迹悄悄抹掉。
+   */
+  public Map<String, String> broken() {
+    return broken;
+  }
+
+  /** 一次扫描的报告。 */
+  public record ScanReport(int loaded, Map<String, String> broken) {
+
+    public ScanReport {
+      broken = Map.copyOf(broken == null ? Map.of() : broken);
+    }
   }
 
   /**
@@ -137,13 +206,26 @@ public final class SkillCatalog {
    */
   public String load(String name) {
     Objects.requireNonNull(name, "name");
-    Skill skill = find(name);
-    if (skill == null) {
-      throw new IllegalArgumentException("未知技能: " + name);
-    }
+    Skill skill = lookup(name).orElseThrow(() -> new IllegalArgumentException("未知技能: " + name));
     String body = SkillLoader.readBody(skill);
     activatedAt.put(skill.name(), activationClock.incrementAndGet());
     return body;
+  }
+
+  /**
+   * 按名查第一档元数据（当前快照内；不存在返回空）。
+   *
+   * <p>与 {@link #load(String)} 的分工：本方法只回答“目录里有没有这个技能”，不读正文、不记激活；未知名字返回空而不是抛错，
+   * 因为它是<b>存在性检查</b>的入口（工具面要先分辨“未知/不可见”再决定读不读）。
+   */
+  public Optional<Skill> lookup(String name) {
+    Objects.requireNonNull(name, "name");
+    for (Skill skill : snapshot) {
+      if (skill.name().equals(name)) {
+        return Optional.of(skill);
+      }
+    }
+    return Optional.empty();
   }
 
   /**
@@ -154,7 +236,20 @@ public final class SkillCatalog {
    * 丢最久未激活的（平局按扫描序靠前者优先），按"最近激活优先"自上而下装填，<b>遇到第一个装不下的就停</b>。停而不是跳过，是为了保证被丢的一律是优先级尾巴：绝不会出现"留下没激活过的小行、丢掉刚激活的大行"；代价是优先级高的大行放不下时目录可能比预算允许的更短——确定性优先于装填率。
    */
   public String listing() {
-    List<Skill> inScanOrder = snapshot;
+    return listing(skill -> true);
+  }
+
+  /**
+   * 同 {@link #listing()}，但只披露<b>过滤命中</b>的技能（扫描序不变、预算与淘汰规则不变）。
+   *
+   * <p>为什么要有这个重载：技能目录里可能同时存在“本调用者看得见”与“看不见”的技能（可见面是逐 Agent 的权限维度，见 {@code
+   * ResourceScopeMap#SKILLS}）。预算与淘汰必须在<b>可见集</b>上算——先按全量算再过滤，会出现“看不见的技能把预算吃光、 看得见的反而没披露”。
+   *
+   * @param filter 元数据过滤器（非 null；谓词抛异常按调用方缺陷上抛，不吞）
+   */
+  public String listing(Predicate<Skill> filter) {
+    Objects.requireNonNull(filter, "filter");
+    List<Skill> inScanOrder = snapshot.stream().filter(filter).toList();
     if (inScanOrder.isEmpty() || listingBudget == 0) {
       return "";
     }
@@ -182,15 +277,6 @@ public final class SkillCatalog {
         .filter(skill -> kept.contains(skill.name()))
         .map(skill -> rendered.get(skill.name()))
         .collect(Collectors.joining(LINE_SEPARATOR));
-  }
-
-  private Skill find(String name) {
-    for (Skill skill : snapshot) {
-      if (skill.name().equals(name)) {
-        return skill;
-      }
-    }
-    return null;
   }
 
   private long activationStamp(Skill skill) {

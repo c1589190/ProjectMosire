@@ -13,6 +13,7 @@ import io.mosire.brain.memory.MemoryStore;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
+import io.mosire.brain.skills.SkillTestSupport;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -64,7 +65,9 @@ class BasicContextAssemblerSourcesTest {
     catalog.scan(skillsDir());
 
     BasicContextAssembler indexOnly =
-        new BasicContextAssembler(ContextPolicy.defaults(), ContextSources.skills(catalog));
+        new BasicContextAssembler(
+            ContextPolicy.defaults(),
+            ContextSources.skills(SkillTestSupport.unrestricted(catalog, skillsDir())));
     String before = systemTextOf(indexOnly.buildRequest(config(), "干活", List.of(), List.of()));
 
     // 第一档：name + description 可见，正文一个字都不进请求
@@ -78,7 +81,9 @@ class BasicContextAssemblerSourcesTest {
 
     BasicContextAssembler preloaded =
         new BasicContextAssembler(
-            ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of("alpha")));
+            ContextPolicy.defaults(),
+            ContextSources.skills(
+                SkillTestSupport.unrestricted(catalog, skillsDir()), Set.of("alpha")));
     String after = systemTextOf(preloaded.buildRequest(config(), "干活", List.of(), List.of()));
 
     // 第二档：正文进 LOADED_SKILLS；第一档目录原样仍在（已激活与否都占一行）
@@ -124,7 +129,9 @@ class BasicContextAssemblerSourcesTest {
         new LinkedHashSet<>(List.of("echo", "delta", "charlie", "bravo", "alpha"));
     BasicContextAssembler assembler =
         new BasicContextAssembler(
-            ContextPolicy.defaults(), ContextSources.skills(catalog, reverseScanOrder));
+            ContextPolicy.defaults(),
+            ContextSources.skills(
+                SkillTestSupport.unrestricted(catalog, skillsDir()), reverseScanOrder));
 
     String text = systemTextOf(assembler.buildRequest(config(), "干活", List.of(), List.of()));
 
@@ -142,7 +149,9 @@ class BasicContextAssemblerSourcesTest {
     BasicContextAssembler unmodifiableVariant =
         new BasicContextAssembler(
             ContextPolicy.defaults(),
-            ContextSources.skills(catalog, Set.of("echo", "delta", "charlie", "bravo", "alpha")));
+            ContextSources.skills(
+                SkillTestSupport.unrestricted(catalog, skillsDir()),
+                Set.of("echo", "delta", "charlie", "bravo", "alpha")));
     assertThat(systemTextOf(unmodifiableVariant.buildRequest(config(), "干活", List.of(), List.of())))
         .isEqualTo(text);
     // 同一输入重复装配逐字节相同（前缀契约的确定性前提）
@@ -159,7 +168,9 @@ class BasicContextAssemblerSourcesTest {
 
     BasicContextAssembler staleOnly =
         new BasicContextAssembler(
-            ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of("ghost")));
+            ContextPolicy.defaults(),
+            ContextSources.skills(
+                SkillTestSupport.unrestricted(catalog, skillsDir()), Set.of("ghost")));
 
     assertThatCode(() -> staleOnly.buildRequest(config(), "干活", List.of(), List.of()))
         .doesNotThrowAnyException();
@@ -173,7 +184,9 @@ class BasicContextAssemblerSourcesTest {
     // 混入真实名字：只跳过 ghost，alpha 照常加载
     BasicContextAssembler mixed =
         new BasicContextAssembler(
-            ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of("ghost", "alpha")));
+            ContextPolicy.defaults(),
+            ContextSources.skills(
+                SkillTestSupport.unrestricted(catalog, skillsDir()), Set.of("ghost", "alpha")));
 
     assertThat(systemTextOf(mixed.buildRequest(config(), "干活", List.of(), List.of())))
         .contains(LOADED_SKILLS_HEADER)
@@ -202,7 +215,9 @@ class BasicContextAssemblerSourcesTest {
     BasicContextAssembler assembler =
         new BasicContextAssembler(
             ContextPolicy.defaults(),
-            ContextSources.skills(catalog, Set.of("broken", "corrupt", "alpha")));
+            ContextSources.skills(
+                SkillTestSupport.unrestricted(catalog, skillsDir()),
+                Set.of("broken", "corrupt", "alpha")));
 
     String text = systemTextOf(assembler.buildRequest(config(), "干活", List.of(), List.of()));
 
@@ -298,7 +313,7 @@ class BasicContextAssemblerSourcesTest {
           new BasicContextAssembler(
               ContextPolicy.defaults(),
               new ContextSources(
-                  catalog,
+                  SkillTestSupport.unrestricted(catalog, skillsDir()),
                   Set.of("alpha"),
                   new MemoryRetriever(store),
                   AgentPermissionSet.unrestricted(AccessToken.DEFAULT),
@@ -335,7 +350,8 @@ class BasicContextAssemblerSourcesTest {
           new BasicContextAssembler(
               ContextPolicy.defaults(),
               new ContextSources(
-                  emptyCatalog,
+                  SkillTestSupport.unrestricted(
+                      emptyCatalog, tempDir.resolve("no-such-skills-dir")),
                   Set.of("ghost"),
                   new MemoryRetriever(store),
                   AgentPermissionSet.unrestricted(AccessToken.DEFAULT),
@@ -385,7 +401,9 @@ class BasicContextAssemblerSourcesTest {
       // 合法形态照常：只接记忆、只接技能、两者都接
       assertThat(ContextSources.memory(retriever, AgentPermissionSet.system()).hasMemory())
           .isTrue();
-      assertThat(ContextSources.skills(new SkillCatalog()).hasSkills()).isTrue();
+      assertThat(
+              ContextSources.skills(SkillTestSupport.unrestricted(new SkillCatalog())).hasSkills())
+          .isTrue();
       assertThat(ContextSources.none().hasSkills()).isFalse();
       assertThat(ContextSources.none().hasMemory()).isFalse();
     }

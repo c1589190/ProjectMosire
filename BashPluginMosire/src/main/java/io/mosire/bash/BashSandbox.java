@@ -96,11 +96,12 @@ public final class BashSandbox {
   private static final String WRAPPER =
       """
       set -eu
-      root="$1"; workdir="$2"; cmd="$3"; setpriv="$4"; shell="$5"; shift 5
+      root="$1"; workdir="$2"; cmd="$3"; setpriv="$4"; shell="$5"; empty="$6"; shift 6
       for item in "$@"; do
         case "$item" in
           ro:*) path="${item#ro:}"; mount --bind -o ro "$path" "$root$path" ;;
           rw:*) path="${item#rw:}"; mount --bind "$path" "$root$path" ;;
+          mask:*) path="${item#mask:}"; mount --bind -o ro "$empty" "$root$path" ;;
           *) echo "沙箱挂载项非法: $item" >&2; exit 125 ;;
         esac
       done
@@ -109,6 +110,9 @@ public final class BashSandbox {
       'cd "$1" || { echo "沙箱内工作目录不可达: $1" >&2; exit 125; }; exec "$2" -c "$3"' \
       mosire-sandbox "$workdir" "$shell" "$cmd"
       """;
+
+  /** 遮蔽用的空目录在沙箱根里的名字（bind 源必须是宿主上真实存在的目录）。 */
+  private static final String MASK_EMPTY_DIR = ".mask-empty";
 
   /** 已装配好的一条沙箱命令：{@code command} 是宿主侧的 argv，{@code root} 供 {@link #cleanup} 删。 */
   public record Wrapped(List<String> command, Path root) {
@@ -186,15 +190,45 @@ public final class BashSandbox {
    * @param command 命令文本（原样交给最内层 {@code bash -c}，本类不解释它）
    * @throws SandboxUnavailableException 沙箱不可用、根/绑定重叠、可写目录缺失或建树失败
    */
+  public Wrapped wrap(Path workingDirectory, List<Path> writableDirs, String command) {
+    return wrap(workingDirectory, writableDirs, command, List.of(), List.of());
+  }
+
+  /**
+   * 同 {@link #wrap(Path, List, String)}，外加<b>技能树围栏</b>（本能力新增）：
+   *
+   * <ul>
+   *   <li>{@code readOnlyPaths}：调用者可见面覆盖的技能路径——沙箱内按<b>只读</b> bind（可读正文/资源，写操作 EROFS）。 技能文档的修改因此只能走带
+   *       frontmatter 校验的技能工具，shell 改不动；
+   *   <li>{@code maskedPaths}：调用者<b>不可见</b>的技能路径——在一切 bind 之后用空目录盖住（沙箱内 ENOENT）。
+   *       遮蔽项必须排在最后：先盖再绑会被随后的 bind 掀掉。
+   * </ul>
+   *
+   * <p><b>不存在/不是目录的项直接跳过</b>（没有可遮蔽的东西；跳过不削弱判定面——判定用的是“调用者可见面是否覆盖这条路径”， 与盘上在不在无关）。空目录源不存在时会现场创建。
+   *
+   * <p>诚实边界（同 {@link SandboxMask}）：本方法只保证<b>沙箱内</b>的可见面；不走进沙箱的调用 （无围栏 +
+   * 不限可达面）拿不到这份保证——工具层会在这种组合上响亮拒绝（{@code SKILL_SCOPE_UNFENCED}）。
+   *
+   * @param readOnlyPaths 只读暴露的技能路径（可为空表）
+   * @param maskedPaths 必须不可见的技能路径（可为空表）
+   */
   @SuppressFBWarnings(
       value = {"DMI_HARDCODED_ABSOLUTE_FILENAME", "THROWS_METHOD_THROWS_RUNTIMEEXCEPTION"},
       justification =
           "本方法按定义操作宿主绝对路径（/dev 设备节点、沙箱根）；且『装不起来就响亮失败』是它的契约"
               + "（SandboxUnavailableException 是 RuntimeException：调用方在工具边界统一转成错误码，"
-              + "不引入受检异常——见 BashToolConfig.Sandbox 的 fail-closed 说明）")
-  public Wrapped wrap(Path workingDirectory, List<Path> writableDirs, String command) {
+              + "不引入受检异常——见 BashToolConfig.Sandbox 的 fail-closed 说明）。"
+              + "抑制挂在真正持有实现的这个重载上（3 参重载只做委托，挂那里会被判无用抑制）")
+  public Wrapped wrap(
+      Path workingDirectory,
+      List<Path> writableDirs,
+      String command,
+      List<Path> readOnlyPaths,
+      List<Path> maskedPaths) {
     Objects.requireNonNull(workingDirectory, "workingDirectory");
     Objects.requireNonNull(command, "command");
+    List<Path> readOnlySkills = immutable(readOnlyPaths);
+    List<Path> maskedSkills = immutable(maskedPaths);
     Optional<String> reason = unavailableReason();
     if (reason.isPresent()) {
       throw new SandboxUnavailableException(reason.get());
@@ -231,6 +265,27 @@ public final class BashSandbox {
         createMountPoint(root, normalized);
         mounts.add("rw:" + normalized);
       }
+      // 只读技能面：可见者能读、不能写（写在最内层被 EROFS 挡下，技能的改写只能走带校验的技能工具）
+      for (Path dir : readOnlySkills) {
+        if (!Files.isDirectory(dir)) {
+          LOG.warn("技能只读面条目不存在，跳过: {}", dir);
+          continue;
+        }
+        createMountPoint(root, dir);
+        mounts.add("ro:" + dir);
+      }
+      // 遮蔽面（最后一批 bind）：不可见的技能树在沙箱内不存在——空目录源必须是宿主上真实存在的目录
+      if (!maskedSkills.isEmpty()) {
+        Files.createDirectories(root.resolve(MASK_EMPTY_DIR));
+        for (Path dir : maskedSkills) {
+          if (!Files.isDirectory(dir)) {
+            LOG.warn("技能遮蔽面条目不存在，跳过: {}", dir);
+            continue;
+          }
+          createMountPoint(root, dir);
+          mounts.add("mask:" + dir);
+        }
+      }
       Files.createDirectories(root.resolve("tmp"));
       Files.createDirectories(root.resolve("dev"));
       for (String device : DEVICE_NODES) {
@@ -255,13 +310,16 @@ public final class BashSandbox {
       argv.add(command);
       argv.add(setpriv.toString());
       argv.add(shell.toString());
+      argv.add(root.resolve(MASK_EMPTY_DIR).toString());
       argv.addAll(mounts);
       LOG.info(
-          "bash 沙箱已装配: root={} 工作目录={} 只读面={} 可写面={}",
+          "bash 沙箱已装配: root={} 工作目录={} 只读面={} 可写面={} 技能只读面={} 技能遮蔽面={}",
           root,
           workingDirectory,
           readOnlyDirs,
-          writableDirs);
+          writableDirs,
+          readOnlySkills,
+          maskedSkills);
       return new Wrapped(argv, root);
     } catch (IOException e) {
       deleteRecursively(root);
@@ -341,6 +399,18 @@ public final class BashSandbox {
     } catch (IOException e) {
       LOG.warn("沙箱根清理失败（残留空目录树，无安全面影响）: {}", root);
     }
+  }
+
+  /** 路径表的防御拷贝 + 绝对化归一（null ⇒ 空表）。 */
+  private static List<Path> immutable(List<Path> paths) {
+    if (paths == null || paths.isEmpty()) {
+      return List.of();
+    }
+    List<Path> copy = new ArrayList<>(paths.size());
+    for (Path path : paths) {
+      copy.add(Objects.requireNonNull(path, "路径").toAbsolutePath().normalize());
+    }
+    return List.copyOf(copy);
   }
 
   /** 按 PATH 找一个可执行文件（不依赖外部 {@code which}）。 */

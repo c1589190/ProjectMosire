@@ -1,5 +1,6 @@
 package io.mosire.brain.subagent;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.permission.CommandMode;
 import java.util.List;
 import java.util.Set;
@@ -27,7 +28,18 @@ import java.util.Set;
  *     同形同义）。<b>与模板的分工</b>：模板那一份是<b>建议</b> （通用配置，超出调用者可达面就静默求交），请求这一份是<b>要求</b>——点名调用者自己没有的工具，{@link
  *     SubagentManager#spawn} 一律响亮拒（{@code
  *     SubagentRejectedException}，消息点名越界工具），不静默截断；求交结果为空是<b>合法</b>取值（= 子体一个工具都没有）， 不是错误
+ * @param allowedSkills 想要给子体的<b>技能可见面</b>：条目是技能文件系统路径（技能文件夹或单个 {@code SKILL.md}）。{@code null} =
+ *     不指定（不额外收窄：调用者可见面 ∩ 模板建议说了算）；空表 = <b>显式"一个技能都看不见"</b>（与 {@code allowedTools: []}
+ *     同形同义）。<b>与模板的分工同 {@code allowedDirs}</b>：模板那一份是建议（超出调用者静默求交），请求这一份是<b>要求</b>——
+ *     超出调用者可达面一律响亮拒（{@code SKILL_SCOPE_DENIED}），不静默截断
+ * @param editableSkills 想要给子体的<b>技能可编辑面</b>（语义同 {@code allowedSkills}，判定对照调用者的可编辑面）。
+ *     生效值恒被求交进最终可见面之内（"改得动但看不见"造不出来）
  */
+@SuppressFBWarnings(
+    value = "EI_EXPOSE_REP",
+    justification =
+        "allowedSkills/editableSkills 在规范构造里已 List.copyOf 成不可变快照；两者允许为 null（null = 不指定，与空表是"
+            + "两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——记录型数据的防御拷贝，不是暴露内部表示")
 public record SubagentLaunchRequest(
     String templateId,
     String goal,
@@ -37,7 +49,9 @@ public record SubagentLaunchRequest(
     Long quotaMaxTokensCap,
     CommandMode mode,
     List<String> allowedDirs,
-    List<String> allowedTools) {
+    List<String> allowedTools,
+    List<String> allowedSkills,
+    List<String> editableSkills) {
 
   public SubagentLaunchRequest {
     if (templateId == null || templateId.isBlank()) {
@@ -61,9 +75,57 @@ public record SubagentLaunchRequest(
         }
       }
     }
+    allowedSkills = checkSkillPaths("allowedSkills", allowedSkills);
+    editableSkills = checkSkillPaths("editableSkills", editableSkills);
     // 不可变副本（内联 copyOf：让 SpotBugs 看得见来源）；null 保持 null——"没提这一嘴"与"显式空表"是两种取值
     allowedDirs = allowedDirs == null ? null : List.copyOf(allowedDirs);
     allowedTools = allowedTools == null ? null : List.copyOf(allowedTools);
+  }
+
+  /**
+   * 技能范围条目的构造期校验（与 {@code allowedDirs}/{@code allowedTools} 同口径：元素必须非空白、null 保持 null）。
+   *
+   * <p>只校验“形态”，不在这里判越界——越界是 {@link SubagentManager#spawn} 的事（它才有调用者可达面这份真值）。
+   */
+  private static List<String> checkSkillPaths(String field, List<String> paths) {
+    if (paths == null) {
+      return null;
+    }
+    for (String path : paths) {
+      if (path == null || path.isBlank()) {
+        throw new IllegalArgumentException(field + " 的元素必须是非空白路径文本: " + paths);
+      }
+    }
+    return List.copyOf(paths);
+  }
+
+  /**
+   * 9 参兼容构造（技能范围字段引入之前）：两个技能范围取 {@code null} = 不指定（逐字回到本字段引入前的行为）。
+   *
+   * <p>请求面是模型/调用方每任务现造的对象，保留旧签名可以让既有构造点（编排工具、夹具）零改动。
+   */
+  public SubagentLaunchRequest(
+      String templateId,
+      String goal,
+      Set<String> extraDenied,
+      Integer maxTurnsCap,
+      Long timeBudgetSecondsCap,
+      Long quotaMaxTokensCap,
+      CommandMode mode,
+      List<String> allowedDirs,
+      List<String> allowedTools) {
+    this(
+        templateId,
+        goal,
+        extraDenied,
+        maxTurnsCap,
+        timeBudgetSecondsCap,
+        quotaMaxTokensCap,
+        mode,
+        allowedDirs,
+        allowedTools,
+        null,
+        null);
   }
 
   /** 6 参兼容构造（S6 之前）：档位未指定、工作目录不指定。 */

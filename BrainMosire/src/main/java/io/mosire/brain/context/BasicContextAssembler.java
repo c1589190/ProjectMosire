@@ -306,13 +306,15 @@ public final class BasicContextAssembler implements ContextAssembler {
     }
     List<LoadedSkill> loaded = new ArrayList<>(preloaded.size());
     Map<String, String> failures = new LinkedHashMap<>();
-    for (Skill skill : sources.skills().catalog()) {
+    // 只在【可见集】上遍历：预载名集里点名了本实例看不见的技能时根本不访问它（连“读失败”都不会发生，
+    // 更不会在目录行上标出它的存在）——可见面是权限维度，不是渲染过滤器
+    for (Skill skill : sources.skills().visibleSkills()) {
       if (!preloaded.contains(skill.name())) {
         continue;
       }
       String body;
       try {
-        body = sources.skills().load(skill.name());
+        body = sources.skills().preloadBody(skill);
       } catch (RuntimeException e) {
         String reason = shortReason(e);
         // 降级必须留痕：prompt 里只放单行短原因（无堆栈、无类名），完整异常归日志——那里才是诊断的地方。

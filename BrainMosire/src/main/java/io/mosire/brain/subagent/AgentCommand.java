@@ -1,5 +1,8 @@
 package io.mosire.brain.subagent;
 
+import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.ResourceScopeMap;
+import io.mosire.brain.skills.SkillPermissions;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,6 +19,11 @@ import java.util.Objects;
  * <目录>}）+（可选 {@code --data-dir <根>/<实例id>}）+（可选 {@code --config-dir <目录>}）+（可选 {@code
  * --parent-link}）。
  *
+ * <p><strong>技能面扩展（{@code skillsDir} + 两个范围项）</strong>：{@code --skills-dir <目录>} 给子体技能根（子进程据此
+ * 做每回合的技能目录预注入）；{@code --skill-visible}/{@code --skill-editable} 由 {@code argv} 从<b>实例权限集</b>现算
+ * （{@code *} = 不限 / {@code none} = 一个都不许 / 其余每个前缀一项），子进程据此恢复自己的技能可见面与可编辑面—— 子体的技能工具仍由父侧 MCP
+ * 链接服务（权限集也是父侧那份），argv 这一份只服务“预注入不得越出可见面”。未表态的命名空间不追加任何项。
+ *
  * <p><strong>三期 S1-A2 扩展（{@code configDir}）</strong>：子 Agent 走真模型时它自己的 {@code --data-dir}
  * 是隔离目录，底下没有 {@code config.json}（配置在父的数据目录） ⇒ 装配层把父的配置根经本组件注入子进程。它是与 {@code templatesDir} 同性质的"注入
  * 值"（Rul C：Brain 不探测任何路径）；<b>只传路径、不传密钥值</b>——密钥由子进程自己从 {@code <configDir>/config.json} 读（D23）。
@@ -30,6 +38,9 @@ import java.util.Objects;
  * @param parentLink 是否带 {@code --parent-link}（父侧已建 stdio 链接，子体走 MCP client 形态）
  * @param configDir 父的配置根目录（装配层注入；同上绝对化；null = 不传——离线/测试形态，子体按自身默认）。<b>只放路径</b>：密钥值绝不经参数面
  *     （R-A2-3/D23）
+ * @param skillsDir 技能根目录（装配层注入；同上绝对化；null = 不传——子体不做技能预注入）。子体的技能<b>可见/可编辑范围</b>不在这里， 而由 {@link
+ *     #argv} 从实例权限集现算成 {@code --skill-visible}/{@code --skill-editable} 项——
+ *     范围是权限数据，必须跟着权限集走（父级收紧过的才是子体该拿的），不能由装配层另配一份
  */
 public record AgentCommand(
     String command,
@@ -39,7 +50,8 @@ public record AgentCommand(
     String templatesDir,
     String childDataDir,
     boolean parentLink,
-    String configDir) {
+    String configDir,
+    String skillsDir) {
 
   public AgentCommand {
     if (command == null || command.isBlank()) {
@@ -53,6 +65,7 @@ public record AgentCommand(
     templatesDir = absoluteOrNull(templatesDir);
     childDataDir = absoluteOrNull(childDataDir);
     configDir = absoluteOrNull(configDir);
+    skillsDir = absoluteOrNull(skillsDir);
   }
 
   /**
@@ -75,6 +88,19 @@ public record AgentCommand(
   /** W3a 兼容构造：无 JVM 参数、无目录注入、非链接模式。 */
   public AgentCommand(String command, List<String> prefix, String idFlag) {
     this(command, List.of(), prefix, idFlag, null, null, false);
+  }
+
+  /** 8 参兼容构造（技能根引入之前）：{@code skillsDir = null}（子体不做技能预注入，行为逐字不变）。 */
+  public AgentCommand(
+      String command,
+      List<String> jvmArgs,
+      List<String> prefix,
+      String idFlag,
+      String templatesDir,
+      String childDataDir,
+      boolean parentLink,
+      String configDir) {
+    this(command, jvmArgs, prefix, idFlag, templatesDir, childDataDir, parentLink, configDir, null);
   }
 
   /**
@@ -103,7 +129,15 @@ public record AgentCommand(
       throw new IllegalArgumentException("jarPath 不能为空");
     }
     return new AgentCommand(
-        javaBinary, jvmArgs, List.of("-jar", jarPath, "agent"), "--id", null, null, false, null);
+        javaBinary,
+        jvmArgs,
+        List.of("-jar", jarPath, "agent"),
+        "--id",
+        null,
+        null,
+        false,
+        null,
+        null);
   }
 
   /**
@@ -130,6 +164,7 @@ public record AgentCommand(
         null,
         null,
         false,
+        null,
         null);
   }
 
@@ -162,6 +197,27 @@ public record AgentCommand(
     if (parentLink) {
       argv.add("--parent-link");
     }
+    if (skillsDir != null) {
+      argv.add("--skills-dir");
+      argv.add(skillsDir);
+    }
+    // 技能范围：只在该命名空间**已表态**时才追加（未接线技能面的既有装配 argv 逐字节不变）。取值直接来自实例权限集——
+    // 父级收紧过的才是子体该拿的，装配层没有第二份可写的地方（写错一处就是静默放大）。
+    appendScope(argv, instance, ResourceScopeMap.SKILLS, "--skill-visible");
+    appendScope(argv, instance, ResourceScopeMap.SKILLS_EDIT, "--skill-editable");
     return argv;
+  }
+
+  /** 把一个已表态的技能作用域编码成重复的 argv 项（未表态 = 不追加，见 {@link #argv}）。 */
+  private static void appendScope(
+      List<String> argv, SubagentInstance instance, String namespace, String flag) {
+    ResourceScope scope = instance.permissions().resourceScopes().declaredScope(namespace);
+    if (scope == null) {
+      return;
+    }
+    for (String item : SkillPermissions.encode(scope)) {
+      argv.add(flag);
+      argv.add(item);
+    }
   }
 }

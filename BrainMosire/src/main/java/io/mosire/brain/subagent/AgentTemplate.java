@@ -1,6 +1,7 @@
 package io.mosire.brain.subagent;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmException;
 import io.mosire.agentlib.llm.LlmRequest;
@@ -46,7 +47,17 @@ import java.util.regex.Pattern;
  * @param allowedWorkingDirs 该模板子体的<b>工作目录建议</b>（S5-B）：null = 不限（不额外收窄，父级说多少就是多少）； 空表 =
  *     <b>显式"哪里都不许"</b>（与 {@code allowedTools: []} 同形同义）。<b>是建议不是要求</b>—— 最终生效值 = 父级可达面 ∩ 这一份 ∩
  *     请求那一份；超出父级的条目<b>静默求交</b>（模板是通用配置，被上级收紧是常态）， 与请求面 {@code allowedDirs} 的响亮拒绝口径不同
+ * @param allowedSkills 该模板子体的<b>技能可见面建议</b>：条目是技能文件系统路径——一个<b>技能文件夹</b>（子树里的技能都可见）或一个 <b>单个 {@code
+ *     SKILL.md}</b>。null = 不限（不额外收窄）；空表 = <b>显式"一个技能都看不见"</b>（与 {@code allowedTools: []}
+ *     同形同义）。同样<b>是建议不是要求</b>：最终生效值 = 调用者可见面 ∩ 这一份 ∩ 请求那一份，超出调用者的条目静默求交
+ * @param editableSkills 该模板子体的<b>技能可编辑面建议</b>（语义同 {@code allowedSkills}）。生效值恒被求交进可见面之内——
+ *     "改得动但看不见"在结构上造不出来（见 {@code SkillPermissions}）
  */
+@SuppressFBWarnings(
+    value = "EI_EXPOSE_REP",
+    justification =
+        "allowedSkills/editableSkills 在规范构造里已 List.copyOf 成不可变快照，但两者允许为 null（null = 不限，与空表"
+            + "是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——这是记录型数据的防御拷贝，不是暴露内部表示")
 public record AgentTemplate(
     String id,
     String description,
@@ -63,7 +74,9 @@ public record AgentTemplate(
     long timeBudgetSeconds,
     long quotaMaxTokens,
     List<ScriptStep> script,
-    List<String> allowedWorkingDirs) {
+    List<String> allowedWorkingDirs,
+    List<String> allowedSkills,
+    List<String> editableSkills) {
 
   /** 模板 id 形态约束（小写、短横线、≤64 字符——可直接充当文件名/进程标识）。 */
   private static final Pattern ID_PATTERN = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
@@ -116,6 +129,97 @@ public record AgentTemplate(
       // 归一结果不保留（每次 spawn 现算，根目录的 realpath 可能随环境变化——判定与运行同刻同源）
       ResourceScope.ofDirs(allowedWorkingDirs.stream().map(Path::of).toList());
     }
+    // 技能范围与工作目录同一口径：null（不限）与 []（哪里都不许）是两种取值，不归一成一个；坏路径装载期响亮失败
+    allowedSkills = normalizedPaths(id, "allowedSkills", allowedSkills);
+    editableSkills = normalizedPaths(id, "editableSkills", editableSkills);
+  }
+
+  /**
+   * 技能范围条目的归一（null 保持 null；元素非空白；非空的表在装载期跑一遍路径归一，坏路径响亮失败）。
+   *
+   * <p>与 {@code allowedWorkingDirs} 的校验逐字同形——两处若各写一套，"坏路径在装载期失败"这条保证会缺一角。
+   */
+  private static List<String> normalizedPaths(String id, String field, List<String> paths) {
+    if (paths == null) {
+      return null;
+    }
+    for (String path : paths) {
+      if (path == null || path.isBlank()) {
+        throw new IllegalArgumentException("模板 " + id + " 的 " + field + " 元素必须是非空白路径文本: " + paths);
+      }
+    }
+    List<String> copy = List.copyOf(paths);
+    if (!copy.isEmpty()) {
+      ResourceScope.ofDirs(copy.stream().map(Path::of).toList());
+    }
+    return copy;
+  }
+
+  /**
+   * 模板的 {@code skills} 作用域建议（可见面）：{@code null} ⇒ 不限；空表 ⇒ 一个都看不见；有值 ⇒ 路径前缀集 （技能文件夹或单个 {@code
+   * SKILL.md}）。
+   */
+  public ResourceScope skillVisibleScope() {
+    return skillScopeOf(allowedSkills);
+  }
+
+  /** 模板的 {@code skills-edit} 作用域建议（可编辑面）；生效值由 {@code SubagentManager} 求交进可见面。 */
+  public ResourceScope skillEditScope() {
+    return skillScopeOf(editableSkills);
+  }
+
+  private static ResourceScope skillScopeOf(List<String> paths) {
+    if (paths == null) {
+      return ResourceScope.unlimited();
+    }
+    if (paths.isEmpty()) {
+      return ResourceScope.none();
+    }
+    return ResourceScope.ofDirs(paths.stream().map(Path::of).toList());
+  }
+
+  /**
+   * 16 参兼容构造（技能范围字段引入之前）：两个技能范围取 {@code null} = 不限（模板不额外收窄，逐字回到本字段引入前的行为）。
+   *
+   * <p>为什么保留：模板是部署者写的数据（JSON 走 {@link JsonCreator} 的规范构造），而代码侧的既有构造点（夹具、脚本模板）
+   * 不该为了一个“没提这一嘴”的字段全量改签名。
+   */
+  public AgentTemplate(
+      String id,
+      String description,
+      String systemPrompt,
+      String model,
+      AccessToken token,
+      Set<String> allowedTools,
+      Set<String> deniedTools,
+      boolean destructiveAllowed,
+      boolean sensitiveAllowed,
+      boolean readOnly,
+      int maxTurns,
+      int maxToolCallsPerTurn,
+      long timeBudgetSeconds,
+      long quotaMaxTokens,
+      List<ScriptStep> script,
+      List<String> allowedWorkingDirs) {
+    this(
+        id,
+        description,
+        systemPrompt,
+        model,
+        token,
+        allowedTools,
+        deniedTools,
+        destructiveAllowed,
+        sensitiveAllowed,
+        readOnly,
+        maxTurns,
+        maxToolCallsPerTurn,
+        timeBudgetSeconds,
+        quotaMaxTokens,
+        script,
+        allowedWorkingDirs,
+        null,
+        null);
   }
 
   /**

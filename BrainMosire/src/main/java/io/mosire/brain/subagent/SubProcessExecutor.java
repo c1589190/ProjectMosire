@@ -7,6 +7,7 @@ import io.mosire.agentlib.proc.ManagedProcess;
 import io.mosire.agentlib.proc.SpawnSpec;
 import io.mosire.agentlib.proc.SubprocessException;
 import io.mosire.agentlib.proc.SubprocessManager;
+import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
@@ -56,6 +57,12 @@ public final class SubProcessExecutor implements AgentExecutor {
   /** 父侧 MCP server 的工具调用入口（S4-B2：装配层注入，缺省 {@link ToolCallAuthorizer#standard()}）。 */
   private final ToolCallAuthorizer authorizer;
 
+  /**
+   * 技能根目录（装配层注入；{@code null} = 本进程未接线技能面）：经 {@link #linkToolConfig} 作为“沙箱遮蔽面”下发， 让子体经父侧调 bash
+   * 时，父侧能按<b>这个子体的技能可见面</b>决定遮蔽还是只读暴露技能树。
+   */
+  private final Path skillsRoot;
+
   public SubProcessExecutor(SubprocessManager processes, AgentCommand command) {
     this(processes, command, null, null, null);
   }
@@ -68,8 +75,8 @@ public final class SubProcessExecutor implements AgentExecutor {
    *
    * <p>EI_EXPOSE_REP2 抑制：{@code parentTools} 为装配层按实例共享的<b>实时</b>工具注册表（R7 语义——子体调用的父级工具面，
    * 工具随后随时可能注册进来，必须持有引用而非快照）；本类只读使用、不对外暴露——与 {@code AgentRuntime.registry()} 同类设计先例。
-   * 抑制落在<b>真正持有引用</b>的那个构造器（下面这个 6 参终态构造）上——标注挂在只做委托的重载上会被 SpotBugs 判为无用抑制 （{@code
-   * US_USELESS_SUPPRESSION_ON_METHOD}），而真正的暴露点反而漏报。
+   * 抑制落在<b>真正持有引用</b>的那个终态构造器（6 参 authorizer 版与 7 参 skillsRoot 版）上——标注挂在只做委托的重载上会被 SpotBugs
+   * 判为无用抑制（{@code US_USELESS_SUPPRESSION_ON_METHOD}），而真正的暴露点反而漏报。
    */
   public SubProcessExecutor(
       SubprocessManager processes,
@@ -89,7 +96,6 @@ public final class SubProcessExecutor implements AgentExecutor {
    *
    * <p>{@code authorizer} 由装配层注入（{@code App} 传装了审批编排器的那个）；本类不认识审批/登记表，只透传。
    */
-  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public SubProcessExecutor(
       SubprocessManager processes,
       AgentCommand command,
@@ -97,9 +103,29 @@ public final class SubProcessExecutor implements AgentExecutor {
       String serverName,
       String serverVersion,
       ToolCallAuthorizer authorizer) {
+    this(processes, command, parentTools, serverName, serverVersion, authorizer, null);
+  }
+
+  /**
+   * 链接形态 + 技能根（本能力新增）：除最后一个参数外与上一构造逐字节相同。
+   *
+   * <p>EI_EXPOSE_REP2 抑制落在本构造上（它才是真正持有 {@code parentTools} 引用的终态构造，见上）。
+   *
+   * @param skillsRoot 技能根目录（{@code null} = 未接线技能面 ⇒ 不下发遮蔽面，bash 行为逐字不变）
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
+  public SubProcessExecutor(
+      SubprocessManager processes,
+      AgentCommand command,
+      ToolRegistry parentTools,
+      String serverName,
+      String serverVersion,
+      ToolCallAuthorizer authorizer,
+      Path skillsRoot) {
     this.processes = Objects.requireNonNull(processes, "processes");
     this.command = Objects.requireNonNull(command, "command");
     this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
+    this.skillsRoot = skillsRoot;
     if (parentTools != null) {
       if (!command.parentLink()) {
         throw new IllegalArgumentException(
@@ -158,18 +184,22 @@ public final class SubProcessExecutor implements AgentExecutor {
    * CONTEXT_UNAVAILABLE}（响亮），不是一份猜出来的库。
    */
   Map<String, Object> linkToolConfig(SubagentInstance instance) {
-    if (command.childDataDir() == null) {
-      return Map.of();
+    Map<String, Object> config = new java.util.LinkedHashMap<>();
+    if (command.childDataDir() != null) {
+      Path root = Path.of(command.childDataDir());
+      String instanceId = instance.instanceId();
+      config.put(AgentContextReader.CONFIG_SUBAGENTS_ROOT, root.toString());
+      config.put(
+          AgentContextReader.CONFIG_SELF_EVENTS_DB,
+          root.resolve(instanceId).resolve("events.db").toString());
+      config.put(AgentContextReader.CONFIG_SELF_AGENT_ID, instanceId);
     }
-    Path root = Path.of(command.childDataDir());
-    String instanceId = instance.instanceId();
-    return Map.of(
-        AgentContextReader.CONFIG_SUBAGENTS_ROOT,
-        root.toString(),
-        AgentContextReader.CONFIG_SELF_EVENTS_DB,
-        root.resolve(instanceId).resolve("events.db").toString(),
-        AgentContextReader.CONFIG_SELF_AGENT_ID,
-        instanceId);
+    if (skillsRoot != null) {
+      // 技能树遮蔽面：链路上下文里也带上（同一条 D30 运行时缝）——子体调父侧 bash 时，父侧按该子体的 skills 命名空间
+      // 判定“整棵树遮蔽 / 只读暴露”，从而堵住“技能不可见却能用 shell 读技能文件”的旁路
+      config.put(SandboxMask.CONFIG_KEY, List.of(skillsRoot.toString()));
+    }
+    return Map.copyOf(config);
   }
 
   @Override

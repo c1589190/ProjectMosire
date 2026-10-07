@@ -7,6 +7,7 @@ import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.Digest;
+import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
 import java.io.IOException;
@@ -68,7 +69,9 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #TIMEOUT}：超过 {@code timeout} 秒仍未结束（已终止直接子进程，消息里带已捕获的输出）；
  *   <li>{@link #INTERRUPTED}：执行线程被中断（已终止直接子进程，中断标记归还调用方）；
  *   <li>{@link #DIR_NOT_ALLOWED}：{@code cwd} 越出调用者的 fs 可达面（L1，命令未执行）；
- *   <li>{@link #SANDBOX_UNAVAILABLE}：需要 L3 沙箱而它不可用（不发命令，不退化）。
+ *   <li>{@link #SANDBOX_UNAVAILABLE}：需要 L3 沙箱而它不可用（不发命令，不退化）；
+ *   <li>{@link #SKILL_SCOPE_UNFENCED}：需要遮蔽技能树而本次调用不会走沙箱（调用者看不见全部技能 + 不限可达面 + {@code
+ *       sandbox=off}）——同样不发命令（本能力新增，见 {@link SandboxMask}）。
  * </ul>
  *
  * <p><strong>工作目录</strong>：构造注入基准目录（缺省 = JVM 当前目录），调用参数 {@code cwd} 可逐次覆盖（相对路径按基准目录解析）。
@@ -91,6 +94,11 @@ import org.slf4j.LoggerFactory;
  *       chroot}/ptrace）关闭。沙箱不可用 ⇒ {@link #SANDBOX_UNAVAILABLE}，<b>绝不</b>静默退回无围栏执行。配置 {@code
  *       require} 把不限可达面的调用者也一起沙箱化，其围栏面取 <b>工具基准工作目录</b>（它没有声明过可达面）。
  * </ol>
+ *
+ * <p><b>技能树围栏（本能力新增，判定见 {@link SandboxMask}）</b>：宿主经 {@link ToolContext#config()} 下发“遮蔽面”
+ * （通常就是技能根）。沙箱运行时：调用者技能可见面覆盖整条路径 ⇒ 只读 bind（可读、写被 EROFS 挡下）；盖不住 ⇒ 用空目录盖住（沙箱内
+ * ENOENT）。<b>不会走沙箱</b>的调用遇到“该遮蔽却没有沙箱”的组合时响亮拒绝 （{@link #SKILL_SCOPE_UNFENCED}）——这是本工具对“技能根不得被 shell
+ * 绕过”这条硬边界的落点；没接线遮蔽面的部署 （{@code ToolContext.config} 里没有这一项）行为逐字不变。
  *
  * <p><b>披露面（诚实说明）</b>：L1/L2 是契约与误操作围栏，只有 L3 是安全意义上的围栏。设计底稿要求"L3 未启用时给受限调用者带一行披露"—— 裁决 ③
  * 让这条分支<b>不可达</b>（受限调用者永远有沙箱，没沙箱就响亮失败），所以本类不写那句披露，改由沙箱的诚实边界 （{@link BashSandbox} 类注释：同 uid 信号仍可达、无
@@ -137,6 +145,12 @@ public final class ShellTool implements AgentTool {
 
   /** 需要沙箱而沙箱不可用（L3；S5-D 新码）——<b>响亮失败，绝不静默退回无围栏执行</b>。 */
   public static final String SANDBOX_UNAVAILABLE = "SANDBOX_UNAVAILABLE";
+
+  /**
+   * 需要遮蔽技能树而本次调用不会走沙箱（本能力新码）：调用者看不见全部技能，却又在不限可达面 + {@code tools.bash.sandbox=off}
+   * 的组合下跑命令——命令一旦跑起来就能读/改它看不见的技能文件，技能边界在那一刻不存在。 <b>fail-closed</b>：不发命令，让模型/装配方去改可达面或沙箱配置，而不是静默放行。
+   */
+  public static final String SKILL_SCOPE_UNFENCED = "SKILL_SCOPE_UNFENCED";
 
   /** 固定用 bash：工具名与语义一致（模型写 bash 语法应可用）；POSIX 之外不支持。 */
   private static final String SHELL_EXECUTABLE = "bash";
@@ -482,6 +496,21 @@ public final class ShellTool implements AgentTool {
     BashToolConfig config = configOf(context);
     // 围栏面（S5-D）：null = 三层围栏都不参与（不限 scope + sandbox=off）⇒ 行为与 S4-C 逐字相同
     ResourceScope fence = fenceOf(context, config);
+    // 技能树围栏（本能力）：宿主经 ToolContext.config 下发遮蔽面；空表 = 未接线技能面 ⇒ 行为逐字不变。
+    // 判定规则只有一处（SandboxMask#fence）：可见面覆盖整条路径 ⇒ 只读暴露；盖不住（含未表态）⇒ 整条遮蔽。
+    SandboxMask.Fence skillFence = SandboxMask.fence(context.permissions(), context.config());
+    if (skillFence.sandboxRequired() && fence == null) {
+      LOG.warn(
+          "bash 需要遮蔽技能树却不会走沙箱（命令未执行）: 遮蔽面={} 调用者技能可达={}",
+          skillFence.masked(),
+          context.permissions().resourceScopes().summary());
+      return ToolResult.error(
+          SKILL_SCOPE_UNFENCED,
+          "本次调用的技能可见面不覆盖技能树，需要在 OS 沙箱内执行才能遮蔽它；但当前调用不会走沙箱"
+              + "（调用者 fs 可达面不限且 tools.bash.sandbox=off）。请给调用者配置受限工作目录"
+              + "（agents.workingDirs / 模板 allowedWorkingDirs / 请求 allowedDirs），"
+              + "或把 tools.bash.sandbox 设为 require；技能正文请改用技能工具读取。");
+    }
 
     Path workingDirectory;
     Map<String, String> env;
@@ -506,7 +535,7 @@ public final class ShellTool implements AgentTool {
 
     BashSandbox.Wrapped wrapped;
     try {
-      wrapped = wrapInSandbox(fence, workingDirectory, command);
+      wrapped = wrapInSandbox(fence, workingDirectory, command, skillFence);
     } catch (BashSandbox.SandboxUnavailableException e) {
       LOG.warn("bash 需要 OS 沙箱但沙箱不可用（命令未执行，不退回无围栏）: 可达面={} 原因={}", fence.summary(), e.getMessage());
       return ToolResult.error(
@@ -523,16 +552,18 @@ public final class ShellTool implements AgentTool {
   }
 
   /**
-   * 本次调用要不要沙箱、可写面是哪几个根。
+   * 本次调用要不要沙箱、可写面是哪几个根、技能树怎么处理。
    *
-   * @return {@code null} = 不沙箱（不限 scope 且 {@code tools.bash.sandbox=off}）
+   * @return {@code null} = 不沙箱（不限 scope 且 {@code tools.bash.sandbox=off}）；调用方在此之前已按 {@link
+   *     SandboxMask.Fence#sandboxRequired()} 拒掉了“该遮蔽却没沙箱”的组合
    */
   private BashSandbox.Wrapped wrapInSandbox(
-      ResourceScope fence, Path workingDirectory, String command) {
+      ResourceScope fence, Path workingDirectory, String command, SandboxMask.Fence skillFence) {
     if (fence == null) {
       return null;
     }
-    return sandbox.wrap(workingDirectory, fence.dirList(), command);
+    return sandbox.wrap(
+        workingDirectory, fence.dirList(), command, skillFence.readOnly(), skillFence.masked());
   }
 
   /**

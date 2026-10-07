@@ -206,7 +206,14 @@ public final class AgentRuntime implements AutoCloseable {
         null);
   }
 
-  private AgentRuntime(
+  /**
+   * 全参装配（不落库形态）：{@link AgentSpec} + 自定义守卫/上下文装配器。
+   *
+   * <p>为什么公开：装配层接线内容源（技能目录档/预载、记忆检索）时必须自己造 {@link ContextAssembler}（内容源是构造期注入的， 见 {@code
+   * BasicContextAssembler}），而既有 {@link AgentSpec} 公开重载都把装配器固定成默认件。本构造即该组合入口； 参数语义与其它重载逐字一致（{@code
+   * store} 缺省 = 不落库）。
+   */
+  public AgentRuntime(
       AgentSpec spec,
       LlmClient llm,
       ToolRegistry registry,
@@ -234,10 +241,14 @@ public final class AgentRuntime implements AutoCloseable {
    * 全参装配（{@code store == null} = 不落库、{@code conversationId} 随之缺省）：两种形态在装配上的<b>唯一</b>差别是 {@link
    * AgentPipeline} 的构造重载——不落库走既有的 9 参构造（行为与持久化接入前逐字节一致），落库走 11 参构造。
    *
+   * <p><b>为什么公开</b>：装配层需要同时给出自定义 {@link ContextAssembler}（如接线技能来源的 {@code
+   * BasicContextAssembler}）与会话存储/审批编排器，而其余公开重载都把 {@code assembler} 固定成 {@code new
+   * BasicContextAssembler()}。本构造是该组合的唯一入口；参数语义与上面几条重载逐字一致。
+   *
    * <p>{@code coordinator} 为 {@code null} = 无审批面（{@code ToolGate.Ask} fail-closed 拒）——除 S4-B2
    * 的终态装配路径外， 所有既有重载都传 {@code null}，行为逐字不变。
    */
-  private AgentRuntime(
+  public AgentRuntime(
       AgentSpec spec,
       LlmClient llm,
       ToolRegistry registry,

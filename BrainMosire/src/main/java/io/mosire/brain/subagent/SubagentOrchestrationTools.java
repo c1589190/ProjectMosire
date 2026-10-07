@@ -105,43 +105,60 @@ public final class SubagentOrchestrationTools {
   static AgentTool spawn(SubagentManager manager) {
     return tool(
         SPAWN_SUB_AGENT,
-        "派生一个子 Agent（由模板驱动；深度/权限/档位/工作目录/cap 均经<b>调用者</b>收紧）。",
+        "派生一个子 Agent（由模板驱动；深度/权限/档位/工作目录/技能范围/cap 均经<b>调用者</b>收紧）。",
         Map.of(
             "type",
             "object",
             "properties",
-            Map.of(
-                "templateId",
-                Map.of("type", "string"),
-                "goal",
-                Map.of("type", "string"),
-                "extraDenied",
-                Map.of("type", "array", "items", Map.of("type", "string")),
+            Map.ofEntries(
+                Map.entry("templateId", Map.of("type", "string")),
+                Map.entry("goal", Map.of("type", "string")),
+                Map.entry(
+                    "extraDenied", Map.of("type", "array", "items", Map.of("type", "string"))),
                 // S5-B：子体的工作目录（可选）。给 = 明确要求（超出调用者可达面直接拒，码 DIR_NOT_ALLOWED）；
                 // 空数组 = 要求"哪里都不许"；不给 = 不额外收窄（调用者 ∩ 模板说了算）。
-                "allowedDirs",
-                Map.of("type", "array", "items", Map.of("type", "string")),
+                Map.entry(
+                    "allowedDirs", Map.of("type", "array", "items", Map.of("type", "string"))),
                 // D27（A1）：点名给子体的工具白名单（可选）。给 = 明确要求（只收窄：与模板白名单求交；点名调用者自己没有的
                 // 工具 ⇒ 派发即拒，码 PERMISSION_DENIED 且消息点名那个工具）；空数组 = 显式"一个工具都不给"；
                 // 不给 = 模板白名单说了算（现状，逐字不变）。描述要进 schema——模型只能看见 schema，看不见这行注释。
-                "allowedTools",
-                Map.of(
-                    "type",
-                    "array",
-                    "items",
-                    Map.of("type", "string"),
-                    "description",
-                    "给子体的工具白名单（可选）：不填 = 模板白名单说了算；空数组 = 一个工具都不给；" + "点名调用者自己没有的工具 ⇒ 派发即拒"),
-                "maxTurnsCap",
-                Map.of("type", "integer"),
-                "timeBudgetSecondsCap",
-                Map.of("type", "integer"),
-                "quotaMaxTokensCap",
-                Map.of("type", "integer"),
+                Map.entry(
+                    "allowedTools",
+                    Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string"),
+                        "description",
+                        "给子体的工具白名单（可选）：不填 = 模板白名单说了算；空数组 = 一个工具都不给；" + "点名调用者自己没有的工具 ⇒ 派发即拒")),
+                // 技能范围（可选，两个面）：条目是技能文件系统路径（技能文件夹或其 SKILL.md）。给 = 明确要求
+                // （超出调用者自己的技能范围 ⇒ 派发即拒，码 SKILL_SCOPE_DENIED）；空数组 = 要求"一个技能都不给"；
+                // 不给 = 调用者范围 ∩ 模板建议说了算。
+                Map.entry(
+                    "allowedSkills",
+                    Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string"),
+                        "description",
+                        "给子体的技能可见范围（可选）：技能文件夹路径或单个 SKILL.md 路径；"
+                            + "不填 = 继承并受模板收窄；空数组 = 一个技能都看不见；超出你自己的可见范围 ⇒ 派发即拒")),
+                Map.entry(
+                    "editableSkills",
+                    Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string"),
+                        "description",
+                        "给子体的技能可编辑范围（可选，语义同上，对照你自己的可编辑范围）；生效值恒在可见范围之内")),
+                Map.entry("maxTurnsCap", Map.of("type", "integer")),
+                Map.entry("timeBudgetSecondsCap", Map.of("type", "integer")),
+                Map.entry("quotaMaxTokensCap", Map.of("type", "integer")),
                 // S6：命令档位（可选）。不给 = 子 Agent 缺省 LIMITED（所有命令都要审批）；要 FULL 得父级本身是 FULL，
                 // 否则 spawn 直接拒（单调性，见 SubagentManager#resolveMode）——"能要"不等于"能拿到"。
-                "mode",
-                Map.of("type", "string", "enum", List.of("full", "limited"))),
+                Map.entry("mode", Map.of("type", "string", "enum", List.of("full", "limited")))),
             "required",
             List.of("templateId", "goal")),
         // S5-A：DEFAULT 级（子 Agent 也能派孙代）；敏感/破坏位与其余编排工具同形
@@ -179,7 +196,9 @@ public final class SubagentOrchestrationTools {
                     longArg(context, "quotaMaxTokensCap"),
                     mode,
                     strListArg(context, "allowedDirs"),
-                    strListArg(context, "allowedTools"));
+                    strListArg(context, "allowedTools"),
+                    strListArg(context, "allowedSkills"),
+                    strListArg(context, "editableSkills"));
           } catch (IllegalArgumentException e) {
             // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
             return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());
@@ -192,6 +211,9 @@ public final class SubagentOrchestrationTools {
             // S5-B：目录越界单独一码（DIR_NOT_ALLOWED）——模型据此改成"要一个够得着的目录"，
             // 而不是像看到 PERMISSION_DENIED 那样去换模板/换身份接着撞
             return ToolResult.error("DIR_NOT_ALLOWED", e.getMessage());
+          } catch (SkillScopeDeniedException e) {
+            // 技能范围越界同理单独一码：模型据此改成"要一个自己看得见的技能范围"，而不是换模板接着撞
+            return ToolResult.error("SKILL_SCOPE_DENIED", e.getMessage());
           } catch (SubagentBudgetExceededException e) {
             // 预算与越权分码：越权 = "你不该要"，预算 = "现在不行"（模型据此才会等/收敛，而不是换条路接着撞）
             return ToolResult.error("BUDGET_EXHAUSTED", e.getMessage());

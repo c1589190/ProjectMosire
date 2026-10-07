@@ -31,6 +31,7 @@ import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
 import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
+import io.mosire.brain.skills.SkillTestSupport;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -1121,7 +1122,9 @@ class AgentPipelineCompactionTest {
     SkillCatalog catalog = new SkillCatalog();
     catalog.scan(writeSkill());
     return new BasicContextAssembler(
-        ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of()), slot);
+        ContextPolicy.defaults(),
+        ContextSources.skills(SkillTestSupport.unrestricted(catalog, writeSkill()), Set.of()),
+        slot);
   }
 
   /** 与 {@link #assembler(CompactSummarySlot)} 同形，但保留实现类型——F2 的取槽访问器只在实现类上。 */
@@ -1129,7 +1132,9 @@ class AgentPipelineCompactionTest {
     SkillCatalog catalog = new SkillCatalog();
     catalog.scan(writeSkill());
     return new BasicContextAssembler(
-        ContextPolicy.defaults(), ContextSources.skills(catalog, Set.of()), slot);
+        ContextPolicy.defaults(),
+        ContextSources.skills(SkillTestSupport.unrestricted(catalog, writeSkill()), Set.of()),
+        slot);
   }
 
   /** 槽由装配器自持（接线方拿不到它）：接线只能经 {@link BasicContextAssembler#compactSummarySlot()} 取——F2 的失配场景。 */

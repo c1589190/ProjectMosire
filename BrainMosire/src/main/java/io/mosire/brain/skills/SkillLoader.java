@@ -50,13 +50,7 @@ public final class SkillLoader {
   public static Skill readMetadata(Path skillDirectory) {
     Objects.requireNonNull(skillDirectory, "skillDirectory");
     Path file = skillDirectory.resolve(Skill.SKILL_FILE_NAME);
-    Document document = read(skillDirectory, file);
-    Map<String, List<String>> fields = parseFields(document.frontmatter(), file);
-    return new Skill(
-        singleValue(fields, "name", file),
-        singleValue(fields, "description", file),
-        allowedTools(fields),
-        skillDirectory);
+    return read(skillDirectory, file).metadata();
   }
 
   /**
@@ -73,19 +67,23 @@ public final class SkillLoader {
     return read(skill.directory(), skill.skillFile()).body();
   }
 
-  /** 一次读盘的结果：frontmatter 原始行 + 正文（正文已 strip）。 */
-  private record Document(List<String> frontmatter, String body) {}
-
-  private static Document read(Path skillDirectory, Path file) {
-    if (!Files.isRegularFile(file)) {
-      throw new IllegalArgumentException("技能目录缺少 " + Skill.SKILL_FILE_NAME + "：" + skillDirectory);
-    }
-    List<String> lines;
-    try {
-      lines = Files.readAllLines(file, StandardCharsets.UTF_8);
-    } catch (IOException e) {
-      throw new IllegalArgumentException("技能文件无法读取：" + file, e);
-    }
+  /**
+   * <b>从文本解析并校验</b>一份 SKILL.md（不落盘）——写入路径的校验入口，与读盘路径<b>共用同一段解析</b>。
+   *
+   * <p>为什么必须有这个方法：技能文档可由 Agent 自己创建/改写，写入前必须回答“这份内容读回来还是不是一个合法技能”。若写入校验另写一套
+   * 解析，两条路迟早分叉——那时“写进去成功、读出来报错”的技能就落进目录里了。校验口径 = {@link Skill} 的规范构造（name ≡ 目录名、 description
+   * 1–1024），外加 frontmatter 结构本身（分隔行、必需字段、未知键忽略）。
+   *
+   * @param text 完整文档文本（frontmatter + 正文）
+   * @param skillDirectory 目标技能目录（{@code <skillsDir>/<name>}；用于 name ≡ 目录名 与错误消息）
+   * @return 解析结果（校验过的元数据 + 已 strip 的正文）
+   * @throws IllegalArgumentException 结构非法 / 缺字段 / name 与目录名不一致 / description 超界（消息带文件路径）
+   */
+  public static Parsed parse(String text, Path skillDirectory) {
+    Objects.requireNonNull(text, "text");
+    Objects.requireNonNull(skillDirectory, "skillDirectory");
+    Path file = skillDirectory.resolve(Skill.SKILL_FILE_NAME);
+    List<String> lines = text.lines().toList();
     if (lines.isEmpty() || !lines.get(0).strip().equals(DELIMITER)) {
       throw new IllegalArgumentException(
           Skill.SKILL_FILE_NAME + " 必须以 frontmatter 分隔行 " + DELIMITER + " 开头：" + file);
@@ -101,7 +99,35 @@ public final class SkillLoader {
       throw new IllegalArgumentException("frontmatter 缺少结束分隔行 " + DELIMITER + "：" + file);
     }
     String body = String.join("\n", lines.subList(end + 1, lines.size())).strip();
-    return new Document(List.copyOf(lines.subList(1, end)), body);
+    Map<String, List<String>> fields = parseFields(List.copyOf(lines.subList(1, end)), file);
+    Skill metadata =
+        new Skill(
+            singleValue(fields, "name", file),
+            singleValue(fields, "description", file),
+            allowedTools(fields),
+            skillDirectory);
+    return new Parsed(metadata, body);
+  }
+
+  /**
+   * 一次“文本 → 校验过的技能”的解析结果。
+   *
+   * @param metadata 第一档元数据（已过 {@link Skill} 的全部不变量）
+   * @param body 第二档正文（首尾空白已剥离）
+   */
+  public record Parsed(Skill metadata, String body) {}
+
+  private static Parsed read(Path skillDirectory, Path file) {
+    if (!Files.isRegularFile(file)) {
+      throw new IllegalArgumentException("技能目录缺少 " + Skill.SKILL_FILE_NAME + "：" + skillDirectory);
+    }
+    String text;
+    try {
+      text = Files.readString(file, StandardCharsets.UTF_8);
+    } catch (IOException e) {
+      throw new IllegalArgumentException("技能文件无法读取：" + file, e);
+    }
+    return parse(text, skillDirectory);
   }
 
   /** 行式解析 frontmatter：每个键收成值列表（块列表的 {@code - 项} 续行挂到当前键上）。 */
