@@ -98,6 +98,8 @@ AgentToMcpServer.start(parentTools, serverName, serverVersion,
 | 主代码**零 `toRealPath()`**（符号链接逃逸无防线；`root` 本身是软链时 `startsWith` 会给**假安全**） | 全仓 grep（仅测试用 realpath） |
 | **无 always-deny 路径清单**：`keys.*` 只是**键空间**级（`FileConfigStore:143,541`、`ConfigAuth:14,94,111`），没有"这些文件谁都不许读" | 全仓 grep |
 | `Workspace.java:20-58` / `EditorTool.java` 是**纯占位**（无实现、无引用），javadoc 明写"路径围栏是三期第一等交付" | `BrainMosire/.../workspace/` |
+
+> ★ **2026-10-13 更新（责任区 R1 已执行）**：上表该行描述的占位接口**已删除**——其实质内容由新包 `workspace-mosire`（`io.mosire.workspace.*`）承担，设计见 `设计-工作区标准与Docs系统.md` §4。原文保留作历史留痕，**不再作为现状依据**。
 | `AgentSpec.java:27` 有单值 `Path workingDirectory`（"不接线"） | 同上 |
 
 ### 1.6 进程 / cwd / env 管道
