@@ -108,20 +108,43 @@ save_state() {
 }
 
 proc_alive() { [ -n "${MAIN_PID:-}" ] && kill -0 "$MAIN_PID" 2>/dev/null; }
-running_mosire_pids() { pgrep -f 'mosire\.jar' 2>/dev/null || true; }
+# ★ 只认**真 java 进程**：`pgrep -f` 会把命令行里含该字面量的 shell（含调用本脚本的那条 bash -c）也匹配上
+#   ⇒ stop 会误报"残留"并写进 PACK.md（R5c 实测：那个"残留 PID"就是取证 shell 自己）。
+#   两处修正：① 模式写 `[m]osire\.jar`（pgrep 自身那条命令行不再自匹配）；② 再用 /proc/<pid>/comm 过滤成 java。
+running_mosire_pids() {
+  local P
+  pgrep -f '[m]osire\.jar' 2>/dev/null | while IFS= read -r P; do
+    [ -r "/proc/$P/comm" ] || continue
+    [ "$(cat "/proc/$P/comm" 2>/dev/null)" = "java" ] && printf '%s\n' "$P"
+  done || true
+}
 
 # ---------- 密钥（只进变量；绝不 echo / 不进 argv） ----------
-secret_of() { # $1=配置文件 → stdout 密钥值（没有则空）
-  python3 - "$1" <<'PY'
+secrets_of() { # $1=配置文件 → stdout 每个密钥值一行（扁平 llm.credentialsRef + 每条 llm.routes.<name>.credentialsRef）
+  # ★ 只读扁平键会让具名路由下的 scan **静默空转且 rc=0**（假绿，R5 实测）⇒ 必须把所有路由的 ref 都收进来。
+  python3 - "$1" <<'PYSCAN'
 import json, sys
 try:
     cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
-    print(""); sys.exit(0)
-ref = (cfg.get("llm") or {}).get("credentialsRef") or ""
-name = ref[len("keys."):] if ref.startswith("keys.") else ""
-print((cfg.get("keys") or {}).get(name, "") or "")
-PY
+    sys.exit(0)
+llm = cfg.get("llm") or {}
+keys = cfg.get("keys") or {}
+refs = []
+if llm.get("credentialsRef"):
+    refs.append(llm["credentialsRef"])
+for route in (llm.get("routes") or {}).values():
+    if isinstance(route, dict) and route.get("credentialsRef"):
+        refs.append(route["credentialsRef"])
+seen = []
+for ref in refs:
+    name = ref[len("keys."):] if ref.startswith("keys.") else ""
+    value = keys.get(name) or ""
+    if value and value not in seen:
+        seen.append(value)
+for value in seen:
+    print(value)
+PYSCAN
 }
 
 # ---------- HTTP ----------
@@ -363,20 +386,25 @@ cmd_db() {
 # =============================== scan ==============================
 cmd_scan() {
   load_state "$CUR_DATA_DIR"
-  local SECRET HITS=0 F OUT="$PACK_DIR/scan.txt"
-  SECRET="$(secret_of "$DATA_DIR/config.json")"
+  local HITS=0 F S OUT="$PACK_DIR/scan.txt"
+  local -a SECRETS=()
+  while IFS= read -r S; do [ -n "$S" ] && SECRETS+=("$S"); done < <(secrets_of "$DATA_DIR/config.json")
   : > "$OUT"
-  if [ -z "$SECRET" ]; then
-    printf '配置副本里没有可扫的密钥值（credentialsRef 指向的键为空/缺失——U7 类场景属正常）\n' | tee -a "$OUT"
+  if [ "${#SECRETS[@]}" -eq 0 ]; then
+    printf '配置里没有任何可扫的密钥值（扁平与具名路由都没给 credentialsRef，或 keys 段为空）⇒ 本次扫描**无判别力**，不得当作"没泄露"的证据（U7 类场景属正常）\n' | tee -a "$OUT"
     return 0
   fi
+  printf '待扫密钥值：%s 个（不回显）\n' "${#SECRETS[@]}" | tee -a "$OUT"
   # 扫数据目录下所有文件，**排除** config.json 本身（它合法地持有密钥）
   while IFS= read -r F; do
     [ -f "$F" ] || continue
     case "$(basename "$F")" in config.json) continue ;; esac
-    if grep -qa -- "$SECRET" "$F"; then
-      HITS=$((HITS + 1)); printf '泄露点: %s\n' "${F#"$DATA_DIR"/}" | tee -a "$OUT" >&2
-    fi
+    for S in "${SECRETS[@]}"; do
+      if grep -qa -- "$S" "$F"; then
+        HITS=$((HITS + 1)); printf '泄露点: %s\n' "${F#"$DATA_DIR"/}" | tee -a "$OUT" >&2
+        break
+      fi
+    done
   done < <(find "$DATA_DIR" -type f ! -path "*/usage-test/*/config.json" 2>/dev/null)
   printf '扫描文件数=%s 命中=%s（排除各 config.json 本身；不打印密钥值）\n' \
     "$(find "$DATA_DIR" -type f ! -path "*/usage-test/*/config.json" | wc -l)" "$HITS" | tee -a "$OUT"
