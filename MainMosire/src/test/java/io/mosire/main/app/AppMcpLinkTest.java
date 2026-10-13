@@ -14,6 +14,8 @@ import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.brain.skills.SkillTools;
+import io.mosire.docs.DocsTools;
+import io.mosire.workspace.WorkspaceTools;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -54,11 +56,12 @@ class AppMcpLinkTest {
       app.close();
     }
     // close 顺序：bridge 先整组下架工具（registry 恢复到"桥接前"的原状），再关源子进程。
-    // 注意"原状"不是空表：主 Agent 的工具面 = 插件供给（本测试无插件目录 ⇒ 空）+ 内置技能工具（本能力新增）。
+    // 注意"原状"不是空表：主 Agent 的工具面 = 插件供给（本测试无插件目录 ⇒ 空）+ 内置技能工具 + R3b 起的
+    // docs 工具（7）与工作区工具（3），合计 21。
     // 断言写全等而非"包含"——桥若没把 echo 摘干净，这里会多出 echo ⇒ 转红。
     assertThat(app.runtime().registry().list())
         .extracting(AgentTool::name)
-        .containsExactlyInAnyOrderElementsOf(SkillTools.NAMES);
+        .containsExactlyInAnyOrderElementsOf(builtinToolNames());
     waitForExit(pidFile);
   }
 
@@ -90,14 +93,15 @@ class AppMcpLinkTest {
             Duration.ofSeconds(30));
     try (McpToolSource client = new McpToolSource(appProcess)) {
       client.connect();
-      // 验收：SDK client listTools 可见主 Agent 工具面 = 桥同步进的 echo + 内置技能工具（本能力新增；
-      // 它们对未表态的外部调用者一律 RESOURCE_DENIED，见 SkillToolsTest）。工作束四起 bash 来自插件，
-      // 本子进程无插件目录 ⇒ 工具面无 bash。仍是全等断言：少一个（桥没同步过来）或多一个（不该外发的漏出去了）都转红。
+      // 验收：SDK client listTools 可见主 Agent 工具面 = 桥同步进的 echo + 内置技能工具 + docs/workspace 工具
+      // （本能力新增；未表态的外部调用者一律 RESOURCE_DENIED，见 SkillToolsTest / DocsToolsTest）。工作束四起
+      // bash 来自插件，本子进程无插件目录 ⇒ 工具面无 bash。仍是全等断言：少一个（桥没同步过来）或多一个
+      // （不该外发的漏出去了）都转红。
       assertThat(client.listTools())
           .extracting(AgentTool::name)
           .containsExactlyInAnyOrderElementsOf(
               java.util.stream.Stream.concat(
-                      java.util.stream.Stream.of("echo"), SkillTools.NAMES.stream())
+                      java.util.stream.Stream.of("echo"), builtinToolNames().stream())
                   .toList());
       // 穿透调用：客户端 → App 的 AgentToMcpServer → registry → 桥 → 外部 MCP server
       AgentTool echo =
@@ -240,6 +244,17 @@ class AppMcpLinkTest {
     Path file = tempDir.resolve("mcp-links.json");
     Files.writeString(file, new ObjectMapper().writeValueAsString(links));
     return file;
+  }
+
+  /**
+   * 主 Agent 的<b>内置</b>工具名（不含插件与 MCP 桥）：技能 11 + Docs 7 + 工作区 3 = 21。
+   *
+   * <p>三处名字集合都从生产常量现取（不重抄字面量）：哪一族少注册一个工具，全等断言当场转红。
+   */
+  private static java.util.Set<String> builtinToolNames() {
+    return java.util.stream.Stream.of(SkillTools.NAMES, DocsTools.NAMES, WorkspaceTools.NAMES)
+        .flatMap(java.util.Set::stream)
+        .collect(java.util.stream.Collectors.toUnmodifiableSet());
   }
 
   private static ToolContext contextWith(String text) {

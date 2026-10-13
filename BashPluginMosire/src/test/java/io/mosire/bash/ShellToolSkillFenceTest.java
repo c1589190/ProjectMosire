@@ -60,8 +60,7 @@ class ShellToolSkillFenceTest {
     // 调用者没有任何技能表态（= 技能工具面里它一个技能都看不见），可达面不限 ⇒ 命令若跑起来就能读技能树
     ToolContext caller =
         caller(
-            AgentPermissionSet.builder(AccessToken.SYSTEM).allowAll().build(),
-            Map.of(SandboxMask.CONFIG_KEY, List.of(skills.toString())));
+            AgentPermissionSet.builder(AccessToken.SYSTEM).allowAll().build(), maskConfig(skills));
 
     ToolResult result = tool.execute(withArgs(caller, "touch " + MARKER));
 
@@ -81,8 +80,7 @@ class ShellToolSkillFenceTest {
             .resourceScopes(
                 ResourceScopeMap.of(SkillNamespaces.SKILLS, ResourceScope.ofDir(skills)))
             .build();
-    ToolContext caller =
-        caller(permissions, Map.of(SandboxMask.CONFIG_KEY, List.of(skills.toString())));
+    ToolContext caller = caller(permissions, maskConfig(skills));
 
     ToolResult result = tool.execute(withArgs(caller, "touch " + MARKER));
 
@@ -105,8 +103,7 @@ class ShellToolSkillFenceTest {
                         ResourceScopeMap.FS, ResourceScope.ofDir(work),
                         SkillNamespaces.SKILLS, ResourceScope.none())))
             .build();
-    ToolContext caller =
-        caller(permissions, Map.of(SandboxMask.CONFIG_KEY, List.of(skills.toString())));
+    ToolContext caller = caller(permissions, maskConfig(skills));
 
     ToolResult result = tool.execute(withArgs(caller, "touch " + MARKER));
 
@@ -129,6 +126,23 @@ class ShellToolSkillFenceTest {
 
   private static ToolContext caller(AgentPermissionSet permissions, Map<String, Object> config) {
     return new ToolContext(AccessToken.SYSTEM, permissions, config, Map.of());
+  }
+
+  /**
+   * 遮蔽面清单（R1 后的新形状：条目自带命名空间 {@code {namespace, path}}）。
+   *
+   * <p>旧的无命名空间条目（裸字符串/裸 {@code Path}）已被 {@link SandboxMask} 响亮拒——技能面的命名空间由写清单的
+   * 装配层声明，本夹具照生产写端同形（{@code SkillNamespaces.SKILLS}）。
+   */
+  private static Map<String, Object> maskConfig(Path root) {
+    return Map.of(
+        SandboxMask.CONFIG_KEY,
+        List.of(
+            Map.of(
+                SandboxMask.NAMESPACE_KEY,
+                SkillNamespaces.SKILLS,
+                SandboxMask.PATH_KEY,
+                root.toString())));
   }
 
   private static ToolContext withArgs(ToolContext caller, String command) {
