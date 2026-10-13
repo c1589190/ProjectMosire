@@ -273,11 +273,16 @@ final class Resolvers {
   static Resolver direct();    // 一对一（v1 唯一实现）
 }
 
+/** 挂载来源：决定它进不进 bash 遮蔽面（M6）。 */
+enum Origin { ASSEMBLY, RUNTIME }
+
 record Mount(
     MountName name, String holder, String user, Path dir,
-    Resolver resolver, Kind kind, Set<String> capabilities) {}
+    Resolver resolver, Kind kind, Set<String> capabilities, Origin origin) {}
 
-/** 调用者 = 身份（holder key）+ 权限集；解析与鉴权都以它为准。 */
+/** 调用者 = 身份（**身份键**）+ 权限集；解析与鉴权都以它为准。
+ *  身份键在解析时与 `Mount.user` 比对（"哪些挂载是我的"），在 M2/M5 检查里与 `Mount.holder` 比对（"谁创建了它"）——
+ *  同一个键扮演两个角色（R2 实现时澄清，控制方确认）。 */
 record WorkspaceCaller(String holder, AgentPermissionSet permissions) {}
 
 /** 喂 bash 侧的**物理落点**清单（虚拟层不下发给插件；静态装配期清单，见 M6）。 */
@@ -418,7 +423,7 @@ main            /workspace            → <dataDir>/workspaces/main
 | **A2** | 挂载的物理范围**必须在挂载者可达面内**，否则拒（防"父级没表态也能开地"，§2.5 的洞） |
 | **A3** | `LOG` / `REFERENCE` 在 bash 侧**只读或遮蔽**——**`LOG` 上永远不给 shell 写**；`FILE` / `SCRATCH` 在本挂载有 `bash` 能力时才可写（v1 无该能力 ⇒ 一律遮蔽，A8/N13） |
 | **A4** | 同一虚拟挂载名在同一 holder 下唯一；冲突具名拒 |
-| **A5** | `grant` 只做"并进 + 求交"，**绝不放大**给定权限集 |
+| **A5** | `grant` 只做"**补进未表态**"：目标权限集在该命名空间**未表态**（`declaredScope == null`）⇒ 并进落点；**已显式表态且不含落点**（含显式 `none()`）⇒ **具名拒（`RESOURCE_DENIED`）+ `workspace.denied` 事件**，绝不静默放大（控制方 2026-10-13 裁定，R2 实现后修订） |
 | **A6** | 物理落点必须绝对化且归一（`..` 拒）；解析结果必须 containment（G1） |
 | **A7** | 面向模型只出虚拟路径（G4） |
 | **A8** | **能力是"工作区里能干什么"的唯一决定点**（N9）：能力**只在挂载/授予时**落成"命名空间 + 前缀"与 shell 可见位；运行期不产生第二处判定；工具族不得自行放宽准入，也不得绕过工作区另开一套"能不能用" |
@@ -432,7 +437,7 @@ main            /workspace            → <dataDir>/workspaces/main
 | **M3** | 挂载声明的能力 id **不得超出**挂载者在同一物理范围上的既有权利（能力落格后必须仍 ⊆ 挂载者面） |
 | **M4** | 虚拟挂载名冲突 ⇒ 具名拒（不静默替换、不覆盖他人挂载） |
 | **M5** | 卸载只允许 **`holder`（创建者）或其祖先**执行；卸载后该名字**解析 fail-closed**（绝不回落成物理路径或"就当没挂载"） |
-| **M6** | 运行期新建的挂载**不进 bash 遮蔽面**（shell 看不见）；要 shell 可见必须装配期声明 |
+| **M6** | 运行期新建的挂载（`Origin.RUNTIME`）**不进 bash 遮蔽面**（shell 看不见）；要 shell 可见必须装配期声明（`Origin.ASSEMBLY`）——`maskEntries()` **只返回装配期条目** |
 | **M7** | 子体挂载集 = 父挂载集 ∩ 模板 ∩ 请求，物化在父侧运行期状态（不留"运行期往上问父级"） |
 | **M8** | 每次挂载/卸载/拒绝都落审计事件（M8 与 §4.7 的审计面同源） |
 | **M9** | **子工作区必须严格更小**：`user` 是自己或后代，落点是自己工作区目录下的**真子目录**（W1/W2）；深度受 `subagents.maxDepth` 约束（W3） |
@@ -786,7 +791,13 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 - 判据不写在派单书里另造——**一律引用设计文档的条目号**（§4.11 / §5.9），保证"测试 Agent 按判据清单验"时与设计同源。
 - R4 的输入 = §4.11 + §5.9 **全量** + R1–R3b 各写代码 Agent 报告的"行为变更/失效断言"清单。
 - 动 AgentLib 的责任区（R1）与最终验收（R4）额外跑下游可用性检查（§0.5）。
-- **R1 → R3b 的交接项**：R1 落地时遮蔽面两个写端先写**字面** `("skills", <技能根>)`（技能面本期不迁 docs）；**R3b 必须改为由 `WorkspaceRegistry.maskEntries()` 产出**（§4.8 的能力落格）。这是登记的交接项，不是 R1 的偏差。
+- **R1 → R3b 的交接项**：R1 落地时遮蔽面两个写端先写**字面** `("skills", <技能根>)`（技能面本期不迁 docs）；**R3b 必须改为由 `WorkspaceRegistry.maskEntries()` 产出**（§4.8 的能力落格）。
+- **R2 → R3b 的交接项**（R2 实现时发现，控制方裁定）：
+  1. **M1 对装配期挂载同样生效** ⇒ 装配方（`App`）必须给主 Agent 的权限集**显式加上 `workspaces` 前缀**（如 `<dataDir>/workspaces`），否则装配期挂载会被 M1 拒；这是有意的 fail-closed，不是缺陷。
+  2. **无能力的挂载不产出遮蔽面条目、也无法被 `resolve`**（谁都不持有该能力 ⇒ `RESOURCE_DENIED`）。要让技能根保持 R1 之前的遮蔽语义，装配方需注册一个**只含 `skills: READ`** 的能力并声明在技能根的 `REFERENCE` 挂载上；**不要**做成 `{skills, skills-edit}` 双命名空间，否则 G7 逐条目求与会把"可读不可改"的调用者一并遮蔽。
+  3. **W3 深度闸不在工作区模块**：它复用 `subagents.maxDepth`，落在派生链（R3b 的 spawn 侧）；工作区模块只保证"真子目录 + 血缘子树"。
+  4. **`resolve` 不检查物理目录是否存在**（解析是纯映射；IO 由消费方 fail-closed 报错），`list` 对缺失/非目录返回 `WORKSPACE_NOT_FOUND`。
+  5. **`unmount(name, caller)` 只有名字一个定位键**：实现取"先自己切片；再'由自己创建'的跨切片挂载（须唯一）"；**祖先直接点名卸子体挂载**走不到——用 M10 级联（卸父自己的挂载即带走子体的）表达。
 - **R1 的已知红（判给 R4）**：`AgentLibMosire/src/test/java/io/mosire/agentlib/tool/SandboxMaskTest.java` 的 fixture/断言按**旧形状**写就（`pathsOf` / `skillsVisible` / 裸路径条目），而设计**有意**改了形状并删了这两个 API ⇒ 该文件**整套按新形状重写**属 R4（统一测试责任区）的活；R1 的门槛判据是 `-DskipTests compile` 绿 + 其余测试源 `test-compile` 绿（R1 用 `-Dmaven.compiler.failOnError=false` 诊断跑证明），**该红登记为带裁定的遗留项**。
 
 ---
