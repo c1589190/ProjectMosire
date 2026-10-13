@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -223,15 +224,44 @@ public final class DocsEngine {
    * {@link DocReadResult#broken()} 带出，坏文件本身以 {@code DOC_READ_FAILED} 具名失败（响亮， 不静默）。
    *
    * <p><b>扫不动的挂载只跳过并记日志</b>：诊断口不该把主操作带崩；跳过的原因进日志（不静默），而该挂载真正的读口会以同一个具名失败 回答调用者。
+   *
+   * <p><b>本形态不带观看者</b>（库 API 的<b>全量诊断快照</b>）：它不判条目可见性，只该给"不把结果读给模型听"的进程内调用点用
+   * （运维诊断、事件留痕、装配自检）。<b>凡面向观看者/模型的披露必须走 {@link #broken(WorkspaceCaller, DocViewer)}</b> ——设计
+   * §9.16：{@code broken} 收口到 {@link DocViewer}，披露只列调用者看得见的地址。留着本形态是"公开形状只增不减"
+   * （既有调用点零改动），不是给工具面留一条旁路：{@link DocsAccess} 与 {@link DocsApi} 的收口形态都是带 viewer 的那个。
    */
   public List<BrokenDoc> broken(WorkspaceCaller caller) {
-    List<BrokenDoc> all = new ArrayList<>();
+    return broken(caller, entries -> true);
+  }
+
+  /**
+   * 坏数据披露的<b>收口形态</b>（设计 §9.16，★ R6）：<b>只披露调用者看得见的地址</b>的坏数据。
+   *
+   * <p><b>"地址看得见"的判据与 {@link #list} 的地址摘要同源</b>：该地址至少有一条条目过 {@link DocVisibility#canSee}
+   * （判据只有一处，本类不另写一份）。于是"不可见 ≡ 不存在"（B2/§5.5）在披露口上同样成立：不可见的地址在披露里<b>一个字都不出现</b> ——含文件名/编码名（{@link
+   * BrokenDoc#where()} 对 {@code LOG} 就是编码后的文件名），否则披露会退化成"挂载里有哪些地址"的 存在性探测器（R4b 发现的缺口）。
+   *
+   * <p><b>判不出可见性 ⇒ 不披露</b>（fail-closed）：整份日志读不出来时该地址没有任何可见条目 ⇒ 它的坏数据不进披露；被丢弃的条目 仍进 {@code
+   * LOG.debug}（对运维不静默，对模型一个字都不出现）。这与 {@code §9.18} 的"扫不动 ⇒ 跳过 + LOG.debug"同一纪律。
+   */
+  public List<BrokenDoc> broken(WorkspaceCaller caller, DocViewer viewer) {
+    java.util.Objects.requireNonNull(viewer, "viewer");
+    return broken(caller, entries -> seesAny(viewer, entries));
+  }
+
+  /**
+   * 披露的共同骨架：逐个 {@code LOG} 挂载现扫，{@code addressVisible} 决定"这个地址扫出的坏数据能不能披露"。
+   *
+   * <p>两个公开形态唯一的差别就是这个判据（全量快照 / 按观看者收口），控制流与"扫不动就跳过"的处置只写这一处。
+   */
+  private List<BrokenDoc> broken(WorkspaceCaller caller, Predicate<List<DocEntry>> addressVisible) {
+    List<BrokenDoc> disclosed = new ArrayList<>();
     for (Mount mount : mounts(caller)) {
       if (mount.kind() != Kind.LOG) {
         continue;
       }
       try {
-        all.addAll(rescanLogs(mount, caller));
+        disclosed.addAll(rescanLogs(mount, caller, addressVisible));
       } catch (WorkspaceException | DocException e) {
         LOG.debug(
             "docs.broken 跳过扫不动的挂载 名字={} 调用者={} 原因={}",
@@ -240,16 +270,43 @@ public final class DocsEngine {
             e.toString());
       }
     }
-    return List.copyOf(all);
+    return List.copyOf(disclosed);
   }
 
-  /** {@code LOG} 挂载的现扫：列地址（坏文件名在此披露）→ 逐地址解析（坏行在此披露并跳过）。只读，不建任何东西。 */
-  private List<BrokenDoc> rescanLogs(Mount mount, WorkspaceCaller caller) {
+  /**
+   * {@code LOG} 挂载的现扫：列地址（坏文件名在此披露）→ 逐地址解析（坏行在此披露并跳过），<b>逐地址</b>过可见性判据。只读，不建任何东西。
+   *
+   * <p><b>坏数据怎么归属到地址</b>：{@link DocStore#broken()} 是"实例内累计、按发现顺序"的快照，而 {@code read(address)}
+   * 只碰它自己那一份日志 ⇒ "读这个地址前后新增的那些"就是这个地址的坏数据。归属<b>不从文件名反解地址</b>（B5：文件名只是索引）， 也就不需要第二个判据。
+   */
+  private List<BrokenDoc> rescanLogs(
+      Mount mount, WorkspaceCaller caller, Predicate<List<DocEntry>> addressVisible) {
     DocStore store = DocLogs.onDisk(baseDirOf(mount, caller));
+    List<BrokenDoc> disclosed = new ArrayList<>();
     for (String address : store.addresses()) {
-      store.read(address);
+      int discovered = store.broken().size();
+      List<DocEntry> entries = store.read(address);
+      if (!addressVisible.test(entries)) {
+        LOG.debug(
+            "docs.broken 不披露这个地址的坏数据（看不见 ⇒ 与不存在同一个回答，fail-closed）: mount={} address={}",
+            mount.name().value(),
+            address);
+        continue;
+      }
+      List<BrokenDoc> found = store.broken();
+      disclosed.addAll(found.subList(discovered, found.size()));
     }
-    return store.broken();
+    return disclosed;
+  }
+
+  /** 地址可见 ⇔ 它至少有一条条目过 {@link DocVisibility#canSee}（与 {@link #list} 的地址摘要同一口径）。 */
+  private static boolean seesAny(DocViewer viewer, List<DocEntry> entries) {
+    for (DocEntry entry : entries) {
+      if (DocVisibility.canSee(viewer, entry)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // ── 内部：解析归位 ───────────────────────────────────────────────────────────────────────────

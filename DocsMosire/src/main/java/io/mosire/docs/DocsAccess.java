@@ -164,9 +164,15 @@ public final class DocsAccess {
 
   // ── 诊断 ────────────────────────────────────────────────────────────────────────────────────
 
-  /** 与某次操作相关的坏数据披露（无 ⇒ 空表）。 */
+  /**
+   * 与某次操作相关的坏数据披露（无 ⇒ 空表），<b>按本次调用的观看者收口</b>（设计 §9.16，★ R6）。
+   *
+   * <p><b>观看者取本工具调用自己那一份</b>（{@link #viewerOf}：身份 + GM 短路位都来自 {@link ToolContext}， 模型给不出也改不了），交给引擎按
+   * {@link DocVisibility#canSee} 逐个地址过滤——只披露这个调用者看得见的地址；
+   * 不可见的地址在披露里一个字都不出现（含文件名/编码名）。工具面因此不可能把"别处有哪些文档"漏出去。
+   */
   public List<BrokenDoc> broken(ToolContext context) {
-    return engine.broken(callerOf(context));
+    return engine.broken(callerOf(context), viewerOf(context));
   }
 
   /** 引擎（工具面自己也要用它做纪律与准入判定，见 {@link DocsTools}）。 */

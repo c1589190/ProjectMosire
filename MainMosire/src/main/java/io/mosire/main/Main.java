@@ -289,6 +289,8 @@ public final class Main {
     boolean parentLink = false;
     Path configDir = null;
     Path skillsDir = null;
+    // 技能目录档预算（D2）：旗标缺席 ⇒ null（子进程按 SkillCatalog 缺省 4096 回落）；0 是合法取值（不披露目录档）
+    Integer skillsListingBudget = null;
     // 技能范围：同一开关可重复出现（每个前缀一项）；"*" = 不限，"none" = 一个都不许（见 SkillPermissions#encode）
     List<String> skillVisible = new ArrayList<>();
     List<String> skillEditable = new ArrayList<>();
@@ -304,6 +306,10 @@ public final class Main {
         case "--data-dir" -> dataDir = Path.of(requireValue(args, ++i));
         case "--config-dir" -> configDir = Path.of(requireValue(args, ++i));
         case "--skills-dir" -> skillsDir = Path.of(requireValue(args, ++i));
+        case "--skills-listing-budget" ->
+            // 整数解析（非整数/缺值都抛 IllegalArgumentException ⇒ 本方法下面的 catch 报"参数错误" + 退出码 2）；
+            // 负数由 Options 的构造期守卫具名拒（与 SkillCatalog 同一口径，不在这一层夹成 0）
+            skillsListingBudget = Integer.valueOf(requireValue(args, ++i));
         case "--skill-visible" -> skillVisible.add(requireValue(args, ++i));
         case "--skill-editable" -> skillEditable.add(requireValue(args, ++i));
         case "--doc-visible" -> docVisible.add(requireValue(args, ++i));
@@ -333,7 +339,8 @@ public final class Main {
               skillVisible,
               skillEditable,
               docVisible,
-              docEditable));
+              docEditable,
+              skillsListingBudget));
     } catch (IllegalArgumentException e) {
       System.err.println("参数错误: " + e.getMessage());
       return 2;
@@ -727,6 +734,7 @@ public final class Main {
                               密钥由本进程自己读；缺席 = 模板引导脚本假 LLM）
              --parent-link   以 MCP client 身份接管 stdin/stdout（父侧已建链接）
              --skills-dir <p> 技能根目录（子体据此做每回合的可见技能目录预注入；缺省不预注入）
+             --skills-listing-budget <n> 技能目录档字符预算（0 = 不披露目录档；缺省回落 4096，缺省值不下发）
              --skill-visible <v>   技能可见面（可重复；* = 不限，none = 一个都不许，其余为路径；缺省 none）
              --skill-editable <v>  技能可编辑面（同上；生效值恒在可见面之内）
              --doc-visible <v>     文档可见面（可重复；编码口径与技能面相同；缺省 none）

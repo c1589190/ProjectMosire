@@ -1,6 +1,7 @@
 package io.mosire.brain.subagent;
 
 import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
 import io.mosire.docs.DocNamespaces;
@@ -25,6 +26,11 @@ import java.util.Objects;
  * （{@code *} = 不限 / {@code none} = 一个都不许 / 其余每个前缀一项），子进程据此恢复自己的技能可见面与可编辑面—— 子体的技能工具仍由父侧 MCP
  * 链接服务（权限集也是父侧那份），argv 这一份只服务“预注入不得越出可见面”。未表态的命名空间不追加任何项。
  *
+ * <p><strong>技能目录档预算（D2，{@code skillsListingBudget}）</strong>：{@code --skills-listing-budget <整数>}
+ * 给子体<b>目录档字符预算</b>（子进程用它建 {@code SkillCatalog}）。值与 {@code --skills-dir} <b>同源</b>（都由装配层从 {@code
+ * skills.listingBudget} 下发）；<b>只有非缺省值才追加</b>——缺省（{@code SkillCatalog.DEFAULT_LISTING_BUDGET}）
+ * 时子进程自己回落同一个数，因此既有装配与既有夹具的 argv <b>逐字不变</b>。{@code null} = 未注入（同"缺省"）。
+ *
  * <p><strong>子工作区扩展（R3b，{@code --doc-visible}/{@code --doc-editable}）</strong>：与技能面同一条缝同一种编码—— 值由
  * {@code argv} 从<b>实例权限集</b>现算（子工作区的 {@code docs} 能力在 spawn 时已落格，见 {@code SubagentManager}），
  * 子进程据此恢复自己的文档可见面与可编辑面。未表态的命名空间不追加任何项；子进程侧对"缺席"的读法是 {@code none}（fail-closed）。
@@ -46,6 +52,9 @@ import java.util.Objects;
  * @param skillsDir 技能根目录（装配层注入；同上绝对化；null = 不传——子体不做技能预注入）。子体的技能<b>可见/可编辑范围</b>不在这里， 而由 {@link
  *     #argv} 从实例权限集现算成 {@code --skill-visible}/{@code --skill-editable} 项——
  *     范围是权限数据，必须跟着权限集走（父级收紧过的才是子体该拿的），不能由装配层另配一份
+ * @param skillsListingBudget 技能目录档字符预算（{@code --skills-listing-budget}；D2）。<b>null = 未注入</b> （子进程按
+ *     {@link SkillCatalog#DEFAULT_LISTING_BUDGET} 回落）；等于缺省时 <b>不追加旗标</b>（argv 逐字不变， 子进程本来就回落同一个数）；0
+ *     是合法取值（不披露目录档），负数在构造期具名拒
  */
 public record AgentCommand(
     String command,
@@ -56,7 +65,8 @@ public record AgentCommand(
     String childDataDir,
     boolean parentLink,
     String configDir,
-    String skillsDir) {
+    String skillsDir,
+    Integer skillsListingBudget) {
 
   public AgentCommand {
     if (command == null || command.isBlank()) {
@@ -67,10 +77,38 @@ public record AgentCommand(
     if (idFlag == null || idFlag.isBlank()) {
       throw new IllegalArgumentException("idFlag 不能为空");
     }
+    if (skillsListingBudget != null && skillsListingBudget < 0) {
+      // 与 SkillCatalog 同一口径：负预算是配置错误，不在这一层静默夹成 0
+      throw new IllegalArgumentException("技能目录档预算不能为负: " + skillsListingBudget);
+    }
     templatesDir = absoluteOrNull(templatesDir);
     childDataDir = absoluteOrNull(childDataDir);
     configDir = absoluteOrNull(configDir);
     skillsDir = absoluteOrNull(skillsDir);
+  }
+
+  /** 9 参兼容构造（D2 之前）：目录档预算<b>未注入</b>（{@code null} ⇒ 不追加旗标，子进程按缺省回落），因此既有调用点的 argv 逐字节不变。 */
+  public AgentCommand(
+      String command,
+      List<String> jvmArgs,
+      List<String> prefix,
+      String idFlag,
+      String templatesDir,
+      String childDataDir,
+      boolean parentLink,
+      String configDir,
+      String skillsDir) {
+    this(
+        command,
+        jvmArgs,
+        prefix,
+        idFlag,
+        templatesDir,
+        childDataDir,
+        parentLink,
+        configDir,
+        skillsDir,
+        null);
   }
 
   /**
@@ -205,6 +243,12 @@ public record AgentCommand(
     if (skillsDir != null) {
       argv.add("--skills-dir");
       argv.add(skillsDir);
+      // D2：目录档预算只在**非缺省**时下发——缺省（4096）由子进程自己回落同一个数，既有装配与既有夹具的 argv 因此逐字不变。
+      if (skillsListingBudget != null
+          && skillsListingBudget != SkillCatalog.DEFAULT_LISTING_BUDGET) {
+        argv.add("--skills-listing-budget");
+        argv.add(Integer.toString(skillsListingBudget));
+      }
     }
     // 技能范围：只在该命名空间**已表态**时才追加（未接线技能面的既有装配 argv 逐字节不变）。取值直接来自实例权限集——
     // 父级收紧过的才是子体该拿的，装配层没有第二份可写的地方（写错一处就是静默放大）。

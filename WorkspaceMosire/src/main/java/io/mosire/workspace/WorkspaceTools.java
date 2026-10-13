@@ -10,7 +10,6 @@ import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
-import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -36,8 +35,19 @@ import java.util.function.Function;
  * <p><b>只创建 {@link Origin#RUNTIME} 挂载</b>（M6）：工具面<b>不接受</b> {@code origin} 参数——要进 bash 遮蔽面必须装配期
  * 声明，那条路只能由进程内的装配代码走。
  *
+ * <p><b>落点形态 = 派生形态</b>（设计 §4.7 的"工具面的落点形态"行，★ R6 修订）：{@code mount_workspace} <b>不接受绝对物理
+ * 路径</b>——它只接受 {@code name} / {@code parent} / {@code subdir} / {@code kind} / {@code
+ * capabilities}，落点 = 解析 {@code parent}（自己已有的挂载名）得到的物理目录 + {@code subdir}（必须是<b>真子目录</b>，复用 W1/W2
+ * 的判据）。理由： ① 面向模型只出虚拟路径（A7/G4），而旧形态要模型输入绝对物理路径，自相矛盾且实测无从得知（R5/R5c）；② 派生形态天然满足"只能在自己的
+ * 地界里划更小的工作区"。<b>绝对 {@code dir} 形态只保留在注册表 API</b>（{@link WorkspaceRegistry#mount}，装配期宿主代码用）：
+ * 工具面无此入参。
+ *
+ * <p><b>归属与血缘写死</b>：新挂载 {@code holder = user = 调用者本人}（工具面只服务"给自己划一块更小的工作区"；"父为子挂载"走 spawn 侧的注册表
+ * API，M2），{@code derivedFrom = parent}（卸载 {@code parent} 时本挂载一并失效，M10）。
+ *
  * <p><b>面向模型的输出只含虚拟路径</b>（G4/A7）：物理落点只进装配日志与审计事件。因此 {@code list_workspaces} 不列物理 目录、{@code
- * mount_workspace} 的返回也不回显落点。
+ * mount_workspace} 的返回也不回显落点，只回显虚拟名与 {@code parent}。{@code list_workspaces} 还必须告诉模型<b>哪些名字能当 {@code
+ * parent}</b>（否则模型仍无从下手）：列的就是调用者自己切片里的挂载名。
  *
  * <p><b>工具等级</b>：{@code DEFAULT} 级、非敏感、非破坏（登记不等于写文件：本模块不创建目录、不改文件）；可外发给子 Agent（子体要能为自己派的小 Agent
  * 划更小的工作区）。
@@ -71,7 +81,11 @@ public final class WorkspaceTools {
     return List.of(mount(registry), unmount(registry), list(registry));
   }
 
-  /** {@code mount_workspace}：在自己的可达面内登记一个工作区（能力必须已注册且不超出自己的权利）。 */
+  /**
+   * {@code mount_workspace}：在自己的某一块工作区（{@code parent}）里划出一块更小的工作区。
+   *
+   * <p>入参是<b>派生形态</b>（§4.7）：没有物理路径；落点由唯一解析点解析 {@code parent} 得到的目录 + {@code subdir} 派生。
+   */
   static AgentTool mount(WorkspaceRegistry registry) {
     Objects.requireNonNull(registry, "registry");
     Map<String, Object> schema =
@@ -85,9 +99,19 @@ public final class WorkspaceTools {
                     "type",
                     "string",
                     "description",
-                    "挂载名（虚拟路径的第一段）：[a-z0-9][a-z0-9-]{0,63}；同一使用者下不得重名"),
-                "dir",
-                Map.of("type", "string", "description", "物理目录（绝对路径、已归一）：必须落在你 workspaces 可达面之内"),
+                    "新挂载名（虚拟路径的第一段）：[a-z0-9][a-z0-9-]{0,63}；同一使用者下不得重名"),
+                "parent",
+                Map.of(
+                    "type",
+                    "string",
+                    "description",
+                    "从哪一块已有的工作区里划出来（你自己切片的挂载名，见 list_workspaces）。只接受虚拟挂载名，不接受物理路径"),
+                "subdir",
+                Map.of(
+                    "type",
+                    "string",
+                    "description",
+                    "相对 parent 落点的子目录（必须是真子目录：非空、不以 '/' 开头、不含空段与 '.'/'..' 段）"),
                 "kind",
                 Map.of(
                     "type",
@@ -103,48 +127,48 @@ public final class WorkspaceTools {
                     "items",
                     Map.of("type", "string"),
                     "description",
-                    "要在这个工作区里授予的能力 id（可空；未注册的 id 会被拒）"),
-                "user",
-                Map.of("type", "string", "description", "使用者身份键（缺省=自己）；只能是自己或自己的后代（血缘子树）"),
-                "derivedFrom",
-                Map.of(
-                    "type",
-                    "string",
-                    "description",
-                    "派生来源挂载名（可选）：你名下已有的挂载名。它被卸载时本挂载一并失效（M10）；缺省 = 独立挂载，不随任何挂载失效")),
+                    "要在这个工作区里授予的能力 id（可空；未注册的 id 会被拒；不得超出 parent 的能力）")),
             "required",
-            List.of("name", "dir", "kind"));
+            List.of("name", "parent", "subdir", "kind"));
     return new WorkspaceTool(
         MOUNT_WORKSPACE,
-        "在当前进程里登记一个工作区（虚拟路径 = 你给出的挂载名）。物理范围必须在你的 workspaces 可达面内；"
-            + "只能在你的血缘子树内指定使用者；工具面只能建运行期挂载（不进 shell 遮蔽面）；"
-            + "可选 derivedFrom 声明\"从哪一块划出来的\"，卸载来源时本挂载一并失效。",
+        "在自己的某一块工作区里划出一块更小的工作区（虚拟路径 = 你给出的挂载名）。"
+            + "落点由 parent（你已有的挂载名，见 list_workspaces）+ subdir（相对子目录）派生，本工具不接受物理路径；"
+            + "必须是 parent 落点下的真子目录（不能是自己的根）；能力不得超出 parent；"
+            + "工具面只能建运行期挂载（不进 shell 遮蔽面）；卸载 parent 时本挂载一并失效。",
         schema,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
-          String name = requiredString(context, "name");
-          Path dir = physicalDir(requiredString(context, "dir"));
+          MountName name = mountNameArg(requiredString(context, "name"));
+          MountName parent = mountNameArg(requiredString(context, "parent"));
+          String subdir = subdirArg(requiredString(context, "subdir"), parent);
           Kind kind = kindArg(requiredString(context, "kind"));
           Set<String> capabilities = capabilitySet(context);
           WorkspaceCaller caller = callerOf(context);
-          String user = optionalString(context, "user").orElse(caller.holder());
-          Optional<MountName> derivedFrom = derivedFromArg(context);
-          // 唯一入口的资源判定：物理范围必须在调用者的 workspaces 可达面内（M1 的工具面那一半，不自造判定器）
+          // parent 的物理落点 = 唯一解析点解析"该挂载的根"（§4.5 五步：拆名 → 查表 → 准入 → 映射 → containment）。
+          // parent 不在你的挂载表里 / 你够不着 / 没有能力 ⇒ 由它给既有错误码（WORKSPACE_NOT_FOUND / RESOURCE_DENIED），
+          // 本类不另判一次"这个 parent 能不能用"。
+          Path parentDir = parentDir(registry, parent, caller);
+          Path dir = parentDir.resolve(subdir).normalize();
+          // 唯一入口的资源判定：派生落点必须在调用者的 workspaces 可达面内（M1 的工具面那一半，不自造判定器）。
+          // 派生落点天然 ⊆ parent 的落点，但这里**不绕过**它——判定仍走注入的 ResourceAuthorizer。
           context
               .resources()
               .require(
                   Operation.WRITE, ResourceId.of(WorkspacePermissions.WORKSPACES, dir.toString()));
           Mount spec =
               new Mount(
-                  new MountName(name),
+                  name,
                   caller.holder(),
-                  user,
+                  // user = 调用者本人（工具面只服务"给自己划"，M2 的"为后代挂载"在 spawn 侧的注册表 API 上）
+                  caller.holder(),
                   dir,
                   Resolvers.direct(),
                   kind,
                   capabilities,
                   Origin.RUNTIME,
-                  derivedFrom);
+                  // derivedFrom = parent（M10）：卸载 parent ⇒ 本挂载级联失效，不按物理包含判
+                  Optional.of(parent));
           Mount mounted = registry.mount(spec, caller);
           return ToolResult.ok(
               "已挂载 虚拟路径="
@@ -155,7 +179,8 @@ public final class WorkspaceTools {
                   + mounted.kind()
                   + " 能力="
                   + renderCapabilities(mounted.capabilities())
-                  + mounted.derivedFrom().map(source -> " 派生自=" + source.value()).orElse("")
+                  + " 派生自="
+                  + parent.value()
                   + " 来源=运行期（shell 看不见该挂载）");
         });
   }
@@ -183,23 +208,31 @@ public final class WorkspaceTools {
         });
   }
 
-  /** {@code list_workspaces}：列出自己名下可解析的工作区（只有虚拟路径，不列物理落点）。 */
+  /**
+   * {@code list_workspaces}：列出自己名下可解析的工作区（只有虚拟路径，不列物理落点）。
+   *
+   * <p><b>为什么必须把"能当 {@code parent} 的名字"写出来</b>（★ R6）：{@code mount_workspace} 的落点由 {@code parent}
+   * 派生，而模型看不到物理布局——不告诉它有哪些名字可用，它仍然无从下手（R5/R5c 的实测就是"只有人把路径喂给它才跑得动"）。 可用的名字 = 调用者自己切片（{@code user ==
+   * holder}）里的挂载名，正是本方法列出的那批；输出仍然只含虚拟路径（A7/G4）。
+   */
   static AgentTool list(WorkspaceRegistry registry) {
     Objects.requireNonNull(registry, "registry");
     Map<String, Object> schema = Map.of("type", "object", "properties", Map.of());
     return new WorkspaceTool(
         LIST_WORKSPACES,
-        "列出你名下的工作区（虚拟路径、纪律、能力、归属、使用者、来源）。",
+        "列出你名下的工作区（虚拟路径、纪律、能力、归属、使用者、来源）。" + "这些虚拟路径的第一段就是可用的挂载名——mount_workspace 的 parent 只能从中挑。",
         schema,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
           WorkspaceCaller caller = callerOf(context);
           List<Mount> mounts = registry.mounts(caller.holder());
           if (mounts.isEmpty()) {
-            return ToolResult.ok("（没有已挂载的工作区）");
+            return ToolResult.ok("（没有已挂载的工作区：一个 parent 也没有，先请装配方给你挂一块）");
           }
           StringBuilder text = new StringBuilder("工作区 ").append(mounts.size()).append(" 个：\n");
+          Set<String> parentCandidates = new TreeSet<>();
           for (Mount mount : mounts) {
+            parentCandidates.add(mount.name().value());
             text.append("- 虚拟路径=")
                 .append(mount.name().value())
                 .append(" 纪律=")
@@ -214,6 +247,9 @@ public final class WorkspaceTools {
                 .append(mount.origin())
                 .append('\n');
           }
+          text.append("可用作 parent 的挂载名：")
+              .append(parentCandidates)
+              .append("（每个条目的虚拟路径第一段；parent 只接受这种名字，不接受物理路径）");
           return ToolResult.ok(text.toString());
         });
   }
@@ -231,49 +267,48 @@ public final class WorkspaceTools {
     return text;
   }
 
-  private static Optional<String> optionalString(ToolContext context, String name) {
-    String text = text(context, name);
-    return text.isEmpty() ? Optional.empty() : Optional.of(text);
-  }
-
   private static String text(ToolContext context, String name) {
     Object value = context.arguments().get(name);
     return value == null ? "" : String.valueOf(value).strip();
   }
 
   /**
-   * {@code derivedFrom} 入参（可选，M10）：只接受合法挂载名（形态与 {@code name} 同一口径）。
+   * 挂载名入参（{@code name} / {@code parent}）：形态由 {@link MountName} 判（<b>唯一</b>一处口径，与虚拟路径第一段同源）。
    *
-   * <p><b>"引用的挂载是否真实存在"不在这里判</b>：那要读挂载表，而挂载表只有一个判定归属地——{@link WorkspaceRegistry#mount} （指向不存在的名字会被
-   * M10 具名拒，不静默退化成一个永不级联的挂载）。
+   * <p><b>物理路径在这里就被挡住</b>：{@code /…}、{@code ..}、大写/空格都不匹配 {@link MountName#PATTERN} ⇒ 具名 {@code
+   * INVALID_ARGUMENTS}，错误消息只回显模型自己给的那个串（不含任何物理路径，A7）。
    */
-  private static Optional<MountName> derivedFromArg(ToolContext context) {
-    Optional<String> text = optionalString(context, "derivedFrom");
-    if (text.isEmpty()) {
-      return Optional.empty();
+  private static MountName mountNameArg(String text) {
+    if (!MountName.isValid(text)) {
+      throw WorkspaceException.invalid("必须是合法挂载名（" + MountName.PATTERN + "），不接受物理路径: " + text);
     }
-    if (!MountName.isValid(text.get())) {
-      throw WorkspaceException.invalid(
-          "derivedFrom 必须是合法挂载名（" + MountName.PATTERN + "）: " + text.get());
-    }
-    return Optional.of(new MountName(text.get()));
+    return new MountName(text);
   }
 
-  /** 物理目录入参：绝对 + 已归一（A6）；不合法即 {@code INVALID_ARGUMENTS}，不猜。 */
-  private static Path physicalDir(String text) {
-    Path dir;
-    try {
-      dir = Path.of(text);
-    } catch (InvalidPathException e) {
-      throw WorkspaceException.invalid("dir 不是合法路径（含无法成为路径的字符）");
-    }
-    if (!dir.isAbsolute()) {
-      throw WorkspaceException.invalid("dir 必须是绝对路径（挂载的物理落点不接受相对路径）");
-    }
-    if (!dir.normalize().equals(dir)) {
-      throw WorkspaceException.invalid("dir 必须已归一（不接受 '.' / '..' 段或重复分隔符）");
-    }
-    return dir;
+  /**
+   * {@code subdir} 入参：必须是 <b>parent 落点下的真子目录</b>的相对拼法（W1/W2）。
+   *
+   * <p><b>不另造一套校验</b>：把 {@code parent + "/" + subdir} 当一条虚拟路径交给 {@link VirtualPath#parse} ——"不得以
+   * {@code /} 开头、不得含空段、不得含 {@code .}/{@code ..} 段、第一段必须是合法挂载名"这四条守卫与解析虚拟路径
+   * 完全同一处实现，本方法只取出它算出的相对部分。因此 {@code ../x} / {@code /x} / {@code a//b} / {@code a/./b} 得到的是
+   * 同一句既有的具名拒。
+   *
+   * <p><b>"真子目录"那一半不在这里判</b>：它由 {@link WorkspaceRegistry#mount} 的 M9/W1 判（落点必须严格落在自己的工作区
+   * 目录之内，等于自己的根即拒）——守卫只有一个归属地。本方法交付的相对拼法不含 {@code ..}/空段，因此派生落点结构上 只可能更深，不可能等于 parent 的根。
+   */
+  private static String subdirArg(String subdir, MountName parent) {
+    return VirtualPath.parse(parent.value() + "/" + subdir).relative();
+  }
+
+  /**
+   * 解析 {@code parent} 的物理落点（该挂载的根）：走<b>唯一解析点</b>（{@link WorkspaceRegistry#resolve}）。
+   *
+   * <p>用虚拟挂载名（相对部分为空 ⇒ 该挂载的根）而不是去读挂载表，是为了复用解析点的全部四步——名字不存在、无权、映射越界都在那里
+   * 得到既有错误码；本方法不产生第二条判据，也不向模型回显任何物理路径。
+   */
+  private static Path parentDir(
+      WorkspaceRegistry registry, MountName parent, WorkspaceCaller caller) {
+    return registry.resolve(parent.value(), caller);
   }
 
   private static Kind kindArg(String text) {

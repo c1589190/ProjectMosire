@@ -278,13 +278,21 @@ public final class SubagentProcessMain {
    * 子体的技能目录预注入装配：{@code --skills-dir} 缺席 ⇒ {@code null}（不接线，行为与接线前逐字一致）。
    *
    * <p>可见面取的是本进程权限集（模板 ∩ 父侧 argv）里那个值——<b>不是</b>模板单独说的那份，否则父级收紧过的范围会在 预注入这一侧被放大回去。
+   *
+   * <p><b>目录档预算（D2）</b>：取 {@code --skills-listing-budget}；旗标缺席 ⇒ {@link
+   * SkillCatalog#DEFAULT_LISTING_BUDGET}（与接线前逐字一致）。此前这里恒用 {@code new SkillCatalog()} ⇒ 父侧配的 {@code
+   * skills.listingBudget} 在子体内失效（本项修复的正是这个缺口）。
    */
   private static BasicContextAssembler skillAssembler(
       Options options, AgentPermissionSet permissions, PrintStream diagnostics) {
     if (options.skillsDir() == null) {
       return null;
     }
-    SkillCatalog catalog = new SkillCatalog();
+    int listingBudget =
+        options.skillsListingBudget() == null
+            ? SkillCatalog.DEFAULT_LISTING_BUDGET
+            : options.skillsListingBudget();
+    SkillCatalog catalog = new SkillCatalog(listingBudget);
     try {
       // 宽容扫描：坏掉的单个技能只影响它自己（其余技能的目录档照常预注入），坏掉这件事 stderr 留痕
       SkillCatalog.ScanReport report = catalog.scanTolerant(options.skillsDir());
@@ -349,6 +357,8 @@ public final class SubagentProcessMain {
    * @param skillEditable 可编辑面（{@code --skill-editable}），语义同上
    * @param docVisible 文档可见面（{@code --doc-visible}，可重复；编码口径与技能面逐字相同）；空表 = none（fail-closed）
    * @param docEditable 文档可编辑面（{@code --doc-editable}）；空表 = none，且恒被夹进可见面
+   * @param skillsListingBudget 技能目录档字符预算（{@code --skills-listing-budget}；D2）。<b>null = 旗标缺席</b> ⇒
+   *     回落 {@link SkillCatalog#DEFAULT_LISTING_BUDGET}（与接线前逐字一致）；0 是合法取值（不披露目录档）；负数在构造期具名拒
    */
   public record Options(
       String instanceId,
@@ -362,7 +372,38 @@ public final class SubagentProcessMain {
       List<String> skillVisible,
       List<String> skillEditable,
       List<String> docVisible,
-      List<String> docEditable) {
+      List<String> docEditable,
+      Integer skillsListingBudget) {
+
+    /** 12 参兼容构造（D2 之前）：目录档预算<b>未下发</b>（{@code null} ⇒ 子进程按缺省 4096 回落，行为逐字不变）。 */
+    public Options(
+        String instanceId,
+        String templateId,
+        String goal,
+        Path templatesDir,
+        Path dataDir,
+        boolean parentLink,
+        Path configDir,
+        Path skillsDir,
+        List<String> skillVisible,
+        List<String> skillEditable,
+        List<String> docVisible,
+        List<String> docEditable) {
+      this(
+          instanceId,
+          templateId,
+          goal,
+          templatesDir,
+          dataDir,
+          parentLink,
+          configDir,
+          skillsDir,
+          skillVisible,
+          skillEditable,
+          docVisible,
+          docEditable,
+          null);
+    }
 
     /** 11 参兼容构造（文档面引入之前）：两个文档面都取空表 = none（fail-closed，逐字回到本字段引入前的行为）。 */
     public Options(
@@ -430,6 +471,10 @@ public final class SubagentProcessMain {
       skillEditable = skillEditable == null ? List.of() : List.copyOf(skillEditable);
       docVisible = docVisible == null ? List.of() : List.copyOf(docVisible);
       docEditable = docEditable == null ? List.of() : List.copyOf(docEditable);
+      if (skillsListingBudget != null && skillsListingBudget < 0) {
+        // 与 SkillCatalog 同一口径（负预算 = 配置错误）：解析即拒，不夹成 0
+        throw new IllegalArgumentException("--skills-listing-budget 不能为负: " + skillsListingBudget);
+      }
     }
   }
 }

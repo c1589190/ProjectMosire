@@ -92,9 +92,24 @@ public final class DocsApi {
 
   // ── 诊断 ────────────────────────────────────────────────────────────────────────────────────
 
-  /** 已观察到的坏数据（坏行/坏文件）：披露不静默（设计 §5.3）。 */
+  /**
+   * 已观察到的坏数据（坏行/坏文件），<b>全量诊断快照</b>：披露不静默（设计 §5.3）。
+   *
+   * <p><b>不判可见性</b>（库 API 形态）：它只该给"不把结果读给模型听"的进程内调用点用。凡要面向观看者/模型披露，必须用 {@link
+   * #broken(WorkspaceCaller, DocViewer)}——设计 §9.16：{@code broken} 收口到 {@link DocViewer}。
+   */
   public List<BrokenDoc> broken(WorkspaceCaller caller) {
     return engine.broken(caller);
+  }
+
+  /**
+   * 已观察到的坏数据，<b>按观看者收口</b>（设计 §9.16，★ R6）：只列调用者看得见的地址的坏数据。
+   *
+   * <p>判据只有一处（{@link DocVisibility#canSee}，与 {@code list} 的地址摘要同源）；不可见的地址在披露里一个字都不出现。
+   * 形状是<b>加重载</b>：既有的 {@link #broken(WorkspaceCaller)} 逐字保留（公开形状只增不减）。
+   */
+  public List<BrokenDoc> broken(WorkspaceCaller caller, DocViewer viewer) {
+    return engine.broken(caller, viewer);
   }
 
   /**

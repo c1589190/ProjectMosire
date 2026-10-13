@@ -614,6 +614,9 @@ public final class App implements AutoCloseable {
                 commandMode,
                 subagentLimits,
                 skillSettings.root(),
+                // D2：技能目录档预算与技能根**同源**下发（同一个 skillSettings）——子体此前恒用 SkillCatalog 缺省 4096，
+                // 父侧配的 skills.listingBudget 在子进程里失效
+                skillSettings.listingBudget(),
                 workspaceRegistry,
                 // M2 要判"user 是不是调用者的后代"，而这份血缘真值住在 Brain（实例记录）；
                 // 装配层把它接进注册表的取数缝（注册表不得依赖 Brain，设计 §3）
@@ -843,6 +846,7 @@ public final class App implements AutoCloseable {
       CommandModeHolder commandMode,
       SubagentLimits limits,
       Path skillsRoot,
+      int skillsListingBudget,
       WorkspaceRegistry workspaceRegistry,
       BiConsumer<String, String> lineageRegistrar) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
@@ -851,7 +855,7 @@ public final class App implements AutoCloseable {
     SubProcessExecutor executor =
         new SubProcessExecutor(
             processes,
-            subagentCommand(config, subagentConfigDir, skillsRoot),
+            subagentCommand(config, subagentConfigDir, skillsRoot, skillsListingBudget),
             tools,
             PARENT_SERVER_NAME,
             Version.VERSION,
@@ -889,9 +893,13 @@ public final class App implements AutoCloseable {
    *
    * <p>S1-A2：{@code subagentConfigDir} 非 null 时追加 {@code --config-dir <该路径>}（子体据此走真模型）。<b>只把路径交给
    * Brain</b>：本方法可见的全部信息里没有任何密钥值（密钥由子进程自己读 {@code <configDir>/config.json}，D23）。
+   *
+   * <p><b>D2</b>：{@code skillsListingBudget} 与 {@code skillsRoot} 同源（都取自 {@code
+   * skills.listingBudget}/{@code skills.dir} 那一份 {@code SkillSettings}）。等于缺省（4096）时 {@code
+   * AgentCommand.argv} 不追加旗标——子进程本就回落同一个数，argv 因此逐字不变。
    */
   private static AgentCommand subagentCommand(
-      BootConfig config, Path subagentConfigDir, Path skillsRoot) {
+      BootConfig config, Path subagentConfigDir, Path skillsRoot, int skillsListingBudget) {
     String java = ProcessHandle.current().info().command().filter(c -> !c.isBlank()).orElse("java");
     return new AgentCommand(
         java,
@@ -902,7 +910,8 @@ public final class App implements AutoCloseable {
         config.dataDir().resolve("subagents").toString(),
         true,
         subagentConfigDir == null ? null : subagentConfigDir.toString(),
-        skillsRoot == null ? null : skillsRoot.toString());
+        skillsRoot == null ? null : skillsRoot.toString(),
+        skillsListingBudget);
   }
 
   /**
