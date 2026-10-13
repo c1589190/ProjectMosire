@@ -261,43 +261,42 @@ public final class DocsEngine {
    * <b>再把落点归位到某个挂载</b>（取它的 {@code Kind}）。反过来（先按名字找挂载、再解析）会让"挂载不存在"与"无权"分成两条路， 而设计 §4.5
    * 要求它们<b>同码</b>——同码这件事由解析点保证，本方法不替它分叉。
    *
+   * <p><b>归位只按虚拟挂载名 + 使用者切片</b>（设计 §4.2，R5 真模型验收后裁定）：物理目录嵌套是 W1 的<b>正常形态</b>（子工作区在定义上就落在父
+   * 工作区目录内，装配期挂载之间也可能物理嵌套，如 {@code workspaces} ⊃ {@code workspace}），<b>不是</b>"嵌套挂载歧义"。按"解析出的物理
+   * 路径落在哪个挂载的目录内"归位，会把默认装配的主工作区整棵子树判成歧义而全链拒绝（R5 实测）。歧义的唯一判据是<b>同一使用者下虚拟挂载名冲突</b> （M4，注册表已经挡住）。这里的
+   * containment 只复核 G1：解析结果必须落在这<b>一个</b>挂载自己的物理范围之内。
+   *
    * @throws DocException {@code INVALID_ARGUMENTS}（虚拟路径拼法非法）/ {@code RESOURCE_DENIED}（范围外或名字不存在）
    */
   DocTarget mountOf(String virtualPath, WorkspaceCaller caller) {
     java.util.Objects.requireNonNull(caller, "caller");
     String relative = relativeOf(virtualPath);
+    String mountName = mountNameOf(virtualPath);
     Path physical;
     try {
       physical = registry.resolve(virtualPath.strip(), caller);
     } catch (WorkspaceException e) {
       throw translate(e);
     }
-    List<Mount> hits = new ArrayList<>();
-    for (Mount mount : registry.mounts(caller.holder())) {
-      Path base;
-      try {
-        base = baseDirOf(mount, caller);
-      } catch (WorkspaceException e) {
-        continue;
-      }
-      if (physical.startsWith(base)) {
-        hits.add(mount);
+    Mount mount = null;
+    for (Mount candidate : registry.mounts(caller.holder())) {
+      if (candidate.name().value().equals(mountName)) {
+        mount = candidate;
+        break;
       }
     }
-    if (hits.isEmpty()) {
-      // 解析成功却归不到任何挂载：只可能是挂载表在解析与归位之间被改过。fail-closed，不猜（也不泄露落点）
+    if (mount == null) {
+      // 解析成功却找不到同名挂载：只可能是挂载表在解析与归位之间被改过。fail-closed，不猜（也不泄露落点）
       throw DocException.denied("这个虚拟路径归不到任何挂载（解析与归位之间挂载表变了）: " + virtualPath);
     }
-    if (hits.size() > 1) {
-      // 嵌套挂载（§4.2 的推迟项）会让"纪律是哪一个"变得不确定：宁拒不猜（否则"该拒的写"可能落进可写的那一个）
-      throw DocException.invalid(
-          "这个虚拟路径同时落在 " + hits.size() + " 个挂载的范围内（嵌套挂载在 v1 是推迟项，无法确定纪律）: " + virtualPath);
+    if (!physical.startsWith(mount.dir())) {
+      // G1 复核（不是歧义判定）：解析结果必须落在该挂载自己的授权范围内，否则就是 resolver 越权后门
+      throw DocException.denied("解析结果落在该挂载的物理范围之外（G1，fail-closed）: " + virtualPath);
     }
-    Mount mount = hits.get(0);
     return new DocTarget(mount, relative, physical);
   }
 
-  /** 解析挂载的物理根（一次解析，不创建任何东西）。 */
+  /** 解析挂载的物理根（一次解析，不创建任何东西；扫不动就抛，由调用点决定跳过还是失败）。 */
   private Path baseDirOf(Mount mount, WorkspaceCaller caller) {
     String name = mount.name().value();
     try {
@@ -305,6 +304,16 @@ public final class DocsEngine {
     } catch (WorkspaceException e) {
       throw translate(e);
     }
+  }
+
+  /**
+   * 虚拟路径的第一段（挂载名）。
+   *
+   * <p>取值而不重复校验：调用点恒在 {@link #relativeOf} 之后，形态（含"第一段是合法挂载名"）已由它判过。
+   */
+  private static String mountNameOf(String virtualPath) {
+    String raw = virtualPath == null ? "" : virtualPath.strip();
+    return raw.split("/", 2)[0];
   }
 
   /**

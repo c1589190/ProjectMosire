@@ -8,6 +8,7 @@ import io.mosire.agentlib.permission.ResourceScopeMap;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -136,6 +137,26 @@ final class WorkspaceFixture {
       Origin origin) {
     return new Mount(
         new MountName(name), holder, user, dir, Resolvers.direct(), kind, capabilities, origin);
+  }
+
+  /**
+   * 派生挂载（M10/W4，R5b 后新增的口径）：由 {@code derivedFrom} 那块派生的子工作区挂载。
+   *
+   * <p>为什么夹具需要它：级联失效**只沿派生链**（不按物理包含），所以"父卸载 ⇒ 子失效"的夹具必须真的写成派生关系， 否则测的是"两块独立挂载恰好物理嵌套"（那正是 R5
+   * 实测里被误伤的形态）。
+   */
+  static Mount derived(
+      String name, String holder, String user, Path dir, Kind kind, String derivedFrom) {
+    return new Mount(
+        new MountName(name),
+        holder,
+        user,
+        dir,
+        Resolvers.direct(),
+        kind,
+        Set.of(DOCS),
+        Origin.RUNTIME,
+        Optional.of(new MountName(derivedFrom)));
   }
 
   /** 挂载并返回注册表（装配一步到位）。 */

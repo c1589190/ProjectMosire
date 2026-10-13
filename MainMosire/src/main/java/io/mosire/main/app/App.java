@@ -506,6 +506,8 @@ public final class App implements AutoCloseable {
       // ① 技能根（REFERENCE，只读引用：shell 只能只读看见 / 看不见，永不写）——它同时就是 R1 那条第 496 行字面的替代物；
       // ② 主 Agent 自己的工作区（FILE + docs 能力：文档经 doc_* 工具读写，shell 侧按 v1 遮蔽）；
       // ③ 子体工作区根（REFERENCE + docs：spawn 时子工作区就划在它下面，且整棵工作区树因此进入遮蔽面）。
+      // ★ derivedFrom = empty（设计 §4.3 / §4.10 M10）：三个装配期挂载彼此<b>独立</b>——② 落在 ③ 的目录里只是"物理嵌套"，
+      // 不是派生关系；级联失效只沿 derivedFrom 链传递，因此卸载 ③ 不会把 ② 一起带走（R5 实测过按物理包含判的误伤）。
       WorkspaceCaller mainCaller = new WorkspaceCaller(agentConfig.id(), permissionSet);
       workspaceRegistry.mount(
           new Mount(
@@ -516,7 +518,8 @@ public final class App implements AutoCloseable {
               Resolvers.direct(),
               Kind.REFERENCE,
               Set.of(SKILLS_READ_CAPABILITY_ID),
-              Origin.ASSEMBLY),
+              Origin.ASSEMBLY,
+              Optional.empty()),
           mainCaller);
       workspaceRegistry.mount(
           new Mount(
@@ -527,7 +530,8 @@ public final class App implements AutoCloseable {
               Resolvers.direct(),
               Kind.FILE,
               Set.of(DocsCapability.ID),
-              Origin.ASSEMBLY),
+              Origin.ASSEMBLY,
+              Optional.empty()),
           mainCaller);
       workspaceRegistry.mount(
           new Mount(
@@ -538,7 +542,8 @@ public final class App implements AutoCloseable {
               Resolvers.direct(),
               Kind.REFERENCE,
               Set.of(DocsCapability.ID),
-              Origin.ASSEMBLY),
+              Origin.ASSEMBLY,
+              Optional.empty()),
           mainCaller);
       // 落格（§4.8：能力只在挂载/授予时落成"命名空间 + 前缀"）：docs ← <工作区>、docs-edit ← <工作区>、
       // workspaces ← <工作区根>、skills ← <技能根>。A5 会拒"已有显式表态却不覆盖落点"的命名空间（响亮，不静默放大）。

@@ -421,7 +421,7 @@ class WorkspaceRegistryTest {
         .isEqualTo(WorkspaceException.WORKSPACE_NOT_FOUND);
   }
 
-  /** §4.11 负向（M10/W4）：父挂载卸载 ⇒ 其下子工作区挂载一并失效，不回落、不静默。 */
+  /** §4.11 负向（M10/W4）：父挂载卸载 ⇒ **由它派生的**子工作区挂载一并失效，不回落、不静默。 */
   @Test
   void parentUnmountCascadesToChildren() throws IOException {
     Path mainDir = Files.createDirectories(root.resolve("workspaces").resolve("main"));
@@ -430,8 +430,12 @@ class WorkspaceRegistryTest {
     WorkspaceCaller main = new WorkspaceCaller("main", WorkspaceFixture.fullFaces(root));
     registry.mount(
         WorkspaceFixture.assembly("workspace", "main", "main", mainDir, Kind.FILE), main);
+    // 子体那块由 main（创建者）在 mainDir 内的真子目录上**派生**挂载：holder=main、user=a1、
+    // derivedFrom=父自己那块。M10 修订后级联只沿派生链——按物理包含判会误伤独立挂载（R5 实测）。
+    registry.mount(
+        WorkspaceFixture.derived("workspace", "main", "a1", childDir, Kind.FILE, "workspace"),
+        main);
     WorkspaceCaller a1 = new WorkspaceCaller("a1", WorkspaceFixture.fullFaces(root));
-    registry.mount(WorkspaceFixture.assembly("workspace", "a1", "a1", childDir, Kind.FILE), a1);
     assertThat(registry.resolve("workspace", a1)).isEqualTo(childDir);
 
     registry.unmount(new MountName("workspace"), main);

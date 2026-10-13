@@ -105,13 +105,20 @@ public final class WorkspaceTools {
                     "description",
                     "要在这个工作区里授予的能力 id（可空；未注册的 id 会被拒）"),
                 "user",
-                Map.of("type", "string", "description", "使用者身份键（缺省=自己）；只能是自己或自己的后代（血缘子树）")),
+                Map.of("type", "string", "description", "使用者身份键（缺省=自己）；只能是自己或自己的后代（血缘子树）"),
+                "derivedFrom",
+                Map.of(
+                    "type",
+                    "string",
+                    "description",
+                    "派生来源挂载名（可选）：你名下已有的挂载名。它被卸载时本挂载一并失效（M10）；缺省 = 独立挂载，不随任何挂载失效")),
             "required",
             List.of("name", "dir", "kind"));
     return new WorkspaceTool(
         MOUNT_WORKSPACE,
         "在当前进程里登记一个工作区（虚拟路径 = 你给出的挂载名）。物理范围必须在你的 workspaces 可达面内；"
-            + "只能在你的血缘子树内指定使用者；工具面只能建运行期挂载（不进 shell 遮蔽面）。",
+            + "只能在你的血缘子树内指定使用者；工具面只能建运行期挂载（不进 shell 遮蔽面）；"
+            + "可选 derivedFrom 声明\"从哪一块划出来的\"，卸载来源时本挂载一并失效。",
         schema,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
@@ -121,6 +128,7 @@ public final class WorkspaceTools {
           Set<String> capabilities = capabilitySet(context);
           WorkspaceCaller caller = callerOf(context);
           String user = optionalString(context, "user").orElse(caller.holder());
+          Optional<MountName> derivedFrom = derivedFromArg(context);
           // 唯一入口的资源判定：物理范围必须在调用者的 workspaces 可达面内（M1 的工具面那一半，不自造判定器）
           context
               .resources()
@@ -135,7 +143,8 @@ public final class WorkspaceTools {
                   Resolvers.direct(),
                   kind,
                   capabilities,
-                  Origin.RUNTIME);
+                  Origin.RUNTIME,
+                  derivedFrom);
           Mount mounted = registry.mount(spec, caller);
           return ToolResult.ok(
               "已挂载 虚拟路径="
@@ -146,6 +155,7 @@ public final class WorkspaceTools {
                   + mounted.kind()
                   + " 能力="
                   + renderCapabilities(mounted.capabilities())
+                  + mounted.derivedFrom().map(source -> " 派生自=" + source.value()).orElse("")
                   + " 来源=运行期（shell 看不见该挂载）");
         });
   }
@@ -163,13 +173,13 @@ public final class WorkspaceTools {
             List.of("name"));
     return new WorkspaceTool(
         UNMOUNT_WORKSPACE,
-        "卸载一个工作区（只注销挂载，物理目录保留在盘上；其下的子工作区挂载会一并失效）。" + "只有创建者或其祖先能卸载。",
+        "卸载一个工作区（只注销挂载，物理目录保留在盘上；由它派生的子工作区挂载会一并失效）。" + "只有创建者或其祖先能卸载。",
         schema,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
           String name = requiredString(context, "name");
           registry.unmount(new MountName(name), callerOf(context));
-          return ToolResult.ok("已卸载 虚拟路径=" + name + "（其下子工作区挂载一并失效；物理目录保留）");
+          return ToolResult.ok("已卸载 虚拟路径=" + name + "（由它派生的子工作区挂载一并失效；物理目录保留）");
         });
   }
 
@@ -229,6 +239,24 @@ public final class WorkspaceTools {
   private static String text(ToolContext context, String name) {
     Object value = context.arguments().get(name);
     return value == null ? "" : String.valueOf(value).strip();
+  }
+
+  /**
+   * {@code derivedFrom} 入参（可选，M10）：只接受合法挂载名（形态与 {@code name} 同一口径）。
+   *
+   * <p><b>"引用的挂载是否真实存在"不在这里判</b>：那要读挂载表，而挂载表只有一个判定归属地——{@link WorkspaceRegistry#mount} （指向不存在的名字会被
+   * M10 具名拒，不静默退化成一个永不级联的挂载）。
+   */
+  private static Optional<MountName> derivedFromArg(ToolContext context) {
+    Optional<String> text = optionalString(context, "derivedFrom");
+    if (text.isEmpty()) {
+      return Optional.empty();
+    }
+    if (!MountName.isValid(text.get())) {
+      throw WorkspaceException.invalid(
+          "derivedFrom 必须是合法挂载名（" + MountName.PATTERN + "）: " + text.get());
+    }
+    return Optional.of(new MountName(text.get()));
   }
 
   /** 物理目录入参：绝对 + 已归一（A6）；不合法即 {@code INVALID_ARGUMENTS}，不猜。 */

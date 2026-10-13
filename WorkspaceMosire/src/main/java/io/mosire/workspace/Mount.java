@@ -2,6 +2,7 @@ package io.mosire.workspace;
 
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -28,6 +29,10 @@ import java.util.Set;
  * @param kind 纪律（决定 shell 待遇，{@link Kind}）
  * @param capabilities 能力 id 集合（空集 = 谁都不放行，fail-closed；未注册的 id 在挂载时被拒）
  * @param origin 挂载来源（决定进不进 bash 遮蔽面，M6）
+ * @param derivedFrom <b>派生关系</b>（设计 §4.3 / §4.10 M10）：本挂载是从<b>创建者自己切片里</b>哪一个挂载划出来的； 装配期挂载与独立划出的挂载
+ *     = {@link Optional#empty()}（缺省）。<b>级联失效只沿这条链传递</b>——{@code derivedFrom}
+ *     指向的挂载被卸载时，本挂载一并失效；物理目录嵌套<b>不</b>构成派生关系（W1 让子工作区必然嵌在父目录内，而装配期独立挂载也可能 物理嵌套，如 {@code workspaces}
+ *     ⊃ {@code workspace}；按包含判级联会把无关挂载一起带走——R5 实测）
  */
 public record Mount(
     MountName name,
@@ -37,7 +42,8 @@ public record Mount(
     Resolver resolver,
     Kind kind,
     Set<String> capabilities,
-    Origin origin) {
+    Origin origin,
+    Optional<MountName> derivedFrom) {
 
   public Mount {
     Objects.requireNonNull(name, "name");
@@ -50,9 +56,29 @@ public record Mount(
     // 内联 Set.copyOf：让 SpotBugs 看得见不可变来源（本仓既有写法）
     capabilities = capabilities == null ? Set.of() : Set.copyOf(capabilities);
     Objects.requireNonNull(origin, "origin");
+    // null 不是"没有派生关系"的第二种写法：没有派生关系就是 empty（同一个语义不留两个形状）
+    derivedFrom = derivedFrom == null ? Optional.empty() : derivedFrom;
   }
 
-  /** 常用形态的语法糖（resolver 取 {@link Resolvers#direct()}）。 */
+  /**
+   * 源兼容形态：不声明派生关系（{@code derivedFrom = empty}）——与 {@link #of} 同义，供"装配期挂载 / 独立挂载"这类调用点使用。
+   *
+   * <p>{@code derivedFrom} 是 R5 后补的组件，给一条不含它的构造重载可以让既有构造点（含离线夹具）保持逐字不动：语义上它们本来就 没有派生来源，缺省即 {@link
+   * Optional#empty()} 是<b>正确</b>的读法，不是"静默打折"。
+   */
+  public Mount(
+      MountName name,
+      String holder,
+      String user,
+      Path dir,
+      Resolver resolver,
+      Kind kind,
+      Set<String> capabilities,
+      Origin origin) {
+    this(name, holder, user, dir, resolver, kind, capabilities, origin, Optional.empty());
+  }
+
+  /** 常用形态的语法糖（resolver 取 {@link Resolvers#direct()}，不声明派生关系）。 */
   public static Mount of(
       MountName name,
       String holder,
@@ -61,10 +87,11 @@ public record Mount(
       Kind kind,
       Set<String> capabilities,
       Origin origin) {
-    return new Mount(name, holder, user, dir, Resolvers.direct(), kind, capabilities, origin);
+    return new Mount(
+        name, holder, user, dir, Resolvers.direct(), kind, capabilities, origin, Optional.empty());
   }
 
-  /** 物理落点是否落在本挂载的授权范围内（段边界，A6/G1；同一实现服务 containment 校验与级联判定）。 */
+  /** 物理落点是否落在本挂载的授权范围内（段边界，A6/G1；containment 校验用它）。 */
   boolean contains(Path candidate) {
     Objects.requireNonNull(candidate, "candidate");
     Path normalized =
@@ -73,7 +100,7 @@ public record Mount(
     return normalized.equals(dir) || normalized.startsWith(dir);
   }
 
-  /** 严格落在本挂载之内（不含等于）——子工作区/级联失效的判据（W1/W2、M10）。 */
+  /** 严格落在本挂载之内（不含等于）——子工作区落点必须严格更小的判据（W1/W2）。 */
   boolean strictlyContains(Path candidate) {
     Objects.requireNonNull(candidate, "candidate");
     Path normalized =

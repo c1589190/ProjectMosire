@@ -1174,6 +1174,9 @@ public final class SubagentManager implements AutoCloseable {
    *
    * <p><b>为什么取"最深的那个 FILE 工作区"</b>：子体自己也有一块 {@code /workspace}，它再派孙代时应当从<b>它自己</b>的那块往下划，
    * 而不是从祖先的根划（否则"逐层只减不增"名存实亡）。按目录段数取最深 = 离自己最近的那一块，且对同一份挂载表是确定性的。
+   *
+   * <p><b>派生关系要写进挂载</b>（M10/W4）：子工作区的 {@code derivedFrom} = 父<b>自己那一块</b>的挂载名——父那块被卸载时子体的挂载靠它
+   * 级联失效。物理包含<b>不</b>是派生关系的表达（装配期独立挂载也可能物理嵌套）。
    */
   private ChildWorkspace planChildWorkspace(String callerId, String childId) {
     WorkspaceRegistry registry = workspaceRegistry;
@@ -1194,6 +1197,8 @@ public final class SubagentManager implements AutoCloseable {
     }
     // 能力 = {docs}（v1 唯一注册的能力，取自 DocsCapability.ID，不在这里抄字符串）；Origin.RUNTIME：
     // 运行期挂载不进 bash 遮蔽面（M6），v1 的挂载在 shell 侧一律遮蔽（A3/A8/N13）
+    // derivedFrom = 父<b>自己那一块</b>工作区的挂载名（真正的派生来源，M10/W4）：父那块被卸载时子体的挂载一并失效。
+    // 不靠物理包含表达派生——W1 让子工作区必然嵌在父目录内，但"物理嵌在别人目录里"本身不是派生关系（R5 实测的误级联）。
     Mount spec =
         new Mount(
             new MountName(own.name().value()),
@@ -1203,7 +1208,8 @@ public final class SubagentManager implements AutoCloseable {
             Resolvers.direct(),
             Kind.FILE,
             Set.of(DocsCapability.ID),
-            Origin.RUNTIME);
+            Origin.RUNTIME,
+            Optional.of(own.name()));
     return new ChildWorkspace(spec);
   }
 

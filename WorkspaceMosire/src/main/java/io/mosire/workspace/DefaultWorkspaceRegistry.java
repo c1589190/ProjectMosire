@@ -174,6 +174,21 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
         }
         requireNarrower(caller, spec, own);
       }
+      // M10（本实现的 fail-closed 加固，不是设计新增的判据，控制方可否决）：派生关系必须指向真实存在的挂载——
+      // derivedFrom 指一个不存在的名字等于"以为会级联、实际不会"的静默失效，那正是本次修订要消灭的含糊。
+      // 引用范围限定在创建者自己的切片（口径与 cascade 的 derivedFrom(Mount) 一致）。
+      if (spec.derivedFrom().isPresent()) {
+        Mount source = lookup(spec.holder(), spec.derivedFrom().get());
+        if (source == null) {
+          throw deny(
+              "M10",
+              caller,
+              spec.user(),
+              spec.name().value(),
+              "声明的派生来源挂载不在创建者自己名下（derivedFrom 只能指向你自己切片里已有的挂载）",
+              "derivedFrom=" + spec.derivedFrom().get());
+        }
+      }
       // M4/A4：同一使用者下虚拟挂载名唯一（具名拒，不静默替换、不覆盖他人挂载）
       Mount occupied = lookup(spec.user(), spec.name());
       if (occupied != null) {
@@ -521,13 +536,7 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
 
   /** 卸载一条挂载：注销 + 留痕 + 级联失效（M10/W4）。 */
   private void remove(Mount target, String reason) {
-    Map<MountName, Mount> slice = slices.get(target.user());
-    if (slice != null) {
-      slice.remove(target.name());
-      if (slice.isEmpty()) {
-        slices.remove(target.user(), slice);
-      }
-    }
+    detach(target);
     emit(
         WorkspaceEvent.unmounted(
             target.holder(),
@@ -537,41 +546,66 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
     cascade(target);
   }
 
-  /**
-   * M10/W4 级联失效：跟随被卸载挂载的物理子树，把落在其<b>真子目录</b>里的所有挂载一并注销（任何使用者）。
-   *
-   * <p><b>为什么按物理落点而不是按创建者链</b>：子工作区在定义上就是"自己工作区目录内的真子目录"（W1/W2），所以"落在
-   * 该目录之下"与"是它的子工作区"是同一件事；按物理判不会漏，也不会依赖某个可能过期的血缘表。失效后条目不存在 ⇒ 解析 {@code
-   * WORKSPACE_NOT_FOUND}，<b>不回落、不静默</b>。
-   */
-  private void cascade(Mount parent) {
-    List<Mount> descendants = new ArrayList<>();
-    for (Map<MountName, Mount> slice : slices.values()) {
-      for (Mount mount : slice.values()) {
-        if (parent.strictlyContains(mount.dir())) {
-          descendants.add(mount);
-        }
+  /** 把一条挂载从它的使用者切片里摘掉（摘表是幂等的：不在表里就当已经摘过）。 */
+  private void detach(Mount target) {
+    Map<MountName, Mount> slice = slices.get(target.user());
+    if (slice != null) {
+      slice.remove(target.name());
+      if (slice.isEmpty()) {
+        slices.remove(target.user(), slice);
       }
     }
-    for (Mount mount : descendants) {
-      Map<MountName, Mount> slice = slices.get(mount.user());
-      if (slice != null) {
-        slice.remove(mount.name());
-        if (slice.isEmpty()) {
-          slices.remove(mount.user(), slice);
-        }
-      }
+  }
+
+  /**
+   * M10/W4 级联失效：<b>沿 {@link Mount#derivedFrom()} 链</b>传递——被卸载挂载派生出的挂载一并注销，再对它们递归。
+   *
+   * <p><b>为什么不按物理包含判</b>（R5 后修订，设计 §4.10 M10）：W1 让子工作区<b>必然</b>物理嵌套在父工作区目录内，但物理嵌套本身不是派生关系
+   * ——装配期独立挂载之间也可能物理嵌套（{@code workspaces} ⊃ {@code workspace}），按包含判会把无关挂载一起带走：R5 实测 {@code
+   * unmount_workspace("workspaces")} 把独立的 {@code workspace} 也级联失效了，此后 {@code workspace/…} 全部 {@code
+   * WORKSPACE_NOT_FOUND}。派生关系是登记时写下的显式事实，只有它知道"谁是从这块划出去的"。
+   *
+   * <p>失效后条目不存在 ⇒ 解析 {@code WORKSPACE_NOT_FOUND}，<b>不回落、不静默</b>。先摘表再递归，因此互相派生（环）与重复访问都不会
+   * 再命中，不会无限递归。
+   */
+  private void cascade(Mount parent) {
+    for (Mount mount : derivedFrom(parent)) {
+      detach(mount);
       emit(
           WorkspaceEvent.unmounted(
               mount.holder(),
               mount.user(),
               mount.name().value(),
-              "级联失效（M10/W4）：父挂载 "
+              "级联失效（M10/W4）：派生来源挂载 "
                   + parent.name().value()
-                  + " 被卸载，其下子工作区一并失效；dir="
+                  + " 被卸载，由它派生的子工作区挂载一并失效；dir="
                   + mount.dir()
                   + "（不回落、不静默）"));
+      cascade(mount);
     }
+  }
+
+  /**
+   * 由 {@code parent} <b>派生</b>出来的挂载（M10）：登记时写下 {@code derivedFrom == parent.name()}，且创建者正是 {@code
+   * parent} 的使用者。
+   *
+   * <p><b>为什么带"创建者"这一档</b>：{@code derivedFrom} 只记名字，而名字的唯一性按<b>使用者</b>分域（M4/A4）——同一个名字在不同使用者的
+   * 切片里是不同挂载。派生关系由"谁创建了它"确定指代：{@code holder} 就是创建者，而创建者引用的那块挂载必在它自己的切片里 （{@code user ==
+   * holder}）。少了这一档，一份独立划出的同名挂载会被别人的卸载带走。
+   */
+  private List<Mount> derivedFrom(Mount parent) {
+    List<Mount> derived = new ArrayList<>();
+    for (Map<MountName, Mount> slice : slices.values()) {
+      for (Mount mount : slice.values()) {
+        if (!mount.holder().equals(parent.user())) {
+          continue;
+        }
+        if (mount.derivedFrom().isPresent() && mount.derivedFrom().get().equals(parent.name())) {
+          derived.add(mount);
+        }
+      }
+    }
+    return derived;
   }
 
   /** "由该身份键创建"的挂载（跨切片；② 档卸载用）。 */

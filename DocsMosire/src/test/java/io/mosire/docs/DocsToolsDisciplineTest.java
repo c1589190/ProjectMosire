@@ -277,7 +277,11 @@ class DocsToolsDisciplineTest {
 
     execute(DocsTools.DOC_CREATE, Map.of("mount", "files/notes.md", "text", "x"));
     ToolResult files = execute(DocsTools.DOC_LIST, Map.of("mount", "files"));
-    assertThat(files.message()).contains("files/notes.md").doesNotContain(fileDir.toString());
+    assertThat(files.message())
+        .as("F3（R5b）：投影只拼一次挂载名（曾是 files/files/notes.md），且输出只含虚拟路径")
+        .contains("files/notes.md")
+        .doesNotContain("files/files/")
+        .doesNotContain(fileDir.toString());
   }
 
   // ────────────────────────────── 夹具 ──────────────────────────────

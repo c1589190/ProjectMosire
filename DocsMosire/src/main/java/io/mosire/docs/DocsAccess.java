@@ -69,9 +69,9 @@ public final class DocsAccess {
         yield List.copyOf(lines);
       }
       case FILE ->
-          engine.registry().list(virtualPath.strip(), caller).stream()
-              .map(entry -> DocsEngine.render(target.mount(), entry))
-              .toList();
+          // 注册表的 list 已经投影成虚拟路径（G4/A7），这里<b>不得</b>再拼一次挂载名——否则得到
+          // "docs-ws/docs-ws/notes" 这种不存在的路径（R5 实测），照着再调用必然失败。
+          engine.registry().list(virtualPath.strip(), caller);
       default ->
           throw DocException.discipline(
               "纪律不符（B9）：list 需要 LOG（列地址）或 FILE（列文件）纪律的挂载，而 '"

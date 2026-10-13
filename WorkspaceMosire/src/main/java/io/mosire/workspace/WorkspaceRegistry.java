@@ -61,8 +61,9 @@ public interface WorkspaceRegistry {
    *       具名拒（无法确定目标，不猜）；零条 ⇒ {@code WORKSPACE_NOT_FOUND}（与"无权"同码）。
    * </ol>
    *
-   * <p><b>M5</b>：卸载只允许 {@code holder}（创建者）或其祖先执行。<b>M10/W4</b>：跟随被卸载挂载的物理子树，把落在其<b>
-   * 真子目录</b>里的所有挂载一并失效（fail-closed：条目被移除，解析绝不回落成物理路径）。
+   * <p><b>M5</b>：卸载只允许 {@code holder}（创建者）或其祖先执行。<b>M10/W4</b>：<b>沿 {@link Mount#derivedFrom()}
+   * 链</b>级联——由被卸载挂载派生出的挂载一并失效（fail-closed：条目被移除，解析绝不回落成物理路径）。<b>不按物理包含判级联</b>：物理嵌套 是 W1
+   * 的正常形态，装配期独立挂载之间也可能物理嵌套（{@code workspaces} ⊃ {@code workspace}）。
    *
    * @throws WorkspaceException {@code WORKSPACE_NOT_FOUND}（名字不在表里）或 {@code RESOURCE_DENIED}（M5）
    */

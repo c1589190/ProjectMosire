@@ -228,6 +228,7 @@ BashPluginMosire ──→ AgentLibMosire（v1 逐字不动，N13）
 - **工具面不接受裸物理路径**：要访问某个外部目录，必须先在装配期或运行期**挂载**它。
 - **挂载名冲突 ⇒ 具名拒**（M4），不静默替换。
 - **嵌套挂载**（如 `/docs/team-a` 叠在 `/docs` 之上）本期**不做**——"部分覆盖"会让可见性判定出现两个来源（`/docs` 的过滤 + 子挂载的过滤），登记为将来的扩展点。
+- ★★ **物理嵌套 ≠ 嵌套挂载**（R5 真模型验收后裁定，2026-10-13）：**W1 要求子工作区落在父工作区目录内 ⇒ 物理目录嵌套是正常形态，不是歧义**。解析只按**虚拟挂载名 + 使用者切片**（`Mount.user`）定位，**不得**因"解析出的物理路径同时落在另一个挂载的目录内"而判歧义并拒绝——那会把默认装配的主工作区全链阻断（`workspaces` ⊃ `workspace`）。歧义的唯一判据是**同一使用者下虚拟挂载名冲突**（M4 已管）。
 
 ### 4.3 接口形状（草案；冻结前允许改，冻结后 Docs 批次不得改）
 
@@ -279,7 +280,8 @@ enum Origin { ASSEMBLY, RUNTIME }
 
 record Mount(
     MountName name, String holder, String user, Path dir,
-    Resolver resolver, Kind kind, Set<String> capabilities, Origin origin) {}
+    Resolver resolver, Kind kind, Set<String> capabilities, Origin origin,
+    Optional<MountName> derivedFrom) {}   // ★ 派生关系（R5 后补）：由哪个挂载派生而来；装配期挂载 = empty
 
 /** 调用者 = 身份（**身份键**）+ 权限集；解析与鉴权都以它为准。
  *  身份键在解析时与 `Mount.user` 比对（"哪些挂载是我的"），在 M2/M5 检查里与 `Mount.holder` 比对（"谁创建了它"）——
@@ -442,7 +444,7 @@ main            /workspace            → <dataDir>/workspaces/main
 | **M7** | 子体挂载集 = 父挂载集 ∩ 模板 ∩ 请求，物化在父侧运行期状态（不留"运行期往上问父级"） |
 | **M8** | 每次挂载/卸载/拒绝都落审计事件（M8 与 §4.7 的审计面同源） |
 | **M9** | **子工作区必须严格更小**：`user` 是自己或后代，落点是自己工作区目录下的**真子目录**（W1/W2）；深度受 `subagents.maxDepth` 约束（W3） |
-| **M10** | **级联失效**：父挂载卸载/回收 ⇒ 其下所有子工作区挂载一并失效（W4），不回落、不静默 |
+| **M10** | **级联失效按登记时记录的派生关系**（`Mount.derivedFrom`，R5 后修订）：父挂载卸载 ⇒ 由它**派生**的子工作区挂载一并失效（沿 `derivedFrom` 链传递）。**不得按物理包含判级联**——W1 让子工作区必然物理嵌套在父目录内，而装配期独立挂载也可能物理嵌套（`workspaces` ⊃ `workspace`），按包含判会把无关挂载一起带走（R5 实测） |
 | **M11** | 子工作区声明的能力必须 ⊆ 父在自己工作区上的能力（W6） |
 | **M12** | **命令白名单只能更窄**：子能力携带的 `allowedCommands` ⊆ 父的（W6）；白名单为空 = 一条命令都不许 |
 
@@ -805,7 +807,7 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
   5. **`unmount(name, caller)` 只有名字一个定位键**：实现取"先自己切片；再'由自己创建'的跨切片挂载（须唯一）"；**祖先直接点名卸子体挂载**走不到——用 M10 级联（卸父自己的挂载即带走子体的）表达。
 - **R3a → R3b 的交接项**（R3a 实现时发现，控制方裁定）：
   1. **`doc_list` 在 `FILE` 挂载上经 `WorkspaceRegistry.list`**（列直接子项是投影的职责，Docs 不重写）：R3b 装配时**必须实测一次**该方法的准入判定与 `docs` 声明面是否一致；若冲突 ⇒ **改 `WorkspaceMosire`（停手上报后由控制方裁定）**，不要在 Docs 侧放宽。
-  2. **虚拟路径同时落在两个挂载范围内 ⇒ 具名拒 `INVALID_ARGUMENTS`**（R3a 的实现选择：不猜纪律——猜错会让"该拒的写"落进可写的那一个）。v1 单物理根 + 每使用者一切片下不构成正常路径；登记为 v1 行为。
+  2. ~~**虚拟路径同时落在两个挂载范围内 ⇒ 具名拒 `INVALID_ARGUMENTS`**~~ **【已被 2026-10-13 R5 裁定取代，见 §4.2】**：物理目录嵌套（`workspaces` ⊃ `workspace`）是 W1 的正常形态，**不构成歧义**；归位只按虚拟挂载名 + 使用者切片。原文保留为历史留痕（R3a 当时的实现选择）。
   3. `DocsApi` 与 `DocsEngine` 有方法重叠：**`DocsApi` 是"库 API 门"的稳定出口，`DocsEngine` 是内部引擎**；R3b 接线用 `DocsApi`（工具面内部走 `DocsEngine`，两者同一实现）。
   4. 运行时 `docs` 能力由 **`DocsCapability.docs()`** 定义、经 `CapabilityCatalog.register(...)` 注册（R3b 装配时做）；`DocsCapability.Manifests.READ/WRITE` 是工具声明面的唯一出处。
 - **R3b → R4 的交接项**（R3b 实现时发现，控制方裁定）：
