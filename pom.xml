@@ -15,6 +15,7 @@
   <modules>
     <module>AgentLibMosire</module>
     <module>WorkspaceMosire</module>
+    <module>DocsMosire</module>
     <module>BrainMosire</module>
     <module>MainMosire</module>
     <module>BashPluginMosire</module>
