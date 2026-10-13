@@ -359,6 +359,7 @@ resolve(虚拟路径, caller):
 | 元素 | 设计 |
 |---|---|
 | 工具 | `mount_workspace` / `unmount_workspace` / `list_workspaces`（`workspace-mosire` 提供；供给源 id `"workspaces"`） |
+| **工具面的落点形态**（★ R6 修订，2026-10-13） | **工具面不再接受绝对物理路径**——它只接受**派生形态**：`mount_workspace(name, parent=<自己已有的挂载名>, subdir=<相对子目录>, kind, capabilities)` ⇒ 落点 = 解析 `parent` 得到的物理目录 + `subdir`（必须是**真子目录**，复用 W1/W2）。理由：① A7/G4 要求"面向模型只出虚拟路径"，而旧形态**要模型输入绝对物理路径**，自相矛盾且实测模型无从得知（R5/R5c：只有人把路径喂给它才跑得通）；② 派生形态天然满足"只能在自己的地界里划更小的工作区"。**绝对 `dir` 形态只保留在注册表 API（装配期宿主代码用）**，不进工具面 |
 | 权限面 | **新命名空间 `workspaces`**：前缀 = **允许在该物理范围内新建挂载**；缺省 `DENY`（未表态 = 一个挂载都建不了） |
 | 守卫 | M 组（§4.10）：物理范围 ⊆ 可达面 ∩ `workspaces` 面；holder 只能是自己或后代；能力不放大；名字冲突拒；卸载限自己/后代 |
 | 审计 | 每次成功/拒绝都落事件：`workspace.mounted` / `workspace.unmounted` / `workspace.denied`（+ `permission.denied` 的既有口径） |
@@ -837,10 +838,12 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 13. ★ **用户可见的行为变化（R3b 装配后，必须对账）**：主 Agent 的 `bash` 现在对 `<dataDir>/workspaces{,/main}` 拿到**只读 bind**（此前这些目录根本不在遮蔽面清单里 ⇒ 未绑定、可写），对技能根仍是只读 bind。这是 §4.8/A3 的既定落点（v1 无 `bash` 能力 ⇒ 文档只经 Docs 工具写），但它**确实收窄了主 Agent 用 shell 写自己工作区的能力**——要不要开这个口子（把工作区根从遮蔽清单里挪出，或等命令面模块给 `bash` 能力）由用户裁定。
 14. **子工作区装配失败时的处置**（R3b 自定，控制方接受）：**不让 spawn 失败**——把子体的 `docs`/`docs-edit`/`workspaces` 收成显式 `none()`，落 `permission.denied` + `workspace.denied` 两条事件 + WARN。判据是"fail-closed 且在模型面可见（工具直接 `RESOURCE_DENIED`）"；若要"挂不上就拒 spawn"，改一处即可。
 15. **M6 的落地口径**（R3b 确认）：子体的**运行期**挂载（它自己的工作区，`Origin.RUNTIME`）**不进它的链路遮蔽面** ⇒ 子在 shell 里看不见自己的工作区（实测 `child fence = masked:[workspaces, workspaces/main], readOnly:[skills]`）。这与 M6/A3 一致：v1 的文档写只经 Docs 工具。
-16. ★ **坏数据披露未按观看者收口**（R4b 发现，**带触发条件的已知缺口**）：`DocsEngine.broken()` 让原先恒空的披露开始真输出后，披露可能带出**调用者看不见的地址**的日志文件名（地址的安全编码）——与 B2/§5.5 的"不可见 ≡ 不存在"不一致。**v1 生产装配只有 REFERENCE/FILE 挂载 ⇒ 该路径不可达**；但 `mount_workspace` 可在运行期挂出 LOG 挂载 ⇒ **运行期 LOG 挂载落地之前必修**（修法：`broken` 收口到 `DocViewer`，公开形状只增不减）。
+16. ★ **坏数据披露未按观看者收口**（R4b 发现；**R6 已修**）：`broken` 收口到 `DocViewer`——披露只列调用者**看得见**的地址（与 B2/§5.5 的"不可见 ≡ 不存在"一致）；`DocsTools` 传它自己那一份 viewer。
 17. **FILE 挂载的坏文件不在引擎层归集**（R4b 裁定维持现状）：坏文件只在"读这一个文件"时观察得到（`DOC_READ_FAILED` 响亮 + `DocReadResult.broken()`）；引擎层要归集就得每次 `doc_*` 读全工作区，代价不可接受。
 18. **`broken()` 的"扫不动 ⇒ 跳过"**：跳过 + `LOG.debug`（主操作照常返回，不把披露问题升级成操作失败）；要 fail-closed 传播是一行的事。
 19. **R4 未覆盖的判据**（逐条见 R4 报告 §7）：M12 白名单（v1 退化）、§5.10 命令面整段、`DOC_SCOPE_DENIED`（全仓测试 0 命中）、App/事件库层的三类 `workspace.*` 事件落库、W2 的"装配方把面配大"、孙代派曾孙、**真子进程 E2E**、resolver 扩展点（N8 推迟项）、`doc_query` 未走工具面。
+20. ★ **A7 的既有缺口（R6a 发现，登记待修）**：**资源前置闸**判否时，`AgentLibMosire/.../permission/ResourceAuthorizer.java:107` 的文案会把**物理路径**带到模型面。工作区/Docs 工具**自己**的拒绝文案不含物理路径（已验），但这条 AgentLib 文案仍会出模型面 ⇒ 归 AgentLib 的收口项（本次未动 AgentLib）。
+21. **`list_workspaces` 会把"零能力的挂载"也列为 parent 候选**（R6a 登记）：按 §4.8/A8，无 `docs` 能力的挂载 `resolve` 会被拒 ⇒ 列出来但用不了。要精确标注得在工具里试解析（可能产生 denied 事件），v1 不做。
 
 ---
 
@@ -863,7 +866,7 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 
 **D1（机制级）**：`设计-Skill运行时能力.md` §3 与 `BrainMosire/.../skills/SkillException.java:18` 均写"不存在与不可见同码 `SKILL_NOT_FOUND`"——**与代码不符**。实际：范围外（含未表态）⇒ `RESOURCE_DENIED`（`SkillAccess.requireRead` `:427-435` → `ToolCallAuthorizer:172-178`）；**面内不存在** ⇒ `SKILL_NOT_FOUND`（`SkillAccess:404-405`）。安全性质（无存在性 oracle）成立，但机制描述错了，且 `AGENTS.md §0.3` 同句照抄。**本文 §5.6 按代码口径写**；旧文与 AGENTS.md 的那两句需另行更正。
 
-**D2**：`SubagentProcessMain.java:279` 用 `new SkillCatalog()`（恒 4096）做子体目录档预算，argv 不带 `skills.listingBudget` ⇒ 该项配置在子体内失效。属技能面，本文不动，登记在案（技能重基批次一并修）。
+**D2**：`SubagentProcessMain.java:279` 用 `new SkillCatalog()`（恒 4096）做子体目录档预算，argv 不带 `skills.listingBudget` ⇒ 该项配置在子体内失效。**R6 修**（新增 `--skills-listing-budget` 旗标，值与 `--skills-dir` 同源从装配层下发；子进程缺省仍回落 4096 以保持兼容）。
 
 ### 10.3 转引自隔壁需求书的"未核"项（二手，尚未在 Simos 侧核实）
 

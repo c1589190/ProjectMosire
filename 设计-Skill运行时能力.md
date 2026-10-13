@@ -110,7 +110,7 @@ ToolExecutionGuard（工具名级：白名单/拒绝名单/等级/敏感破坏�
 | `skill_create` | `name`、`description`（必填）、`body?`、`allowedTools?` | 新技能元数据 | 可编辑 |
 | `skill_edit` | `name`（必填）+ `description?`/`body?`/`allowedTools?` 至少一项 | 改后元数据 | 可编辑 |
 
-- **错误码**：`RESOURCE_DENIED`（权限面，唯一入口转码）、`SKILL_NOT_FOUND`（不存在**或不可见**——两者刻意同码，否则工具面会变成隐藏技能的存在性探测器）、`SKILL_EXISTS`、`INVALID_ARGUMENTS`、`SKILL_INVALID`（frontmatter 校验不过）、`SKILL_READ_FAILED`、`SKILL_WRITE_FAILED`、`SKILL_RELOAD_FAILED`。
+- **错误码**：`RESOURCE_DENIED`（权限面，唯一入口转码）、`SKILL_NOT_FOUND`（**仅"面内不存在"**——★ **2026-10-13 更正**：原文写"不存在**或不可见**——两者刻意同码"，与代码不符：**范围外（含未表态）走 `RESOURCE_DENIED`**（`SkillAccess.requireRead` `:427-435` → `ToolCallAuthorizer` `:172-178`），**面内不存在**才是 `SKILL_NOT_FOUND`（`SkillAccess:404-405`）。安全性同效：不可达的名字与隐藏技能都得同一条 `RESOURCE_DENIED`，无存在性 oracle。原文保留为历史留痕）、`SKILL_EXISTS`、`INVALID_ARGUMENTS`、`SKILL_INVALID`（frontmatter 校验不过）、`SKILL_READ_FAILED`、`SKILL_WRITE_FAILED`、`SKILL_RELOAD_FAILED`。
 - **判定顺序固定为“先范围后存在”**：越权者拿不到“这个技能存不存在”这一个 bit。
 - **事件落账**：写工具的 `ledgerArgs` 只落 `name/description/bodyChars/allowedTools`，不把整篇正文复制进事件库。
 - **技能名形态**：`[a-z0-9][a-z0-9-]{0,63}`（≡ 目录名；形态校验在路径拼接之前，`..`/分隔符在这一关就死掉）。

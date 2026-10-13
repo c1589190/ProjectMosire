@@ -15,7 +15,13 @@ public class SkillException extends RuntimeException {
 
   private static final long serialVersionUID = 1L;
 
-  /** 技能不存在<b>或调用者看不见</b>（两者刻意同码同消息：否则工具面会变成隐藏技能的“存在性探测器”）。 */
+  /**
+   * 技能在**可见面之内**不存在（★ 2026-10-13 更正：原文写"不存在<b>或调用者看不见</b>——同码"与代码不符）。
+   *
+   * <p>真实口径：**范围外（含未表态）⇒ `RESOURCE_DENIED`**（{@code SkillAccess.requireRead} 抛 {@code
+   * ResourceDeniedException}，由 {@code ToolCallAuthorizer} 统一转码），**只有"面内不存在"**才走本码。
+   * 安全性同效：不可达的名字与隐藏技能得到同一条 {@code RESOURCE_DENIED}，工具面仍不是存在性探测器。
+   */
   public static final String SKILL_NOT_FOUND = "SKILL_NOT_FOUND";
 
   /** 创建时目标技能目录/文档已存在（不覆盖——覆盖已有技能走 {@code skill_edit}）。 */
