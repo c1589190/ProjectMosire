@@ -85,7 +85,14 @@ public final class DocsAccess {
   public sealed interface ReadOutcome permits ReadOutcome.Entries, ReadOutcome.Text {
 
     /** {@code LOG}：读到的条目（可见性已收口）。 */
-    record Entries(List<DocEntry> entries) implements ReadOutcome {}
+    record Entries(List<DocEntry> entries) implements ReadOutcome {
+
+      public Entries {
+        // 防御拷贝（EI_EXPOSE_REP + EI_EXPOSE_REP2）：构造与访问器在同一处收口，
+        // 调用方拿不回一个能反向改本值的可变表。目标为 null 时 List.copyOf 直接 NPE（fail-closed）
+        entries = List.copyOf(entries);
+      }
+    }
 
     /** {@code FILE}：读到的文本片段。 */
     record Text(DocReadResult result) implements ReadOutcome {}

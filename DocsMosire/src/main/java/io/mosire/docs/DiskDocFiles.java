@@ -1,5 +1,6 @@
 package io.mosire.docs;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
@@ -83,12 +84,30 @@ final class DiskDocFiles implements DocFileStore {
     }
   }
 
+  /**
+   * 原子创建（撞名拒）。
+   *
+   * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：本契约的失败一律是 {@link DocException}（{@code
+   * RuntimeException} 子类 + 稳定错误码，见其类 javadoc），{@code catch (RuntimeException e)} 只为"删掉临时文件后原样重抛"
+   * ——清理不是吞异常；本方法没有更窄的异常类型可声明。
+   */
+  @SuppressFBWarnings(
+      value = "THROWS_METHOD_THROWS_RUNTIMEEXCEPTION",
+      justification =
+          "创建失败=DocException（RuntimeException 子类，稳定错误码）原样上抛是本契约；catch 只为删临时文件后重抛，"
+              + "无更窄的异常类型可用（与 App.start / BashSandbox 同款先例）。")
   @Override
   public DocFile create(String relativePath, String text) {
     synchronized (lock) {
       String label = labelOf.apply(relativePath);
       Path file = resolve(relativePath);
-      ensureDirectory(file.getParent());
+      Path parent = file.getParent();
+      if (parent == null) {
+        // 落点没有父目录 = 挂载根解析成了"根/空路径"：装配/输入已坏，不能继续。
+        // 此刻盘上还没有任何新东西（临时文件尚未落定），文案只出虚拟路径、不出物理落点
+        throw DocException.writeFailed("文档落点没有父目录（挂载根解析异常）: " + label, null);
+      }
+      ensureDirectory(parent);
       String content = normalize(text);
       byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
       Path temporary = temporaryPath(file);
@@ -112,6 +131,18 @@ final class DiskDocFiles implements DocFileStore {
     }
   }
 
+  /**
+   * 行寻址编辑（多项全成或全不成；失败时盘上不动一个字）。
+   *
+   * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：同 {@link #create}——失败一律是 {@link
+   * DocException}（{@code RuntimeException} 子类 + 稳定错误码），{@code catch (RuntimeException e)}
+   * 只为清理临时文件后原样重抛。
+   */
+  @SuppressFBWarnings(
+      value = "THROWS_METHOD_THROWS_RUNTIMEEXCEPTION",
+      justification =
+          "编辑失败=DocException（RuntimeException 子类，稳定错误码）原样上抛是本契约；catch 只为删临时文件后重抛，"
+              + "无更窄的异常类型可用（同 create）。")
   @Override
   public DocFile edit(String relativePath, List<EditOp> ops) {
     if (ops == null || ops.isEmpty()) {

@@ -127,14 +127,16 @@ public final class DocsTools {
             return ToolResult.ok("文档根 " + mounts.size() + " 个：\n" + text);
           }
           List<String> entries = access.list(context, mount);
+          // 坏数据现扫一次（见 DocsEngine.broken 的代价说明）——一次调用只扫这一遍，空结果分支也复用它
+          List<BrokenDoc> broken = access.broken(context);
           if (entries.isEmpty()) {
-            return ToolResult.ok(emptyListing(access, context, mount));
+            return ToolResult.ok(emptyListing(access, context, mount, broken));
           }
           StringBuilder text = new StringBuilder("共 " + entries.size() + " 项：\n");
           for (String entry : entries) {
             text.append("- ").append(entry).append('\n');
           }
-          return ToolResult.ok(withBroken(text.toString(), access.broken(context)));
+          return ToolResult.ok(withBroken(text.toString(), broken));
         });
   }
 
@@ -458,17 +460,18 @@ public final class DocsTools {
     return text.replace("\n", "\\n").replace("\r", "\\r");
   }
 
-  private static String emptyListing(DocsAccess access, ToolContext context, String mount) {
+  private static String emptyListing(
+      DocsAccess access, ToolContext context, String mount, List<BrokenDoc> broken) {
     List<Mount> mounts = access.mounts(context);
     for (Mount item : mounts) {
       if (item.name().value().equals(mount.strip())) {
         if (item.kind() == Kind.LOG) {
-          return "（这个文档根里没有你能看见的文档地址）" + brokenSuffix(access.broken(context));
+          return "（这个文档根里没有你能看见的文档地址）" + brokenSuffix(broken);
         }
-        return "（这个文档根里没有条目）" + brokenSuffix(access.broken(context));
+        return "（这个文档根里没有条目）" + brokenSuffix(broken);
       }
     }
-    return "（没有可列出的内容）" + brokenSuffix(access.broken(context));
+    return "（没有可列出的内容）" + brokenSuffix(broken);
   }
 
   /** 坏数据披露（设计 §5.3：不静默；<b>不抛</b>——一条坏行不该让整个调用失败）。 */

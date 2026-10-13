@@ -2,7 +2,6 @@ package io.mosire.brain.subagent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -302,15 +301,13 @@ public final class SubagentManager implements AutoCloseable {
   /**
    * 全参装配 + <b>子工作区接线</b>（R3b）。
    *
-   * <p>EI_EXPOSE_REP2 抑制落在本构造（真正的终态构造）：{@code workspaceRegistry} 是装配层按实例共享的<b>实时</b>注册表
-   * （子工作区登记正是它的职责），{@code lineageRegistrar} 是同一条装配缝上的回调；两者都<b>允许为 null</b>（未接线）， 因此拿不到 {@code
-   * Objects.requireNonNull} 那层"已防御"的判据——与 {@code SubProcessExecutor} 的终态构造同款理由
-   * （同包先例；挂在只做委托的重载上会被判为无用抑制）。
+   * <p><b>本构造不挂 {@code @SuppressFBWarnings}</b>：SpotBugs 在这里并不报 {@code EI_EXPOSE_REP2}，原先那行抑制被它判为
+   * {@code US_USELESS_SUPPRESSION_ON_METHOD}（多余抑制 = 假披露，已删）。{@code workspaceRegistry} 与 {@code
+   * lineageRegistrar} 是装配层按实例共享的实时件，本类只按字段读用（见字段 javadoc），不向调用方转交。日后若真报出来，按真问题修 ——不要再把无用注解挂回去。
    *
    * @param workspaceRegistry 工作区注册表（{@code null} = 未接线：不挂子工作区，其余行为逐字不变——既有夹具与离线装配走这一档）
    * @param lineageRegistrar 血缘登记缝（{@code null} = 未接线；与 {@code workspaceRegistry} 同进同出，见字段 javadoc）
    */
-  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public SubagentManager(
       AgentTemplateStore templateStore,
       SubagentLauncher launcher,

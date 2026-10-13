@@ -80,7 +80,8 @@ final class DocEditOps {
     boolean hasAnchor = map.get("anchor") != null;
     boolean hasLine = map.get("line") != null;
     boolean hasFrom = map.get("from") != null;
-    boolean hasTo = map.get("to") != null;
+    // 不设 hasTo 变量：单给 to 由下面这条成对检查拒掉，"to 是否存在"在本方法里不需要单独判断
+    // （起过这个名字的局部量是死存储，SpotBugs DLS_DEAD_LOCAL_STORE 指的就是它）
     if (map.get("from") != null ^ map.get("to") != null) {
       throw DocException.invalid(where + " 的行区间必须同时给 from 与 to（闭区间，从 1 起）");
     }

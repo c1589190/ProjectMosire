@@ -532,6 +532,8 @@ canSee(viewer, entry):
   viewer.affiliations ∩ entry.affiliations ≠ ∅  → true
   其余                                          → false   ← fail-closed（"无主 ≠ 大家都能看"）
   ★ viewer.actorId 解不出（空/未知）⇒ 跳过 affiliations 支，只走 tags（不许把"不知道你是谁"读成"按归属放行"）
+  ★★ **控制方裁定（2026-10-13，R4 验证后）**：v1 实现比上式**更严**——身份解不出时 **tags 支也不匹配**（`DocVisibility` 用 `resolvable()` 一并挡住）。
+     接受该更严语义（fail-closed；对外无实际差别：身份解不出本就是宿主未绑定身份），本节按**更严**口径读；R4 的用例已按实际行为钉住。
 ```
 
 `fields` **不参与**身份、可见性、排序（隔壁 R-C4）。
@@ -833,6 +835,10 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 13. ★ **用户可见的行为变化（R3b 装配后，必须对账）**：主 Agent 的 `bash` 现在对 `<dataDir>/workspaces{,/main}` 拿到**只读 bind**（此前这些目录根本不在遮蔽面清单里 ⇒ 未绑定、可写），对技能根仍是只读 bind。这是 §4.8/A3 的既定落点（v1 无 `bash` 能力 ⇒ 文档只经 Docs 工具写），但它**确实收窄了主 Agent 用 shell 写自己工作区的能力**——要不要开这个口子（把工作区根从遮蔽清单里挪出，或等命令面模块给 `bash` 能力）由用户裁定。
 14. **子工作区装配失败时的处置**（R3b 自定，控制方接受）：**不让 spawn 失败**——把子体的 `docs`/`docs-edit`/`workspaces` 收成显式 `none()`，落 `permission.denied` + `workspace.denied` 两条事件 + WARN。判据是"fail-closed 且在模型面可见（工具直接 `RESOURCE_DENIED`）"；若要"挂不上就拒 spawn"，改一处即可。
 15. **M6 的落地口径**（R3b 确认）：子体的**运行期**挂载（它自己的工作区，`Origin.RUNTIME`）**不进它的链路遮蔽面** ⇒ 子在 shell 里看不见自己的工作区（实测 `child fence = masked:[workspaces, workspaces/main], readOnly:[skills]`）。这与 M6/A3 一致：v1 的文档写只经 Docs 工具。
+16. ★ **坏数据披露未按观看者收口**（R4b 发现，**带触发条件的已知缺口**）：`DocsEngine.broken()` 让原先恒空的披露开始真输出后，披露可能带出**调用者看不见的地址**的日志文件名（地址的安全编码）——与 B2/§5.5 的"不可见 ≡ 不存在"不一致。**v1 生产装配只有 REFERENCE/FILE 挂载 ⇒ 该路径不可达**；但 `mount_workspace` 可在运行期挂出 LOG 挂载 ⇒ **运行期 LOG 挂载落地之前必修**（修法：`broken` 收口到 `DocViewer`，公开形状只增不减）。
+17. **FILE 挂载的坏文件不在引擎层归集**（R4b 裁定维持现状）：坏文件只在"读这一个文件"时观察得到（`DOC_READ_FAILED` 响亮 + `DocReadResult.broken()`）；引擎层要归集就得每次 `doc_*` 读全工作区，代价不可接受。
+18. **`broken()` 的"扫不动 ⇒ 跳过"**：跳过 + `LOG.debug`（主操作照常返回，不把披露问题升级成操作失败）；要 fail-closed 传播是一行的事。
+19. **R4 未覆盖的判据**（逐条见 R4 报告 §7）：M12 白名单（v1 退化）、§5.10 命令面整段、`DOC_SCOPE_DENIED`（全仓测试 0 命中）、App/事件库层的三类 `workspace.*` 事件落库、W2 的"装配方把面配大"、孙代派曾孙、**真子进程 E2E**、resolver 扩展点（N8 推迟项）、`doc_query` 未走工具面。
 
 ---
 

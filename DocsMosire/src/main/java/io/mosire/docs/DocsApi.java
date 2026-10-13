@@ -1,5 +1,6 @@
 package io.mosire.docs;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.workspace.WorkspaceCaller;
 import io.mosire.workspace.WorkspaceRegistry;
 import java.util.List;
@@ -96,7 +97,18 @@ public final class DocsApi {
     return engine.broken(caller);
   }
 
-  /** 底层引擎（给"要解析挂载/纪律"的进程内调用点用；工具面经 {@link DocsAccess}）。 */
+  /**
+   * 底层引擎（给"要解析挂载/纪律"的进程内调用点用；工具面经 {@link DocsAccess}）。
+   *
+   * <p>EI_EXPOSE_REP 抑制：这里要交出的<b>就是装配期注入的那一个引擎</b>——它持有的注册表是唯一解析点（见 {@link DocsEngine} 类
+   * javadoc）。防御拷贝在此不适用：拷贝引擎 = 复制解析点，调用点会看到另一份状态，" 解析点只有一个"随之失效（不是"忘了拷贝"）。引擎本身不新增可变状态，只是共享件的持有者。
+   */
+  @SuppressFBWarnings(
+      value = "EI_EXPOSE_REP",
+      justification =
+          "本方法是库 API 的进程内出口：要共享的就是同一个引擎实例（它持有的注册表是唯一解析点）。防御拷贝既不适用也"
+              + "无意义——拷贝出来的引擎要么仍共享同一个注册表（等于没拷贝），要么造出第二个解析点（违反"
+              + "\"解析点只有一个\"）。属设计意图，不是内部表示泄漏。")
   public DocsEngine engine() {
     return engine;
   }

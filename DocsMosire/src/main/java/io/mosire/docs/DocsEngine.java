@@ -211,22 +211,45 @@ public final class DocsEngine {
     return List.copyOf(mounted);
   }
 
-  /** 已观察到的坏数据（坏行/坏文件），按挂载归集——披露不静默（设计 §5.3）。 */
+  /**
+   * 坏数据披露（坏行/坏文件名），按挂载归集——披露不静默（设计 §5.3/§5.9）。
+   *
+   * <p><b>为什么必须现扫一遍</b>：存储每次操作现建实例，坏数据清单是<b>实例内</b>累计的（设计 §5.3 的重扫语义：没有缓存可以陈旧）。
+   * 因此"拿一个刚建好的实例问它见过什么坏数据"恒为空——本方法当场把 {@code LOG} 挂载读一遍：列地址（坏文件名在此披露）→ 逐地址解析
+   * （坏行在此披露并跳过）。<b>什么算坏、怎么跳过，判据仍然只有一处</b>：{@link DocLogs}。
+   *
+   * <p><b>{@code FILE} 挂载为什么不在这里扫</b>：坏文件（读不出来/不是合法 UTF-8）只在"读这一个文件"时观察得到，而 {@code FILE}
+   * 挂载在生产装配里就是工作区（可能有二进制、大文件）——把任意一次 {@code doc_*} 调用变成"读全工作区"的代价不可接受。那一侧的披露 在读口上本来就是活的：读成功时经
+   * {@link DocReadResult#broken()} 带出，坏文件本身以 {@code DOC_READ_FAILED} 具名失败（响亮， 不静默）。
+   *
+   * <p><b>扫不动的挂载只跳过并记日志</b>：诊断口不该把主操作带崩；跳过的原因进日志（不静默），而该挂载真正的读口会以同一个具名失败 回答调用者。
+   */
   public List<BrokenDoc> broken(WorkspaceCaller caller) {
     List<BrokenDoc> all = new ArrayList<>();
     for (Mount mount : mounts(caller)) {
+      if (mount.kind() != Kind.LOG) {
+        continue;
+      }
       try {
-        Path base = baseDirOf(mount, caller);
-        if (mount.kind() == Kind.LOG) {
-          all.addAll(DocLogs.onDisk(base).broken());
-        } else if (mount.kind() == Kind.FILE) {
-          all.addAll(new DiskDocFiles(base, relative -> render(mount, relative)).broken());
-        }
-      } catch (WorkspaceException e) {
-        LOG.debug("docs.broken 跳过盖不住的挂载 名字={} 调用者={}", mount.name().value(), caller.holder());
+        all.addAll(rescanLogs(mount, caller));
+      } catch (WorkspaceException | DocException e) {
+        LOG.debug(
+            "docs.broken 跳过扫不动的挂载 名字={} 调用者={} 原因={}",
+            mount.name().value(),
+            caller.holder(),
+            e.toString());
       }
     }
     return List.copyOf(all);
+  }
+
+  /** {@code LOG} 挂载的现扫：列地址（坏文件名在此披露）→ 逐地址解析（坏行在此披露并跳过）。只读，不建任何东西。 */
+  private List<BrokenDoc> rescanLogs(Mount mount, WorkspaceCaller caller) {
+    DocStore store = DocLogs.onDisk(baseDirOf(mount, caller));
+    for (String address : store.addresses()) {
+      store.read(address);
+    }
+    return store.broken();
   }
 
   // ── 内部：解析归位 ───────────────────────────────────────────────────────────────────────────

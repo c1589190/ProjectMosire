@@ -143,7 +143,13 @@ final class DocLogs implements DocStore {
    */
   private DocEntry withFileLock(Path file, LockedAction action) {
     synchronized (jvmLock(file)) {
-      ensureDirectory(file.getParent());
+      Path parent = file.getParent();
+      if (parent == null) {
+        // 落点没有父目录 = 挂载根解析成了"根/空路径"：这不是"日志文件还不存在"，是装配/输入已经坏了。
+        // 继续下去只会是 createDirectories(null) 的 NPE（fail-closed，不猜落点；文案只出文件名，不出物理路径）
+        throw DocException.writeFailed("日志落点没有父目录（挂载根解析异常，这一行没有落盘）: " + fileNameOf(file), null);
+      }
+      ensureDirectory(parent);
       try (FileChannel channel =
           FileChannel.open(
               file, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
@@ -383,7 +389,13 @@ final class DocLogs implements DocStore {
    * <p><b>为什么要求"回编码一致"</b>：编码是单射，认一个非规范文件名会让两个不同地址共用同一份日志——那正是 B5 要避免的 "把文件名当身份"。
    */
   private String canonicalAddress(Path file) {
-    String encoded = stripSuffix(file.getFileName().toString());
+    Path name = file.getFileName();
+    if (name == null) {
+      // 路径没有文件名 ⇒ 它不是"挂载下的某个文件"，也就无从谈"它是哪个地址"：不猜、不静默按坏数据跳过，
+      // 直接具名失败（fail-closed；文案只出一个占位名，不出物理路径）
+      throw DocException.readFailed("日志文件名解不出来（路径没有文件名，无法判定它属于哪个地址）: " + fileNameOf(file), null);
+    }
+    String encoded = stripSuffix(name.toString());
     try {
       String address = DocAddress.require(decode(encoded));
       if (!encode(address).equals(encoded)) {
@@ -404,7 +416,13 @@ final class DocLogs implements DocStore {
     }
     try (Stream<Path> children = Files.list(dir)) {
       for (Path child : children.toList()) {
-        if (Files.isRegularFile(child) && child.getFileName().toString().endsWith(LOG_SUFFIX)) {
+        Path name = child.getFileName();
+        if (name == null) {
+          // 目录项没有文件名 ⇒ 连"它是不是一份日志"都判不了。静默跳过会让这个挂载看起来"干干净净"，
+          // 与"坏行/坏文件名不静默"（设计 §5.3）相反 ⇒ 具名失败（fail-closed）
+          throw DocException.reloadFailed("日志目录里有项没有文件名（无法判定它是不是日志）", null);
+        }
+        if (Files.isRegularFile(child) && name.toString().endsWith(LOG_SUFFIX)) {
           files.add(child);
         }
       }
