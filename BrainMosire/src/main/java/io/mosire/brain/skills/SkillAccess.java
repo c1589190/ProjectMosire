@@ -5,7 +5,6 @@ import io.mosire.agentlib.permission.Operation;
 import io.mosire.agentlib.permission.ResourceDeniedException;
 import io.mosire.agentlib.permission.ResourceId;
 import io.mosire.agentlib.permission.ResourceScope;
-import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.tool.ToolContext;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -426,22 +425,22 @@ public final class SkillAccess {
   /** 读权限：工具面走宿主注入的判定者（失败即 {@link ResourceDeniedException}），装配面用可见面直判。 */
   private void requireRead(Path file) {
     if (authorizer != null) {
-      authorizer.require(Operation.READ, ResourceScopeMap.SKILLS, file);
+      authorizer.require(Operation.READ, SkillNamespaces.SKILLS, file);
       return;
     }
     if (!visible.allowsDir(file)) {
-      throw denied(Operation.READ, ResourceScopeMap.SKILLS, file, visible);
+      throw denied(Operation.READ, SkillNamespaces.SKILLS, file, visible);
     }
   }
 
   /** 写权限：口径同上，命名空间是 {@code skills-edit}。 */
   private void requireWrite(Path file) {
     if (authorizer != null) {
-      authorizer.require(Operation.WRITE, ResourceScopeMap.SKILLS_EDIT, file);
+      authorizer.require(Operation.WRITE, SkillNamespaces.SKILLS_EDIT, file);
       return;
     }
     if (!editable.allowsDir(file)) {
-      throw denied(Operation.WRITE, ResourceScopeMap.SKILLS_EDIT, file, editable);
+      throw denied(Operation.WRITE, SkillNamespaces.SKILLS_EDIT, file, editable);
     }
   }
 

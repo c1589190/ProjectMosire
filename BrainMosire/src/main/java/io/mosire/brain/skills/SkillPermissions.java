@@ -12,7 +12,7 @@ import java.util.TreeMap;
 import java.util.function.Predicate;
 
 /**
- * 技能可见面 / 可编辑面在权限集上的落格与读取（{@link ResourceScopeMap#SKILLS} / {@link ResourceScopeMap#SKILLS_EDIT}）。
+ * 技能可见面 / 可编辑面在权限集上的落格与读取（{@link SkillNamespaces#SKILLS} / {@link SkillNamespaces#SKILLS_EDIT}）。
  *
  * <p><b>为什么复用第 7 维（{@code resourceScopes}）而不是新加权限字段</b>：技能范围必须与工具、目录、档位、预算同走 “逐跳只减不增”的单调性守卫（红线 1）。第
  * 7 维已经带着 {@link ResourceScope#narrowTo}（求交）与 {@link ResourceScope#covers}（涵盖）两段现成语义，{@code
@@ -41,12 +41,12 @@ public final class SkillPermissions {
 
   /** 可见面（未表态 ⇒ {@link ResourceScope#none()}，fail-closed）。 */
   public static ResourceScope visible(AgentPermissionSet permissions) {
-    return declared(permissions, ResourceScopeMap.SKILLS);
+    return declared(permissions, SkillNamespaces.SKILLS);
   }
 
   /** 可编辑面（未表态 ⇒ {@link ResourceScope#none()}，fail-closed）。 */
   public static ResourceScope editable(AgentPermissionSet permissions) {
-    return declared(permissions, ResourceScopeMap.SKILLS_EDIT);
+    return declared(permissions, SkillNamespaces.SKILLS_EDIT);
   }
 
   /** 某个技能文件（{@code SKILL.md}）是否可见。 */
@@ -80,8 +80,8 @@ public final class SkillPermissions {
     Objects.requireNonNull(visible, "visible");
     Objects.requireNonNull(editable, "editable");
     Map<String, ResourceScope> scopes = new TreeMap<>(permissions.resourceScopes().byNamespace());
-    scopes.put(ResourceScopeMap.SKILLS, visible);
-    scopes.put(ResourceScopeMap.SKILLS_EDIT, editable.narrowTo(visible));
+    scopes.put(SkillNamespaces.SKILLS, visible);
+    scopes.put(SkillNamespaces.SKILLS_EDIT, editable.narrowTo(visible));
     return permissions.withResourceScopes(new ResourceScopeMap(scopes));
   }
 

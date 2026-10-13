@@ -113,7 +113,6 @@ class SandboxMaskTest {
   }
 
   private static AgentPermissionSet withSkills(ResourceScope scope) {
-    return AgentPermissionSet.system()
-        .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.SKILLS, scope));
+    return AgentPermissionSet.system().withResourceScopes(ResourceScopeMap.of("skills", scope));
   }
 }

@@ -1,7 +1,7 @@
 package io.mosire.brain.subagent;
 
 import io.mosire.agentlib.permission.ResourceScope;
-import io.mosire.agentlib.permission.ResourceScopeMap;
+import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -203,8 +203,8 @@ public record AgentCommand(
     }
     // 技能范围：只在该命名空间**已表态**时才追加（未接线技能面的既有装配 argv 逐字节不变）。取值直接来自实例权限集——
     // 父级收紧过的才是子体该拿的，装配层没有第二份可写的地方（写错一处就是静默放大）。
-    appendScope(argv, instance, ResourceScopeMap.SKILLS, "--skill-visible");
-    appendScope(argv, instance, ResourceScopeMap.SKILLS_EDIT, "--skill-editable");
+    appendScope(argv, instance, SkillNamespaces.SKILLS, "--skill-visible");
+    appendScope(argv, instance, SkillNamespaces.SKILLS_EDIT, "--skill-editable");
     return argv;
   }
 

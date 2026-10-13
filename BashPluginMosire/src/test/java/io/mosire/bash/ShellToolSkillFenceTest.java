@@ -9,6 +9,7 @@ import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
+import io.mosire.brain.skills.SkillNamespaces;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -78,7 +79,7 @@ class ShellToolSkillFenceTest {
         AgentPermissionSet.builder(AccessToken.SYSTEM)
             .allowAll()
             .resourceScopes(
-                ResourceScopeMap.of(ResourceScopeMap.SKILLS, ResourceScope.ofDir(skills)))
+                ResourceScopeMap.of(SkillNamespaces.SKILLS, ResourceScope.ofDir(skills)))
             .build();
     ToolContext caller =
         caller(permissions, Map.of(SandboxMask.CONFIG_KEY, List.of(skills.toString())));
@@ -102,7 +103,7 @@ class ShellToolSkillFenceTest {
                 ResourceScopeMap.of(
                     Map.of(
                         ResourceScopeMap.FS, ResourceScope.ofDir(work),
-                        ResourceScopeMap.SKILLS, ResourceScope.none())))
+                        SkillNamespaces.SKILLS, ResourceScope.none())))
             .build();
     ToolContext caller =
         caller(permissions, Map.of(SandboxMask.CONFIG_KEY, List.of(skills.toString())));

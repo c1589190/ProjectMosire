@@ -17,6 +17,7 @@ import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
+import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -840,8 +841,8 @@ public final class SubagentManager implements AutoCloseable {
     return callerPermissions
         .resourceScopes()
         .withNamespace(ResourceScopeMap.FS, effectiveFs)
-        .withNamespace(ResourceScopeMap.SKILLS, effectiveVisible)
-        .withNamespace(ResourceScopeMap.SKILLS_EDIT, effectiveEditable);
+        .withNamespace(SkillNamespaces.SKILLS, effectiveVisible)
+        .withNamespace(SkillNamespaces.SKILLS_EDIT, effectiveEditable);
   }
 
   /**

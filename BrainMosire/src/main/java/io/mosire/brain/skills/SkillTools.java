@@ -6,7 +6,6 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.ResourceManifest;
 import io.mosire.agentlib.permission.ResourcePolicy;
-import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
@@ -31,7 +30,7 @@ import java.util.function.Function;
  *   <li><b>工具名级</b>：{@code ToolExecutionGuard} 按调用者白名单/拒绝名单判（子 Agent 的模板白名单要列出技能工具名， deny-default
  *       才有意义）；
  *   <li><b>资源声明级</b>：每个工具声明自己的命名空间与缺省策略 {@link ResourcePolicy#DENY}（读工具声明 {@link
- *       ResourceScopeMap#SKILLS}，写工具声明 {@link ResourceScopeMap#SKILLS_EDIT}）。缺省 DENY 的含义是：<b>调用者没在
+ *       SkillNamespaces#SKILLS}，写工具声明 {@link SkillNamespaces#SKILLS_EDIT}）。缺省 DENY 的含义是：<b>调用者没在
  *       权限集里显式表态 ⇒ 这次调用在执行前就被拒</b>——“没配技能”永远读作“没有技能”，不会静默变成“随便用”；
  *   <li><b>逐路径级</b>：{@link SkillAccess} 在真正读写前调 {@code context.resources().require}（宿主在唯一入口注入的判定者），
  *       判否抛 {@code ResourceDeniedException}，由 {@code ToolCallAuthorizer} 统一转成 {@code
@@ -86,11 +85,11 @@ public final class SkillTools {
 
   /** 读工具声明的资源面：{@code skills} 命名空间，缺省 DENY（调用者不表态就够不着）。 */
   private static final ResourceManifest READ_MANIFEST =
-      ResourceManifest.of(ResourceScopeMap.SKILLS, ResourcePolicy.DENY);
+      ResourceManifest.of(SkillNamespaces.SKILLS, ResourcePolicy.DENY);
 
   /** 写工具声明的资源面：{@code skills-edit} 命名空间，缺省 DENY。 */
   private static final ResourceManifest WRITE_MANIFEST =
-      ResourceManifest.of(ResourceScopeMap.SKILLS_EDIT, ResourcePolicy.DENY);
+      ResourceManifest.of(SkillNamespaces.SKILLS_EDIT, ResourcePolicy.DENY);
 
   private SkillTools() {}
 

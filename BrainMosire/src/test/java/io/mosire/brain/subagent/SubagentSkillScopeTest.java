@@ -14,7 +14,6 @@ import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.ResourceScope;
-import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
@@ -22,6 +21,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
+import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -85,8 +85,8 @@ class SubagentSkillScopeTest {
             AgentIdentity.main(CommandMode.FULL),
             callerWithSkills(ResourceScope.ofDir(skillsRoot), ResourceScope.ofDir(skillsRoot)));
 
-    ResourceScope visible = skillScopeOf(child, ResourceScopeMap.SKILLS);
-    ResourceScope editable = skillScopeOf(child, ResourceScopeMap.SKILLS_EDIT);
+    ResourceScope visible = skillScopeOf(child, SkillNamespaces.SKILLS);
+    ResourceScope editable = skillScopeOf(child, SkillNamespaces.SKILLS_EDIT);
     assertThat(visible.allowsDir(skillsRoot.resolve("alpha").resolve("SKILL.md"))).isTrue();
     assertThat(visible.allowsDir(skillsRoot.resolve("beta").resolve("SKILL.md")))
         .as("模板没给 beta ⇒ 求交掉")
@@ -185,11 +185,11 @@ class SubagentSkillScopeTest {
             AgentIdentity.subagent(child.instanceId(), CommandMode.LIMITED, "子目标", 1),
             childPermissions);
     assertThat(
-            skillScopeOf(grandchild, ResourceScopeMap.SKILLS)
+            skillScopeOf(grandchild, SkillNamespaces.SKILLS)
                 .allowsDir(skillsRoot.resolve("alpha").resolve("SKILL.md")))
         .isTrue();
     assertThat(
-            skillScopeOf(grandchild, ResourceScopeMap.SKILLS)
+            skillScopeOf(grandchild, SkillNamespaces.SKILLS)
                 .allowsDir(skillsRoot.resolve("beta").resolve("SKILL.md")))
         .isFalse();
   }
@@ -206,8 +206,8 @@ class SubagentSkillScopeTest {
             AgentIdentity.main(CommandMode.FULL),
             AgentPermissionSet.system());
 
-    assertThat(skillScopeOf(child, ResourceScopeMap.SKILLS)).isEqualTo(ResourceScope.none());
-    assertThat(skillScopeOf(child, ResourceScopeMap.SKILLS_EDIT)).isEqualTo(ResourceScope.none());
+    assertThat(skillScopeOf(child, SkillNamespaces.SKILLS)).isEqualTo(ResourceScope.none());
+    assertThat(skillScopeOf(child, SkillNamespaces.SKILLS_EDIT)).isEqualTo(ResourceScope.none());
   }
 
   /** argv 传递面：有表态才追加，值就是实例权限集里那一份（父级收紧过的）。 */

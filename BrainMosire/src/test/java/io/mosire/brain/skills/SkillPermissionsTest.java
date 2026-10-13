@@ -6,7 +6,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.permission.ResourceScope;
-import io.mosire.agentlib.permission.ResourceScopeMap;
 import java.nio.file.Path;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -44,10 +43,10 @@ class SkillPermissionsTest {
             ResourceScope.ofDir(visibleRoot),
             ResourceScope.ofDir(tempDir));
 
-    assertThat(permissions.resourceScopes().declaredScope(ResourceScopeMap.SKILLS))
+    assertThat(permissions.resourceScopes().declaredScope(SkillNamespaces.SKILLS))
         .isEqualTo(ResourceScope.ofDir(visibleRoot));
     ResourceScope editable =
-        permissions.resourceScopes().declaredScope(ResourceScopeMap.SKILLS_EDIT);
+        permissions.resourceScopes().declaredScope(SkillNamespaces.SKILLS_EDIT);
     assertThat(editable.allowsDir(visibleRoot.resolve("a").resolve("SKILL.md"))).isTrue();
     assertThat(editable.allowsDir(tempDir.resolve("elsewhere").resolve("b").resolve("SKILL.md")))
         .as("可编辑面被求交进可见面：更宽的那部分消失")

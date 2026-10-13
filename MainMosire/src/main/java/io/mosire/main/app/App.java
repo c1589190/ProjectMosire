@@ -57,6 +57,7 @@ import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.TurnResult;
 import io.mosire.brain.skills.SkillAccess;
 import io.mosire.brain.skills.SkillCatalog;
+import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
 import io.mosire.brain.skills.SkillSettings;
 import io.mosire.brain.skills.SkillTools;
@@ -493,7 +494,16 @@ public final class App implements AutoCloseable {
       toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
       // 技能树遮蔽面（本能力）：文件工具（bash 的 L3 沙箱）据此决定“整棵技能树遮蔽 / 只读暴露”——
       // 这是技能边界在文件工具一侧的唯一数据入口（判定见 SandboxMask）
-      toolConfig.put(SandboxMask.CONFIG_KEY, List.of(skillSettings.root().toString()));
+      // R1 收编：条目必须自带命名空间——SandboxMask 已命名空间无关，判定按条目声明的命名空间取值（不再硬编码 skills）；
+      // 技能面本期不迁 docs，命名空间仍是 SkillNamespaces.SKILLS
+      toolConfig.put(
+          SandboxMask.CONFIG_KEY,
+          List.of(
+              Map.of(
+                  SandboxMask.NAMESPACE_KEY,
+                  SkillNamespaces.SKILLS,
+                  SandboxMask.PATH_KEY,
+                  skillSettings.root().toString())));
       toolConfig = Map.copyOf(toolConfig);
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面

@@ -11,6 +11,7 @@ import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
+import io.mosire.brain.skills.SkillNamespaces;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -197,7 +198,15 @@ public final class SubProcessExecutor implements AgentExecutor {
     if (skillsRoot != null) {
       // 技能树遮蔽面：链路上下文里也带上（同一条 D30 运行时缝）——子体调父侧 bash 时，父侧按该子体的 skills 命名空间
       // 判定“整棵树遮蔽 / 只读暴露”，从而堵住“技能不可见却能用 shell 读技能文件”的旁路
-      config.put(SandboxMask.CONFIG_KEY, List.of(skillsRoot.toString()));
+      // R1 收编：条目必须自带命名空间（SandboxMask 命名空间无关，不再硬编码 skills）
+      config.put(
+          SandboxMask.CONFIG_KEY,
+          List.of(
+              Map.of(
+                  SandboxMask.NAMESPACE_KEY,
+                  SkillNamespaces.SKILLS,
+                  SandboxMask.PATH_KEY,
+                  skillsRoot.toString())));
     }
     return Map.copyOf(config);
   }
