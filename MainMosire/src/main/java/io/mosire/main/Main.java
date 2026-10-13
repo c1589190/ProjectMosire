@@ -292,6 +292,9 @@ public final class Main {
     // 技能范围：同一开关可重复出现（每个前缀一项）；"*" = 不限，"none" = 一个都不许（见 SkillPermissions#encode）
     List<String> skillVisible = new ArrayList<>();
     List<String> skillEditable = new ArrayList<>();
+    // 文档范围（R3b）：编码口径与技能面逐字相同（同一个 encode/decode），同样可重复出现
+    List<String> docVisible = new ArrayList<>();
+    List<String> docEditable = new ArrayList<>();
     for (int i = 1; i < args.length; i++) {
       switch (args[i]) {
         case "--id" -> instanceId = requireValue(args, ++i);
@@ -303,6 +306,8 @@ public final class Main {
         case "--skills-dir" -> skillsDir = Path.of(requireValue(args, ++i));
         case "--skill-visible" -> skillVisible.add(requireValue(args, ++i));
         case "--skill-editable" -> skillEditable.add(requireValue(args, ++i));
+        case "--doc-visible" -> docVisible.add(requireValue(args, ++i));
+        case "--doc-editable" -> docEditable.add(requireValue(args, ++i));
         case "--parent-link" -> parentLink = true;
         default -> {
           System.err.println("未知参数: " + args[i]);
@@ -326,7 +331,9 @@ public final class Main {
               configDir,
               skillsDir,
               skillVisible,
-              skillEditable));
+              skillEditable,
+              docVisible,
+              docEditable));
     } catch (IllegalArgumentException e) {
       System.err.println("参数错误: " + e.getMessage());
       return 2;
@@ -722,6 +729,8 @@ public final class Main {
              --skills-dir <p> 技能根目录（子体据此做每回合的可见技能目录预注入；缺省不预注入）
              --skill-visible <v>   技能可见面（可重复；* = 不限，none = 一个都不许，其余为路径；缺省 none）
              --skill-editable <v>  技能可编辑面（同上；生效值恒在可见面之内）
+             --doc-visible <v>     文档可见面（可重复；编码口径与技能面相同；缺省 none）
+             --doc-editable <v>    文档可编辑面（同上；生效值恒在可见面之内）
           doctor          （M3）自检
           config          （M3）配置管理
         """

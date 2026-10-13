@@ -31,6 +31,7 @@ import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillPermissions;
 import io.mosire.brain.subagent.AgentTemplate;
 import io.mosire.brain.subagent.AgentTemplateStore;
+import io.mosire.docs.DocNamespaces;
 import io.mosire.main.app.BootConfig;
 import java.io.OutputStream;
 import java.io.PrintStream;
@@ -137,6 +138,13 @@ public final class SubagentProcessMain {
               template.toPermissionSet(),
               SkillPermissions.decode(options.skillVisible()),
               SkillPermissions.decode(options.skillEditable()));
+      // 文档两个面（R3b）：同一条缝、同一个编码口径（SkillPermissions 的 encode/decode 是"ResourceScope ↔ argv
+      // 文本表"的唯一实现，两族范围复用而不是各写一份）。argv 缺席 ⇒ none（fail-closed）；可编辑面恒被夹进可见面。
+      permissions =
+          withDocsScopes(
+              permissions,
+              SkillPermissions.decode(options.docVisible()),
+              SkillPermissions.decode(options.docEditable()));
       ToolRegistry registry = new ToolRegistry();
       if (options.parentLink()) {
         // 父侧建好的管道 → MCP client（握手/工具目录/调用全经此传输；父侧永远在同一对管道上服务）
@@ -292,6 +300,24 @@ public final class SubagentProcessMain {
     return new BasicContextAssembler(ContextPolicy.defaults(), ContextSources.skills(access));
   }
 
+  /**
+   * 子体的文档两个面落进权限集（R3b）：与 {@code SkillPermissions.withScopes} 同一形状——<b>可编辑面自动与可见面求交</b>， 于是 {@code
+   * docs-edit ⊆ docs} 在数据上成立（"改得动但看不见"造不出来），单调性守卫也看得见这两个命名空间。
+   *
+   * <p><b>为什么在本模块自己写这一小段而不是再开一个常量类</b>：命名空间常量仍取自 {@code docs-mosire}（不抄字符串），这里只做两次 {@code
+   * withNamespace}；技能面之所以有 {@code SkillPermissions} 那个类，是因为它还带着目录扫描过滤等一堆用法，文档面这一侧在子进程里 只用到"恢复两个面"。
+   */
+  private static AgentPermissionSet withDocsScopes(
+      AgentPermissionSet permissions,
+      io.mosire.agentlib.permission.ResourceScope visible,
+      io.mosire.agentlib.permission.ResourceScope editable) {
+    return permissions.withResourceScopes(
+        permissions
+            .resourceScopes()
+            .withNamespace(DocNamespaces.DOCS, visible)
+            .withNamespace(DocNamespaces.DOCS_EDIT, editable.narrowTo(visible)));
+  }
+
   /** 模板权限集 → 桥同步过滤器：白名单通配（{@code "*"}）不过滤，否则按名命中。 */
   private static Predicate<String> filterFor(AgentPermissionSet permissions) {
     if (permissions.allowedTools().contains(AgentPermissionSet.ALL_TOOLS)) {
@@ -321,6 +347,8 @@ public final class SubagentProcessMain {
    * @param skillVisible 可见面（{@code --skill-visible}，可重复；{@code *}/{@code none}/路径，见 {@link
    *     SkillPermissions#encode}）；空表 = none（fail-closed）
    * @param skillEditable 可编辑面（{@code --skill-editable}），语义同上
+   * @param docVisible 文档可见面（{@code --doc-visible}，可重复；编码口径与技能面逐字相同）；空表 = none（fail-closed）
+   * @param docEditable 文档可编辑面（{@code --doc-editable}）；空表 = none，且恒被夹进可见面
    */
   public record Options(
       String instanceId,
@@ -332,9 +360,38 @@ public final class SubagentProcessMain {
       Path configDir,
       Path skillsDir,
       List<String> skillVisible,
-      List<String> skillEditable) {
+      List<String> skillEditable,
+      List<String> docVisible,
+      List<String> docEditable) {
 
-    /** 7 参兼容构造（技能面引入之前）：不预注入、两个技能面都取 none。 */
+    /** 11 参兼容构造（文档面引入之前）：两个文档面都取空表 = none（fail-closed，逐字回到本字段引入前的行为）。 */
+    public Options(
+        String instanceId,
+        String templateId,
+        String goal,
+        Path templatesDir,
+        Path dataDir,
+        boolean parentLink,
+        Path configDir,
+        Path skillsDir,
+        List<String> skillVisible,
+        List<String> skillEditable) {
+      this(
+          instanceId,
+          templateId,
+          goal,
+          templatesDir,
+          dataDir,
+          parentLink,
+          configDir,
+          skillsDir,
+          skillVisible,
+          skillEditable,
+          List.of(),
+          List.of());
+    }
+
+    /** 7 参兼容构造（技能面引入之前）：不预注入、四个范围面都取 none。 */
     public Options(
         String instanceId,
         String templateId,
@@ -371,6 +428,8 @@ public final class SubagentProcessMain {
       // 不可变快照；null 与空表同口径（都读作 none —— 缺省方向朝收紧）
       skillVisible = skillVisible == null ? List.of() : List.copyOf(skillVisible);
       skillEditable = skillEditable == null ? List.of() : List.copyOf(skillEditable);
+      docVisible = docVisible == null ? List.of() : List.copyOf(docVisible);
+      docEditable = docEditable == null ? List.of() : List.copyOf(docEditable);
     }
   }
 }

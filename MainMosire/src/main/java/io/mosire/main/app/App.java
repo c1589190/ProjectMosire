@@ -33,6 +33,7 @@ import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandModeHolder;
 import io.mosire.agentlib.permission.CommandModeLoader;
+import io.mosire.agentlib.permission.Operation;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
@@ -71,6 +72,9 @@ import io.mosire.brain.subagent.SubagentLimitsLoader;
 import io.mosire.brain.subagent.SubagentManager;
 import io.mosire.brain.subagent.SubagentOrchestrationTools;
 import io.mosire.brain.tools.WorkingDirsLoader;
+import io.mosire.docs.DocNamespaces;
+import io.mosire.docs.DocsCapability;
+import io.mosire.docs.DocsTools;
 import io.mosire.main.Version;
 import io.mosire.main.approval.CommandModeHttpHandler;
 import io.mosire.main.approval.TtyApprovalChannel;
@@ -87,6 +91,21 @@ import io.mosire.main.gateway.debug.DebugChatHttpServer;
 import io.mosire.main.gateway.debug.DebugChatService;
 import io.mosire.main.setup.SetupHttpServer;
 import io.mosire.main.setup.SetupLlmRouter;
+import io.mosire.workspace.Capability;
+import io.mosire.workspace.CapabilityCatalog;
+import io.mosire.workspace.CapabilityCatalogs;
+import io.mosire.workspace.DefaultWorkspaceRegistry;
+import io.mosire.workspace.Kind;
+import io.mosire.workspace.MaskEntry;
+import io.mosire.workspace.Mount;
+import io.mosire.workspace.MountName;
+import io.mosire.workspace.Origin;
+import io.mosire.workspace.Resolvers;
+import io.mosire.workspace.WorkspaceCaller;
+import io.mosire.workspace.WorkspaceEvent;
+import io.mosire.workspace.WorkspacePermissions;
+import io.mosire.workspace.WorkspaceRegistry;
+import io.mosire.workspace.WorkspaceTools;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
@@ -97,9 +116,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.BiConsumer;
 import org.a2aproject.sdk.spec.AgentCapabilities;
 import org.a2aproject.sdk.spec.AgentCard;
 import org.a2aproject.sdk.spec.AgentInterface;
@@ -152,6 +174,33 @@ public final class App implements AutoCloseable {
 
   /** 技能工具的供给源 id（ToolRegistry 的来源归属；供审计与「按源整组卸载」用）。 */
   private static final String SKILL_TOOL_SOURCE_ID = "skills";
+
+  /** Docs 工具（{@code doc_*} 七个）的供给源 id（R3b）。 */
+  private static final String DOCS_TOOL_SOURCE_ID = "docs";
+
+  /**
+   * 工作区工具（{@code mount_workspace}/{@code unmount_workspace}/{@code list_workspaces}）的供给源 id（R3b）。
+   */
+  private static final String WORKSPACE_TOOL_SOURCE_ID = "workspace";
+
+  /**
+   * 技能根的能力 id（R2→R3b 交接项 2）：<b>只含 {@code skills: READ}</b>。
+   *
+   * <p>为什么不复用 {@code {skills, skills-edit}} 或直接声明 {@code skills} 能力：技能根的用途是"bash 侧只读/遮蔽"这一条， 而
+   * {@code SandboxMask} 的 G7 是<b>逐条目求与</b>——多一条 {@code skills-edit} 条目就会把"可读不可改"的调用者一并遮成不可见 （R1
+   * 之前的语义正是"读得到就只读 bind"）。名字带 {@code -read} 是刻意的：将来技能重基（R6）注册的 {@code docs} 能力 不会与它撞名（同名不同义会让
+   * {@code CapabilityCatalogs} 响亮失败）。
+   */
+  private static final String SKILLS_READ_CAPABILITY_ID = "skills-read";
+
+  /** 技能根的虚拟挂载名（技能树在 bash 遮蔽面里的那条路径由它承载）。 */
+  private static final String SKILLS_MOUNT = "skills";
+
+  /** 主 Agent 自己工作区的虚拟挂载名（子体的 {@code /workspace} 沿用同一个名字，W5：虚拟命名自洽）。 */
+  private static final String WORKSPACE_MOUNT = "workspace";
+
+  /** 子体工作区根的虚拟挂载名（装配期声明 ⇒ 整棵工作区树进遮蔽面）。 */
+  private static final String WORKSPACES_MOUNT = "workspaces";
 
   /**
    * 主 Agent 的初始会话 id（P3-3）：恒为 {@code "main"}（= 主 Agent 的 {@code AgentConfig} id，同源）。
@@ -407,6 +456,109 @@ public final class App implements AutoCloseable {
           skillSettings.listingBudget(),
           skillSettings.preloaded(),
           SkillTools.NAMES);
+      // ★★ 工作区标准 + Docs 装配（R3b，设计 §4.7/§4.8/§5.7）★★
+      // 顺序写死：主 Agent 的权限集先补 workspaces 前缀（R2→R3b 交接项 1）→ 能力目录 → 注册表 → 挂装配期挂载 → 落格
+      // → 注册两族工具。原因：M1 对装配期挂载同样生效，"不表态 ⇒ 一个挂载都建不了"是有意的 fail-closed，
+      // 所以 workspace 前缀必须在第一次 mount 之前就在权限集里。
+      Path workspacesRoot = config.dataDir().resolve("workspaces").toAbsolutePath().normalize();
+      Path mainWorkspace = workspacesRoot.resolve(agentConfig.id());
+      Path skillsRoot = skillSettings.root().toAbsolutePath().normalize();
+      // ① workspaces 面 = <b>装配期挂载的落点根集合</b>（工作区根 + 技能根）：
+      //    a) 交接项 1 要求"显式表态"（不表态 ⇒ M1 拒掉一切挂载，含装配期挂载——有意的 fail-closed）；
+      //    b) 只写 <dataDir>/workspaces 会把<b>技能根</b>的装配期挂载一并拒掉（实测命中 M1：技能根不在工作区根之下），
+      //       所以面必须覆盖"部署声明的每一个静态根"，而不是一个想当然的公共父目录；
+      //    c) 前缀集合只列这两个根——不把整个 dataDir（events.db / config.json / subagents 都在里面）放进来。
+      ResourceScope assemblyMountRoots =
+          ResourceScope.of(
+              WorkspacePermissions.directoryPrefix(workspacesRoot),
+              WorkspacePermissions.directoryPrefix(skillsRoot));
+      // ② docs / docs-edit 面也要<b>先表态再挂载</b>：M1/M3 的第二半判的是"能力落格后仍 ⊆ 调用者面"，
+      //    而主 Agent 的文档面在装配期本来就没有来源（它不是从谁那里继承来的）——装配方就是它的来源。
+      //    面 = 工作区树根（主 Agent 自己的工作区在其下），与三个装配期挂载的落点一致（grant 时 A5 再核一遍：
+      //    若这里有显式表态却不覆盖落点，挂载/落格会响亮拒，不会静默放大）。
+      ResourceScope assemblyDocs =
+          ResourceScope.of(WorkspacePermissions.directoryPrefix(workspacesRoot));
+      permissionSet =
+          WorkspacePermissions.withNamespace(
+              permissionSet, WorkspacePermissions.WORKSPACES, assemblyMountRoots);
+      permissionSet =
+          WorkspacePermissions.withNamespace(permissionSet, DocNamespaces.DOCS, assemblyDocs);
+      permissionSet =
+          WorkspacePermissions.withNamespace(permissionSet, DocNamespaces.DOCS_EDIT, assemblyDocs);
+      CapabilityCatalog capabilities = CapabilityCatalogs.inMemory();
+      DocsCapability.register(capabilities);
+      // R2→R3b 交接项 2：技能根的 bash 遮蔽语义靠"一个只含 skills: READ 的能力"保住——**不是**
+      // {skills, skills-edit} 双命名空间：G7 是逐条目求与，双条目会把"可读不可改"的调用者一并遮成不可见。
+      capabilities.register(
+          Capability.of(
+              SKILLS_READ_CAPABILITY_ID,
+              Map.of(SkillNamespaces.SKILLS, Set.of(Operation.READ)),
+              false,
+              Set.of()));
+      // 血缘真值住在 Brain（实例记录），工作区模块不得依赖 Brain（设计 §3）⇒ 装配层用一个索引把两者接起来：
+      // 注册表读它判 M2/M5（"user 是不是自己或后代"），spawn 侧在挂载<b>之前</b>登记拟建子体的路径（见 SubagentManager）。
+      Map<String, String> lineageIndex = new ConcurrentHashMap<>();
+      lineageIndex.put(agentConfig.id(), agentConfig.id());
+      DefaultWorkspaceRegistry workspaceRegistry =
+          DefaultWorkspaceRegistry.create(
+              capabilities, event -> recordWorkspaceEvent(events, event), lineageIndex::get);
+      // 装配期挂载（Origin.ASSEMBLY）：只有这一档进 bash 遮蔽面（M6）。三个都是"部署声明的静态路径"：
+      // ① 技能根（REFERENCE，只读引用：shell 只能只读看见 / 看不见，永不写）——它同时就是 R1 那条第 496 行字面的替代物；
+      // ② 主 Agent 自己的工作区（FILE + docs 能力：文档经 doc_* 工具读写，shell 侧按 v1 遮蔽）；
+      // ③ 子体工作区根（REFERENCE + docs：spawn 时子工作区就划在它下面，且整棵工作区树因此进入遮蔽面）。
+      WorkspaceCaller mainCaller = new WorkspaceCaller(agentConfig.id(), permissionSet);
+      workspaceRegistry.mount(
+          new Mount(
+              new MountName(SKILLS_MOUNT),
+              agentConfig.id(),
+              agentConfig.id(),
+              skillsRoot,
+              Resolvers.direct(),
+              Kind.REFERENCE,
+              Set.of(SKILLS_READ_CAPABILITY_ID),
+              Origin.ASSEMBLY),
+          mainCaller);
+      workspaceRegistry.mount(
+          new Mount(
+              new MountName(WORKSPACE_MOUNT),
+              agentConfig.id(),
+              agentConfig.id(),
+              mainWorkspace,
+              Resolvers.direct(),
+              Kind.FILE,
+              Set.of(DocsCapability.ID),
+              Origin.ASSEMBLY),
+          mainCaller);
+      workspaceRegistry.mount(
+          new Mount(
+              new MountName(WORKSPACES_MOUNT),
+              agentConfig.id(),
+              agentConfig.id(),
+              workspacesRoot,
+              Resolvers.direct(),
+              Kind.REFERENCE,
+              Set.of(DocsCapability.ID),
+              Origin.ASSEMBLY),
+          mainCaller);
+      // 落格（§4.8：能力只在挂载/授予时落成"命名空间 + 前缀"）：docs ← <工作区>、docs-edit ← <工作区>、
+      // workspaces ← <工作区根>、skills ← <技能根>。A5 会拒"已有显式表态却不覆盖落点"的命名空间（响亮，不静默放大）。
+      permissionSet = workspaceRegistry.grant(agentConfig.id(), permissionSet);
+      // 两族工具（Docs 7 个 + 工作区 3 个）：供给源 id 分开，便于审计与"按源整组卸载"
+      for (AgentTool docTool : DocsTools.all(workspaceRegistry)) {
+        tools.register(DOCS_TOOL_SOURCE_ID, docTool);
+      }
+      for (AgentTool workspaceTool : WorkspaceTools.all(workspaceRegistry)) {
+        tools.register(WORKSPACE_TOOL_SOURCE_ID, workspaceTool);
+      }
+      LOG.info(
+          "工作区与 Docs 已装配: 工作区根={} 主工作区={} 技能根={} 装配期挂载={} 遮蔽面条目={} 工具={}+{}",
+          workspacesRoot,
+          mainWorkspace,
+          skillsRoot,
+          workspaceRegistry.mounts(agentConfig.id()).size(),
+          workspaceRegistry.maskEntries().size(),
+          DocsTools.NAMES,
+          WorkspaceTools.NAMES);
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
@@ -456,7 +608,11 @@ public final class App implements AutoCloseable {
                 approvalAuthorizer,
                 commandMode,
                 subagentLimits,
-                skillSettings.root());
+                skillSettings.root(),
+                workspaceRegistry,
+                // M2 要判"user 是不是调用者的后代"，而这份血缘真值住在 Brain（实例记录）；
+                // 装配层把它接进注册表的取数缝（注册表不得依赖 Brain，设计 §3）
+                lineageIndex::put);
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
       }
@@ -492,18 +648,11 @@ public final class App implements AutoCloseable {
       toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
       // S6：档位持有者经同一个运行时缝下发（AgentPipeline 建调用上下文时现读它定主 Agent 的身份/档位）
       toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
-      // 技能树遮蔽面（本能力）：文件工具（bash 的 L3 沙箱）据此决定“整棵技能树遮蔽 / 只读暴露”——
-      // 这是技能边界在文件工具一侧的唯一数据入口（判定见 SandboxMask）
-      // R1 收编：条目必须自带命名空间——SandboxMask 已命名空间无关，判定按条目声明的命名空间取值（不再硬编码 skills）；
-      // 技能面本期不迁 docs，命名空间仍是 SkillNamespaces.SKILLS
-      toolConfig.put(
-          SandboxMask.CONFIG_KEY,
-          List.of(
-              Map.of(
-                  SandboxMask.NAMESPACE_KEY,
-                  SkillNamespaces.SKILLS,
-                  SandboxMask.PATH_KEY,
-                  skillSettings.root().toString())));
+      // 遮蔽面（R3b 起由工作区注册表产出）：文件工具（bash 的 L3 沙箱）据此决定"这条路径遮蔽 / 只读暴露"——
+      // 这是资源边界在文件工具一侧的唯一数据入口（判定见 SandboxMask，逐条目求与）。
+      // ★ 这里不再写死 ("skills", <技能根>) 字面：技能根本身就是一个装配期 REFERENCE 挂载，它的条目由
+      //   WorkspaceRegistry.maskEntries() 连命名空间一起产出（M6：只返回装配期条目；运行期挂载不进遮蔽面）。
+      toolConfig.put(SandboxMask.CONFIG_KEY, maskConfigOf(workspaceRegistry));
       toolConfig = Map.copyOf(toolConfig);
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
@@ -688,7 +837,9 @@ public final class App implements AutoCloseable {
       ToolCallAuthorizer authorizer,
       CommandModeHolder commandMode,
       SubagentLimits limits,
-      Path skillsRoot) {
+      Path skillsRoot,
+      WorkspaceRegistry workspaceRegistry,
+      BiConsumer<String, String> lineageRegistrar) {
     AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
     templateStore.load();
     SubprocessManager processes = new SubprocessManager();
@@ -700,7 +851,9 @@ public final class App implements AutoCloseable {
             PARENT_SERVER_NAME,
             Version.VERSION,
             authorizer,
-            skillsRoot);
+            skillsRoot,
+            // R3b：子体链路的遮蔽面改由注册表产出（技能根 + 工作区树，判定按该子体自己的面逐条求与）
+            workspaceRegistry);
     // S6：父级档位取数缝传的是<b>持有者</b>（现读）——HTTP 断点把主 Agent 降到 LIMITED 后，接着派子 Agent 也拿不到 FULL
     SubagentManager manager =
         new SubagentManager(
@@ -713,7 +866,11 @@ public final class App implements AutoCloseable {
             0,
             commandMode::get,
             limits,
-            config.dataDir().resolve("subagents"));
+            config.dataDir().resolve("subagents"),
+            // R3b：spawn 侧为每个子体挂一块自己的工作区（holder=父 / user=子 / 落点=父工作区下的真子目录）
+            workspaceRegistry,
+            // 血缘登记缝：工作区模块不得依赖 Brain，而"拟建子体"的血缘只有 spawn 侧算得出来
+            lineageRegistrar);
     BuiltinToolSource builtin =
         new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager));
     for (AgentTool tool : builtin.listTools()) {
@@ -741,6 +898,50 @@ public final class App implements AutoCloseable {
         true,
         subagentConfigDir == null ? null : subagentConfigDir.toString(),
         skillsRoot == null ? null : skillsRoot.toString());
+  }
+
+  /**
+   * 遮蔽面清单（R3b）：把 {@link WorkspaceRegistry#maskEntries()} 的条目翻成 {@link SandboxMask} 要的 {@code
+   * {namespace, path}} 形状。
+   *
+   * <p><b>为什么不在这里筛</b>：清单的内容（哪些路径、属于哪个命名空间、能不能进）是工作区模块与能力目录共同决定的事——注册表已经保证
+   * "只返回装配期条目、去重、次序稳定"（M6），装配层再筛一遍就等于给"进不进 bash 面"造出第二个判定点。判定仍由 {@code SandboxMask.fence} 按
+   * <b>调用者</b>的权限集逐条求与。
+   */
+  private static List<Map<String, Object>> maskConfigOf(WorkspaceRegistry registry) {
+    List<Map<String, Object>> entries = new ArrayList<>();
+    for (MaskEntry entry : registry.maskEntries()) {
+      entries.add(
+          Map.of(
+              SandboxMask.NAMESPACE_KEY, entry.namespace(),
+              SandboxMask.PATH_KEY, entry.path().toString()));
+    }
+    return List.copyOf(entries);
+  }
+
+  /**
+   * 工作区审计事件落到事件库（M8 / §4.7：每次挂载 / 卸载 / 拒绝都留痕）。
+   *
+   * <p><b>{@code detail} 可以含物理路径</b>——它只进事件库（内部留痕），不进模型面；网关读事件时按既有口径原样回吐，因此这里不额外加工。
+   * 落库失败只告警：审计失败不该改业务判定（同 B1 的既有口径）。
+   */
+  private static void recordWorkspaceEvent(EventStore events, WorkspaceEvent event) {
+    String payload;
+    try {
+      Map<String, Object> fields = new LinkedHashMap<>();
+      fields.put("mount", event.mount());
+      fields.put("detail", event.detail());
+      payload = PLUGIN_PAYLOAD.writeValueAsString(fields);
+    } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+      // 两个字符串键写不出 JSON 属结构性缺陷：退化成不带 payload 也要留痕（丢的只是细节，不是事件）
+      LOG.warn("工作区事件 payload 序列化失败（按无 payload 记）: type={}", event.type(), e);
+      payload = "";
+    }
+    try {
+      events.append(EventWrite.of(event.type(), event.holder(), payload, event.user()));
+    } catch (RuntimeException e) {
+      LOG.warn("工作区事件落库失败（审计失败不改业务判定）: type={} holder={}", event.type(), event.holder(), e);
+    }
   }
 
   /**

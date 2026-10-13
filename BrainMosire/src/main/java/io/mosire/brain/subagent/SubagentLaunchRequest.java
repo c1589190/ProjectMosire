@@ -34,12 +34,19 @@ import java.util.Set;
  *     超出调用者可达面一律响亮拒（{@code SKILL_SCOPE_DENIED}），不静默截断
  * @param editableSkills 想要给子体的<b>技能可编辑面</b>（语义同 {@code allowedSkills}，判定对照调用者的可编辑面）。
  *     生效值恒被求交进最终可见面之内（"改得动但看不见"造不出来）
+ * @param allowedDocs 想要给子体的<b>文档可见面</b>（R3b）：条目是文档面的物理路径前缀（{@code docs} 命名空间落格的就是挂载落点）。 {@code
+ *     null} = 不指定（不额外收窄：调用者可见面 ∩ 模板建议说了算）；空表 = <b>显式"什么文档都看不见"</b>（与 {@code allowedTools: []}
+ *     同形同义）。<b>与模板的分工同 {@code allowedDirs}</b>：模板那一份是建议（超出调用者静默求交），请求这一份是
+ *     <b>要求</b>——超出调用者可达面一律响亮拒（{@code DOC_SCOPE_DENIED}），不静默截断
+ * @param editableDocs 想要给子体的<b>文档可编辑面</b>（语义同 {@code allowedDocs}，判定对照调用者的可编辑面）。
+ *     生效值恒被求交进最终可见面之内（{@code docs-edit ⊆ docs}）
  */
 @SuppressFBWarnings(
     value = "EI_EXPOSE_REP",
     justification =
-        "allowedSkills/editableSkills 在规范构造里已 List.copyOf 成不可变快照；两者允许为 null（null = 不指定，与空表是"
-            + "两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——记录型数据的防御拷贝，不是暴露内部表示")
+        "allowedSkills/editableSkills/allowedDocs/editableDocs 在规范构造里已 List.copyOf 成不可变快照；四者允许为 null"
+            + "（null = 不指定，与空表是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——记录型数据的防御拷贝，"
+            + "不是暴露内部表示")
 public record SubagentLaunchRequest(
     String templateId,
     String goal,
@@ -51,7 +58,9 @@ public record SubagentLaunchRequest(
     List<String> allowedDirs,
     List<String> allowedTools,
     List<String> allowedSkills,
-    List<String> editableSkills) {
+    List<String> editableSkills,
+    List<String> allowedDocs,
+    List<String> editableDocs) {
 
   public SubagentLaunchRequest {
     if (templateId == null || templateId.isBlank()) {
@@ -77,13 +86,16 @@ public record SubagentLaunchRequest(
     }
     allowedSkills = checkSkillPaths("allowedSkills", allowedSkills);
     editableSkills = checkSkillPaths("editableSkills", editableSkills);
+    // 文档范围（R3b）与技能范围同一口径同一个校验函数：元素非空白、null 保持 null（"没提这一嘴"与"显式空表"是两种取值）
+    allowedDocs = checkSkillPaths("allowedDocs", allowedDocs);
+    editableDocs = checkSkillPaths("editableDocs", editableDocs);
     // 不可变副本（内联 copyOf：让 SpotBugs 看得见来源）；null 保持 null——"没提这一嘴"与"显式空表"是两种取值
     allowedDirs = allowedDirs == null ? null : List.copyOf(allowedDirs);
     allowedTools = allowedTools == null ? null : List.copyOf(allowedTools);
   }
 
   /**
-   * 技能范围条目的构造期校验（与 {@code allowedDirs}/{@code allowedTools} 同口径：元素必须非空白、null 保持 null）。
+   * 范围条目的构造期校验（技能与文档四个字段共用；与 {@code allowedDirs}/{@code allowedTools} 同口径：元素必须非空白、null 保持 null）。
    *
    * <p>只校验“形态”，不在这里判越界——越界是 {@link SubagentManager#spawn} 的事（它才有调用者可达面这份真值）。
    */
@@ -97,6 +109,39 @@ public record SubagentLaunchRequest(
       }
     }
     return List.copyOf(paths);
+  }
+
+  /**
+   * 11 参兼容构造（文档范围字段引入之前）：两个文档范围取 {@code null} = 不指定（逐字回到本字段引入前的行为）。
+   *
+   * <p>与 9 参那条同理：请求面是模型/调用方每任务现造的对象，保留旧签名可以让既有构造点（编排工具、夹具）零改动。
+   */
+  public SubagentLaunchRequest(
+      String templateId,
+      String goal,
+      Set<String> extraDenied,
+      Integer maxTurnsCap,
+      Long timeBudgetSecondsCap,
+      Long quotaMaxTokensCap,
+      CommandMode mode,
+      List<String> allowedDirs,
+      List<String> allowedTools,
+      List<String> allowedSkills,
+      List<String> editableSkills) {
+    this(
+        templateId,
+        goal,
+        extraDenied,
+        maxTurnsCap,
+        timeBudgetSecondsCap,
+        quotaMaxTokensCap,
+        mode,
+        allowedDirs,
+        allowedTools,
+        allowedSkills,
+        editableSkills,
+        null,
+        null);
   }
 
   /**

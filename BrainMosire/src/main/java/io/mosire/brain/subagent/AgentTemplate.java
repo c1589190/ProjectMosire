@@ -52,12 +52,18 @@ import java.util.regex.Pattern;
  *     同形同义）。同样<b>是建议不是要求</b>：最终生效值 = 调用者可见面 ∩ 这一份 ∩ 请求那一份，超出调用者的条目静默求交
  * @param editableSkills 该模板子体的<b>技能可编辑面建议</b>（语义同 {@code allowedSkills}）。生效值恒被求交进可见面之内——
  *     "改得动但看不见"在结构上造不出来（见 {@code SkillPermissions}）
+ * @param allowedDocs 该模板子体的<b>文档可见面建议</b>（R3b）：条目是文档面的物理路径前缀——{@code docs}/{@code docs-edit} 两个
+ *     命名空间落格的就是挂载的物理落点（见 {@code DocNamespaces}）。null = 不限（不额外收窄）；空表 = <b>显式"什么文档都看不见"</b> （与 {@code
+ *     allowedTools: []} 同形同义）。同样<b>是建议不是要求</b>：最终生效值 = 调用者可见面 ∩ 这一份 ∩ 请求那一份
+ * @param editableDocs 该模板子体的<b>文档可编辑面建议</b>（语义同 {@code allowedDocs}）。生效值恒被求交进可见面之内——
+ *     "改得动但看不见"在结构上造不出来（{@code docs-edit ⊆ docs}）
  */
 @SuppressFBWarnings(
     value = "EI_EXPOSE_REP",
     justification =
-        "allowedSkills/editableSkills 在规范构造里已 List.copyOf 成不可变快照，但两者允许为 null（null = 不限，与空表"
-            + "是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——这是记录型数据的防御拷贝，不是暴露内部表示")
+        "allowedSkills/editableSkills/allowedDocs/editableDocs 在规范构造里已 List.copyOf 成不可变快照，但都允许为"
+            + " null（null = 不限，与空表是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——这是记录型数据的防御拷贝，"
+            + "不是暴露内部表示")
 public record AgentTemplate(
     String id,
     String description,
@@ -76,7 +82,9 @@ public record AgentTemplate(
     List<ScriptStep> script,
     List<String> allowedWorkingDirs,
     List<String> allowedSkills,
-    List<String> editableSkills) {
+    List<String> editableSkills,
+    List<String> allowedDocs,
+    List<String> editableDocs) {
 
   /** 模板 id 形态约束（小写、短横线、≤64 字符——可直接充当文件名/进程标识）。 */
   private static final Pattern ID_PATTERN = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
@@ -132,6 +140,9 @@ public record AgentTemplate(
     // 技能范围与工作目录同一口径：null（不限）与 []（哪里都不许）是两种取值，不归一成一个；坏路径装载期响亮失败
     allowedSkills = normalizedPaths(id, "allowedSkills", allowedSkills);
     editableSkills = normalizedPaths(id, "editableSkills", editableSkills);
+    // 文档范围（R3b）与技能范围同一口径：同一个归一函数，理由同上——"坏路径在装载期失败"这条保证不许缺角
+    allowedDocs = normalizedPaths(id, "allowedDocs", allowedDocs);
+    editableDocs = normalizedPaths(id, "editableDocs", editableDocs);
   }
 
   /**
@@ -176,6 +187,71 @@ public record AgentTemplate(
       return ResourceScope.none();
     }
     return ResourceScope.ofDirs(paths.stream().map(Path::of).toList());
+  }
+
+  /**
+   * 模板的 {@code docs} 作用域建议（文档可见面，R3b）：{@code null} ⇒ 不限；空表 ⇒ 什么都看不见；有值 ⇒ 物理路径前缀集 （挂载的落点，见 {@code
+   * DocNamespaces}）。
+   */
+  public ResourceScope docVisibleScope() {
+    return docScopeOf(allowedDocs);
+  }
+
+  /** 模板的 {@code docs-edit} 作用域建议（文档可编辑面）；生效值由 {@code SubagentManager} 求交进可见面。 */
+  public ResourceScope docEditScope() {
+    return docScopeOf(editableDocs);
+  }
+
+  /** 文档范围与技能范围共用同一个"null = 不限 / 空表 = 没有 / 有值 = 路径前缀集"读法（口径只有一处）。 */
+  private static ResourceScope docScopeOf(List<String> paths) {
+    return skillScopeOf(paths);
+  }
+
+  /**
+   * 18 参兼容构造（文档范围字段引入之前）：两个文档范围取 {@code null} = 不限（模板不额外收窄，逐字回到本字段引入前的行为）。
+   *
+   * <p>与 16 参那条同理：模板是部署者写的数据（JSON 走 {@link JsonCreator} 的规范构造），代码侧的既有构造点不该为了两个"没提这一嘴" 的字段全量改签名。
+   */
+  public AgentTemplate(
+      String id,
+      String description,
+      String systemPrompt,
+      String model,
+      AccessToken token,
+      Set<String> allowedTools,
+      Set<String> deniedTools,
+      boolean destructiveAllowed,
+      boolean sensitiveAllowed,
+      boolean readOnly,
+      int maxTurns,
+      int maxToolCallsPerTurn,
+      long timeBudgetSeconds,
+      long quotaMaxTokens,
+      List<ScriptStep> script,
+      List<String> allowedWorkingDirs,
+      List<String> allowedSkills,
+      List<String> editableSkills) {
+    this(
+        id,
+        description,
+        systemPrompt,
+        model,
+        token,
+        allowedTools,
+        deniedTools,
+        destructiveAllowed,
+        sensitiveAllowed,
+        readOnly,
+        maxTurns,
+        maxToolCallsPerTurn,
+        timeBudgetSeconds,
+        quotaMaxTokens,
+        script,
+        allowedWorkingDirs,
+        allowedSkills,
+        editableSkills,
+        null,
+        null);
   }
 
   /**

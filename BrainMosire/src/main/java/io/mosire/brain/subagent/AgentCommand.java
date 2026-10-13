@@ -3,6 +3,7 @@ package io.mosire.brain.subagent;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
+import io.mosire.docs.DocNamespaces;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +24,10 @@ import java.util.Objects;
  * 做每回合的技能目录预注入）；{@code --skill-visible}/{@code --skill-editable} 由 {@code argv} 从<b>实例权限集</b>现算
  * （{@code *} = 不限 / {@code none} = 一个都不许 / 其余每个前缀一项），子进程据此恢复自己的技能可见面与可编辑面—— 子体的技能工具仍由父侧 MCP
  * 链接服务（权限集也是父侧那份），argv 这一份只服务“预注入不得越出可见面”。未表态的命名空间不追加任何项。
+ *
+ * <p><strong>子工作区扩展（R3b，{@code --doc-visible}/{@code --doc-editable}）</strong>：与技能面同一条缝同一种编码—— 值由
+ * {@code argv} 从<b>实例权限集</b>现算（子工作区的 {@code docs} 能力在 spawn 时已落格，见 {@code SubagentManager}），
+ * 子进程据此恢复自己的文档可见面与可编辑面。未表态的命名空间不追加任何项；子进程侧对"缺席"的读法是 {@code none}（fail-closed）。
  *
  * <p><strong>三期 S1-A2 扩展（{@code configDir}）</strong>：子 Agent 走真模型时它自己的 {@code --data-dir}
  * 是隔离目录，底下没有 {@code config.json}（配置在父的数据目录） ⇒ 装配层把父的配置根经本组件注入子进程。它是与 {@code templatesDir} 同性质的"注入
@@ -205,10 +210,14 @@ public record AgentCommand(
     // 父级收紧过的才是子体该拿的，装配层没有第二份可写的地方（写错一处就是静默放大）。
     appendScope(argv, instance, SkillNamespaces.SKILLS, "--skill-visible");
     appendScope(argv, instance, SkillNamespaces.SKILLS_EDIT, "--skill-editable");
+    // 文档两个面（R3b）：与技能同一条缝、同一个编码（SkillPermissions.encode 是"ResourceScope → argv 项"的
+    // 唯一实现，文档面复用它而不是另写一份编解码）。命名空间常量取自 DocNamespaces——不在这里抄字符串。
+    appendScope(argv, instance, DocNamespaces.DOCS, "--doc-visible");
+    appendScope(argv, instance, DocNamespaces.DOCS_EDIT, "--doc-editable");
     return argv;
   }
 
-  /** 把一个已表态的技能作用域编码成重复的 argv 项（未表态 = 不追加，见 {@link #argv}）。 */
+  /** 把一个已表态的作用域编码成重复的 argv 项（未表态 = 不追加，见 {@link #argv}）。技能面与文档面共用（编码只有一处）。 */
   private static void appendScope(
       List<String> argv, SubagentInstance instance, String namespace, String flag) {
     ResourceScope scope = instance.permissions().resourceScopes().declaredScope(namespace);

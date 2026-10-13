@@ -191,7 +191,8 @@ BashPluginMosire ──→ AgentLibMosire（v1 逐字不动，N13）
 | `DocsMosire`（新） | `docs-mosire` | `io.mosire.docs.*` | `agentlib-mosire` + `workspace-mosire` | **Docs**：`LOG` 追加日志与条目模型（含可见性判据）+ `FILE` 的**自实现 IO**（原子创建/行寻址编辑/区间读）+ 库 API + `doc_*` 工具面。**不依赖执行核心、不挂 bash 入口（N13）** |
 | `BashPluginMosire` | `bash-plugin-mosire` | `io.mosire.bash.*` | `agentlib-mosire`（PF4J provided） | v1 **逐字不动**（104 条用例语义不变）；抽核与薄壳化见 §8 ⑤ |
 | `ShellMosire`（**后续**） | `shell-mosire` | `io.mosire.shell.*` | `agentlib-mosire` | **执行核心**（进程 + 三层围栏 + `BashSandbox` + 超时/截断）——随命令面模块一起落地（§8 ⑤、§5.10 草案） |
-| `BrainMosire` | `brain-mosire` | `io.mosire.brain.*` | `agentlib-mosire`（本期不变；技能重基批次再加 `docs-mosire`） | Agent 运行时；技能面本期**逐字不动**（其命名空间常量迁到本模块，见 §6.1） |
+| `BrainMosire` | `brain-mosire` | `io.mosire.brain.*` | `agentlib-mosire` + **`workspace-mosire` + `docs-mosire`**（R3b 起；控制方裁定：物化子体 `docs`/`docs-edit` 面、挂子体工作区、取 `DocsCapability` 常量都在 spawn 侧，**不许在 Brain 里另抄命名空间字符串**） | Agent 运行时；技能面本期**逐字不动**（其命名空间常量迁到本模块，见 §6.1） |
+| `MainMosire` | `main-mosire` | `io.mosire.main.*` | `brain-mosire` + **`workspace-mosire` + `docs-mosire`**（R3b 起：装配点注册两族工具、注册能力、挂装配期挂载） | 进程组装与网关；**不含 Agent 行为逻辑** |
 
 **依赖方向纪律**（新增）：`workspace-mosire` / `docs-mosire` **不得** import `io.mosire.brain.*` / `io.mosire.main.*`；`agentlib-mosire` 不得 import 任何下游；`docs-mosire` **不依赖任何插件**。
 
@@ -794,7 +795,8 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 - 动 AgentLib 的责任区（R1）与最终验收（R4）额外跑下游可用性检查（§0.5）。
 - **R1 → R3b 的交接项**：R1 落地时遮蔽面两个写端先写**字面** `("skills", <技能根>)`（技能面本期不迁 docs）；**R3b 必须改为由 `WorkspaceRegistry.maskEntries()` 产出**（§4.8 的能力落格）。
 - **R2 → R3b 的交接项**（R2 实现时发现，控制方裁定）：
-  1. **M1 对装配期挂载同样生效** ⇒ 装配方（`App`）必须给主 Agent 的权限集**显式加上 `workspaces` 前缀**（如 `<dataDir>/workspaces`），否则装配期挂载会被 M1 拒；这是有意的 fail-closed，不是缺陷。
+  1. **M1 对装配期挂载同样生效** ⇒ 装配方（`App`）必须给主 Agent 的权限集**显式加上 `workspaces` 前缀**——★ **R3b 实测修正**：前缀口径不是"`<dataDir>/workspaces`"一条，而是**装配期挂载的落点根集合**（R3b 落成 `{workspacesRoot, skillsRoot}`）；只写工作区根会让技能根的装配期挂载被 M1 拒。
+  1b. ★ **文档面必须先表态再挂载**（R3b 实测补充）：主 Agent 的 `docs`/`docs-edit` 面在装配期没有来源（不是继承来的），必须由装配方**显式声明**，否则挂主工作区会被 M1/M3 拒（"能力落格后必须仍 ⊆ 调用者面"）。
   2. **无能力的挂载不产出遮蔽面条目、也无法被 `resolve`**（谁都不持有该能力 ⇒ `RESOURCE_DENIED`）。要让技能根保持 R1 之前的遮蔽语义，装配方需注册一个**只含 `skills: READ`** 的能力并声明在技能根的 `REFERENCE` 挂载上；**不要**做成 `{skills, skills-edit}` 双命名空间，否则 G7 逐条目求与会把"可读不可改"的调用者一并遮蔽。
   3. **W3 深度闸不在工作区模块**：它复用 `subagents.maxDepth`，落在派生链（R3b 的 spawn 侧）；工作区模块只保证"真子目录 + 血缘子树"。
   4. **`resolve` 不检查物理目录是否存在**（解析是纯映射；IO 由消费方 fail-closed 报错），`list` 对缺失/非目录返回 `WORKSPACE_NOT_FOUND`。
@@ -804,6 +806,12 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
   2. **虚拟路径同时落在两个挂载范围内 ⇒ 具名拒 `INVALID_ARGUMENTS`**（R3a 的实现选择：不猜纪律——猜错会让"该拒的写"落进可写的那一个）。v1 单物理根 + 每使用者一切片下不构成正常路径；登记为 v1 行为。
   3. `DocsApi` 与 `DocsEngine` 有方法重叠：**`DocsApi` 是"库 API 门"的稳定出口，`DocsEngine` 是内部引擎**；R3b 接线用 `DocsApi`（工具面内部走 `DocsEngine`，两者同一实现）。
   4. 运行时 `docs` 能力由 **`DocsCapability.docs()`** 定义、经 `CapabilityCatalog.register(...)` 注册（R3b 装配时做）；`DocsCapability.Manifests.READ/WRITE` 是工具声明面的唯一出处。
+- **R3b → R4 的交接项**（R3b 实现时发现，控制方裁定）：
+  1. **两条必红（读码取证，未跑）**：`MainMosire/.../app/AppMcpLinkTest.java:59-61` 与 `:96-98` 的"工具面全等"断言——主 Agent registry 从 11 → **21**（+7 docs +3 workspace），期望集合必须由 R4 扩到新集合（**收紧而不是放宽**：仍是全等）。
+  2. **SpotBugs 首轮盯一条**：`SubagentManager` 新增 12 参终态构造上有 `@SuppressFBWarnings("EI_EXPOSE_REP2")`；若 verify 报 `US_USELESS_SUPPRESSION_ON_METHOD` ⇒ 删该注解（一行）。
+  3. **真子进程 E2E 未跑**：`W3SubagentE2ETest`、`SubagentSkillE2ETest`、`SubagentConfigDirWiringTest` 是否仍绿，由 R4 跑。
+  4. **注意事件库新增三类事件**：主事件库会多出 `workspace.mounted/unmounted/denied`——任何"遍历事件库并假定类型集合"的用例要一并核。
+  5. **R3b 的冒烟在仓外**（`/tmp/r3b-harness`，非测试文件）：它当场抓到两处实现缺陷（workspaces 前缀口径、文档面须先表态），可作为 R4 写用例的输入。
 - **R1 的已知红（判给 R4）**：`AgentLibMosire/src/test/java/io/mosire/agentlib/tool/SandboxMaskTest.java` 的 fixture/断言按**旧形状**写就（`pathsOf` / `skillsVisible` / 裸路径条目），而设计**有意**改了形状并删了这两个 API ⇒ 该文件**整套按新形状重写**属 R4（统一测试责任区）的活；R1 的门槛判据是 `-DskipTests compile` 绿 + 其余测试源 `test-compile` 绿（R1 用 `-Dmaven.compiler.failOnError=false` 诊断跑证明），**该红登记为带裁定的遗留项**。
 
 ---
@@ -822,6 +830,9 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 10. **登记的挂载表与磁盘可能不一致**：目录被外部进程删掉时，解析会 fail-closed，但登记不会自动清理（需要一次显式核对）；v1 只保证"不回落、不静默"。
 11. **递归工作区的回收**：父工作区卸载后子挂载级联失效（M10）；但已写在子工作区里的**数据仍在盘上**（不随卸载删除）——这是刻意的（文档是数据），也是需要使用者知道的行为。
 12. **N13 收缩的代价**：v1 的 `FILE` 文档只能经 `doc_create`/`doc_edit`/`doc_read` 操作，**没有 `grep`/`sort`/`sed` 这类便利**（命令面在后续模块）；且 `FILE` 挂载在 shell 侧遮蔽 ⇒ 想用 shell 处理文档，v1 做不到。**这是有意的取舍**（命令权限要独立模块评审），不是遗漏。
+13. ★ **用户可见的行为变化（R3b 装配后，必须对账）**：主 Agent 的 `bash` 现在对 `<dataDir>/workspaces{,/main}` 拿到**只读 bind**（此前这些目录根本不在遮蔽面清单里 ⇒ 未绑定、可写），对技能根仍是只读 bind。这是 §4.8/A3 的既定落点（v1 无 `bash` 能力 ⇒ 文档只经 Docs 工具写），但它**确实收窄了主 Agent 用 shell 写自己工作区的能力**——要不要开这个口子（把工作区根从遮蔽清单里挪出，或等命令面模块给 `bash` 能力）由用户裁定。
+14. **子工作区装配失败时的处置**（R3b 自定，控制方接受）：**不让 spawn 失败**——把子体的 `docs`/`docs-edit`/`workspaces` 收成显式 `none()`，落 `permission.denied` + `workspace.denied` 两条事件 + WARN。判据是"fail-closed 且在模型面可见（工具直接 `RESOURCE_DENIED`）"；若要"挂不上就拒 spawn"，改一处即可。
+15. **M6 的落地口径**（R3b 确认）：子体的**运行期**挂载（它自己的工作区，`Origin.RUNTIME`）**不进它的链路遮蔽面** ⇒ 子在 shell 里看不见自己的工作区（实测 `child fence = masked:[workspaces, workspaces/main], readOnly:[skills]`）。这与 M6/A3 一致：v1 的文档写只经 Docs 工具。
 
 ---
 

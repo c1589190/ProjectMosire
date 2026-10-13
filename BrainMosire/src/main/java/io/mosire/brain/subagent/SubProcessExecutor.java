@@ -12,6 +12,8 @@ import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.skills.SkillNamespaces;
+import io.mosire.workspace.MaskEntry;
+import io.mosire.workspace.WorkspaceRegistry;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -61,8 +63,24 @@ public final class SubProcessExecutor implements AgentExecutor {
   /**
    * 技能根目录（装配层注入；{@code null} = 本进程未接线技能面）：经 {@link #linkToolConfig} 作为“沙箱遮蔽面”下发， 让子体经父侧调 bash
    * 时，父侧能按<b>这个子体的技能可见面</b>决定遮蔽还是只读暴露技能树。
+   *
+   * <p><b>R3b 起这不是生产路径</b>：工作区面接线后，遮蔽面由 {@link #workspaceRegistry} 的装配期静态清单产出（技能根本身就是一个装配期 {@code
+   * REFERENCE} 挂载），本字段只服务"未接线工作区的既有装配与离线夹具"这一档——那时行为逐字回到 R3b 之前。
    */
   private final Path skillsRoot;
+
+  /**
+   * 工作区注册表（装配层注入；{@code null} = 未接线 ⇒ 退回 {@link #skillsRoot} 那一档的旧行为）。
+   *
+   * <p><b>为什么遮蔽面也从注册表取</b>：遮蔽面条目 = {@code {namespace, path}}，其内容（哪些路径、属于哪个命名空间）是装配期挂载的
+   * 函数；在子体链路里写死"技能根"就等于在装配层之外又开了一处拼写点（设计 §2.1 的"第二处拼写点"）。取 {@link
+   * WorkspaceRegistry#maskEntries()}（<b>只含装配期条目</b>，M6），判定仍由 {@link SandboxMask#fence}
+   * 按<b>该子体</b>的权限集 逐条求与——于是"这条路径对这个子体可见吗"的答案只取决于子体自己的面。
+   *
+   * <p><b>为什么不把子体自己的工作区挂载塞进来</b>：那是运行期挂载（{@code Origin.RUNTIME}），M6 明令不进遮蔽面（shell 看不见它， 这也正是 v1 的
+   * fail-closed 落点 A3/A8）。
+   */
+  private final WorkspaceRegistry workspaceRegistry;
 
   public SubProcessExecutor(SubprocessManager processes, AgentCommand command) {
     this(processes, command, null, null, null);
@@ -110,9 +128,29 @@ public final class SubProcessExecutor implements AgentExecutor {
   /**
    * 链接形态 + 技能根（本能力新增）：除最后一个参数外与上一构造逐字节相同。
    *
-   * <p>EI_EXPOSE_REP2 抑制落在本构造上（它才是真正持有 {@code parentTools} 引用的终态构造，见上）。
+   * <p>{@code workspaceRegistry = null} ⇒ 遮蔽面退回 {@link #skillsRoot} 那一档（R3b
+   * 之前的行为，逐字不变）；EI_EXPOSE_REP2 抑制落在真正持有引用的 8 参终态构造上——挂在本条只做委托的重载上会被 SpotBugs 判为无用抑制。
    *
    * @param skillsRoot 技能根目录（{@code null} = 未接线技能面 ⇒ 不下发遮蔽面，bash 行为逐字不变）
+   */
+  public SubProcessExecutor(
+      SubprocessManager processes,
+      AgentCommand command,
+      ToolRegistry parentTools,
+      String serverName,
+      String serverVersion,
+      ToolCallAuthorizer authorizer,
+      Path skillsRoot) {
+    this(processes, command, parentTools, serverName, serverVersion, authorizer, skillsRoot, null);
+  }
+
+  /**
+   * 链接形态 + <b>工作区遮蔽面</b>（R3b）：除最后一个参数外与上一构造逐字节相同。
+   *
+   * <p>EI_EXPOSE_REP2 抑制落在本构造上（它才是真正持有 {@code parentTools} 引用的终态构造，见上）；{@code workspaceRegistry}
+   * 同理是装配层按实例共享的实时注册表，本类只读使用。
+   *
+   * @param workspaceRegistry 工作区注册表（{@code null} = 未接线 ⇒ 遮蔽面退回 {@code skillsRoot} 那一档）
    */
   @SuppressFBWarnings("EI_EXPOSE_REP2")
   public SubProcessExecutor(
@@ -122,7 +160,9 @@ public final class SubProcessExecutor implements AgentExecutor {
       String serverName,
       String serverVersion,
       ToolCallAuthorizer authorizer,
-      Path skillsRoot) {
+      Path skillsRoot,
+      WorkspaceRegistry workspaceRegistry) {
+    this.workspaceRegistry = workspaceRegistry;
     this.processes = Objects.requireNonNull(processes, "processes");
     this.command = Objects.requireNonNull(command, "command");
     this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
@@ -177,9 +217,10 @@ public final class SubProcessExecutor implements AgentExecutor {
    * childDataDir}（实例的数据目录一律由<b>本进程</b>这个根派生——子体的 {@code spawn_sub_agent} 经父侧编排执行，孙代也在同一个根下落库， 与
    * {@code SubagentManager.childDbPath} 的 {@code <root>/<id>/events.db} 口径逐字对齐）。
    *
-   * <p><b>边界（不许含糊）</b>：这里<b>只</b>有这三键，补的是"子体读得到"。bash 三件套等其它工具的配置<b>不</b>在此注入——它们在这条缝上仍拿到空 config ⇒
-   * 各自的缺省口径（{@code io.mosire.bash.BashToolConfig.fromToolConfig} 对空表有安全缺省；<b>但</b>部署侧配的 {@code
-   * tools.bash.*} 附加项对子体不生效——见本轮报告，属未修的独立缝）。
+   * <p><b>边界（不许含糊）</b>：补的是"子体读得到"三键 <b>+ R3b 起补遮蔽面</b>（{@link SandboxMask#CONFIG_KEY}，见 {@link
+   * #maskEntries()}——技能树与工作区树在子体的 bash 侧必须按<b>该子体</b>的面遮蔽/只读）。其余工具配置（bash 三件套、套件内其余键）<b>不</b>在此注入——
+   * 它们在这条缝上仍拿到空 config ⇒ 各自的缺省口径（{@code io.mosire.bash.BashToolConfig.fromToolConfig} 对空表有安全缺省；
+   * <b>但</b>部署侧配的 {@code tools.bash.*} 附加项对子体不生效——见本轮报告，属未修的独立缝）。
    *
    * <p>{@code childDataDir == null}（装配层没注入数据根）⇒ 返回空表，逐字回到本缝接线前的行为：<b>不编路径</b>，读侧拿到的是 {@code
    * CONTEXT_UNAVAILABLE}（响亮），不是一份猜出来的库。
@@ -195,10 +236,16 @@ public final class SubProcessExecutor implements AgentExecutor {
           root.resolve(instanceId).resolve("events.db").toString());
       config.put(AgentContextReader.CONFIG_SELF_AGENT_ID, instanceId);
     }
-    if (skillsRoot != null) {
-      // 技能树遮蔽面：链路上下文里也带上（同一条 D30 运行时缝）——子体调父侧 bash 时，父侧按该子体的 skills 命名空间
-      // 判定“整棵树遮蔽 / 只读暴露”，从而堵住“技能不可见却能用 shell 读技能文件”的旁路
-      // R1 收编：条目必须自带命名空间（SandboxMask 命名空间无关，不再硬编码 skills）
+    if (workspaceRegistry != null) {
+      // R3b：遮蔽面 = 工作区注册表的装配期静态清单（{namespace, path} 形状，与主 Agent 那侧同一份数据源）——
+      // 判定仍按**该子体**的权限集逐条求与（SandboxMask.fence），所以"技能树遮蔽/只读""工作区树遮蔽"都随这个子体的面走。
+      // 运行期挂载（子体自己的工作区）按 M6 不进清单：shell 看不见它（v1 的 fail-closed 落点 A3/A8）。
+      List<Map<String, Object>> entries = maskEntries();
+      if (!entries.isEmpty()) {
+        config.put(SandboxMask.CONFIG_KEY, entries);
+      }
+    } else if (skillsRoot != null) {
+      // 未接线工作区（既有装配/离线夹具）：逐字保留 R3b 之前的单条技能根遮蔽面
       config.put(
           SandboxMask.CONFIG_KEY,
           List.of(
@@ -209,6 +256,22 @@ public final class SubProcessExecutor implements AgentExecutor {
                   skillsRoot.toString())));
     }
     return Map.copyOf(config);
+  }
+
+  /**
+   * 装配期静态遮蔽面清单（{@code {namespace, path}} 条目；设计 §4.8 与 M6）。
+   *
+   * <p>读 {@link WorkspaceRegistry#maskEntries()}——注册表已保证只返回装配期条目、去重且次序稳定；本类只做形状翻译，不筛不猜。
+   */
+  private List<Map<String, Object>> maskEntries() {
+    List<Map<String, Object>> entries = new java.util.ArrayList<>();
+    for (MaskEntry entry : workspaceRegistry.maskEntries()) {
+      entries.add(
+          Map.of(
+              SandboxMask.NAMESPACE_KEY, entry.namespace(),
+              SandboxMask.PATH_KEY, entry.path().toString()));
+    }
+    return List.copyOf(entries);
   }
 
   @Override

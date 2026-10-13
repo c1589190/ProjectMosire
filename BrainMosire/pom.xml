@@ -20,6 +20,26 @@
       <artifactId>agentlib-mosire</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!--
+      工作区标准（R3b 裁定 2026-10-13）：spawn 侧要"为一个子体挂一块自己的工作区并落格 docs 能力"——
+      这是父侧运行期状态的一次登记（holder=父/user=子），必须在 Brain 的派生链上完成，不能挪到 Main 的装配期
+      （那时还不知道实例 id）。依赖方向无环：workspace-mosire → agentlib-mosire（workspace 不依赖 Brain）。
+    -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>workspace-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!--
+      Docs 面（同上裁定）：{@code docs}/{@code docs-edit} 两个命名空间常量住在 docs-mosire（DocNamespaces），
+      物化与 argv 传递都必须引用<b>那一份</b>——在 Brain 里另抄一份字符串就是设计 §2.1 点名的"第二处拼写点"。
+      依赖方向无环：docs-mosire → workspace-mosire → agentlib-mosire。
+    -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>docs-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <!-- 事件 payload/工具参数 JSON 序列化（版本由根 pom jackson-bom 管理） -->
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>

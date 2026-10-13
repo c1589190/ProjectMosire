@@ -42,7 +42,10 @@ import org.slf4j.LoggerFactory;
  * <p>错误映射契约：参数缺失/非法 → {@code INVALID_ARGUMENTS}；编排层拒绝（工具越界/单调性/深度，对应 {@link
  * SubagentRejectedException}）→ {@code PERMISSION_DENIED}（可读原因经 message 透出）；<b>工作目录越界</b>（{@link
  * WorkingDirDeniedException}）→ {@code
- * DIR_NOT_ALLOWED}（S5-B：与"你不该用这个工具"分码——它要说的是"你要的目录不在上级可达面里"）；<b>繁殖预算耗尽</b>（{@link
+ * DIR_NOT_ALLOWED}（S5-B：与"你不该用这个工具"分码——它要说的是"你要的目录不在上级可达面里"）；<b>技能范围越界</b>（{@link
+ * SkillScopeDeniedException}）→ {@code SKILL_SCOPE_DENIED}、<b>文档范围越界</b>（{@link
+ * DocScopeDeniedException}，R3b）→ {@code
+ * DOC_SCOPE_DENIED}（同一条理由：模型要能分辨"我要的范围不成立"与"我不该用这个工具"）；<b>繁殖预算耗尽</b>（{@link
  * SubagentBudgetExceededException}）→ {@code
  * BUDGET_EXHAUSTED}（与越权分码：前者"现在不行"、后者"你不该要"，见该异常的类注释）；未知实例 → {@code UNKNOWN_INSTANCE}；<b>越出血缘范围</b>
  * → {@code SUBTREE_DENIED}（D27；模型面只说"这一类被拒"，细节进日志）；启动失败 → {@code LAUNCH_FAILED}；读上下文失败（库不存在/配置未注入）→
@@ -153,6 +156,28 @@ public final class SubagentOrchestrationTools {
                         Map.of("type", "string"),
                         "description",
                         "给子体的技能可编辑范围（可选，语义同上，对照你自己的可编辑范围）；生效值恒在可见范围之内")),
+                // 文档范围（R3b，可选，两个面）：条目是文档面的物理路径前缀（= 你自己的工作区落点）。
+                // 给 = 明确要求（超出你自己的文档面 ⇒ 派发即拒，码 DOC_SCOPE_DENIED）；空数组 = 要求"什么文档都看不见"；
+                // 不给 = 调用者范围 ∩ 模板建议说了算。子体拿到的工作区恒是它自己那块（父的其它内容对它不可见）。
+                Map.entry(
+                    "allowedDocs",
+                    Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string"),
+                        "description",
+                        "给子体的文档可见范围（可选）：文档面的物理路径前缀；"
+                            + "不填 = 继承并受模板收窄；空数组 = 什么文档都看不见；超出你自己的文档面 ⇒ 派发即拒")),
+                Map.entry(
+                    "editableDocs",
+                    Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string"),
+                        "description",
+                        "给子体的文档可编辑范围（可选，语义同上，对照你自己的可编辑范围）；生效值恒在可见范围之内")),
                 Map.entry("maxTurnsCap", Map.of("type", "integer")),
                 Map.entry("timeBudgetSecondsCap", Map.of("type", "integer")),
                 Map.entry("quotaMaxTokensCap", Map.of("type", "integer")),
@@ -198,7 +223,9 @@ public final class SubagentOrchestrationTools {
                     strListArg(context, "allowedDirs"),
                     strListArg(context, "allowedTools"),
                     strListArg(context, "allowedSkills"),
-                    strListArg(context, "editableSkills"));
+                    strListArg(context, "editableSkills"),
+                    strListArg(context, "allowedDocs"),
+                    strListArg(context, "editableDocs"));
           } catch (IllegalArgumentException e) {
             // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
             return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());
@@ -214,6 +241,9 @@ public final class SubagentOrchestrationTools {
           } catch (SkillScopeDeniedException e) {
             // 技能范围越界同理单独一码：模型据此改成"要一个自己看得见的技能范围"，而不是换模板接着撞
             return ToolResult.error("SKILL_SCOPE_DENIED", e.getMessage());
+          } catch (DocScopeDeniedException e) {
+            // 文档范围越界（R3b）同理单独一码：模型据此改成"要一个自己够得着的文档面"
+            return ToolResult.error("DOC_SCOPE_DENIED", e.getMessage());
           } catch (SubagentBudgetExceededException e) {
             // 预算与越权分码：越权 = "你不该要"，预算 = "现在不行"（模型据此才会等/收敛，而不是换条路接着撞）
             return ToolResult.error("BUDGET_EXHAUSTED", e.getMessage());

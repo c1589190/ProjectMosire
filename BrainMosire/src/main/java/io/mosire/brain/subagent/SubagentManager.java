@@ -2,6 +2,7 @@ package io.mosire.brain.subagent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -19,6 +20,17 @@ import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
+import io.mosire.docs.DocNamespaces;
+import io.mosire.docs.DocsCapability;
+import io.mosire.workspace.Kind;
+import io.mosire.workspace.Mount;
+import io.mosire.workspace.MountName;
+import io.mosire.workspace.Origin;
+import io.mosire.workspace.Resolvers;
+import io.mosire.workspace.WorkspaceCaller;
+import io.mosire.workspace.WorkspaceException;
+import io.mosire.workspace.WorkspacePermissions;
+import io.mosire.workspace.WorkspaceRegistry;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -34,6 +46,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
@@ -136,6 +149,27 @@ public final class SubagentManager implements AutoCloseable {
    * 报异常终局，也不假装子体交代过）。生产装配（{@code App.wireSubagents}）必注入。
    */
   private final Path childDataRoot;
+
+  /**
+   * 工作区注册表（装配层注入；{@code null} = 本进程未接线工作区面）。
+   *
+   * <p><b>为什么住在这里而不是 Main 的装配期</b>：子工作区的落点 = 父自己工作区目录下的真子目录、{@code user} = <b>拟建实例 id</b>——实例 id 只有
+   * spawn 那一刻才存在（{@link #instanceIdOf}），装配期根本不知道要给谁挂。因此挂载动作属于派生链（设计 §5.7： "spawn
+   * 时：父侧为子体挂两个挂载"），Main 只负责把注册表交给本类与把事件汇聚点接上。
+   *
+   * <p><b>{@code null} 的行为</b>：不挂子工作区、{@code docs}/{@code docs-edit} 两个面按"调用者 ∩ 模板 ∩
+   * 请求"照常物化（物化不依赖注册表）。
+   */
+  private final WorkspaceRegistry workspaceRegistry;
+
+  /**
+   * 血缘路径登记缝（装配层注入；{@code null} = 未接线）：把<b>拟建子体</b>的血缘路径登记进工作区注册表的取数缝。
+   *
+   * <p><b>为什么需要这条缝</b>：工作区模块的 M2 守卫要判"user 是不是自己或后代"，而血缘路径的真值住在 Brain（实例记录）；工作区模块<b>不得依赖
+   * Brain</b>（设计 §3），因此它的血缘取数函数由装配层注入——而"拟建子体"的血缘只有 spawn 侧算得出来（{@code 父path + "/" + 子
+   * id}），必须在这条缝上先登记、再挂载。不登记 ⇒ M2 解析不出 ⇒ 具名拒 ⇒ 子体拿不到工作区（fail-closed，不是静默放大）。
+   */
+  private final BiConsumer<String, String> lineageRegistrar;
 
   /** 私有锁：状态记录/事件顺序/句柄表全部在锁内原子推进（同 SubprocessManager/USO 理由）。 */
   private final Object lock = new Object();
@@ -250,6 +284,48 @@ public final class SubagentManager implements AutoCloseable {
       Supplier<CommandMode> parentMode,
       SubagentLimits limits,
       Path childDataRoot) {
+    this(
+        templateStore,
+        launcher,
+        events,
+        bus,
+        parentConfig,
+        parentPermissions,
+        parentDepth,
+        parentMode,
+        limits,
+        childDataRoot,
+        null,
+        null);
+  }
+
+  /**
+   * 全参装配 + <b>子工作区接线</b>（R3b）。
+   *
+   * <p>EI_EXPOSE_REP2 抑制落在本构造（真正的终态构造）：{@code workspaceRegistry} 是装配层按实例共享的<b>实时</b>注册表
+   * （子工作区登记正是它的职责），{@code lineageRegistrar} 是同一条装配缝上的回调；两者都<b>允许为 null</b>（未接线）， 因此拿不到 {@code
+   * Objects.requireNonNull} 那层"已防御"的判据——与 {@code SubProcessExecutor} 的终态构造同款理由
+   * （同包先例；挂在只做委托的重载上会被判为无用抑制）。
+   *
+   * @param workspaceRegistry 工作区注册表（{@code null} = 未接线：不挂子工作区，其余行为逐字不变——既有夹具与离线装配走这一档）
+   * @param lineageRegistrar 血缘登记缝（{@code null} = 未接线；与 {@code workspaceRegistry} 同进同出，见字段 javadoc）
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
+  public SubagentManager(
+      AgentTemplateStore templateStore,
+      SubagentLauncher launcher,
+      EventStore events,
+      EventBus bus,
+      AgentConfig parentConfig,
+      AgentPermissionSet parentPermissions,
+      int parentDepth,
+      Supplier<CommandMode> parentMode,
+      SubagentLimits limits,
+      Path childDataRoot,
+      WorkspaceRegistry workspaceRegistry,
+      BiConsumer<String, String> lineageRegistrar) {
+    this.workspaceRegistry = workspaceRegistry;
+    this.lineageRegistrar = lineageRegistrar;
     this.childDataRoot = childDataRoot;
     this.limits = Objects.requireNonNull(limits, "limits");
     this.templateStore = Objects.requireNonNull(templateStore, "templateStore");
@@ -337,14 +413,23 @@ public final class SubagentManager implements AutoCloseable {
     String instanceId = instanceIdOf(template.id());
     // D27：授权面点名 ⊆ 调用者能力集（I1）——<b>派发即拒</b>，与目录越界同形（同"请求面是要求"口径）
     checkRequestedToolsWithinCaller(template, instanceId, request, callerPermissions, caller);
+    // 血缘在派发那一刻算定（{@link #lineagePathOf}）：既进实例记录，也先登记进工作区注册表的血缘缝——
+    // 子工作区的 M2 守卫要在挂载那一刻判"这个 user 是不是调用者的后代"，而它查的就是这份路径
+    String lineagePath = lineagePathOf(caller.instanceId(), instanceId);
+    ChildWorkspace childWorkspace = planChildWorkspace(caller.instanceId(), instanceId);
     AgentPermissionSet permissions =
-        tightenPermissions(template, request, callerPermissions, instanceId, caller.instanceId());
+        tightenPermissions(
+            template, request, callerPermissions, instanceId, caller.instanceId(), childWorkspace);
     checkMonotonicity(template, instanceId, permissions, callerPermissions, caller.instanceId());
     CommandMode mode = resolveMode(template, instanceId, request, caller);
     int depth = caller.depth() + 1;
+    // W3（设计 §4.10 M9）：子工作区的递归深度 = 子 Agent 的递归深度——同一道闸（subagents.maxDepth），
+    // 且在挂载<b>之前</b>：深度超限时根本走不到挂载，所以不存在第二个深度旋钮，也不存在"闸外多挂一层"
     checkDepth(template, instanceId, depth, caller.instanceId());
+    // 子工作区：父为子挂 /workspace（holder=父、user=子、落点 = 父自己工作区下的真子目录，W1/W2/M9/M11/M12 在注册表里判）
+    permissions =
+        openChildWorkspace(childWorkspace, permissions, caller, callerPermissions, lineagePath);
     AgentConfig childConfig = deriveConfig(template, request, instanceId, permissions);
-    String lineagePath = lineagePathOf(caller.instanceId(), instanceId);
 
     SubagentInstance configured =
         new SubagentInstance(
@@ -694,9 +779,10 @@ public final class SubagentManager implements AutoCloseable {
       SubagentLaunchRequest request,
       AgentPermissionSet callerPermissions,
       String instanceId,
-      String callerId) {
+      String callerId,
+      ChildWorkspace childWorkspace) {
     ResourceScopeMap scopes =
-        effectiveScopes(template, request, callerPermissions, instanceId, callerId);
+        effectiveScopes(template, request, callerPermissions, instanceId, callerId, childWorkspace);
     AgentPermissionSet base = narrowedTemplatePermissions(template, request);
     if (request.extraDenied().isEmpty()) {
       return base.withResourceScopes(scopes);
@@ -772,13 +858,22 @@ public final class SubagentManager implements AutoCloseable {
    *
    * <p>其余命名空间（{@code fs} 以外的）逐条照抄调用者的取值——本段只给 {@code fs} 定义了"模板/请求怎么参与"， 别的命名空间没有对应字段，照抄即"继承父级"（裁决
    * ②）。
+   *
+   * <p><b>文档两个面（R3b）与技能同形</b>：{@code docs} / {@code docs-edit} 也是"调用者是真值来源、模板是建议（静默求交）、请求是要求 （越界响亮拒
+   * {@code DOC_SCOPE_DENIED}）"，且<b>必须物化</b>——留空会让子体的文档面回落到"未表态"，而单调性守卫看不见"没表态"那一层 （S5-A
+   * 的构造期常量教训的同一形态）。生效值恒满足 {@code docs-edit ⊆ docs}。
+   *
+   * <p><b>W5 收窄</b>：有子工作区时，两个文档面再与"子体自己的工作区落点"求交——子体只看得见自己的工作区，父的其它内容对它不可见 （设计 §4.7 W5）。收窄用的是
+   * {@link ResourceScope#narrowTo} 的 containment 语义：覆盖不到 ⇒ 空集（fail-closed），绝不"猜一个更宽的面"。 {@code
+   * workspaces} 面同样收窄到该落点（W2：只能在自己的工作区目录内划更小的工作区）。
    */
   private ResourceScopeMap effectiveScopes(
       AgentTemplate template,
       SubagentLaunchRequest request,
       AgentPermissionSet callerPermissions,
       String instanceId,
-      String callerId) {
+      String callerId,
+      ChildWorkspace childWorkspace) {
     ResourceScope callerFs = callerPermissions.fsScope();
     ResourceScope requested = requestedDirScope(template, request, instanceId, callerId, callerFs);
     if (requested != null && !callerFs.covers(requested)) {
@@ -838,11 +933,60 @@ public final class SubagentManager implements AutoCloseable {
             .narrowTo(effective(requestedEditable))
             .narrowTo(effectiveVisible);
 
+    // 文档两个面（R3b）：与技能同一套口径。命名空间常量取自 docs-mosire（{@link DocNamespaces}）——
+    // 这里不写任何字符串字面，避免"第二处拼写点"。
+    ResourceScope callerDocs = WorkspacePermissions.declared(callerPermissions, DocNamespaces.DOCS);
+    ResourceScope requestedDocs =
+        requestedDocScope(
+            template, "allowedDocs", request.allowedDocs(), instanceId, callerId, callerDocs);
+    if (requestedDocs != null && !callerDocs.covers(requestedDocs)) {
+      throw docDenied(
+          template, instanceId, callerId, "allowedDocs", request.allowedDocs(), callerDocs, true);
+    }
+    ResourceScope effectiveDocs =
+        callerDocs.narrowTo(template.docVisibleScope()).narrowTo(effective(requestedDocs));
+
+    ResourceScope callerDocsEdit =
+        WorkspacePermissions.declared(callerPermissions, DocNamespaces.DOCS_EDIT);
+    ResourceScope requestedDocsEdit =
+        requestedDocScope(
+            template, "editableDocs", request.editableDocs(), instanceId, callerId, callerDocsEdit);
+    if (requestedDocsEdit != null && !callerDocsEdit.covers(requestedDocsEdit)) {
+      throw docDenied(
+          template,
+          instanceId,
+          callerId,
+          "editableDocs",
+          request.editableDocs(),
+          callerDocsEdit,
+          false);
+    }
+    // 不变式：docs-edit ⊆ docs（求交落成数据）
+    ResourceScope effectiveDocsEdit =
+        callerDocsEdit
+            .narrowTo(template.docEditScope())
+            .narrowTo(effective(requestedDocsEdit))
+            .narrowTo(effectiveDocs);
+
+    ResourceScope effectiveWorkspaces =
+        WorkspacePermissions.declared(callerPermissions, WorkspacePermissions.WORKSPACES);
+    if (childWorkspace != null) {
+      // W5/W2：子工作区是子体文档面的唯一边界，也是它"能往哪里划更小工作区"的边界。
+      // narrowTo 是 containment 求交：覆盖不到就成空集（fail-closed），不会悄悄放宽。
+      ResourceScope own = ResourceScope.ofDir(childWorkspace.dir());
+      effectiveDocs = effectiveDocs.narrowTo(own);
+      effectiveDocsEdit = effectiveDocsEdit.narrowTo(own);
+      effectiveWorkspaces = effectiveWorkspaces.narrowTo(own);
+    }
+
     return callerPermissions
         .resourceScopes()
         .withNamespace(ResourceScopeMap.FS, effectiveFs)
         .withNamespace(SkillNamespaces.SKILLS, effectiveVisible)
-        .withNamespace(SkillNamespaces.SKILLS_EDIT, effectiveEditable);
+        .withNamespace(SkillNamespaces.SKILLS_EDIT, effectiveEditable)
+        .withNamespace(DocNamespaces.DOCS, effectiveDocs)
+        .withNamespace(DocNamespaces.DOCS_EDIT, effectiveDocsEdit)
+        .withNamespace(WorkspacePermissions.WORKSPACES, effectiveWorkspaces);
   }
 
   /**
@@ -923,6 +1067,221 @@ public final class SubagentManager implements AutoCloseable {
             "callerSkillScope", callerScope.summary(),
             "face", field));
     return new SkillScopeDeniedException(message);
+  }
+
+  /**
+   * 请求面的文档范围（R3b，{@code null} = 没提这一嘴 ⇒ 不参与求交；空表 = 显式"什么文档都看不见"）。
+   *
+   * <p>与 {@link #requestedSkillScope} 逐条同形：路径归一失败也走 {@link
+   * DocScopeDeniedException}（坏路径与越界同属"这次要的东西不成立"， 工具层落同一个码，模型改一次就行）。
+   */
+  private ResourceScope requestedDocScope(
+      AgentTemplate template,
+      String field,
+      List<String> paths,
+      String instanceId,
+      String callerId,
+      ResourceScope callerScope) {
+    if (paths == null) {
+      return null;
+    }
+    if (paths.isEmpty()) {
+      return ResourceScope.none();
+    }
+    try {
+      return ResourceScope.ofDirs(paths.stream().map(Path::of).toList());
+    } catch (IllegalArgumentException | UncheckedIOException e) {
+      String message =
+          "子 Agent 文档范围参数无法归一（DOC_SCOPE_DENIED）: " + field + "=" + paths + " 原因=" + e.getMessage();
+      emit(
+          EventTypes.PERMISSION_DENIED,
+          callerId,
+          instanceId,
+          Map.of(
+              "template", template.id(),
+              "childId", instanceId,
+              "reason", message,
+              "requestedDocs", paths,
+              "callerDocScope", callerScope.summary(),
+              "face", field));
+      throw new DocScopeDeniedException(message);
+    }
+  }
+
+  /** 文档范围越界拒绝：{@code permission.denied} 事件（agent = 被拒的调用者）+ 带需求与可达面的异常。 */
+  private DocScopeDeniedException docDenied(
+      AgentTemplate template,
+      String instanceId,
+      String callerId,
+      String field,
+      List<String> requested,
+      ResourceScope callerScope,
+      boolean visibleFace) {
+    String face = visibleFace ? "可见面" : "可编辑面";
+    String message =
+        "子 Agent 文档"
+            + face
+            + "越界（DOC_SCOPE_DENIED）: 请求 "
+            + field
+            + "="
+            + requested
+            + " 调用者"
+            + face
+            + "可达="
+            + callerScope.summary()
+            + "（请求面是'要求'不是'建议'：超出上级可达面一律拒，任一方都不静默截断）";
+    emit(
+        EventTypes.PERMISSION_DENIED,
+        callerId,
+        instanceId,
+        Map.of(
+            "template", template.id(),
+            "childId", instanceId,
+            "reason", message,
+            "requestedDocs", requested,
+            "callerDocScope", callerScope.summary(),
+            "face", field));
+    return new DocScopeDeniedException(message);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // 子工作区（R3b：设计 §5.7 + §4.7 W1–W6 / M9–M12）
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * 拟建的子工作区：{@code /workspace}（沿用父的虚拟挂载名，W5："子体看到的仍是自己的 /workspace"）。
+   *
+   * <p>只有{@code dir}要参与权限物化（W5 的收窄），{@code spec} 是挂载时才用到的登记项——分两步是为了让"权限先物化、再挂载"这个顺序
+   * 在代码里看得见：物化必须在单调性/深度守卫之前完成，挂载必须在它们<b>之后</b>（W3）。
+   */
+  private record ChildWorkspace(Mount spec) {
+
+    Path dir() {
+      return spec.dir();
+    }
+  }
+
+  /**
+   * 计划一个子工作区（<b>只读、无副作用</b>）：父自己名下要有一个带 {@code docs} 能力的 {@code FILE} 工作区， 落点 = 它下面以<b>拟建实例 id</b>
+   * 命名的真子目录（W1：严格更小）。
+   *
+   * <p>四个"不挂"的情形（都朝 fail-closed 一侧，且不新增任何权限）：
+   *
+   * <ul>
+   *   <li>本进程未接线工作区（{@code workspaceRegistry == null}）——既有装配与离线夹具走这一档，行为逐字不变；
+   *   <li>父自己名下没有 {@code FILE} + {@code docs} 的工作区——没有"自己的工作区"就没有可以划小的范围（N12 的前提）；
+   *   <li>落点归一后不等于自身（含 {@code ..} 段）——instanceId 的形态本不允许，但这里不"猜"，直接不挂；
+   *   <li>物化后的文档面覆盖不到落点（模板/请求把它收成了空）——挂一块子体解析不了的挂载只会制造"有工作区却什么都做不了"的假象， 在 {@link
+   *       #openChildWorkspace} 里跳过。
+   * </ul>
+   *
+   * <p><b>为什么取"最深的那个 FILE 工作区"</b>：子体自己也有一块 {@code /workspace}，它再派孙代时应当从<b>它自己</b>的那块往下划，
+   * 而不是从祖先的根划（否则"逐层只减不增"名存实亡）。按目录段数取最深 = 离自己最近的那一块，且对同一份挂载表是确定性的。
+   */
+  private ChildWorkspace planChildWorkspace(String callerId, String childId) {
+    WorkspaceRegistry registry = workspaceRegistry;
+    if (registry == null) {
+      return null;
+    }
+    Mount own = ownDocsWorkspace(callerId);
+    if (own == null) {
+      return null;
+    }
+    Path dir = own.dir().resolve(childId).normalize();
+    if (!dir.isAbsolute()
+        || !dir.normalize().equals(dir)
+        || !dir.startsWith(own.dir())
+        || dir.equals(own.dir())) {
+      LOG.warn("子工作区落点不可用，本次不挂（fail-closed）: caller={} child={} dir={}", callerId, childId, dir);
+      return null;
+    }
+    // 能力 = {docs}（v1 唯一注册的能力，取自 DocsCapability.ID，不在这里抄字符串）；Origin.RUNTIME：
+    // 运行期挂载不进 bash 遮蔽面（M6），v1 的挂载在 shell 侧一律遮蔽（A3/A8/N13）
+    Mount spec =
+        new Mount(
+            new MountName(own.name().value()),
+            callerId,
+            childId,
+            dir,
+            Resolvers.direct(),
+            Kind.FILE,
+            Set.of(DocsCapability.ID),
+            Origin.RUNTIME);
+    return new ChildWorkspace(spec);
+  }
+
+  /** 某身份键名下"能当子工作区父目录"的那一块：带 {@code docs} 能力的 {@code FILE} 挂载里最深的那个。 */
+  private Mount ownDocsWorkspace(String callerId) {
+    Mount best = null;
+    for (Mount mount : workspaceRegistry.mounts(callerId)) {
+      if (mount.kind() != Kind.FILE || !mount.capabilities().contains(DocsCapability.ID)) {
+        continue;
+      }
+      if (best == null || mount.dir().getNameCount() > best.dir().getNameCount()) {
+        best = mount;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * 真挂：登记子工作区挂载 + 把 {@code docs} 能力落格进子体权限集（设计 §4.8：能力只在挂载/授予时落格，A8）。
+   *
+   * <p>顺序写死：<b>先登记血缘路径</b>（M2 要判"user 是不是调用者的后代"，而它查的血缘真值住在 Brain）→ <b>再 mount</b>（M1–M4 / M9 / M11
+   * / M12 全在注册表里判）→ <b>再 grant</b>（A5：只补进未表态/已覆盖的落点，绝不放大）。
+   *
+   * <p><b>被拒的处置（fail-closed，不静默也不连坐）</b>：注册表的守卫拒绝不让整个 spawn 失败（那会把"文档面配错了"升级成"派不出子 Agent"），
+   * 但子体<b>不保留任何指向不存在挂载的面</b>——{@code docs}/{@code docs-edit}/{@code workspaces} 一并收成显式 {@code
+   * none()}， 并落一条 {@code permission.denied} 事件（注册表自己的 {@code workspace.denied}
+   * 审计另有一条）。于是"有工作区"与"能用文档面"在数据上永远一致。
+   */
+  private AgentPermissionSet openChildWorkspace(
+      ChildWorkspace plan,
+      AgentPermissionSet permissions,
+      AgentIdentity caller,
+      AgentPermissionSet callerPermissions,
+      String lineagePath) {
+    if (plan == null) {
+      return permissions;
+    }
+    if (!WorkspacePermissions.covered(
+        WorkspacePermissions.declared(permissions, DocNamespaces.DOCS), plan.dir())) {
+      // 模板/请求把文档面收成了空（或收成别处）：不挂一块子体解析不了的工作区（见 planChildWorkspace 的 javadoc）
+      LOG.info(
+          "子体的文档面覆盖不到拟建的工作区落点，本次不挂子工作区: child={} face={}",
+          plan.spec().user(),
+          WorkspacePermissions.declared(permissions, DocNamespaces.DOCS).summary());
+      return permissions;
+    }
+    try {
+      BiConsumer<String, String> registrar = lineageRegistrar;
+      if (registrar != null) {
+        registrar.accept(plan.spec().user(), lineagePath);
+      }
+      workspaceRegistry.mount(
+          plan.spec(), new WorkspaceCaller(caller.instanceId(), callerPermissions));
+      return workspaceRegistry.grant(plan.spec().user(), permissions);
+    } catch (WorkspaceException e) {
+      String message =
+          "子工作区挂载被拒（" + e.code() + "）：本次不为子体挂载工作区，子体的文档面一并收成 none（fail-closed）: " + e.getMessage();
+      LOG.warn("{} child={} guard={}", message, plan.spec().user(), e.code());
+      emit(
+          EventTypes.PERMISSION_DENIED,
+          caller.instanceId(),
+          plan.spec().user(),
+          Map.of("childId", plan.spec().user(), "reason", message, "code", e.code()));
+      return withoutDocsScope(permissions);
+    }
+  }
+
+  /** 把文档两个面与 {@code workspaces} 面收成显式 {@code none()}（"没有工作区" ⇔ "没有这些面"，两者不许分叉）。 */
+  private static AgentPermissionSet withoutDocsScope(AgentPermissionSet permissions) {
+    return permissions.withResourceScopes(
+        permissions
+            .resourceScopes()
+            .withNamespace(DocNamespaces.DOCS, ResourceScope.none())
+            .withNamespace(DocNamespaces.DOCS_EDIT, ResourceScope.none())
+            .withNamespace(WorkspacePermissions.WORKSPACES, ResourceScope.none()));
   }
 
   /**

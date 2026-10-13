@@ -25,6 +25,21 @@
       <artifactId>agentlib-mosire</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!--
+      工作区标准 + Docs 系统（R3b 装配）：主 Agent 的装配点要注册 7 个 doc_* 工具与 3 个 workspace 工具、
+      注册 docs 能力与技能根的只读能力、挂装配期挂载（技能根 / 自己的工作区 / 子体工作区根），
+      并把 WorkspaceRegistry.maskEntries() 写成遮蔽面。两个模块都只依赖 agentlib（无环）。
+    -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>workspace-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>docs-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
