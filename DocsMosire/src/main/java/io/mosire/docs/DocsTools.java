@@ -9,7 +9,9 @@ import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.workspace.Kind;
 import io.mosire.workspace.Mount;
+import io.mosire.workspace.WorkspaceException;
 import io.mosire.workspace.WorkspaceRegistry;
+import io.mosire.workspace.WorkspaceTools;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,11 +22,18 @@ import java.util.function.Function;
 
 /**
  * Docs 工具面（设计 §5.6）：{@code doc_list} / {@code doc_read} / {@code doc_query} / {@code doc_append} /
- * {@code doc_void} / {@code doc_create} / {@code doc_edit}——七个工具，两种纪律。
+ * {@code doc_void} / {@code doc_create} / {@code doc_edit}——七个工具，两种纪律；外加能力自述的 {@code doc_guide}（设计
+ * §5.11）。
+ *
+ * <p><b>{@code doc_guide} 是刻意的例外</b>（{@link
+ * ResourceManifest#NONE}，不声明任何资源面）：它不读盘、不读别人的东西，只输出调用者自己的挂载名 与"工具契约"（模型本来就在工具列表里看得到）。若也声明 {@code
+ * docs} 面，最需要它的调用者（面空/未表态）恰好会被前置闸拒——那与"给模型一条自救 渠道"的目的正相反。代价是它内部不得调资源 SPI（{@code doc_guide} 的 body
+ * 里没有 {@code require} 调用），且输出必须只含调用者自己的东西、绝不含 物理落点（A7/G4）——这两条进负向判据（设计 §5.11）。
  *
  * <p><b>工具族与工作区解耦</b>（A8）：本类的工具<b>不认识工作区</b>——它们只按 {@link ResourceManifest} 判 {@code docs} / {@code
  * docs-edit}，逐路径的 {@code require} 由 {@link DocsEngine} 在真正读写前完成。"这个 Agent 能不能用 docs 能力"是装配时挂载/授予的
- * <b>落格结果</b>，工具侧不再判一次，也不允许自行放宽。
+ * <b>落格结果</b>，工具侧不再判一次，也不允许自行放宽。（{@code doc_guide} 只<b>读</b>调用者的表态来如实报告"你可读/可写"，不构成第二套判定：
+ * 真正放行/拒绝仍只发生在 {@link DocsEngine} 与唯一入口。）
  *
  * <p><b>资源声明</b>（设计 §5.6）：读工具 {@code ResourceManifest.of("docs", DENY)}；写工具 {@code
  * ResourceManifest.of("docs-edit", DENY)} 且 {@link ToolSpec} 标 {@code destructive =
@@ -58,9 +67,16 @@ public final class DocsTools {
   /** 行寻址编辑（{@code FILE}，多项全成或全不成，破坏性）。 */
   public static final String DOC_EDIT = "doc_edit";
 
+  /**
+   * 自述：{@code doc_*} 工具清单与用法 + 两种纪律 + 在调用者自己的哪些挂载上可读/可写（设计 §5.11）。
+   *
+   * <p><b>这个常量是对外的名字</b>：别的工具族要指路"文档工具怎么用去问它"时引这里，不要手抄字面量。
+   */
+  public static final String DOC_GUIDE = "doc_guide";
+
   /** 本工具族注册的工具名集合（装配与"子进程不要把同名工具重复桥进来"的判断都用它）。 */
   public static final Set<String> NAMES =
-      Set.of(DOC_LIST, DOC_READ, DOC_QUERY, DOC_APPEND, DOC_VOID, DOC_CREATE, DOC_EDIT);
+      Set.of(DOC_LIST, DOC_READ, DOC_QUERY, DOC_APPEND, DOC_VOID, DOC_CREATE, DOC_EDIT, DOC_GUIDE);
 
   private static final ResourceManifest READ_MANIFEST = DocsCapability.Manifests.READ;
 
@@ -71,7 +87,7 @@ public final class DocsTools {
   }
 
   /**
-   * 造出全套 Docs 工具（七个工具共享同一个引擎/访问层，因此共享同一份挂载视图）。
+   * 造出全套 Docs 工具（七个文档工具共享同一个引擎/访问层，因此共享同一份挂载视图；自述工具也看同一份）。
    *
    * @param registry 工作区注册表（唯一解析点；由装配方注入）
    */
@@ -85,7 +101,8 @@ public final class DocsTools {
         append(access),
         voidEntry(access),
         create(access),
-        edit(access));
+        edit(access),
+        guide(registry, access));
   }
 
   // ── 读工具 ──────────────────────────────────────────────────────────────────────────────────
@@ -148,7 +165,11 @@ public final class DocsTools {
                 "mount", requiredText("虚拟路径或文档根（如 workspace 或 docs/notes.md）"),
                 "id", Map.of("type", "string", "description", "LOG 条目 id（<地址>#<序号>）"),
                 "address", Map.of("type", "string", "description", "LOG 地址（读该地址下你可看见的条目）"),
-                "lines", Map.of("type", "string", "description", "FILE 行区间，如 \"10,40\"；缺省 = 全文")));
+                "lines", Map.of("type", "string", "description", "FILE 行区间，如 \"10,40\"；缺省 = 全文")),
+            // 只有 mount 是运行期硬要求（本方法体里的 DocArguments.required(…, "mount")）；id / address 是"二选一"
+            // （LOG 挂载上两者都缺才拒，见 DocsAccess.read 的 INVALID_ARGUMENTS），schema 表达不了"二选一"，故不塞进
+            // required；lines 纯可选。
+            List.of("mount"));
     return new DocTool(
         DOC_READ,
         "读一个文档：LOG 根按 id 或 address 读条目；FILE 根按路径读文本（可用 lines 只取一段，省 token）。"
@@ -277,7 +298,7 @@ public final class DocsTools {
             List.of("mount", "id"));
     return new DocTool(
         DOC_VOID,
-        "作废一条追加型（LOG）文档条目：不改原记录，而是<b>再追加</b>一条 VOIDED 记录（留痕、可重放）。" + "这是改变盘上数据的操作。",
+        "作废一条追加型（LOG）文档条目：不改原记录，而是再追加一条 VOIDED 记录（留痕、可重放）。" + "这是改变盘上数据的操作。",
         schema,
         WRITE_MANIFEST,
         ToolSpec.level(AccessToken.DEFAULT, false, true),
@@ -302,7 +323,9 @@ public final class DocsTools {
             Map.of(
                 "mount", requiredText("虚拟路径（<挂载名>/<相对路径>，如 workspace/notes/2026-10-13.md）"),
                 "text", Map.of("type", "string", "description", "文件内容（一次落定）")),
-            List.of("mount", "text"));
+            // 只有 mount 是运行期硬要求（本方法体里的 DocArguments.required(…, "mount")）；text 走 DocArguments.text
+            // （缺 ⇒ 空串），实测"不给 text 也成功建出 0 字节文件"（DiskDocFiles.create 不拒空内容）⇒ 不标必填。
+            List.of("mount"));
     return new DocTool(
         DOC_CREATE,
         "在文件型（FILE）文档根里原子创建一个文件：撞名即拒（不覆盖），内容一次落定——盘上不会出现写一半的文档。" + "这是改变盘上数据的操作。",
@@ -360,7 +383,7 @@ public final class DocsTools {
     return new DocTool(
         DOC_EDIT,
         "在文件型（FILE）文档根里就地编辑：按行号/行区间/唯一精确锚点寻址，一次可给多个操作（全成或全不成）。"
-            + "锚点不命中或不唯一、expect 不符、行号越界都会整体拒绝且<b>盘上不动一个字</b>。这是改变盘上数据的操作。",
+            + "锚点不命中或不唯一、expect 不符、行号越界都会整体拒绝且盘上不动一个字。这是改变盘上数据的操作。",
         schema,
         WRITE_MANIFEST,
         ToolSpec.level(AccessToken.DEFAULT, false, true),
@@ -378,6 +401,40 @@ public final class DocsTools {
                   + " 字节="
                   + edited.bytes());
         });
+  }
+
+  // ── 自述（非破坏性、不声明资源面） ─────────────────────────────────────────────────────────────
+
+  /**
+   * {@code doc_guide}：回答"{@code doc_*} 有哪些、怎么用、在我的哪些挂载上可读/可写"（设计 §5.11）。
+   *
+   * <p><b>为什么必须存在</b>：真机验收里，"自由记录文档"这条管道全通、模型却完全不知道——它没有任何渠道知道自己的挂载叫什么，于是拿工具名当挂载名
+   * 猜，一猜就错。开场消息点名的是既有工具，{@code catalog} 只列命令类型，{@code AgentTool} 不在其中。本工具就是那条渠道： <b>nudge
+   * 写在描述里</b>（描述是模型发现一个工具的唯一入口），输出里再给真挂载名。
+   *
+   * <p><b>工具清单从真实工具对象现读</b>（{@link DocGuide}）：家族新增一个 {@code doc_*} 工具，本工具的输出自动包含它——"不漂移"这条硬性质
+   * 靠这条结构性保证，而不是靠人记得同步文案。
+   *
+   * <p><b>无参数、不声明资源面</b>（{@link ResourceManifest#NONE}）：没有挂载、面空、未表态的调用者照样能调它——它恰恰是最需要它的人。
+   */
+  static AgentTool guide(WorkspaceRegistry registry, DocsAccess access) {
+    Objects.requireNonNull(registry, "registry");
+    Map<String, Object> schema = objectSchema(Map.of());
+    return new DocTool(
+        DOC_GUIDE,
+        "文档工具怎么用、该在哪个挂载上用什么 ⇒ 先调我。"
+            + "不知道自己有哪些挂载 / 不确定 doc_* 怎么用 / 刚被 "
+            + WorkspaceException.WORKSPACE_NOT_FOUND
+            + " 或 "
+            + DocException.DOC_NOT_FOUND
+            + " 拒了 ⇒ 调我；挂载名清单也可以问 "
+            + WorkspaceTools.WORKSPACE_INFO
+            + "。无参数；"
+            + "一个挂载都没有的人调它也会得到清楚回答（不是错误）。",
+        schema,
+        ResourceManifest.NONE,
+        ToolSpec.level(AccessToken.DEFAULT, false, false),
+        context -> ToolResult.ok(DocGuide.render(registry, access, context)));
   }
 
   // ── 内部：参数与渲染 ─────────────────────────────────────────────────────────────────────────

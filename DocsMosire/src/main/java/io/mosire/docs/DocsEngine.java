@@ -1,5 +1,6 @@
 package io.mosire.docs;
 
+import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.Operation;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.workspace.Kind;
@@ -7,6 +8,7 @@ import io.mosire.workspace.Mount;
 import io.mosire.workspace.MountName;
 import io.mosire.workspace.WorkspaceCaller;
 import io.mosire.workspace.WorkspaceException;
+import io.mosire.workspace.WorkspacePermissions;
 import io.mosire.workspace.WorkspaceRegistry;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -441,16 +443,34 @@ public final class DocsEngine {
   }
 
   /**
+   * 逐路径准入的<b>唯一判据</b>（唯一出处）：调用者在 {@code namespace} 面上是否盖得住 {@code physical} 这个落点、且整体盖得住 {@code
+   * mountRoot} 这个挂载根。
+   *
+   * <p><b>两段都判、顺序写死</b>：① {@link ResourceScope#allows} 看"这个具体落点"在不在可达面内；② {@link
+   * ResourceScope#covers} 看前缀集合<b>整体</b>盖住挂载根——嵌套/多根挂载下"(a) 允许但 (b) 只覆盖一半"是可能的，只判 ①
+   * 会让半个挂载溜进来。短路顺序（① 在前） 与提取前的 {@code require} 逐字一致。
+   *
+   * <p><b>为什么落点与挂载根是两个参数</b>：本模块的两个调用点是两种粒度——{@link #require} 判"这一次访问的那个落点"，第一个参数给 {@code
+   * target.physical()}；{@code doc_guide} 回答"整块挂载能不能读/写"，两个参数都给挂载根。若只留一个参数，引擎要么丢掉逐路径那一段
+   * （放宽准入），要么把挂载根那一段错用成落点（同样是放宽）——两种都是权限判定上的实质变化。
+   *
+   * <p><b>只读</b>：不调资源 SPI、不落事件、不改任何状态（guide 显示一次结论不该被记成一次访问尝试）。
+   */
+  static boolean faceCovers(
+      AgentPermissionSet permissions, String namespace, Path physical, Path mountRoot) {
+    ResourceScope scope = WorkspacePermissions.declared(permissions, namespace);
+    return scope.allows(physical.toString()) && scope.covers(ResourceScope.ofDir(mountRoot));
+  }
+
+  /**
    * 逐路径准入：读面看 {@code docs}，写面看 {@code docs-edit}；未表态即拒（fail-closed，设计 §5.6）。
    *
-   * <p><b>两段都判</b>：① {@link ResourceScope#allows} 看"这个具体落点"在不在可达面内；② {@link ResourceScope#covers}
-   * 看前缀集合<b>整体</b>盖住挂载根——嵌套/多根挂载下"(a) 允许但 (b) 只覆盖一半"是可能的，只判 ① 会让半个挂载溜进来。两道都过才算够得着。
+   * <p><b>判据不在这里写第二遍</b>：两段式（落点 + 挂载根）只有 {@link #faceCovers} 一处（{@code doc_guide} 也调它）， 本方法只负责"取面 +
+   * 具名拒"。
    */
   private void require(DocTarget target, WorkspaceCaller caller, RequestKind kind) {
     String namespace = kind.writes ? DocNamespaces.DOCS_EDIT : DocNamespaces.DOCS;
-    ResourceScope scope = caller.scope(namespace);
-    ResourceScope root = ResourceScope.ofDir(target.baseDir());
-    if (!scope.allows(target.physical().toString()) || !scope.covers(root)) {
+    if (!faceCovers(caller.permissions(), namespace, target.physical(), target.baseDir())) {
       throw DocException.denied(
           "范围外：调用者在 "
               + namespace

@@ -548,7 +548,7 @@ public final class App implements AutoCloseable {
       // 落格（§4.8：能力只在挂载/授予时落成"命名空间 + 前缀"）：docs ← <工作区>、docs-edit ← <工作区>、
       // workspaces ← <工作区根>、skills ← <技能根>。A5 会拒"已有显式表态却不覆盖落点"的命名空间（响亮，不静默放大）。
       permissionSet = workspaceRegistry.grant(agentConfig.id(), permissionSet);
-      // 两族工具（Docs 7 个 + 工作区 3 个）：供给源 id 分开，便于审计与"按源整组卸载"
+      // 两族工具（Docs 8 个 + 工作区 4 个，含自述工具 doc_guide / workspace_info）：供给源 id 分开，便于审计与"按源整组卸载"
       for (AgentTool docTool : DocsTools.all(workspaceRegistry)) {
         tools.register(DOCS_TOOL_SOURCE_ID, docTool);
       }

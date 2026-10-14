@@ -22,10 +22,16 @@ import java.util.TreeSet;
 import java.util.function.Function;
 
 /**
- * 挂载管理的工具面（设计 §4.7）：{@code mount_workspace} / {@code unmount_workspace} / {@code list_workspaces}。
+ * 挂载管理的工具面（设计 §4.7）：{@code mount_workspace} / {@code unmount_workspace} / {@code
+ * list_workspaces}，外加能力自述的 {@code workspace_info}（设计 §5.11）。
  *
- * <p><b>三个工具共用一条权限面</b>：{@link ResourceManifest}{@code .of("workspaces", DENY)}——调用者没在权限集里显式表态
+ * <p><b>前三个工具共用一条权限面</b>：{@link ResourceManifest}{@code .of("workspaces", DENY)}——调用者没在权限集里显式表态
  * {@code workspaces} ⇒ 执行前就被既有资源前置闸拒（"未表态 = 一个挂载都建不了"）。这是设计 §4.3 的工具面形状，本类不自造 第二套判定。
+ *
+ * <p><b>{@code workspace_info} 是刻意的例外</b>（{@link ResourceManifest#NONE}，不声明任何资源面）：它不读盘、不读别人的东西，只输出
+ * "调用者自己"的挂载名与工具契约。若也声明 {@code workspaces} 面，最需要它的调用者（面空/未表态）恰好会被前置闸拒——那与"给模型一条
+ * 自救渠道"的目的正相反。代价是它内部不得调资源 SPI（{@code workspace_info} 的 body 里没有 {@code require} 调用；前三个工具仍各自调一次），
+ * 且输出必须只含调用者自己的东西、绝不含物理落点（A7/G4）——这两条进负向判据（设计 §5.11）。
  *
  * <p><b>工具只调不判</b>：{@code mount_workspace} 在真正登记前调 {@code context.resources().require(WRITE,
  * workspaces:<绝对路径>)}——"这个物理范围在不在我的挂载面里"由既有 {@link
@@ -50,7 +56,7 @@ import java.util.function.Function;
  * parent}</b>（否则模型仍无从下手）：列的就是调用者自己切片里的挂载名。
  *
  * <p><b>工具等级</b>：{@code DEFAULT} 级、非敏感、非破坏（登记不等于写文件：本模块不创建目录、不改文件）；可外发给子 Agent（子体要能为自己派的小 Agent
- * 划更小的工作区）。
+ * 划更小的工作区）。{@code workspace_info} 同档：它只读内存里的挂载表，不读盘、不改任何东西，而且子体正是最需要"我有哪些挂载"的那一类调用者。
  */
 public final class WorkspaceTools {
 
@@ -63,9 +69,16 @@ public final class WorkspaceTools {
   /** 列出自己名下（可解析）的工作区。 */
   public static final String LIST_WORKSPACES = "list_workspaces";
 
+  /**
+   * 自述：工作区是什么 + 调用者自己的挂载清单 + 纪律怎么用（设计 §5.11）。
+   *
+   * <p><b>这个常量是对外的名字</b>：别的工具族要指路"不知道挂载名就先调它"时引这里，不要手抄字面量——名字改一次，指路的地方自动跟着变。
+   */
+  public static final String WORKSPACE_INFO = "workspace_info";
+
   /** 本能力注册的工具名集合（装配与"子进程不要把同名工具重复桥进来"的判断都用它）。 */
   public static final Set<String> NAMES =
-      Set.of(MOUNT_WORKSPACE, UNMOUNT_WORKSPACE, LIST_WORKSPACES);
+      Set.of(MOUNT_WORKSPACE, UNMOUNT_WORKSPACE, LIST_WORKSPACES, WORKSPACE_INFO);
 
   /** 三个工具共同的资源面：{@code workspaces} 命名空间，缺省 DENY（未表态 = 一个挂载都建不了，§4.7）。 */
   private static final ResourceManifest MANIFEST =
@@ -75,10 +88,10 @@ public final class WorkspaceTools {
     throw new AssertionError("No instances");
   }
 
-  /** 造出全套工作区工具（三个工具共享同一个注册表实例）。 */
+  /** 造出全套工作区工具（四个工具共享同一个注册表实例）。 */
   public static List<AgentTool> all(WorkspaceRegistry registry) {
     Objects.requireNonNull(registry, "registry");
-    return List.of(mount(registry), unmount(registry), list(registry));
+    return List.of(mount(registry), unmount(registry), list(registry), info(registry));
   }
 
   /**
@@ -137,6 +150,7 @@ public final class WorkspaceTools {
             + "必须是 parent 落点下的真子目录（不能是自己的根）；能力不得超出 parent；"
             + "工具面只能建运行期挂载（不进 shell 遮蔽面）；卸载 parent 时本挂载一并失效。",
         schema,
+        MANIFEST,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
           MountName name = mountNameArg(requiredString(context, "name"));
@@ -200,6 +214,7 @@ public final class WorkspaceTools {
         UNMOUNT_WORKSPACE,
         "卸载一个工作区（只注销挂载，物理目录保留在盘上；由它派生的子工作区挂载会一并失效）。" + "只有创建者或其祖先能卸载。",
         schema,
+        MANIFEST,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
           String name = requiredString(context, "name");
@@ -222,6 +237,7 @@ public final class WorkspaceTools {
         LIST_WORKSPACES,
         "列出你名下的工作区（虚拟路径、纪律、能力、归属、使用者、来源）。" + "这些虚拟路径的第一段就是可用的挂载名——mount_workspace 的 parent 只能从中挑。",
         schema,
+        MANIFEST,
         ToolSpec.level(AccessToken.DEFAULT, false, false),
         context -> {
           WorkspaceCaller caller = callerOf(context);
@@ -252,6 +268,31 @@ public final class WorkspaceTools {
               .append("（每个条目的虚拟路径第一段；parent 只接受这种名字，不接受物理路径）");
           return ToolResult.ok(text.toString());
         });
+  }
+
+  /**
+   * {@code workspace_info}：回答"工作区是什么、我有哪些挂载、纪律怎么用"（设计 §5.11）。
+   *
+   * <p><b>无参数</b>：模型不需要事先知道任何名字——这正是这个工具存在的理由（隔壁真机事故里，模型拿工具名当挂载名猜， 每次必失败；根因是它没有任何渠道知道自己的挂载叫什么）。
+   *
+   * <p><b>唯一不声明资源面的工作区工具</b>（{@link ResourceManifest#NONE}）：见类注释的资源声明段。本工具的 body 里<b>没有</b> {@code
+   * resources()} 调用——不声明面却去调它，等于期望一个必然拒绝的判定者放行。
+   *
+   * <p><b>零挂载不抛异常</b>：解析不出身份或挂载表为空时给"你还没有工作区 + 让上级给你挂一块"的清楚回答（设计 §5.11 判据）。
+   */
+  static AgentTool info(WorkspaceRegistry registry) {
+    Objects.requireNonNull(registry, "registry");
+    Map<String, Object> schema = Map.of("type", "object", "properties", Map.of());
+    return new WorkspaceTool(
+        WORKSPACE_INFO,
+        "告诉你自己的工作区是什么、有哪些挂载（虚拟名 / 纪律 / 能力 / 来源 / 能否作 parent）以及纪律怎么用。"
+            + "想知道自己的挂载叫什么名字、不知道该从哪块地开始读写、刚被 "
+            + WorkspaceException.WORKSPACE_NOT_FOUND
+            + " 拒了 ⇒ 调我。无参数；一个挂载都没有的人调它也会得到清楚回答（不是错误）。",
+        schema,
+        ResourceManifest.NONE,
+        ToolSpec.level(AccessToken.DEFAULT, false, false),
+        context -> ToolResult.ok(WorkspaceInfo.render(registry, context)));
   }
 
   /** 调用者 = 宿主绑定的实例 id（身份不由模型给出，见 {@link WorkspaceCaller}）+ 本次调用的权限集。 */
@@ -349,17 +390,27 @@ public final class WorkspaceTools {
     return Set.copyOf(capabilities);
   }
 
-  /** 能力集合的稳定渲染（空集写 {@code []}：那正是"一个能力都不给"的诚实写法）。 */
-  private static String renderCapabilities(Set<String> capabilities) {
+  /**
+   * 能力集合的稳定渲染（空集写 {@code []}：那正是"一个能力都不给"的诚实写法）。
+   *
+   * <p><b>包级可见</b>：{@link WorkspaceInfo} 复用同一份渲染——两个工具对"能力"的写法若各写一套，同一个挂载在两处就会长得不一样。
+   */
+  static String renderCapabilities(Set<String> capabilities) {
     return new TreeSet<>(capabilities).toString();
   }
 
-  /** 共同骨架：把 {@link WorkspaceException} 转成错误码（权限拒绝仍走唯一入口的统一转码）。 */
+  /**
+   * 共同骨架：把 {@link WorkspaceException} 转成错误码（权限拒绝仍走唯一入口的统一转码）。
+   *
+   * <p><b>资源面是构造参数而不是常量</b>：前三个工具共用 {@link #MANIFEST}，{@code workspace_info} 用 {@link
+   * ResourceManifest#NONE}（见类注释）。骨架只保管这份声明、从不读它——"工具声明了什么面"与"这次调用能不能过"是两件事，后者归唯一入口的判定者。
+   */
   private static final class WorkspaceTool implements AgentTool {
 
     private final String name;
     private final String description;
     private final Map<String, Object> schema;
+    private final ResourceManifest manifest;
     private final ToolSpec spec;
     private final Function<ToolContext, ToolResult> body;
 
@@ -367,11 +418,13 @@ public final class WorkspaceTools {
         String name,
         String description,
         Map<String, Object> schema,
+        ResourceManifest manifest,
         ToolSpec spec,
         Function<ToolContext, ToolResult> body) {
       this.name = name;
       this.description = description;
       this.schema = schema;
+      this.manifest = manifest;
       this.spec = spec;
       this.body = body;
     }
@@ -403,7 +456,7 @@ public final class WorkspaceTools {
 
     @Override
     public ResourceManifest resources() {
-      return MANIFEST;
+      return manifest;
     }
 
     @Override
