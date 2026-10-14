@@ -762,7 +762,15 @@ doc_guide（无参数）
 - 负：**别人的挂载不出现**（换身份调用 ⇒ 看不到）；**物理路径不出现**（A7/G4）；未注册的能力 id 不出现；`ResourceManifest.NONE` 下不调 `require`（结构性：工具源码里没有 `require` 调用）。
 - **使用模式（§三，必跑）**：真进程 + `gemma4-local`，复现隔壁场景——模型先调 `doc_guide` → 拿到真挂载名 → `doc_create(workspace/notes/x.md)` **一次成功**（不再猜名字）。
 
-**★ 仍需用户裁定（开工前）**：① 工具名（`workspace_info`/`doc_guide` vs 其它）；② 是否坚持 `ResourceManifest.NONE`（还是要求调用者有 `workspaces`/`docs` 面）；③ 隔壁报告里的 (甲)(乙)(丙) 三选一**只影响隔壁侧**——本方案（工具自述）与三者都不冲突：隔壁可继续走它的注入，也可以什么都不做；若用户仍要 (丙)「自动注入的简单 Agents.md」，那是**另一件事**，本设计不覆盖。
+**★ 用户裁定（2026-10-14，已定）**：① 工具名 = **`workspace_info`**（`workspace-mosire`）+ **`doc_guide`**（`docs-mosire`）；② 两个工具**都 `ResourceManifest.NONE`**（不声明资源面）；③ 隔壁报告里的 (甲)(乙)(丙) 三选一**只影响隔壁侧**——本方案（工具自述）与三者都不冲突：隔壁可继续走它的注入，也可以什么都不做；若用户仍要 (丙)「自动注入的简单 Agents.md」，那是**另一件事**，本设计不覆盖。
+
+**R8 实现事实（2026-10-14，R8a + R8-fix，已由控制方复核）**：
+- **判定判据只有一份**：`DocsEngine.faceCovers(permissions, namespace, 落点, 挂载根)`（包级静态，**唯一定义处**）；`DocsEngine.require` 与 `DocGuide` 都调它。签名是 4 参而非 2 参：引擎判两段用**两个不同的路径**（落点 = `target.physical()`，挂载根 = `target.baseDir()`），把两者合一会在"面=`根/sub`"这类用例上**放宽准入**（实测 2/11 行改判）——所以不合并。
+- **`doc_guide` 的清单包含它自己**：家族集合全等（`all(registry)` == guide 列出的名字集合 == `NAMES`），判据不需要任何减法。
+- **`workspace_info` 不写 `doc_guide` 的名字**（不引入反向依赖）；"先问路线"由 docs 侧承担（`doc_guide` 的输出与描述都指回 `WorkspaceTools.WORKSPACE_INFO` 常量）。
+- **`workspace_info` 的「可作 parent」只做结构上可证的预告**（切片内 + 能力非空），**不**为预测试探 `resolve`——那会为只读自述工具写下**假审计事件**（`workspace.denied`）。这是有意的取舍。
+- **`required` 与运行期对齐（R8-fix）**：`doc_read` 补 `[mount]`（此前缺）；**`doc_create` 去掉 `text`**（运行期本就可选——缺 text 建 0 字节文件成功，"内容一次落定"说的是**原子性**，不是必填）；其余六个工具的 required 经最小参数真跑核对已正确。**两处都是模型可见的契约/提示变化，运行期零变化**。
+
 
 ---
 
