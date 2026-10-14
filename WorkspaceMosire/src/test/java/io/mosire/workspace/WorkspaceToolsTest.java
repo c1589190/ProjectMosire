@@ -38,7 +38,8 @@ import org.junit.jupiter.api.io.TempDir;
  * <p><b>逐条对号</b>：
  *
  * <ul>
- *   <li>{@link #threeToolsShareTheWorkspacesManifest()}（§4.7：三个工具共用 {@code workspaces} 面、缺省 DENY）；
+ *   <li>{@link #toolSurfacesMatchDeclaredResourceFaces()}（§4.7 + §5.11：三个挂载管理工具共用 {@code
+ *       workspaces} 面、缺省 DENY；{@code workspace_info} 刻意<b>不声明任何面</b>）；
  *   <li>{@link #mountSchemaIsDerivedFormOnly()}（§4.7：schema 只有派生形态五个入参，{@code dir}/{@code
  *       user}/{@code derivedFrom} 已删）；
  *   <li>{@link #mountWorkspaceSucceedsAndStaysRuntimeOnly()}（正向 + M6/M10：落点、归属、血缘、只建运行期挂载）；
@@ -73,15 +74,32 @@ class WorkspaceToolsTest {
     permissions = WorkspaceFixture.fullFaces(root);
   }
 
-  /** §4.7：三个工具名与共用资源面（{@code workspaces}、缺省 {@link ResourcePolicy#DENY}）。 */
+  /**
+   * §4.7 + §5.11：资源面<b>按声明分组</b>断言——三个挂载管理工具共用 {@code workspaces} 面（缺省 {@link
+   * ResourcePolicy#DENY}），{@code workspace_info} 是刻意<b>一个面都不声明</b>的那一个（{@code
+   * ResourceManifest.NONE}）。
+   *
+   * <p><b>为什么不再"遍历每个工具都断言 workspaces"</b>（★ R8）：{@code workspace_info} 若也声明面，"面空/未表态"的调用者会被
+   * 资源前置闸拒——而它恰恰是最需要这条自救渠道的人（设计 §5.11 资源声明段）。分组断言两边都收紧：管理工具少声明一个面、 或 {@code workspace_info}
+   * 多声明一个面，都会转红；它<b>不是</b>"不检查"。
+   */
   @Test
-  void threeToolsShareTheWorkspacesManifest() {
+  void toolSurfacesMatchDeclaredResourceFaces() {
     List<AgentTool> tools = WorkspaceTools.all(registry);
 
     assertThat(tools)
         .extracting(AgentTool::name)
         .containsExactlyInAnyOrderElementsOf(WorkspaceTools.NAMES);
-    for (AgentTool tool : tools) {
+    List<AgentTool> managing =
+        tools.stream().filter(tool -> !WorkspaceTools.WORKSPACE_INFO.equals(tool.name())).toList();
+    assertThat(managing)
+        .as("挂载管理工具那一组（自述工具除外）")
+        .extracting(AgentTool::name)
+        .containsExactlyInAnyOrder(
+            WorkspaceTools.MOUNT_WORKSPACE,
+            WorkspaceTools.UNMOUNT_WORKSPACE,
+            WorkspaceTools.LIST_WORKSPACES);
+    for (AgentTool tool : managing) {
       assertThat(tool.resources().namespaces())
           .as("%s 的资源面", tool.name())
           .containsExactly(WorkspacePermissions.WORKSPACES);
@@ -89,6 +107,26 @@ class WorkspaceToolsTest {
           .as("未表态 = 一个挂载都建不了")
           .isEqualTo(ResourcePolicy.DENY);
       assertThat(tool.spec().destructive()).as("登记不改文件，不是破坏性工具").isFalse();
+    }
+
+    AgentTool info = tool(registry, WorkspaceTools.WORKSPACE_INFO);
+    assertThat(info.resources().isEmpty())
+        .as("§5.11：workspace_info 不声明任何资源面（空声明面 ⇒ 前置闸对空面调用者不说话）")
+        .isTrue();
+    assertThat(info.resources().namespaces()).as("空声明面").isEmpty();
+    assertThat(info.resources().policyFor(WorkspacePermissions.WORKSPACES))
+        .as("连 workspaces 都没声明——不是「声明了再放行」")
+        .isNull();
+    assertThat(info.spec().destructive()).as("自述工具不写盘、不登记").isFalse();
+
+    for (AgentTool tool : tools) {
+      assertThat(tool.spec().requiredLevel())
+          .as("%s 的最低身份级别", tool.name())
+          .isEqualTo(AccessToken.DEFAULT);
+      assertThat(tool.spec().sensitive()).as("%s 不敏感", tool.name()).isFalse();
+      assertThat(tool.spec().noExport())
+          .as("%s 必须可外发——子体正是最需要「我有哪些挂载」的那一类调用者（§5.11 动机段）", tool.name())
+          .isFalse();
     }
   }
 

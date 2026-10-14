@@ -84,7 +84,10 @@ class DocsWiringTest {
     assertThat(registry.list("docs", caller)).containsExactly("docs/a");
   }
 
-  /** 工具面自证：七个 {@code doc_*} 工具都能被造出来、资源面与破坏性标记与设计 §5.6 一致。 */
+  /**
+   * 工具面自证：<b>八个</b> {@code doc_*} 工具都能被造出来、资源面与破坏性标记与设计 §5.6/<b>§5.11</b> 一致（资源面<b>按声明分组</b>：
+   * 七个文档工具各自声明 {@code docs}/{@code docs-edit}，{@code doc_guide} 一个面都不声明）。
+   */
   @Test
   void docsToolsExposeDesignSurface() throws IOException {
     Path dir = Files.createDirectories(tempDir.resolve("docs-root"));
@@ -98,7 +101,10 @@ class DocsWiringTest {
     assertThat(tools)
         .extracting(AgentTool::name)
         .containsExactlyInAnyOrderElementsOf(DocsTools.NAMES);
-    for (AgentTool tool : tools) {
+    List<AgentTool> documents =
+        tools.stream().filter(tool -> !DocsTools.DOC_GUIDE.equals(tool.name())).toList();
+    assertThat(documents).as("七个文档工具 + 一个自述工具").hasSize(7);
+    for (AgentTool tool : documents) {
       boolean write =
           tool.name().equals(DocsTools.DOC_APPEND)
               || tool.name().equals(DocsTools.DOC_VOID)
@@ -109,6 +115,9 @@ class DocsWiringTest {
           .containsExactly(write ? DocNamespaces.DOCS_EDIT : DocNamespaces.DOCS);
       assertThat(tool.spec().destructive()).as("%s 的破坏性标记", tool.name()).isEqualTo(write);
     }
+    AgentTool guide = DocsFixture.tool(registry, DocsTools.DOC_GUIDE);
+    assertThat(guide.resources().isEmpty()).as("§5.11：doc_guide 不声明任何资源面（空面调用者才调得到它）").isTrue();
+    assertThat(guide.resources().namespaces()).isEmpty();
   }
 
   /** 工具面自证：{@code doc_append} 经工具执行成功并回显虚拟地址（不泄露物理落点）。 */

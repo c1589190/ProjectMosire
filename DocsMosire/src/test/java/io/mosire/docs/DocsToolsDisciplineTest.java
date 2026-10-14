@@ -30,8 +30,10 @@ import org.junit.jupiter.api.io.TempDir;
  * RESOURCE_DENIED}、资源面与破坏性标记、列目录不含物理路径。
  *
  * <ul>
- *   <li>{@link #toolSurfaceMatchesDesign()}（§5.6 表 + §5.9"FILE 删除在 v1 工具面不存在"）；
- *   <li>{@link #manifestDefaultsToDeny()}（§5.6：读 {@code docs}、写 {@code docs-edit}，缺省 DENY）；
+ *   <li>{@link #toolSurfaceMatchesDesign()}（§5.6 表 + §5.9"FILE 删除在 v1 工具面不存在" + §5.11：{@code
+ *       doc_guide} 不声明面）；
+ *   <li>{@link #manifestDefaultsToDeny()}（§5.6：读 {@code docs}、写 {@code docs-edit}，缺省 DENY；§5.11：
+ *       {@code doc_guide} 显式断言空声明面）；
  *   <li>{@link #disciplineIsDeclarativeThroughTools()}（B9：LOG 上建/改文件、FILE 上追加/作废都具名拒，且盘上不动）；
  *   <li>{@link #invisibleAndMissingShareTheSameAnswer()}（§5.9 负向：不可见 ≡ 不存在，不泄露存在性）；
  *   <li>{@link #outOfScopeIsResourceDeniedAtTheToolBoundary()}（§5.6/§5.9：范围外 ⇒
@@ -60,7 +62,9 @@ class DocsToolsDisciplineTest {
     registry.mount(DocsFixture.mount("files", "main", "main", fileDir, Kind.FILE), main);
   }
 
-  /** §5.6：七个工具、资源面、破坏性标记；§5.9：v1 工具面里没有"删文件"。 */
+  /**
+   * §5.6 表 + §5.11：工具面<b>八个</b>（七个文档工具 + 自述 {@code doc_guide}），资源面<b>按声明分组</b>；§5.9：v1 工具面里没有"删文件"。
+   */
   @Test
   void toolSurfaceMatchesDesign() {
     List<AgentTool> tools = DocsTools.all(registry);
@@ -71,8 +75,21 @@ class DocsToolsDisciplineTest {
     assertThat(DocsTools.NAMES)
         .as("v1 不做删除：rm / doc_delete 都不在工具面里")
         .doesNotContain("doc_delete", "doc_remove", "doc_rm", "rm")
-        .hasSize(7);
-    for (AgentTool tool : tools) {
+        .hasSize(8);
+    List<AgentTool> documents =
+        tools.stream().filter(tool -> !DocsTools.DOC_GUIDE.equals(tool.name())).toList();
+    assertThat(documents)
+        .as("文档工具那一组（自述工具除外）")
+        .extracting(AgentTool::name)
+        .containsExactlyInAnyOrder(
+            DocsTools.DOC_LIST,
+            DocsTools.DOC_READ,
+            DocsTools.DOC_QUERY,
+            DocsTools.DOC_APPEND,
+            DocsTools.DOC_VOID,
+            DocsTools.DOC_CREATE,
+            DocsTools.DOC_EDIT);
+    for (AgentTool tool : documents) {
       boolean write =
           Set.of(DocsTools.DOC_APPEND, DocsTools.DOC_VOID, DocsTools.DOC_CREATE, DocsTools.DOC_EDIT)
               .contains(tool.name());
@@ -81,14 +98,48 @@ class DocsToolsDisciplineTest {
           .containsExactly(write ? DocNamespaces.DOCS_EDIT : DocNamespaces.DOCS);
       assertThat(tool.spec().destructive()).as("%s 的破坏性标记", tool.name()).isEqualTo(write);
     }
+
+    AgentTool guide = tool(DocsTools.DOC_GUIDE);
+    assertThat(guide.resources().isEmpty())
+        .as("§5.11：doc_guide 不声明任何资源面（空声明面 ⇒ 前置闸对空面调用者不说话）")
+        .isTrue();
+    assertThat(guide.resources().namespaces()).as("空声明面").isEmpty();
+    assertThat(guide.spec().destructive()).as("自述工具不写盘").isFalse();
+
+    for (AgentTool tool : tools) {
+      assertThat(tool.spec().requiredLevel())
+          .as("%s 的最低身份级别", tool.name())
+          .isEqualTo(AccessToken.DEFAULT);
+      assertThat(tool.spec().sensitive()).as("%s 不敏感", tool.name()).isFalse();
+      assertThat(tool.spec().noExport())
+          .as("%s 必须可外发（子体也要能问「doc_* 怎么用」，§5.11 动机段）", tool.name())
+          .isFalse();
+    }
   }
 
-  /** §5.6：两个面的缺省策略都是 {@link ResourcePolicy#DENY}（未表态 = 什么都看不见/改不了）。 */
+  /**
+   * §5.6：<b>声明了面</b>的工具，其每个命名空间的缺省策略都是 {@link ResourcePolicy#DENY}（未表态 = 什么都看不见/改不了）。
+   *
+   * <p>§5.11：{@code doc_guide} 不声明任何面 ⇒ 没有"第一个命名空间"可取（旧写法在这里 {@code NoSuchElementException}），
+   * 因此对它<b>显式断言空声明面</b>——而不是跳过它。
+   */
   @Test
   void manifestDefaultsToDeny() {
     for (AgentTool tool : DocsTools.all(registry)) {
-      String namespace = tool.resources().namespaces().iterator().next();
-      assertThat(tool.resources().policyFor(namespace)).isEqualTo(ResourcePolicy.DENY);
+      if (tool.resources().isEmpty()) {
+        assertThat(tool.name()).as("唯一不声明资源面的工具是 doc_guide（§5.11）").isEqualTo(DocsTools.DOC_GUIDE);
+        assertThat(tool.resources().namespaces()).isEmpty();
+        assertThat(tool.resources().policyFor(DocNamespaces.DOCS)).as("没有声明 docs 面").isNull();
+        assertThat(tool.resources().policyFor(DocNamespaces.DOCS_EDIT))
+            .as("没有声明 docs-edit 面")
+            .isNull();
+        continue;
+      }
+      for (String namespace : tool.resources().namespaces()) {
+        assertThat(tool.resources().policyFor(namespace))
+            .as("%s 的 %s 面缺省策略", tool.name(), namespace)
+            .isEqualTo(ResourcePolicy.DENY);
+      }
     }
   }
 
