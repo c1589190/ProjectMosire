@@ -703,6 +703,69 @@ bash(mount="/workspace", command="sed -i 's|old|new|' notes/x.md")
 
 ---
 
+### 5.11 能力自述工具（★ 责任区 R8 规划，2026-10-14 用户裁定）
+
+**需求来源（用户原话，2026-10-14）**：
+
+> 「我建议的下一步（要你点头）补那条缺口，让 DM 知道自己的能力和工作区。……」
+> 「——隔壁报告的问题，我的解决方案是让你在这额外做一个查看信息的工具，查看工作区就是查看工作区是啥，查看doc就是简单了解doc系列工具的用法」
+
+**问题事实（隔壁真机验收，`~/SimulatorMosire` 2026-10-14）**：
+- 工具在面（DM 面 48 条含 6 条 `doc_*`）、工作区在盘（`workspaces/dm/dm-alpha`、`workspaces/dm/dm-gamma`）、审批链在等（`APPROVAL_PENDING tool=doc_create caller=DEFAULT`）；
+- 但**模型不知道自己的挂载叫什么**，于是**拿工具名当挂载名猜**：
+  `WARN 工作区找不到: holder=decision-maker:dm-gamma mount=simos-command-catalog`、
+  `APPROVAL_PENDING summary="doc_create mount=simos_sd_packet_intent"`（两个都是**工具名**）。
+- 根因：开场消息逐条点名既有工具，**只字未提文档工具/工作区**；`catalog` 只列**命令类型**，`doc_*` 是 `AgentTool` 不是命令 ⇒ **模型没有任何渠道知道**。
+- ⇒ 结论：**「自由记录文档」现在是"管道全通、模型不知道"**——一猜就错，每次必失败。
+
+**用户裁定的解法**：**做一个"查看信息"的工具**（不是往隔壁开场消息里塞文案）——
+**查看工作区 = 查看工作区是啥；查看 doc = 简单了解 doc 系列工具的用法**。
+即：**能力自述由能力自己提供**，隔壁零改动（它注册 `DocsTools.all(registry)` / `WorkspaceTools.all(registry)` 就自动多出这两条）。
+
+**两个工具（各自住自己的模块，不引入反向依赖）**：
+
+| 工具 | 模块 | 回答什么 |
+|---|---|---|
+| `workspace_info` | `workspace-mosire` | **工作区是什么**（虚拟路径形态、你看不到物理目录）+ **你有哪些挂载**（虚拟名/纪律/能力 id/来源/能否作 parent）+ **谁来给你开地**。**不列举 `doc_*`**——它不知道 Docs 存在 |
+| `doc_guide` | `docs-mosire` | **`doc_*` 工具清单与用法**（从**真实工具对象**生成，见"不漂移"）+ 两种纪律与工具对应 + **在你的哪些挂载上可读/可写**（结合 `docs`/`docs-edit` 面）+ 路径示例 + 常用错误码对照 + 「不知道挂载名就先调 `workspace_info`」（名字引 `WorkspaceTools.WORKSPACE_INFO` 常量，不手抄） |
+
+**资源声明（关键裁定项）**：两个工具都**不声明资源面**（`ResourceManifest.NONE`）。
+- 理由 ①：它们**不读盘、不读别人的数据**——只输出"**调用者自己**的挂载名"与"工具契约（模型本来就在工具列表里看得到）"；
+- 理由 ②：若声明 `workspaces`/`docs` 面，**最需要帮助的调用者（面空/未表态）恰好会被前置闸拒**——那正是 R5/R6 实测过的 `RESOURCE_DENIED`，与"给个渠道让模型自救"的目的相悖；
+- 代价：工具内**不得**调 `resources().require(...)`（NONE 的工具本来也用不了该 SPI）；输出必须**只含调用者自己的东西**，且**绝不含物理路径**（A7/G4）——这两条进负向判据。
+
+**输出形状（草案；★ 措辞可改，结构不要改）**：
+
+```text
+workspace_info（无参数）
+【你是什么】工作区 = 你能读写的一块"地"。你只见虚拟路径（形如 workspace/notes/x.md），物理目录对你不可见。
+【你的挂载】2 个：
+- workspace  纪律=FILE  能力=[docs]  来源=ASSEMBLY  可作 parent
+- journal    纪律=LOG   能力=[docs]  来源=ASSEMBLY  可作 parent
+【怎么用】FILE：整文件读写；LOG：只能追加/作废（不能就地改）。
+【没有工作区？】让上级给你挂一块（子 Agent 找父 Agent；决策人由宿主装配期挂）。
+
+doc_guide（无参数）
+【工具】8 个（名字 / 一句话 / 必需参数）——**从真实工具对象生成**
+【两种纪律】FILE=整文件（doc_create/doc_read/doc_edit）；LOG=只追加/作废（doc_append/doc_void/doc_query/doc_void）
+【在你的挂载上】workspace：可写 ✅（你的 docs-edit 面覆盖它） / journal：只读 ⚠
+【路径形态】`<挂载名>/<相对路径>`，例：workspace/notes/hello.md
+【常见回答】RESOURCE_DENIED=够不着；DOC_NOT_FOUND=不存在**或**不可见（同一句话）；WORKSPACE_NOT_FOUND=挂载名不对或不是你的
+```
+
+**★ 不漂移（本设计的硬性质）**：说明里的工具清单**从工具对象生成**（`name()` + `description()` + schema 的 required），**不写死文案**——
+新加一个 `doc_*` 工具后 `doc_guide` 自动包含它。判据：**把家族工具集合与 guide 输出的工具名集合做全等断言**（见 §5.11 判据段与实施计划 R8）。
+**★ nudge 放在工具描述里**：`doc_guide` 的描述写明"不知道有哪些挂载 / 不确定 `doc_*` 怎么用 / 刚被 `WORKSPACE_NOT_FOUND`·`DOC_NOT_FOUND` 拒了 ⇒ 先调我"——**这是模型发现该工具的渠道**，不需要隔壁改开场消息。
+
+**判据（正/负，R7 的验收）**：
+- 正：调用即得到语义说明 + **自己的**挂载清单（名字可用）；模型**不需要事先知道任何名字**；`doc_guide` 的工具清单与家族工具集合**全等**；零挂载的调用者得到"你还没有工作区 + 找谁开"的**清晰回答**（不是报错）。
+- 负：**别人的挂载不出现**（换身份调用 ⇒ 看不到）；**物理路径不出现**（A7/G4）；未注册的能力 id 不出现；`ResourceManifest.NONE` 下不调 `require`（结构性：工具源码里没有 `require` 调用）。
+- **使用模式（§三，必跑）**：真进程 + `gemma4-local`，复现隔壁场景——模型先调 `doc_guide` → 拿到真挂载名 → `doc_create(workspace/notes/x.md)` **一次成功**（不再猜名字）。
+
+**★ 仍需用户裁定（开工前）**：① 工具名（`workspace_info`/`doc_guide` vs 其它）；② 是否坚持 `ResourceManifest.NONE`（还是要求调用者有 `workspaces`/`docs` 面）；③ 隔壁报告里的 (甲)(乙)(丙) 三选一**只影响隔壁侧**——本方案（工具自述）与三者都不冲突：隔壁可继续走它的注入，也可以什么都不做；若用户仍要 (丙)「自动注入的简单 Agents.md」，那是**另一件事**，本设计不覆盖。
+
+---
+
 ## 6. 前置批次：AgentLib 权限接口收编
 
 ### 6.1 收编内容

@@ -161,6 +161,45 @@
 
 ---
 
+## 责任区 R8：能力自述工具（查看工作区 / 查看 doc）
+
+> **编号说明**：尾部"后续"列表里的 R5（命令面）/ R6（技能重基）/ R7（其余工具）**仍未开工**；
+> 本责任区编号接续为 **R8**，由用户 2026-10-14 裁定**插到最前**做。
+> 设计出处：**设计 §5.11**（含用户原话、隔壁真机事实、两个工具的形状与判据）。
+
+**目标**：补上"管道全通、模型不知道"那条缺口——**能力自述由能力自己提供**，
+让模型**不必事先知道任何名字**就能问出：工作区是什么、我有哪些挂载（真名）、`doc_*` 怎么用。
+
+**交付物（两个工具，各住自己的模块，不引入反向依赖）**：
+
+| 工具 | 模块 | 内容 |
+|---|---|---|
+| `workspace_info` | `workspace-mosire` | 工作区是什么 + **调用者自己的**挂载清单（虚拟名/纪律/能力 id/来源/能否作 parent）+ 谁来开地；**不列举 `doc_*`** |
+| `doc_guide` | `docs-mosire` | `doc_*` 工具清单与用法（**从真实工具对象生成，不写死**）+ 两种纪律与工具对应 + 在哪些挂载上可读/可写 + 路径示例 + 错误码对照 + 指向 `workspace_info` |
+
+**关键口径（设计 §5.11 已写死）**：
+1. 两个工具都 **`ResourceManifest.NONE`**（不声明资源面）——它们不读盘、只输出调用者自己的东西；
+   若声明面，"最需要帮助的调用者（面空/未表态）"反而会被前置闸拒，与目的相悖。
+2. **绝不输出物理路径**（A7/G4）；**只输出调用者自己的挂载**（换身份 ⇒ 看不到别人的）。
+3. **不漂移**：`doc_guide` 的工具清单从工具对象现读 ⇒ 家族新增工具后自动包含；用"集合全等"断言钉住。
+4. **nudge 放工具描述里**：`doc_guide` 描述写明"不知道有哪些挂载 / 不确定怎么用 / 刚被 `WORKSPACE_NOT_FOUND`、`DOC_NOT_FOUND` 拒了 ⇒ 先调我"——这是模型发现该工具的渠道，**隔壁零改动**。
+
+**文件所有权**：`WorkspaceMosire/src/main/java/io/mosire/workspace/{WorkspaceTools,WorkspaceInfo}.java`；
+`DocsMosire/src/main/java/io/mosire/docs/{DocsTools,DocGuide}.java`。**不动 AgentLib / Brain / Main**（装配处 `App` 若按 `all(registry)` 注册则自动生效）。
+
+**判据**：设计 §5.11 判据段（正/负 + 使用模式）。**负向必须有真样本**：别人的挂载、物理路径、未注册能力 id。
+
+**门槛**：`./mvnw -o -DskipTests compile` + 相关模块 `spotbugs:check`（写代码 Agent）；全仓 `./mvnw verify` 全绿并报本轮真数（测试 Agent / 控制方）。
+
+**预告既有断言失效（测试 Agent 的输入）**：`MainMosire/.../AppMcpLinkTest`（工具面 21 → 23，**仍用全等**）、
+`WorkspaceMosire/.../WorkspaceToolsTest`（家族 3 → 4）、`DocsMosire/.../DocsToolsDisciplineTest`（家族 7 → 8）、
+以及任何"工具总数/家族集合"的断言。
+
+**验收（缺一不算完成）**：① 判据正/负全绿 + 变异自证；② 全仓 `verify` 真数；③ **真模型使用模式**（AGENTS §三）：
+真进程 + `gemma4-local`，**复现隔壁 DM 场景**——模型先调 `doc_guide` → 拿到真挂载名 → `doc_create(workspace/notes/x.md)` **一次成功**（不再猜名字）。
+
+---
+
 ## 后续（不在本计划）
 
 R5 命令面模块（N13：`shell-mosire` 抽核 + `bash(mount=…)` + 白名单 + `bash` 能力，草案见设计 §5.10）；R6 技能重基（注册 `docs` 能力 + frontmatter 校验器）；R7 其余默认工具按 workspace 重写、插件/子体目录迁入登记。
