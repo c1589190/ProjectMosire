@@ -1,0 +1,73 @@
+name: publish-maven
+
+# 把三个库（agentlib / workspace / docs）发布到 GitHub Pages，当作**只读 Maven 仓库**：
+#   https://c1589190.github.io/ProjectMosire/
+# 消费方只需在 pom 里加一个 <repository>，**不需要任何凭据**。
+#
+# 用法：打一个 tag（如 v0.1.0）即发布该版本；也可在 Actions 页手动 dispatch 指定版本。
+# 版本号必须固定（不能是 -SNAPSHOT）：Pages 上的文件被覆盖就没有可复现性了。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "发布版本号（不含前导 v），例如 0.1.0"
+        required: true
+        default: "0.1.0"
+
+permissions:
+  contents: write # 推 gh-pages 分支
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装配 JDK 21 + Maven 缓存
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: 定版本（tag 名去掉前导 v；手动 dispatch 用输入）
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          if [ -z "${V}" ]; then V="${GITHUB_REF_NAME#v}"; fi
+          echo "发布版本：$V"
+          echo "PUBLISH_VERSION=$V" >> "$GITHUB_ENV"
+          ./mvnw -B -q versions:set -DnewVersion="$V" -DgenerateBackupPoms=false -DprocessAllModules=true
+
+      - name: 构建 + 部署到本地暂存目录（标准 Maven 仓库布局）
+        # 只发父 pom + 三个库：Brain/Main/Bash 不发（Pages 仓库越小越好，消费方也用不到）
+        # SpotBugs 在本地门禁已跑；发布链路跳过它以缩短时间、减少抖动
+        run: |
+          set -euo pipefail
+          ./mvnw -B -DskipTests -Dspotbugs.skip=true \
+            -pl .,AgentLibMosire,WorkspaceMosire,DocsMosire \
+            deploy -DaltDeploymentRepository=pages::default::file://$PWD/target/pages
+
+      - name: 核对暂存目录是合法仓库（父 pom 必须在，否则消费方解析不到子模块）
+        run: |
+          set -euo pipefail
+          V="${PUBLISH_VERSION}"
+          test -f "target/pages/io/mosire/mosire-parent/${V}/mosire-parent-${V}.pom"
+          for a in agentlib-mosire workspace-mosire docs-mosire; do
+            for f in "${a}-${V}.jar" "${a}-${V}.pom" "${a}-${V}-sources.jar"; do
+              test -f "target/pages/io/mosire/${a}/${V}/${f}" || { echo "缺文件: ${a}/${V}/${f}"; exit 1; }
+            done
+          done
+          echo "暂存目录内容："
+          find target/pages -type f | sort
+
+      - name: 发布到 gh-pages（keep_files：历史版本保留）
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/pages
+          publish_branch: gh-pages
+          keep_files: true
