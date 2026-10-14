@@ -51,6 +51,12 @@ jobs:
             -pl .,AgentLibMosire,WorkspaceMosire,DocsMosire \
             deploy -DaltDeploymentRepository=pages::default::file://$PWD/target/pages
 
+      - name: 带上落地页（仓库根没有 index.html 会返回 GitHub 的 404 页）
+        # pages/index.html 是仓库内的源（改它要提交）；keep_files=true 让它在后续发布中保留，这里再显式带上更稳
+        run: |
+          set -euo pipefail
+          cp pages/index.html target/pages/index.html
+
       - name: 核对暂存目录是合法仓库（父 pom 必须在，否则消费方解析不到子模块）
         run: |
           set -euo pipefail

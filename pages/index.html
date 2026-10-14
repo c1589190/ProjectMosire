@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mosire Maven 仓库</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 15px/1.7 -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+             max-width: 46rem; margin: 3rem auto; padding: 0 1.2rem; }
+      h1 { font-size: 1.5rem; margin-bottom: .2rem; }
+      .sub { opacity: .65; margin-top: 0; }
+      h2 { font-size: 1.05rem; margin-top: 2rem; }
+      pre { background: rgba(127,127,127,.13); padding: .9rem 1rem; border-radius: 6px; overflow-x: auto; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid rgba(127,127,127,.3); }
+      a { color: inherit; }
+      .note { border-left: 3px solid rgba(127,127,127,.5); padding-left: .9rem; opacity: .85; }
+    </style>
+  </head>
+  <body>
+    <h1>Mosire Maven 仓库</h1>
+    <p class="sub">这是一个<strong>只读 Maven 仓库</strong>（GitHub Pages），不是网站首页的替代品。</p>
+
+    <h2>消费方：加一段 repository 就能用</h2>
+    <pre><code>&lt;repositories&gt;
+  &lt;repository&gt;
+    &lt;id&gt;mosire-pages&lt;/id&gt;
+    &lt;url&gt;https://c1589190.github.io/ProjectMosire/&lt;/url&gt;
+    &lt;releases&gt;&lt;enabled&gt;true&lt;/enabled&gt;&lt;/releases&gt;
+    &lt;snapshots&gt;&lt;enabled&gt;false&lt;/enabled&gt;&lt;/snapshots&gt;
+  &lt;/repository&gt;
+&lt;/repositories&gt;
+
+&lt;dependency&gt;
+  &lt;groupId&gt;io.mosire&lt;/groupId&gt;
+  &lt;artifactId&gt;docs-mosire&lt;/artifactId&gt;
+  &lt;version&gt;0.1.0&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+    <h2>已发布的制品（0.1.0）</h2>
+    <table>
+      <tr><th>坐标</th><th>jar</th><th>sources</th><th>版本清单</th></tr>
+      <tr>
+        <td><code>io.mosire:agentlib-mosire</code></td>
+        <td><a href="io/mosire/agentlib-mosire/0.1.0/agentlib-mosire-0.1.0.jar">jar</a></td>
+        <td><a href="io/mosire/agentlib-mosire/0.1.0/agentlib-mosire-0.1.0-sources.jar">sources</a></td>
+        <td><a href="io/mosire/agentlib-mosire/maven-metadata.xml">metadata</a></td>
+      </tr>
+      <tr>
+        <td><code>io.mosire:workspace-mosire</code></td>
+        <td><a href="io/mosire/workspace-mosire/0.1.0/workspace-mosire-0.1.0.jar">jar</a></td>
+        <td><a href="io/mosire/workspace-mosire/0.1.0/workspace-mosire-0.1.0-sources.jar">sources</a></td>
+        <td><a href="io/mosire/workspace-mosire/maven-metadata.xml">metadata</a></td>
+      </tr>
+      <tr>
+        <td><code>io.mosire:docs-mosire</code></td>
+        <td><a href="io/mosire/docs-mosire/0.1.0/docs-mosire-0.1.0.jar">jar</a></td>
+        <td><a href="io/mosire/docs-mosire/0.1.0/docs-mosire-0.1.0-sources.jar">sources</a></td>
+        <td><a href="io/mosire/docs-mosire/maven-metadata.xml">metadata</a></td>
+      </tr>
+      <tr>
+        <td><code>io.mosire:mosire-parent</code>（父 pom，<strong>必须一起拿</strong>）</td>
+        <td colspan="2"><a href="io/mosire/mosire-parent/0.1.0/mosire-parent-0.1.0.pom">pom</a></td>
+        <td><a href="io/mosire/mosire-parent/maven-metadata.xml">metadata</a></td>
+      </tr>
+    </table>
+
+    <h2>说明</h2>
+    <ul>
+      <li>依赖方向：<code>docs-mosire → workspace-mosire → agentlib-mosire</code>；写两条依赖即可，agentlib 会传递带过来。</li>
+      <li>只发<strong>固定版本</strong>（不发 SNAPSHOT）：Pages 上的文件被覆盖就没有可复现性了。</li>
+      <li>历史版本保留（发布用 <code>keep_files=true</code>），消费方可以钉旧版。</li>
+      <li>需要 JDK 21。</li>
+      <li>接入细节（权限面三命名空间、<code>destructiveAllowed</code>、<code>identity.instanceId</code> 即工作区调用者键等）见仓库内
+        <code>接入指南-三个库给消费方.md</code>。</li>
+    </ul>
+
+    <p class="note">维护方发新版：<code>git tag -a vX.Y.Z &amp;&amp; git push origin vX.Y.Z</code> —— 由
+      <code>.github/workflows/publish-maven.yml</code> 自动构建并发布到这里。</p>
+  </body>
+</html>
