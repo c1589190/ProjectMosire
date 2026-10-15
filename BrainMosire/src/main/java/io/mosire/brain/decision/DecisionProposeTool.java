@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,8 +68,12 @@ import org.slf4j.LoggerFactory;
  * summary} 只含<b>工具名 + 摘要</b>，两者都会被提示面/事件面引用； ② 本工具覆写 {@link #ledgerArgs(ToolContext)}，让 {@code
  * tool.call} 事件只落"几条、什么工具、摘要"—— 缺省实现会把模型给的整包明文（可能含命令/令牌）写进事件库。
  *
- * <p><b>★ 本单（RB2a）的边界</b>：只做"模型能提议、拿到 packageId"。<b>不含</b>审批面投递与裁决回填（RB2b）、 <b>不含</b>事件与 HTTP
- * 面（RB3）。所以提议成功只意味着包已登记（{@code PROPOSED}）——此刻没有任何 {@code PendingApprovals} 投递；没人裁的包到点由 {@link
+ * <p><b>★ 提议成功回调（RB2b 的审批面投递缝）</b>：包一登记成功就调注入的 {@code onProposed}（缺省 no-op）。投递<b>不在本工具里</b>： 装配层把
+ * {@code DecisionApprovalBridge} 的回调接进来，由它决定"这个包怎么投、谁来裁"——本工具只负责"我登记了一个包"。回调在提议线程上
+ * <b>同步</b>执行（所以实现必须自己保证快速返回，长活儿自己开线程）；回调抛异常只落 WARN，<b>不</b>把已登记的包报成失败（包在表里，报失败是假话）。
+ *
+ * <p><b>★ 本单（RB2b）的边界</b>：本类只加这条缝；审批面投递与裁决回填在 {@code DecisionApprovalBridge}，事件与 HTTP
+ * 面（RB3）仍<b>不含</b>。 没有装配回调（或装配了 no-op）的部署行为与 RB2a 逐字相同：提议成功 = 包停在 {@code PROPOSED}，没人裁的包到点由 {@link
  * DecisionPackages#expire} 置 {@code EXPIRED}（零落盘）。
  *
  * <p><b>★ 已知缺口（如实记，不许说成已判）</b>：{@link ItemValidator} 这条缝今天只能表达
@@ -112,17 +117,38 @@ public final class DecisionProposeTool implements AgentTool {
   private final DecisionPackages packages;
   private final ToolRegistry registry;
   private final ValidatorSource validators;
+  private final Consumer<DecisionPackage> onProposed;
 
   /**
+   * 3 参构造（RB2a 的既有形状逐字保留）：提议成功回调缺省 no-op = "没人要听"。
+   *
+   * <p>保留它不是兼容洁癖：没有装配回调的部署（离线夹具、只验提议面的用例）行为必须与 RB2a 逐字相同，"缺省 no-op"就是那句话的载体。
+   *
    * @param packages 决策包登记表（装配层持有的<b>那一个</b>实例；本工具不建单例）
    * @param registry 工具目录（结构面：工具在不在、可不可被提议）
    * @param validators 按调用者权限集产出条目校验器（装配注入；权限面见 {@link ValidatorSource}）
    */
   public DecisionProposeTool(
       DecisionPackages packages, ToolRegistry registry, ValidatorSource validators) {
+    this(packages, registry, validators, created -> {});
+  }
+
+  /**
+   * @param packages 决策包登记表（装配层持有的<b>那一个</b>实例；本工具不建单例）
+   * @param registry 工具目录（结构面：工具在不在、可不可被提议）
+   * @param validators 按调用者权限集产出条目校验器（装配注入；权限面见 {@link ValidatorSource}）
+   * @param onProposed 提议成功回调（RB2b 的审批面投递缝；非 null，3 参构造用 no-op）。它<b>在提议线程上同步</b>调用 ⇒
+   *     实现必须自己保证快速返回（长活儿自己开线程，见 {@code DecisionApprovalBridge}）；抛异常只落 WARN，不改变"包已登记"这个事实。
+   */
+  public DecisionProposeTool(
+      DecisionPackages packages,
+      ToolRegistry registry,
+      ValidatorSource validators,
+      Consumer<DecisionPackage> onProposed) {
     this.packages = Objects.requireNonNull(packages, "packages");
     this.registry = Objects.requireNonNull(registry, "registry");
     this.validators = Objects.requireNonNull(validators, "validators");
+    this.onProposed = Objects.requireNonNull(onProposed, "onProposed");
   }
 
   /**
@@ -324,6 +350,12 @@ public final class DecisionProposeTool implements AgentTool {
         created.proposerKey(),
         created.items().size(),
         created.deadlineEpochMs());
+    // ④ 投递缝（RB2b）：回调失败不改变"包已登记"的语义（包在表里，报失败是假话），但要让失败可见
+    try {
+      onProposed.accept(created);
+    } catch (RuntimeException failure) {
+      LOG.warn("提议成功回调失败（包已登记，本次仍按成功返回） id={} 异常={}", created.id(), failure.toString());
+    }
     return ToolResult.ok(successJson(created));
   }
 

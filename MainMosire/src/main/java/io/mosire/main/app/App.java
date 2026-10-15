@@ -15,6 +15,7 @@ import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
 import io.mosire.agentlib.config.ConfigStore;
 import io.mosire.agentlib.config.FileConfigStore;
+import io.mosire.agentlib.decision.DecisionCommitPort;
 import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
@@ -55,6 +56,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
+import io.mosire.brain.decision.DecisionApprovalBridge;
 import io.mosire.brain.decision.DecisionProposeTool;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
@@ -597,25 +599,6 @@ public final class App implements AutoCloseable {
           workspaceRegistry.maskEntries().size(),
           DocsTools.NAMES,
           WorkspaceTools.NAMES);
-      // ★ RB2a（设计 §5.9 ① ②）：决策包<b>提议面</b>——包登记表 + 模型面提议工具 decision_propose。
-      //   本单只做"模型能提议、拿到 packageId"：审批面投递与裁决回填是 RB2b、事件与 HTTP 面是 RB3；
-      //   今天提议成功 ⇒ 包停在 PROPOSED（没人裁，到点由 DecisionPackages 惰性置 EXPIRED、零落盘）。
-      //   供给源口径与其它 builtin 工具同法（BuiltinToolSource + sourceId 归属）；
-      //   DecisionPackages 随 App 字段持有（见 App#decisionPackages），RB2b/RB3 取同一个实例——不造静态单例、
-      //   也不另建第二张表（两张表 = "这个包里有什么"有两个答案）。
-      DecisionPackages decisionPackages = new DecisionPackages();
-      BuiltinToolSource decisionToolSource =
-          new BuiltinToolSource(
-              BUILTIN_TOOL_SOURCE_ID,
-              List.of(new DecisionProposeTool(decisionPackages, tools, decisionValidators(tools))));
-      for (AgentTool decisionTool : decisionToolSource.listTools()) {
-        tools.register(decisionToolSource.id(), decisionTool);
-      }
-      LOG.info(
-          "决策包提议面已装配：工具={} 条目上限={} 裁决窗口={}ms（审批面投递=RB2b、事件/HTTP 面=RB3，本单未接）",
-          DecisionProposeTool.NAME,
-          DecisionProposeTool.MAX_ITEMS,
-          DecisionProposeTool.DEFAULT_DEADLINE_MILLIS);
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
@@ -651,6 +634,41 @@ public final class App implements AutoCloseable {
               : "http://127.0.0.1:" + approvalServer.boundPort(),
           approvalTtyChannel.available() ? "可用" : "不可用（无控制终端）",
           approvalConfig.timeout().toSeconds());
+      // ★ RB2a/RB2b（设计 §5.9 ① ② ③）：决策包<b>提议面</b>（包登记表 + 模型面提议工具 decision_propose）
+      //   与<b>审批面投递桥</b>（一个包 = 一条 ApprovalRequest，答复回填统一裁决）。
+      //   装配顺序刻意排在审批面<b>之后</b>：桥要拿的正是上面刚建好的那两个实例——同一份 PendingApprovals、
+      //   同一个 ApprovalCoordinator（不新建第二张表 / 不新建通道 / 不另起 HTTP 端点族，设计 §5.4 的验收判据）。
+      //   供给源口径与其它 builtin 工具同法（BuiltinToolSource + sourceId 归属）；
+      //   DecisionPackages 随 App 字段持有（见 App#decisionPackages），RB2b/RB3 取同一个实例——不造静态单例。
+      DecisionPackages decisionPackages = new DecisionPackages();
+      // 世界提交口（RB1 的 DecisionCommitPort，实现方是隔壁 RC1）：今天尚未落地 ⇒ empty = 未装配。
+      // 桥不会因此假装已落定：裁决后包保持 DECIDED 并落一行 WARN（见 DecisionApprovalBridge 的 backfill）。
+      // RC1 接上时只需把下面的 empty() 换成 Optional.of(它的实例)——桥与提议工具都不必改。
+      // ★ 用 Optional 而不是可空局部：装配层今天只可能传 null，可空写法被 SpotBugs 判成「恒为 null + 冗余判空」而门禁红。
+      Optional<DecisionCommitPort> decisionCommitPort = Optional.empty();
+      DecisionApprovalBridge decisionApprovalBridge =
+          new DecisionApprovalBridge(
+              decisionPackages, approvalCoordinator, pendingApprovals, decisionCommitPort);
+      BuiltinToolSource decisionToolSource =
+          new BuiltinToolSource(
+              BUILTIN_TOOL_SOURCE_ID,
+              List.of(
+                  new DecisionProposeTool(
+                      decisionPackages,
+                      tools,
+                      decisionValidators(tools),
+                      decisionApprovalBridge::onProposed)));
+      for (AgentTool decisionTool : decisionToolSource.listTools()) {
+        tools.register(decisionToolSource.id(), decisionTool);
+      }
+      LOG.info(
+          "决策包面已装配：工具={} 条目上限={} 裁决窗口={}ms 审批桥=已接（一条包=一条审批请求 classKey={}）"
+              + " 提交口={}（事件/HTTP 面=RB3，本单未接）",
+          DecisionProposeTool.NAME,
+          DecisionProposeTool.MAX_ITEMS,
+          DecisionProposeTool.DEFAULT_DEADLINE_MILLIS,
+          DecisionApprovalBridge.CLASS_KEY,
+          decisionCommitPort.isPresent() ? "已装配" : "未装配（裁决后包保持 DECIDED）");
       // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
       // ★ RA4（设计 §4.6）：模板库在这里<b>只装载一次</b>——既供 SubagentManager 用，也供紧随其后的装订期角色审计取
       //   declaredRoles。上移只让审计看得见同一份快照；装载时机与失败语义（坏模板 / 缺目录 ⇒ 启动响亮失败）逐字不变。
