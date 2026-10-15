@@ -61,7 +61,7 @@
 | D27 两维落地了吗 | **没有**：全仓 `grep subtree\|capabilities(` 只命中无关的 `ModelCapabilities`（模型能力表） |
 
 ⇒ `op ∈ capabilities(caller) ∧ target ∈ subtree(caller)` 这条判据**今天判不了**（第二维无输入、第一维的 caller 也认不出）。
-更糟的是**读工具一旦注册就会被外发**：`AgentToMcpServer.start(tools, …)`（`App.java:252`）把**整个 ToolRegistry** 交给子体当 MCP 桥，
+更糟的是**读工具一旦注册就会被外发**：`AgentToMcpServer.start(tools, …)`（`App.java:252`）把**整个 ToolRegistry** 交给子体当 MCP 桥，（★ 2026-10-16：此处「整个 ToolRegistry」已被 A-6 收窄为该子体判定面放行的子集——见下方 ★ 更正与 设计-角色与统一决策包.md §4.8）
 `--mcp-expose` 一开，子体手里就有 `list_sub_agents` 这类编排工具的副本（U6 实测：`orch-probe` 子体列出了桥接进来的 3 个工具）。
 ★ **2026-10-16 更正（A-6 落地后，用户裁定接受）**：本行的「3 个工具」已不成立——父侧外发面改按**判定面**收窄（见 `设计-角色与统一决策包.md` §4.8）：`orch-probe` 子体现在只看得见 `list_sub_agents`（spawn/kill 是破坏性工具而该模板 `destructiveAllowed=false`，本就一调就被拒 ⇒ 不再外发）。★ 但「整注册表外发」这个担忧**只是被削窄、不是被消除**：A-6 保证「外发的工具 ⊆ 该子体判定面放行的工具」，**不替代 `noExport`**（D30 的「读权力不外包」仍然必需）。原文保留为历史留痕。
 ⇒ 直接注册 `read_agent_context` = **每个子体都能读别家子体的上下文**，正是 D27 读侧明令禁止的事。
@@ -123,7 +123,7 @@ A 的实现纪律：**只读连接**（`jdbc:sqlite:file:<path>?mode=ro`，不�
 | 调用者身份/权限 | `ToolContext.caller`（只有三级 `AccessToken`）+ `ToolContext.permissions`（`AgentPermissionSet.isToolAllowed`） |
 | 工具配置注入点 | `ToolContext.config`（**这是运行时给工具注入自身配置的既定缝**，子库根路径走它，别走构造器全局） |
 | 事件读取 | `EventQuery(agent,type,correlationId,beforeSeq,limit)` → 按 seq **倒序**返回；**没有正向游标**（本稿承诺的 `sinceSeq/nextSinceSeq` 需要加法式扩展，或读侧自行过滤+反转） |
-| 外发面 | `AgentToMcpServer.start(tools, …)` 把整个 ToolRegistry 交给子体（`App.java:252`）⇒ 必须加"禁外发"标记 |
+| 外发面 | `AgentToMcpServer.start(tools, …)` 把整个 ToolRegistry 交给子体（`App.java:252`）⇒ 必须加"禁外发"标记 |（★ 2026-10-16：此处「整个 ToolRegistry」已被 A-6 收窄为该子体判定面放行的子集——见下方 ★ 更正与 设计-角色与统一决策包.md §4.8）
 
 **步骤**：
 
