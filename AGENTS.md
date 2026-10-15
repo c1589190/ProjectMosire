@@ -133,6 +133,15 @@ BashPluginMosire ────────────────────┘
 
    ★ **作用域 = 本 checkout**：别的仓库/别的项目在跑 Maven 不阻塞本仓。判断时看进程命令行/cwd 是否落在
    `/home/cna/ProjectMosire`，**不要用裸 `pgrep` 把隔壁项目也算进来**。
+
+   ★★ **"等 Maven 空闲"不能这样写**（2026-10-16 实测事故，两个 Agent 互堵）：
+   `while pgrep -f "classworlds.*ProjectMosire|surefirebooter" >/dev/null; do sleep 20; done`
+   **会匹配执行它的那个 shell 自己的命令行**（命令行里就含这串字面量）⇒ 条件永远为真、空转不退出；若它同时持着
+   `flock`，等锁的其它 Agent 会被一起堵死。正确写法二选一：① 只匹配 java 进程 ——
+   `pgrep -a java | grep -q classworlds`；② 括号技巧 —— `pgrep -f "[c]lassworlds.*ProjectMosire|[s]urefirebooter"`
+   （自己命令行里不再含可匹配字面量）。串行化的标准写法：
+   `flock -w <秒> .work/maven.lock -c '<命令段>'`；★ 注意 `flock -c` **没有 `set -e`**，外层 `EXIT=$?` 只反映
+   **最后一条**命令——多命令段要么逐条留退出码，要么显式 `set -e`。
 2. ★ **一个文件一个 owner。** 动手前先 `git status --porcelain`，再用
    `find <模块>/src -mmin -3`（或等价方式）看有没有人正在写；看到**半成品尾巴**（例如 import 了刚被删的类
    ⇒ 编译不过）**不要接手**——那通常不是坏尾，是另一个 Agent 的中间态。先报告控制方。
