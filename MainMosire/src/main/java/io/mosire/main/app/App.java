@@ -36,6 +36,7 @@ import io.mosire.agentlib.permission.CommandModeLoader;
 import io.mosire.agentlib.permission.Operation;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
+import io.mosire.agentlib.permission.RoleCatalogAudit;
 import io.mosire.agentlib.permission.RoleSet;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.plugin.HostServices;
@@ -66,6 +67,7 @@ import io.mosire.brain.skills.SkillSettings;
 import io.mosire.brain.skills.SkillTools;
 import io.mosire.brain.subagent.AgentCommand;
 import io.mosire.brain.subagent.AgentContextReader;
+import io.mosire.brain.subagent.AgentTemplate;
 import io.mosire.brain.subagent.AgentTemplateStore;
 import io.mosire.brain.subagent.SubProcessExecutor;
 import io.mosire.brain.subagent.SubagentInstance;
@@ -119,6 +121,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -611,10 +614,16 @@ public final class App implements AutoCloseable {
           approvalTtyChannel.available() ? "可用" : "不可用（无控制终端）",
           approvalConfig.timeout().toSeconds());
       // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
+      // ★ RA4（设计 §4.6）：模板库在这里<b>只装载一次</b>——既供 SubagentManager 用，也供紧随其后的装订期角色审计取
+      //   declaredRoles。上移只让审计看得见同一份快照；装载时机与失败语义（坏模板 / 缺目录 ⇒ 启动响亮失败）逐字不变。
+      AgentTemplateStore templateStore = null;
       if (config.templatesDir() != null) {
+        templateStore = new AgentTemplateStore(config.templatesDir());
+        templateStore.load();
         SubagentRig rig =
             wireSubagents(
                 config,
+                templateStore,
                 tools,
                 events,
                 bus,
@@ -634,6 +643,43 @@ public final class App implements AutoCloseable {
                 lineageIndex::put);
         subagentManager = rig.manager();
         subagentProcesses = rig.processes();
+      }
+      // ★ RA4（设计 §4.6「装订期：派生 + 审计」，不变量 A-4 / A-5）：注册表在这一点已是"对外服务前的完整面貌"
+      //   （插件 / 技能 / docs / 工作区 / 编排工具都已注册），把角色维扫一遍：
+      //   ① 未登记角色名 ⇒ 下面响亮失败（拼错的角色 = 永远不可达的工具，"漂移无症状"）；
+      //   ② 声明了角色但没有任何调用者配置能覆盖 ⇒ 一行报告（不失败）；
+      //   ③ 派生 ⇔ 手抄对账只在宿主两样都给了时做——本装配今天不提供派生函数与手抄清单 ⇒ 跳过（不是"空跑通过"）。
+      //   已知角色全集 = 主 Agent 角色（agent.roles）∪ 在场模板的 declaredRoles ∪ 外部 MCP 面角色（今天 = ⊥ = 空集）。
+      Set<String> knownRoles = new TreeSet<>(agentRoles.roles());
+      if (templateStore != null) {
+        for (AgentTemplate template : templateStore.all().values()) {
+          // null = 模板对本维不表态（不额外收窄），不是"谁都不是"——与 SubagentManager 的求交口径同源
+          RoleSet declaredRoles = template.declaredRoles();
+          if (declaredRoles != null) {
+            knownRoles.addAll(declaredRoles.roles());
+          }
+        }
+      }
+      // 外部 MCP 面（下方 AgentToMcpServer 的 ToolContext）今天显式表态为 RoleSet.none()（⊥）⇒ 贡献空集。
+      // 将来该面配了角色必须并进这里：否则声明了该角色的工具会被报成"没有调用者能覆盖"（报告失真，不是安全洞）。
+      Set<String> externalMcpRoles = Set.of();
+      knownRoles.addAll(externalMcpRoles);
+      RoleCatalogAudit.Report roleAudit = RoleCatalogAudit.of(tools, knownRoles).run();
+      if (roleAudit.hasFailures()) {
+        // 沿用本文件既有的装配失败口径：RuntimeException 原样上抛 → 主 catch 回收已装配资源 → CLI 非零退出（不新造一套）
+        throw new IllegalStateException(
+            "装订期角色审计失败（未登记角色名 / 目录对账不符；设计 §4.6 不变量 A-4/A-5）："
+                + String.join("；", roleAudit.failures()));
+      }
+      // 成功恒一行 INFO（模板目录缺失时把"未并入模板角色"与摘要并进同一行，避免多一行噪音）；
+      // 报告项（报告 = 不是失败）另起一行 WARN 并点名——角色名可进装订期审计 / 运维日志（§4.3.1 的面的分工）。
+      if (templateStore == null) {
+        LOG.info("{}（模板目录未配置，未并入模板角色）", roleAudit.summary());
+      } else {
+        LOG.info("{}", roleAudit.summary());
+      }
+      if (!roleAudit.uncoveredRoleFindings().isEmpty()) {
+        LOG.warn("装订期角色审计（报告，不失败）: {}", roleAudit.uncoveredRoleFindings());
       }
       // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）。
       // S4-B2：改用带 authorizer 的 5 参重载（V8 的结构前提——子体经 MCP 调父级工具时审批同样生效）；
@@ -836,9 +882,10 @@ public final class App implements AutoCloseable {
   }
 
   /**
-   * W3b 子 Agent 编排装配：模板库装载（fail-fast——坏模板/缺目录在启动期暴露）→ 子进程管理器 + 链接形态 {@link AgentCommand}（当前 java +
-   * 本进程 classpath + {@code Main agent}，JVM 内存 cap -Xmx128m，目录注入，{@code --parent-link}）→ {@link
-   * SubagentManager}（父级 = 主 Agent：权限/深度 0 对照）→ 五个内置编排工具以 builtin 供给源注册进工具面（二期 L2：sourceId 归属）。
+   * W3b 子 Agent 编排装配：模板库（由 {@code start} <b>装载一次</b>后传入——装载时机与 fail-fast 语义"坏模板/缺目录在启动期暴露"
+   * 逐字不变，上移只为让装订期角色审计看到同一份快照）→ 子进程管理器 + 链接形态 {@link AgentCommand}（当前 java + 本进程 classpath + {@code
+   * Main agent}，JVM 内存 cap -Xmx128m，目录注入，{@code --parent-link}）→ {@link SubagentManager}（父级 = 主
+   * Agent：权限/深度 0 对照）→ 五个内置编排工具以 builtin 供给源注册进工具面（二期 L2：sourceId 归属）。
    *
    * <p>S5-A：那句"父级 = 主 Agent 对照"只覆盖 3 参 {@code spawn}（= 主 Agent 在要）；经 MCP 链接进来的下级调用走 {@code
    * spawn(request, identity, permissions)}，对照物是<b>调用者自己</b>。
@@ -849,6 +896,7 @@ public final class App implements AutoCloseable {
    */
   private static SubagentRig wireSubagents(
       BootConfig config,
+      AgentTemplateStore templateStore,
       ToolRegistry tools,
       EventStore events,
       EventBus bus,
@@ -862,8 +910,6 @@ public final class App implements AutoCloseable {
       int skillsListingBudget,
       WorkspaceRegistry workspaceRegistry,
       BiConsumer<String, String> lineageRegistrar) {
-    AgentTemplateStore templateStore = new AgentTemplateStore(config.templatesDir());
-    templateStore.load();
     SubprocessManager processes = new SubprocessManager();
     SubProcessExecutor executor =
         new SubProcessExecutor(
