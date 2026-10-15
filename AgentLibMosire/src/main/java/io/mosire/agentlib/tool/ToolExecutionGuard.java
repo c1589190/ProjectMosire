@@ -24,6 +24,11 @@ public final class ToolExecutionGuard {
    * 否则一次审批放行就可能把一个本就无权执行的调用洗白。判定规则与 {@link #execute} 逐条同源（同一个 {@link
    * PermissionChecker}），此处不新增规则、不吞异常。
    *
+   * <p>第 8 维"角色"也在这里进判定：工具的 {@link AgentTool#roles()} 声明<b>原样传给</b> {@code
+   * PermissionChecker.denialReason(..., tool.roles())}——声明空集 ⇒ 本维不表态 ⇒ 既有工具行为逐字不变；声明非空 ⇒
+   * 与调用者角色不相交即拒（{@code PERMISSION_DENIED}）。这里是判定面唯一把"工具声明"与"调用者权限集"接起来的缝， 漏掉它 = {@code roles()}
+   * 只是个没人读的注解。
+   *
    * @param registry 注册表（工具不存在 ⇒ {@code TOOL_NOT_FOUND}，与 {@link #execute} 同码同文案）
    */
   public Optional<ToolResult> denial(ToolRegistry registry, String toolName, ToolContext context) {
@@ -40,7 +45,8 @@ public final class ToolExecutionGuard {
    * @param tool 非 null（调用方已解析）
    */
   public Optional<ToolResult> denial(AgentTool tool, ToolContext context) {
-    return PermissionChecker.denialReason(context.permissions(), tool.name(), tool.spec())
+    return PermissionChecker.denialReason(
+            context.permissions(), tool.name(), tool.spec(), tool.roles())
         .map(reason -> ToolResult.error(DENIED, reason));
   }
 

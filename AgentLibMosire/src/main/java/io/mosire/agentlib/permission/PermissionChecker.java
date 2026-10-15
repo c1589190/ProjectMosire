@@ -1,6 +1,9 @@
 package io.mosire.agentlib.permission;
 
+import java.util.Collection;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * 权限判定（纯函数，供 {@code ToolExecutionGuard} 与子 Agent 单调性守卫共用）。
@@ -11,6 +14,7 @@ import java.util.Optional;
  *   <li>denied 名单命中 → 拒绝（显式拒绝优先级最高）；
  *   <li>白名单存在且不命中（含通配） → 拒绝（deny-default）；
  *   <li>身份级别不足 → 拒绝（工具要求的级别只能由更高身份满足）；
+ *   <li>角色不相交（工具声明了角色，且与调用者角色无交集） → 拒绝（第 8 维；先答"你是不是这个工具的人"，再答"你有没有资格碰这一档"）；
  *   <li>工具标记 sensitive/destructive 而权限集未显式放行 → 拒绝（终局拒绝，不走审批流—— ApprovalGate 在 M2 经 AG-UI 补）。
  * </ol>
  */
@@ -21,12 +25,41 @@ public final class PermissionChecker {
   /**
    * 判定一次调用；拒绝时返回原因，允许时返回空。
    *
+   * <p><b>不带工具角色声明</b>的重载：等价于工具在第 8 维<b>不表态</b>（{@link #denialReason(AgentPermissionSet, String,
+   * ToolSpec, Collection)} 传空集），行为与本维引入前逐字相同。
+   *
    * @param permissions 调用者权限集
    * @param toolName 工具名
    * @param spec 工具三要素（null 视为 {@link ToolSpec#DEFAULT}）
    */
   public static Optional<String> denialReason(
       AgentPermissionSet permissions, String toolName, ToolSpec spec) {
+    return denialReason(permissions, toolName, spec, Set.of());
+  }
+
+  /**
+   * 判定一次调用（含第 8 维"角色"）；拒绝时返回原因，允许时返回空。
+   *
+   * <p>判定式（设计 §4.4）：工具声明的角色<b>空</b> ⇒ 本维不表态 ⇒ 通过；否则要求 {@code caller.roles() ∩ toolRoles ≠
+   * ∅}。角色只是<b>合取项</b>（只减不增），永远不能单独放行。
+   *
+   * <p>位置与拒码：排在桶/白名单之后、敏感破坏之前；拒码沿用 {@code PERMISSION_DENIED}——模型改不了"我是谁"， 与 {@code RESOURCE_DENIED}
+   * 的"改个路就能过"不同（分码标准是"模型能不能自救"）。
+   *
+   * <p>{@code toolRoles} 为 {@code null} 与空集同读"不表态"（同下方 {@code spec} 的 null ⇒ {@link
+   * ToolSpec#DEFAULT} 口径）；SPI 契约上它应当是 {@code AgentTool.roles()} 的非 null 返回值。声明里只含空白名 ⇒ 不匹配任何调用者 ⇒
+   * 拒（fail-closed），不是"退回不表态"。
+   *
+   * @param permissions 调用者权限集
+   * @param toolName 工具名
+   * @param spec 工具三要素（null 视为 {@link ToolSpec#DEFAULT}）
+   * @param toolRoles 工具的声明面（{@code AgentTool.roles()}，见 {@link RoleSet#intersects(Collection)}）
+   */
+  public static Optional<String> denialReason(
+      AgentPermissionSet permissions,
+      String toolName,
+      ToolSpec spec,
+      Collection<String> toolRoles) {
     if (permissions == null) {
       return Optional.of("无权限上下文（权限集为空）");
     }
@@ -49,10 +82,33 @@ public final class PermissionChecker {
               + "，调用者为 "
               + permissions.grantedToken());
     }
+    // 角色（第 8 维，设计 §4.4）：排在桶/白名单之后、敏感破坏之前。
+    // 声明侧空集 = 本维不表态（既有工具一个都没声明角色）⇒ 既有工具行为逐字不变；非空 ⇒ 参与判定且只收窄。
+    if (toolRoles != null && !toolRoles.isEmpty() && !permissions.roles().intersects(toolRoles)) {
+      return Optional.of(
+          "角色不相交：工具 "
+              + toolName
+              + " 声明的角色 "
+              + renderRoles(toolRoles)
+              + "，调用者角色是 ["
+              + permissions.roles().summary()
+              + "]");
+    }
     if (sensitiveOrDestroyed(permissions, s)) {
       return Optional.of("工具 " + toolName + (s.destructive() ? " 为破坏性操作，需显式放行" : " 为敏感操作，需显式放行"));
     }
     return Optional.empty();
+  }
+
+  /** 声明面渲染（拒因文案用）：去空白、丢空白项、按字典序——与 {@link RoleSet#intersects} 的比对口径一致。 */
+  private static String renderRoles(Collection<String> roles) {
+    Set<String> names = new TreeSet<>();
+    for (String role : roles) {
+      if (role != null && !role.isBlank()) {
+        names.add(role.trim());
+      }
+    }
+    return "[" + String.join(",", names) + "]";
   }
 
   private static boolean sensitiveOrDestroyed(AgentPermissionSet permissions, ToolSpec spec) {
@@ -72,7 +128,10 @@ public final class PermissionChecker {
    *   <li>敏感/破坏放行：子级放行 ⇒ 父级也已放行；
    *   <li>只读：父级只读 ⇒ 子级必须只读（只读是收缩；子级主动更只读总是允许）；
    *   <li>资源可达面（S5-B 第 7 维）：父级表态过的每个命名空间，子级都不得更宽（{@link ResourceScopeMap#covers}）。
-   *       父级没表态的命名空间不构成约束（子级主动更窄总是允许）。
+   *       父级没表态的命名空间不构成约束（子级主动更窄总是允许）；
+   *   <li>角色（§A 第 8 维，设计 §4.5）：父级的角色必须涵盖子级的角色（{@link RoleSet#covers}， <b>不另写
+   *       containsAll</b>：子集序的唯一实现点在 {@link RoleSet}）。父级 ⊥ ⇒ 子级必须 ⊥
+   *       （"父不表态、子自称管理员"的放大天然被封住）；子级拿父级角色的子集总是允许。
    * </ul>
    *
    * @param granted 被授予（较低/子）权限集
@@ -114,6 +173,10 @@ public final class PermissionChecker {
     }
     // 资源可达面（第 7 维）：父级表过态的命名空间，子级一个也不许更宽
     if (!parent.resourceScopes().covers(granted.resourceScopes())) {
+      return false;
+    }
+    // 角色（第 8 维，设计 §4.5）：父级必须涵盖子级——走 RoleSet.covers（子集序的唯一实现点），不另写 containsAll。
+    if (!parent.roles().covers(granted.roles())) {
       return false;
     }
     return true;

@@ -3,6 +3,7 @@ package io.mosire.agentlib.tool;
 import io.mosire.agentlib.permission.ResourceManifest;
 import io.mosire.agentlib.permission.ToolSpec;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 工具唯一接口：一个 Agent 可执行动作的最小描述 + 执行器。
@@ -34,6 +35,29 @@ public interface AgentTool {
 
   default ToolSpec spec() {
     return ToolSpec.DEFAULT;
+  }
+
+  /**
+   * 本工具能被哪些角色调用（§A 角色维的<b>声明侧</b>，设计 §4.2）。
+   *
+   * <p><b>空集 = 本维不表态 = 任意角色都能调</b>（= 本维引入前的行为）。为什么空集读作"不表态"而不是"谁都不能用"： 既有工具（bash / skill_* / doc_*
+   * / workspace_*）一个都没声明角色，若空集读作"谁都不能用"，本维一引入就把全部既有 工具打死。所以本维的正确切法是：<b>不表态 ⇒ 不构成约束；非空 ⇒
+   * 参与判定且只收窄</b>。
+   *
+   * <p>★ 与调用者侧的空集读法<b>相反</b>（{@link io.mosire.agentlib.permission.AgentPermissionSet#roles()} 的空集 =
+   * ⊥ = "谁都不是"，fail-closed）——身份没有"回落"，资源面才有。两侧不共用一个 {@code any()}，语义表见 {@link
+   * io.mosire.agentlib.permission.RoleSet}。
+   *
+   * <p>"不让任何角色用"这个语义<b>不提供</b>：那种工具根本不该注册（要停用走白名单/黑名单）。
+   *
+   * <p>角色名对 AgentLib 是<b>不透明标签</b>（宿主用枚举实现、以 {@code name()} 落配置与事件），通用层不认识 {@code GM}/{@code
+   * DM}。声明里的空白名不匹配任何调用者（fail-closed），不是"退回不表态"。
+   *
+   * <p>返回值必须<b>非 null</b>（缺省 {@code Set.of()}）：判定点对 null 按"不表态"读（同 {@link #spec()} 的 null ⇒ {@code
+   * ToolSpec.DEFAULT} 口径），那只是防呆，不是允许返回 null。
+   */
+  default Set<String> roles() {
+    return Set.of();
   }
 
   /**

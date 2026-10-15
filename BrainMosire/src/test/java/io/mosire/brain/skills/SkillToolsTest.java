@@ -6,10 +6,13 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.RoleSet;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolContext;
+import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import java.io.IOException;
@@ -17,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -175,6 +179,46 @@ class SkillToolsTest {
             scopes(ResourceScope.unlimited(), ResourceScope.none()));
     assertThat(result.success()).isFalse();
     assertThat(result.code()).isEqualTo(SkillException.SKILL_NOT_FOUND);
+  }
+
+  /**
+   * A-2 的真实工具面回归钉：{@link SkillTools#all} 产出的<b>既有技能工具</b>都没覆写 {@code roles()} ⇒ 声明空集 ⇒ 第 8 维不表态。真入口
+   * {@link ToolExecutionGuard#denial(AgentTool, ToolContext)} 与三参 {@link
+   * PermissionChecker#denialReason} 对任意调用者逐字同结论（= 本维引入前行为）。
+   *
+   * <p>AgentLib 侧的一般规则（stub 矩阵）在 {@code ToolExecutionGuardTest}；这里把“今天全部既有工具”这句话落到 <b>真实工具对象</b>上。★
+   * 若将来给某个既有工具声明角色，本用例会红——那不是回归，是提醒同步更新 A-2/A-3 的期望。
+   */
+  @Test
+  void builtinSkillToolsDeclareNoRolesAndTheirVerdictsStayUnchanged() {
+    ToolExecutionGuard guard = new ToolExecutionGuard();
+    List<AgentPermissionSet> callers =
+        List.of(
+            AgentPermissionSet.system(), // roles ⊥（缺省，fail-closed 的调用者侧）
+            AgentPermissionSet.builder(AccessToken.DEFAULT).allowAll().build(),
+            AgentPermissionSet.builder(AccessToken.DEFAULT)
+                .allowAll()
+                .build()
+                .withRoles(RoleSet.of("GM")),
+            AgentPermissionSet.builder(AccessToken.DEFAULT).allowAll().readOnly(true).build(),
+            AgentPermissionSet.builder(AccessToken.DEFAULT).allow(SkillTools.SKILL_LIST).build());
+    for (AgentTool tool : registry.list()) {
+      assertThat(tool.roles()).as("既有技能工具 %s 不声明任何角色", tool.name()).isNotNull().isEmpty();
+      for (AgentPermissionSet caller : callers) {
+        Optional<ToolResult> viaGuard =
+            guard.denial(tool, ToolContext.of(caller.grantedToken(), caller));
+        Optional<String> viaThreeArg =
+            PermissionChecker.denialReason(caller, tool.name(), tool.spec());
+        assertThat(viaGuard.map(ToolResult::message))
+            .as("工具 %s × 调用者 roles=%s 经两条路逐字一致", tool.name(), caller.roles().summary())
+            .isEqualTo(viaThreeArg);
+      }
+    }
+    // ⊥ 角色调用者 + 不表态工具 ⇒ 不得被第 8 维打死（本维不参与判定）
+    AgentTool list = registry.find(SkillTools.SKILL_LIST).orElseThrow();
+    assertThat(guard.denial(list, ToolContext.of(AccessToken.SYSTEM, AgentPermissionSet.system())))
+        .as("角色 ⊥ 的调用者仍能调不声明角色的真实工具")
+        .isEmpty();
   }
 
   @Test
