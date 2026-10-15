@@ -14,6 +14,7 @@ import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
+import io.mosire.agentlib.permission.RoleSet;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.EventTypes;
@@ -63,11 +64,13 @@ import org.slf4j.LoggerFactory;
  * <p><strong>spawn 检查顺序</strong>（中期计划 W3 + D27 的 I1 与血缘）：模板存在 → <b>{@code A1}
  * 工具越界</b>（D27：请求面点名了调用者没有的工具 ⇒ {@link SubagentRejectedException} + {@code permission.denied} 事件，见
  * {@link #checkRequestedToolsWithinCaller}）→ <b>工作目录越界</b>（S5-B，请求面要了调用者够不着的地方 ⇒ {@link
- * WorkingDirDeniedException} + {@code permission.denied} 事件）→ 权限单调性 （{@link
- * PermissionChecker#isSubset}，拒绝即 {@link SubagentRejectedException} + {@code permission.denied}
- * 事件）→ 档位单调性（S6，{@code decision} 无事件、拒绝走 {@code permission.denied}）→ 深度（{@code 调用者depth+1 > 子深度上限}
- * 拒绝，{@code decision:DEPTH_LIMIT} 事件）→〔锁内〕繁殖预算（{@code decision:BUDGET_EXHAUSTED} 事件）→ launcher
- * 启动。cap 派生： {@code min(模板, 请求收紧, 父级)}——子级只能更小（D10 硬顶的"单调性第四维度"）。
+ * WorkingDirDeniedException} + {@code permission.denied} 事件）→ <b>角色越界</b>（第 8 维，请求面点名了调用者没有的角色 ⇒
+ * {@link SubagentRejectedException} + {@code permission.denied} 事件，见 {@link #effectiveRoles}）→
+ * 权限单调性 （{@link PermissionChecker#isSubset}，拒绝即 {@link SubagentRejectedException} + {@code
+ * permission.denied} 事件）→ 档位单调性（S6，{@code decision} 无事件、拒绝走 {@code permission.denied}）→ 深度（{@code
+ * 调用者depth+1 > 子深度上限} 拒绝，{@code decision:DEPTH_LIMIT} 事件）→〔锁内〕繁殖预算（{@code
+ * decision:BUDGET_EXHAUSTED} 事件）→ launcher 启动。cap 派生： {@code min(模板, 请求收紧, 父级)}——子级只能更小（D10
+ * 硬顶的"单调性第四维度"）。
  *
  * <p><strong>血缘（D27）</strong>：每个实例在派发那一刻被写上 {@code lineagePath}（{@code main/a1/a1-1}，见 {@link
  * #lineagePathOf}），判定读它（{@link ContextAccessJudge}）。它是<b>事实记录</b>而不是守卫输入—— 父解析不出时记空串、照常派发，由判定面对空串
@@ -388,6 +391,10 @@ public final class SubagentManager implements AutoCloseable {
    * <p><b>授权面（D27 的 {@code A1}）同样锚在 {@code callerPermissions} 上</b>：请求点了调用者没有的工具 ⇒ {@link
    * #checkRequestedToolsWithinCaller} 派发即拒（{@code permission.denied} 事件点名越界工具）；给了白名单就与模板求交（只收窄，见
    * {@link #tightenPermissions}）。
+   *
+   * <p><b>角色维（第 8 维，设计 §4.5）锚在同一处</b>：请求点了调用者没有的角色 ⇒ {@link SubagentRejectedException} 派发即拒（{@code
+   * permission.denied} 事件，reason 不含角色名）；生效值 = {@code 调用者 ∩ 模板基线 ∩ 请求}，逐跳只减不增 （见 {@link
+   * #effectiveRoles}）。子进程通道据此把同一份生效值经 argv 下发（{@code AgentCommand#argv}）。
    *
    * <p><b>血缘在派发那一刻落账</b>：{@code lineagePath} 由本方法拼给实例（{@link #lineagePathOf}），子体改不了也给不出；
    * 父身份解析不出时记空串、照常派发（判定面 fail-closed）。
@@ -767,6 +774,9 @@ public final class SubagentManager implements AutoCloseable {
    * 静默求交），调用者能力集是<b>硬上限</b>（超出 ⇒ {@link #checkRequestedToolsWithinCaller}
    * 派发即拒，不在这里）。求交结果为空是<b>合法</b>取值（显式"什么都不给"）， 不是错误；{@code null}（没提这一嘴）逐字退回模板白名单。
    *
+   * <p><b>角色维（第 8 维）在同一处物化</b>（见 {@link #effectiveRoles}）：调用者 ∩ 模板基线 ∩ 请求——与资源面同一个形状，
+   * 且同样"请求越界响亮拒、模板越界静默求交"。
+   *
    * <p><b>为什么继承要物化而不是"运行时往上问父级"</b>：{@link PermissionChecker#isSubset} 比的是两份<b>权限集数据</b>。
    * 如果子体这一维留空（"我照父级的办"）， covers 只能看到"子级没表态"，无从证明它不比父级宽——判定会静默放行一个运行期真正生效的面比父级宽的子体（锚错对象的同族缺陷， 见 S5-A
    * 的构造期常量教训）。
@@ -780,9 +790,12 @@ public final class SubagentManager implements AutoCloseable {
       ChildWorkspace childWorkspace) {
     ResourceScopeMap scopes =
         effectiveScopes(template, request, callerPermissions, instanceId, callerId, childWorkspace);
+    // 第 8 维（角色，设计 §4.5）：调用者 ∩ 模板基线 ∩ 请求，与资源面同一处物化（留空会让子体的角色面回落到"没表态"，
+    // 而单调性守卫看不见那一层——S5-A 构造期常量教训的同一形态）。请求越界在这一步响亮拒。
+    RoleSet roles = effectiveRoles(template, request, callerPermissions, instanceId, callerId);
     AgentPermissionSet base = narrowedTemplatePermissions(template, request);
     if (request.extraDenied().isEmpty()) {
-      return base.withResourceScopes(scopes);
+      return base.withResourceScopes(scopes).withRoles(roles);
     }
     Set<String> denied = new HashSet<>(base.deniedTools());
     denied.addAll(request.extraDenied());
@@ -793,7 +806,78 @@ public final class SubagentManager implements AutoCloseable {
         base.destructiveAllowed(),
         base.sensitiveAllowed(),
         base.readOnly(),
-        scopes);
+        scopes,
+        roles);
+  }
+
+  /**
+   * 子体角色的<b>生效值</b>（设计 §4.5）：{@code 调用者 ∩ 模板 ∩ 请求}，用 {@link
+   * RoleSet#narrowTo}（meet）逐层求交，<b>不另写交集</b>。
+   *
+   * <p>三个来源的分工与资源面/技能面完全同形：
+   *
+   * <ul>
+   *   <li><b>调用者</b>：身份真值——子体只能是它的子集（{@link PermissionChecker#isSubset} 的 {@code covers} 已守这一维）；
+   *   <li><b>模板</b>（{@link AgentTemplate#declaredRoles()}）：<b>基线/建议</b>——{@code
+   *       null}（没写）不参与求交；空表是显式"谁都不是"； 超出调用者的条目<b>静默求交</b>（模板是通用配置，被上级收紧是常态），不报错；
+   *   <li><b>请求</b>（{@link SubagentLaunchRequest#roles()}）：<b>要求</b>——{@code null}
+   *       不参与求交；空表是显式"谁都不是"； 点名调用者没有的角色一律<b>响亮拒</b>（{@link SubagentRejectedException} + {@code
+   *       permission.denied} 事件）， 不静默截断（同 {@code allowedTools}/{@code allowedDirs}）。
+   * </ul>
+   *
+   * <p>越界判据只用 {@link RoleSet#covers}（§4.3.1 的唯一实现点）——这里不写任何 {@code containsAll}。求交结果为空是<b>合法</b>取值
+   * （子体一个角色都没有），不是错误。
+   */
+  private RoleSet effectiveRoles(
+      AgentTemplate template,
+      SubagentLaunchRequest request,
+      AgentPermissionSet callerPermissions,
+      String instanceId,
+      String callerId) {
+    RoleSet callerRoles = callerPermissions.roles();
+    RoleSet requested = requestedRoles(request);
+    if (requested != null && !callerRoles.covers(requested)) {
+      throw roleDenied(template, instanceId, callerId);
+    }
+    RoleSet effective = callerRoles;
+    RoleSet templateRoles = template.declaredRoles();
+    if (templateRoles != null) {
+      effective = effective.narrowTo(templateRoles);
+    }
+    if (requested != null) {
+      effective = effective.narrowTo(requested);
+    }
+    return effective;
+  }
+
+  /**
+   * 请求面的角色（{@code null} = 没提这一嘴 ⇒ 不参与求交；空表 = 显式"谁都不是"）。
+   *
+   * <p>元素形态（非空白、不含文本线分隔符）已在 {@link SubagentLaunchRequest} 构造期校验，这里只做"三档取值"的翻译。
+   */
+  private static RoleSet requestedRoles(SubagentLaunchRequest request) {
+    List<String> roles = request.roles();
+    if (roles == null) {
+      return null;
+    }
+    return roles.isEmpty() ? RoleSet.none() : RoleSet.of(roles.toArray(String[]::new));
+  }
+
+  /**
+   * 角色越界拒绝：{@code permission.denied} 事件（{@code agent} = <b>被拒的调用者</b>）+ 带结论的异常。
+   *
+   * <p><b>角色名不进事件 / 日志</b>（本责任区的明文面纪律）：载荷保持既有三键形状（模板 / 子实例 id / reason），reason
+   * 只说"这次越界了"这一事实——要分辨具体是哪个名字越界，读调用者的配置与请求（那是仅有的两处真相）。角色名可进 argv（不是密钥）， 但事件与日志面不新增任何承载角色名的字段。
+   */
+  private SubagentRejectedException roleDenied(
+      AgentTemplate template, String instanceId, String callerId) {
+    String message = "子 Agent 角色越界（红线 1 单调性）：请求面点名的角色超出调用者角色集合（请求面是'要求'不是'建议'，不静默截断）";
+    emit(
+        EventTypes.PERMISSION_DENIED,
+        callerId,
+        instanceId,
+        Map.of("template", template.id(), "childId", instanceId, "reason", message));
+    return new SubagentRejectedException(message);
   }
 
   /**
@@ -831,6 +915,7 @@ public final class SubagentManager implements AutoCloseable {
       }
     }
     // 空集合法（= 子体一个工具都没有）；A1 有限而模板通配 ⇒ narrowed = A1 本身（上面那条分支只挡"含 *"）
+    // 角色维逐字照抄 base（本方法只动白名单；生效角色由 tightenPermissions 求交后挂上，见 effectiveRoles）
     return new AgentPermissionSet(
         base.grantedToken(),
         narrowed,
@@ -838,7 +923,8 @@ public final class SubagentManager implements AutoCloseable {
         base.destructiveAllowed(),
         base.sensitiveAllowed(),
         base.readOnly(),
-        base.resourceScopes());
+        base.resourceScopes(),
+        base.roles());
   }
 
   /**
@@ -1512,6 +1598,10 @@ public final class SubagentManager implements AutoCloseable {
             + " 子级="
             + child.summary();
       }
+    }
+    // 角色（第 8 维，与 isSubset 的检查顺序一致）：只报"哪一维不满足"，不把角色名写进消息（明文面纪律）
+    if (!parent.roles().covers(granted.roles())) {
+      return "子级角色超出父级角色集合（角色维）";
     }
     return "权限集不在父级范围内";
   }

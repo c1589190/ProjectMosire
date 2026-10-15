@@ -2,6 +2,8 @@ package io.mosire.brain.subagent;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.permission.CommandMode;
+import io.mosire.agentlib.permission.RoleSet;
+import io.mosire.brain.permission.AgentRoles;
 import java.util.List;
 import java.util.Set;
 
@@ -40,11 +42,15 @@ import java.util.Set;
  *     <b>要求</b>——超出调用者可达面一律响亮拒（{@code DOC_SCOPE_DENIED}），不静默截断
  * @param editableDocs 想要给子体的<b>文档可编辑面</b>（语义同 {@code allowedDocs}，判定对照调用者的可编辑面）。
  *     生效值恒被求交进最终可见面之内（{@code docs-edit ⊆ docs}）
+ * @param roles 想要给子体的<b>角色</b>（设计 §4.5 的第 8 维）。{@code null} = 不指定（子体的角色由调用者角色 ∩ 模板基线说了算，
+ *     逐字回到本字段引入前的行为）；空表 = <b>显式"一个角色都不给"</b>（与 {@code allowedTools: []} 同形同义）。<b>与模板的分工同 {@code
+ *     allowedDirs}</b>：模板那一份是<b>建议</b>（超出调用者就静默求交），请求这一份是<b>要求</b>——点名调用者自己没有的角色， {@link
+ *     SubagentManager#spawn} 一律响亮拒（{@code SubagentRejectedException}），不静默截断
  */
 @SuppressFBWarnings(
     value = "EI_EXPOSE_REP",
     justification =
-        "allowedSkills/editableSkills/allowedDocs/editableDocs 在规范构造里已 List.copyOf 成不可变快照；四者允许为 null"
+        "allowedSkills/editableSkills/allowedDocs/editableDocs/roles 在规范构造里已 List.copyOf 成不可变快照；五者允许为 null"
             + "（null = 不指定，与空表是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——记录型数据的防御拷贝，"
             + "不是暴露内部表示")
 public record SubagentLaunchRequest(
@@ -60,7 +66,8 @@ public record SubagentLaunchRequest(
     List<String> allowedSkills,
     List<String> editableSkills,
     List<String> allowedDocs,
-    List<String> editableDocs) {
+    List<String> editableDocs,
+    List<String> roles) {
 
   public SubagentLaunchRequest {
     if (templateId == null || templateId.isBlank()) {
@@ -89,6 +96,19 @@ public record SubagentLaunchRequest(
     // 文档范围（R3b）与技能范围同一口径同一个校验函数：元素非空白、null 保持 null（"没提这一嘴"与"显式空表"是两种取值）
     allowedDocs = checkSkillPaths("allowedDocs", allowedDocs);
     editableDocs = checkSkillPaths("editableDocs", editableDocs);
+    // 第 8 维（角色）：元素非空白，且必须能无损落到 argv 文本线上（含分隔符的名字在构造期就响亮失败——
+    // 静默切分会让子体拿到调用者没有的角色，撞红线 1；校验走 AgentRoles 的同一实现，本类不另写一套口径）
+    if (roles != null) {
+      for (String role : roles) {
+        if (role == null || role.isBlank()) {
+          throw new IllegalArgumentException("roles 的元素必须是非空白角色名: " + roles);
+        }
+      }
+      roles = List.copyOf(roles);
+      if (!roles.isEmpty()) {
+        AgentRoles.requireWireSafe(RoleSet.of(roles.toArray(String[]::new)));
+      }
+    }
     // 不可变副本（内联 copyOf：让 SpotBugs 看得见来源）；null 保持 null——"没提这一嘴"与"显式空表"是两种取值
     allowedDirs = allowedDirs == null ? null : List.copyOf(allowedDirs);
     allowedTools = allowedTools == null ? null : List.copyOf(allowedTools);
@@ -109,6 +129,42 @@ public record SubagentLaunchRequest(
       }
     }
     return List.copyOf(paths);
+  }
+
+  /**
+   * 13 参兼容构造（角色维引入之前）：{@code roles = null} = 不指定（逐字回到本字段引入前的行为）。
+   *
+   * <p>与 11/9 参两条同理：请求面是模型/调用方每任务现造的对象，保留旧签名可以让既有构造点（编排工具、夹具）零改动。
+   */
+  public SubagentLaunchRequest(
+      String templateId,
+      String goal,
+      Set<String> extraDenied,
+      Integer maxTurnsCap,
+      Long timeBudgetSecondsCap,
+      Long quotaMaxTokensCap,
+      CommandMode mode,
+      List<String> allowedDirs,
+      List<String> allowedTools,
+      List<String> allowedSkills,
+      List<String> editableSkills,
+      List<String> allowedDocs,
+      List<String> editableDocs) {
+    this(
+        templateId,
+        goal,
+        extraDenied,
+        maxTurnsCap,
+        timeBudgetSecondsCap,
+        quotaMaxTokensCap,
+        mode,
+        allowedDirs,
+        allowedTools,
+        allowedSkills,
+        editableSkills,
+        allowedDocs,
+        editableDocs,
+        null);
   }
 
   /**

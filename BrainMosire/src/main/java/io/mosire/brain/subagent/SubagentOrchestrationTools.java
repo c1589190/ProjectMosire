@@ -118,6 +118,18 @@ public final class SubagentOrchestrationTools {
                 Map.entry("goal", Map.of("type", "string")),
                 Map.entry(
                     "extraDenied", Map.of("type", "array", "items", Map.of("type", "string"))),
+                // 角色维（设计 §4.5）：给子体的角色（可选）。给 = 明确要求（点名调用者自己没有的角色 ⇒ 派发即拒，
+                // 码 PERMISSION_DENIED）；空数组 = 显式"一个角色都不给"；不给 = 调用者角色 ∩ 模板基线说了算。
+                // 描述要进 schema——模型只能看见 schema，看不见这行注释。
+                Map.entry(
+                    "roles",
+                    Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string"),
+                        "description",
+                        "给子体的角色（可选）：不填 = 继承你自己的角色并受模板收窄；空数组 = 一个角色都不给；" + "点名你自己没有的角色 ⇒ 派发即拒")),
                 // S5-B：子体的工作目录（可选）。给 = 明确要求（超出调用者可达面直接拒，码 DIR_NOT_ALLOWED）；
                 // 空数组 = 要求"哪里都不许"；不给 = 不额外收窄（调用者 ∩ 模板说了算）。
                 Map.entry(
@@ -225,7 +237,8 @@ public final class SubagentOrchestrationTools {
                     strListArg(context, "allowedSkills"),
                     strListArg(context, "editableSkills"),
                     strListArg(context, "allowedDocs"),
-                    strListArg(context, "editableDocs"));
+                    strListArg(context, "editableDocs"),
+                    strListArg(context, "roles"));
           } catch (IllegalArgumentException e) {
             // 字段存在但非数字：与类 Javadoc 一致 → INVALID_ARGUMENTS（而非静默当"未收紧"——那会无抱怨地放宽上限）
             return ToolResult.error("INVALID_ARGUMENTS", e.getMessage());

@@ -22,6 +22,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
+import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.EventTypes;
@@ -133,11 +134,16 @@ public final class SubagentProcessMain {
       AgentConfig config = template.toAgentConfig(options.instanceId());
       // 技能两个面（本能力）：模板给基线，父侧 argv 传下来的是**收紧后的生效值**（父级物化过的），
       // 这里 decode 后与模板求交（withScopes 再把可编辑面夹进可见面）。argv 缺席 ⇒ none（fail-closed，不是“不限”）。
+      //
+      // 第 8 维（角色，设计 §4.5）：父侧算出的生效角色（调用者 ∩ 模板 ∩ 请求）经 argv 下发，这里 decode 后挂上——
+      // 子体的角色**只**认这份下发值（模板的 roles 只是父侧求交的输入之一，不能在这里被重新放大回去）。
+      // 旗标缺席 / 空白 ⇒ ⊥（fail-closed，不是"不限"）：老装配或漏传不会让子体白拿角色。
       AgentPermissionSet permissions =
           SkillPermissions.withScopes(
-              template.toPermissionSet(),
-              SkillPermissions.decode(options.skillVisible()),
-              SkillPermissions.decode(options.skillEditable()));
+                  template.toPermissionSet(),
+                  SkillPermissions.decode(options.skillVisible()),
+                  SkillPermissions.decode(options.skillEditable()))
+              .withRoles(AgentRoles.decode(options.roles()));
       // 文档两个面（R3b）：同一条缝、同一个编码口径（SkillPermissions 的 encode/decode 是"ResourceScope ↔ argv
       // 文本表"的唯一实现，两族范围复用而不是各写一份）。argv 缺席 ⇒ none（fail-closed）；可编辑面恒被夹进可见面。
       permissions =
@@ -359,6 +365,9 @@ public final class SubagentProcessMain {
    * @param docEditable 文档可编辑面（{@code --doc-editable}）；空表 = none，且恒被夹进可见面
    * @param skillsListingBudget 技能目录档字符预算（{@code --skills-listing-budget}；D2）。<b>null = 旗标缺席</b> ⇒
    *     回落 {@link SkillCatalog#DEFAULT_LISTING_BUDGET}（与接线前逐字一致）；0 是合法取值（不披露目录档）；负数在构造期具名拒
+   * @param roles 角色（{@code --roles}，逗号连接的升序角色名；第 8 维，设计 §4.5）。<b>null = 旗标缺席</b> ⇒ {@code
+   *     RoleSet.none()}（fail-closed，不是"不限"）——老装配或漏传不会让子体白拿角色。父侧下发的就是算好的生效值 （{@code 调用者 ∩ 模板 ∩
+   *     请求}），子进程侧不再与模板求交（重复求交只会把父级的收紧洗回去）
    */
   public record Options(
       String instanceId,
@@ -373,7 +382,40 @@ public final class SubagentProcessMain {
       List<String> skillEditable,
       List<String> docVisible,
       List<String> docEditable,
-      Integer skillsListingBudget) {
+      Integer skillsListingBudget,
+      String roles) {
+
+    /** 13 参兼容构造（角色维引入之前）：{@code roles = null} = 旗标缺席 ⇒ 子体 ⊥（fail-closed，逐字回到本字段引入前的行为）。 */
+    public Options(
+        String instanceId,
+        String templateId,
+        String goal,
+        Path templatesDir,
+        Path dataDir,
+        boolean parentLink,
+        Path configDir,
+        Path skillsDir,
+        List<String> skillVisible,
+        List<String> skillEditable,
+        List<String> docVisible,
+        List<String> docEditable,
+        Integer skillsListingBudget) {
+      this(
+          instanceId,
+          templateId,
+          goal,
+          templatesDir,
+          dataDir,
+          parentLink,
+          configDir,
+          skillsDir,
+          skillVisible,
+          skillEditable,
+          docVisible,
+          docEditable,
+          skillsListingBudget,
+          null);
+    }
 
     /** 12 参兼容构造（D2 之前）：目录档预算<b>未下发</b>（{@code null} ⇒ 子进程按缺省 4096 回落，行为逐字不变）。 */
     public Options(

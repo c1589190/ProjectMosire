@@ -291,6 +291,9 @@ public final class Main {
     Path skillsDir = null;
     // 技能目录档预算（D2）：旗标缺席 ⇒ null（子进程按 SkillCatalog 缺省 4096 回落）；0 是合法取值（不披露目录档）
     Integer skillsListingBudget = null;
+    // 角色（第 8 维，设计 §4.5）：逗号连接的升序角色名，由父侧 AgentCommand.argv 从实例权限集现算下发；
+    // 旗标缺席 ⇒ null ⇒ 子体 ⊥（fail-closed，不是"不限"）。角色名不是密钥，可以进 argv。
+    String roles = null;
     // 技能范围：同一开关可重复出现（每个前缀一项）；"*" = 不限，"none" = 一个都不许（见 SkillPermissions#encode）
     List<String> skillVisible = new ArrayList<>();
     List<String> skillEditable = new ArrayList<>();
@@ -314,6 +317,7 @@ public final class Main {
         case "--skill-editable" -> skillEditable.add(requireValue(args, ++i));
         case "--doc-visible" -> docVisible.add(requireValue(args, ++i));
         case "--doc-editable" -> docEditable.add(requireValue(args, ++i));
+        case "--roles" -> roles = requireValue(args, ++i);
         case "--parent-link" -> parentLink = true;
         default -> {
           System.err.println("未知参数: " + args[i]);
@@ -340,7 +344,8 @@ public final class Main {
               skillEditable,
               docVisible,
               docEditable,
-              skillsListingBudget));
+              skillsListingBudget,
+              roles));
     } catch (IllegalArgumentException e) {
       System.err.println("参数错误: " + e.getMessage());
       return 2;
@@ -739,6 +744,8 @@ public final class Main {
              --skill-editable <v>  技能可编辑面（同上；生效值恒在可见面之内）
              --doc-visible <v>     文档可见面（可重复；编码口径与技能面相同；缺省 none）
              --doc-editable <v>    文档可编辑面（同上；生效值恒在可见面之内）
+             --roles <r>           角色（逗号连接的升序角色名，第 8 维；由父侧从实例权限集现算下发；
+                                   缺省 = 一个角色都没有——fail-closed，不是"不限"）
           doctor          （M3）自检
           config          （M3）配置管理
         """

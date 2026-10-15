@@ -1,6 +1,8 @@
 package io.mosire.brain.subagent;
 
 import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.RoleSet;
+import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillNamespaces;
 import io.mosire.brain.skills.SkillPermissions;
@@ -34,6 +36,11 @@ import java.util.Objects;
  * <p><strong>子工作区扩展（R3b，{@code --doc-visible}/{@code --doc-editable}）</strong>：与技能面同一条缝同一种编码—— 值由
  * {@code argv} 从<b>实例权限集</b>现算（子工作区的 {@code docs} 能力在 spawn 时已落格，见 {@code SubagentManager}），
  * 子进程据此恢复自己的文档可见面与可编辑面。未表态的命名空间不追加任何项；子进程侧对"缺席"的读法是 {@code none}（fail-closed）。
+ *
+ * <p><strong>角色维（第 8 维，{@code --roles}）</strong>：与上面三面同一条缝——值由 {@code argv} 从<b>实例权限集</b>现算
+ * （父侧算出的生效角色 = {@code 调用者 ∩ 模板 ∩ 请求}），形态是逗号连接的升序角色名（编解码只有一份：{@code AgentRoles}）。
+ * ⊥（一个角色都没有）<b>不追加旗标</b>：子进程侧的缺省读法就是 ⊥（fail-closed，不是"不限"），既有装配与既有夹具的 argv 因此逐字不变。 角色名不是密钥（设计
+ * §4.3.1）⇒ 可以进 argv；但本类不打印、不记事件——角色名不进日志/事件面是明文面纪律。
  *
  * <p><strong>三期 S1-A2 扩展（{@code configDir}）</strong>：子 Agent 走真模型时它自己的 {@code --data-dir}
  * 是隔离目录，底下没有 {@code config.json}（配置在父的数据目录） ⇒ 装配层把父的配置根经本组件注入子进程。它是与 {@code templatesDir} 同性质的"注入
@@ -258,6 +265,15 @@ public record AgentCommand(
     // 唯一实现，文档面复用它而不是另写一份编解码）。命名空间常量取自 DocNamespaces——不在这里抄字符串。
     appendScope(argv, instance, DocNamespaces.DOCS, "--doc-visible");
     appendScope(argv, instance, DocNamespaces.DOCS_EDIT, "--doc-editable");
+    // 角色（第 8 维，设计 §4.5）：取值的唯一来源同样是**实例权限集**（父侧算出的生效值 = 调用者 ∩ 模板 ∩ 请求）——
+    // 装配层没有第二份可写的地方，写错一处就是静默放大。⊥（一个角色都没有）**不追加旗标**：子进程侧的缺省读法就是 ⊥
+    // （fail-closed），既有装配与既有夹具的 argv 因此逐字不变。角色名不是密钥（设计 §4.3.1）⇒ 可以进 argv；
+    // 但这里不打印、不记事件（明文面纪律）。
+    RoleSet roles = instance.permissions().roles();
+    if (!roles.roles().isEmpty()) {
+      argv.add("--roles");
+      argv.add(AgentRoles.encode(roles));
+    }
     return argv;
   }
 

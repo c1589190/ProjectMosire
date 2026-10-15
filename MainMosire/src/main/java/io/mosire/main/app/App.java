@@ -36,6 +36,7 @@ import io.mosire.agentlib.permission.CommandModeLoader;
 import io.mosire.agentlib.permission.Operation;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
+import io.mosire.agentlib.permission.RoleSet;
 import io.mosire.agentlib.plugin.BuiltinToolSource;
 import io.mosire.agentlib.plugin.HostServices;
 import io.mosire.agentlib.plugin.PluginListener;
@@ -51,6 +52,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
+import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
@@ -427,10 +429,19 @@ public final class App implements AutoCloseable {
       // S5-B：主 Agent 的 fs 作用域（工作目录围栏）——配置 agents.workingDirs，<b>缺省不限</b>（裁决 ①，逐跳只减不增）。
       // 本键只有配置文件/环境层能写：ConfigAuth 的 agents.* 语法是 agents.<id>.<key>（三段），两段的这条写不进去（账本记档）。
       ResourceScope workingDirs = WorkingDirsLoader.load(configStore);
+      // 第 8 维（角色，设计 §4.5）：主 Agent 的角色来自配置 agent.roles——**缺省 ⊥（谁都不是，fail-closed）**：
+      // 没配角色的部署拿不到"角色门"工具，而不是把它们全开；项存在但值非法（不是数组 / 含空白名）⇒ 启动期响亮失败（E_AGENT_ROLES）。
+      // 挂在这一层而不是 AgentPermissionSet.system() 里：system() 表达"运行时自身、本维不表态"（语义不动），
+      // 从配置读出的身份是**装配层**的事实。角色名不进日志（明文面纪律），这里只报项数。
+      RoleSet agentRoles = AgentRoles.load(configStore);
       AgentPermissionSet permissionSet =
           AgentPermissionSet.system()
-              .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, workingDirs));
+              .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, workingDirs))
+              .withRoles(agentRoles);
       LOG.info("主 Agent 工作目录围栏: {}（配置 agents.workingDirs；* = 不限，子体逐跳只减不增）", workingDirs.summary());
+      LOG.info(
+          "主 Agent 角色维: 角色数={}（配置 agent.roles；缺省 0 = 谁都不是 = 角色门工具全拒；角色名不落日志）",
+          agentRoles.roles().size());
       // ★ 技能能力装配（本能力）：配置读取 → 目录快照 → 主 Agent 的两个技能面 → 工具面注册 → 上下文来源。
       //   主 Agent 是技能根的所有者：可见面与可编辑面都是配置的根（要收窄就在配置里换根/换 agents 权限，不在代码里另设缺省）。
       SkillSettings skillSettings =
@@ -637,7 +648,9 @@ public final class App implements AutoCloseable {
                   Version.VERSION,
                   ToolContext.of(
                       AccessToken.GUEST,
-                      AgentPermissionSet.unrestricted(AccessToken.GUEST),
+                      // 第 8 维（角色，设计 §4.5）：外部 MCP 面**显式表态为 ⊥**（一个角色都不是）⇒ 角色门工具对该面全拒。
+                      // 桶（GUEST）与白名单（unrestricted）语义逐字不变——这一句只是把"恰好被桶挡住"变成"表态结果"。
+                      AgentPermissionSet.unrestricted(AccessToken.GUEST).withRoles(RoleSet.none()),
                       // S6：外部面显式自我介绍（external-mcp + FULL）。档位照旧不变，身份<b>必须</b>显式——
                       // 判定闸据此认出"这不是我派的下级"，从而不为外部客户端的命令背书（到人，见 SuperiorJudgeGate）
                       AgentIdentity.external()),

@@ -9,6 +9,8 @@ import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.agentlib.permission.RoleSet;
+import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -57,12 +59,16 @@ import java.util.regex.Pattern;
  *     allowedTools: []} 同形同义）。同样<b>是建议不是要求</b>：最终生效值 = 调用者可见面 ∩ 这一份 ∩ 请求那一份
  * @param editableDocs 该模板子体的<b>文档可编辑面建议</b>（语义同 {@code allowedDocs}）。生效值恒被求交进可见面之内——
  *     "改得动但看不见"在结构上造不出来（{@code docs-edit ⊆ docs}）
+ * @param roles 该模板子体的<b>角色基线</b>（设计 §4.5，第 8 维）：null = <b>不额外收窄</b>（调用者是什么角色，子体就接什么）；空表 =
+ *     <b>显式"谁都不是"</b>（与 {@code allowedTools: []} 同形同义）。<b>是基线不是要求</b>——最终生效值 = 调用者角色 ∩ 这一份 ∩ 请求那一份，
+ *     超出调用者的条目<b>静默求交</b>（模板是通用配置，被上级收紧是常态），与请求面 {@code roles} 的响亮拒绝口径不同。角色名不得含逗号 （argv 文本线的分隔符，见
+ *     {@code AgentRoles#requireWireSafe}），装载期即响亮失败
  */
 @SuppressFBWarnings(
     value = "EI_EXPOSE_REP",
     justification =
-        "allowedSkills/editableSkills/allowedDocs/editableDocs 在规范构造里已 List.copyOf 成不可变快照，但都允许为"
-            + " null（null = 不限，与空表是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——这是记录型数据的防御拷贝，"
+        "allowedSkills/editableSkills/allowedDocs/editableDocs/roles 在规范构造里已 List.copyOf 成不可变快照，但都允许为"
+            + " null（null = 不限/不额外收窄，与空表是两种取值），那个 null 分支让 SpotBugs 的字段不可变性推断失效——这是记录型数据的防御拷贝，"
             + "不是暴露内部表示")
 public record AgentTemplate(
     String id,
@@ -84,7 +90,8 @@ public record AgentTemplate(
     List<String> allowedSkills,
     List<String> editableSkills,
     List<String> allowedDocs,
-    List<String> editableDocs) {
+    List<String> editableDocs,
+    List<String> roles) {
 
   /** 模板 id 形态约束（小写、短横线、≤64 字符——可直接充当文件名/进程标识）。 */
   private static final Pattern ID_PATTERN = Pattern.compile("[a-z0-9][a-z0-9-]{0,63}");
@@ -143,6 +150,31 @@ public record AgentTemplate(
     // 文档范围（R3b）与技能范围同一口径：同一个归一函数，理由同上——"坏路径在装载期失败"这条保证不许缺角
     allowedDocs = normalizedPaths(id, "allowedDocs", allowedDocs);
     editableDocs = normalizedPaths(id, "editableDocs", editableDocs);
+    // 角色基线（第 8 维）与上一条同一口径：null（不额外收窄）与 []（谁都不是）是两种取值，不归一成一个
+    roles = normalizedRoles(id, roles);
+  }
+
+  /**
+   * 角色基线的归一（{@code null} 保持 null = 不额外收窄；空表 = 谁都不是；元素非空白，且必须能无损落到 argv 文本线上）。
+   *
+   * <p>与 {@code allowedSkills}/{@code allowedDocs} 同一口径：装载期就把坏值挡住——"拼错的角色 = 永远不可达的工具"（设计 §4.6）。
+   * 含分隔符的名字在这里（装载期）就响亮失败，理由见 {@link AgentRoles#requireWireSafe}；校验走 {@code AgentRoles}
+   * 的同一实现，本类不另写一套口径。
+   */
+  private static List<String> normalizedRoles(String id, List<String> roles) {
+    if (roles == null) {
+      return null;
+    }
+    for (String role : roles) {
+      if (role == null || role.isBlank()) {
+        throw new IllegalArgumentException("模板 " + id + " 的 roles 元素必须是角色名文本: " + roles);
+      }
+    }
+    List<String> copy = List.copyOf(roles);
+    if (!copy.isEmpty()) {
+      AgentRoles.requireWireSafe(RoleSet.of(copy.toArray(String[]::new)));
+    }
+    return copy;
   }
 
   /**
@@ -208,6 +240,20 @@ public record AgentTemplate(
   }
 
   /**
+   * 模板的角色基线（设计 §4.5 的第 8 维）：{@code null} ⇒ <b>不额外收窄</b>（调用者是什么角色，子体就接什么）；{@link RoleSet#none()} ⇒
+   * 显式"谁都不是"（空表）；其余 ⇒ 明确集合。
+   *
+   * <p><b>为什么返回可空的 {@link RoleSet} 而不是一种取值</b>：模板的"没写"（不表态）与"写了空表"（谁都不是）是两种语义，而 {@link RoleSet} 只有
+   * ⊥ 与"一组具体角色"两种取值（它刻意不提供 {@code any()}——那是声明侧的读法）。spawn 侧据此决定这一份基线<b>参不参与</b>求交。
+   */
+  public RoleSet declaredRoles() {
+    if (roles == null) {
+      return null;
+    }
+    return roles.isEmpty() ? RoleSet.none() : RoleSet.of(roles.toArray(String[]::new));
+  }
+
+  /**
    * 18 参兼容构造（文档范围字段引入之前）：两个文档范围取 {@code null} = 不限（模板不额外收窄，逐字回到本字段引入前的行为）。
    *
    * <p>与 16 参那条同理：模板是部署者写的数据（JSON 走 {@link JsonCreator} 的规范构造），代码侧的既有构造点不该为了两个"没提这一嘴" 的字段全量改签名。
@@ -251,6 +297,56 @@ public record AgentTemplate(
         allowedSkills,
         editableSkills,
         null,
+        null);
+  }
+
+  /**
+   * 20 参兼容构造（角色维引入之前）：{@code roles = null} = 不额外收窄（模板不额外收窄角色，逐字回到本字段引入前的行为）。
+   *
+   * <p>与 18/16 参两条同理：模板是部署者写的数据（JSON 走 {@link JsonCreator} 的规范构造），代码侧的既有构造点不该为了一个"没提这一嘴"的字段全量改签名。
+   */
+  public AgentTemplate(
+      String id,
+      String description,
+      String systemPrompt,
+      String model,
+      AccessToken token,
+      Set<String> allowedTools,
+      Set<String> deniedTools,
+      boolean destructiveAllowed,
+      boolean sensitiveAllowed,
+      boolean readOnly,
+      int maxTurns,
+      int maxToolCallsPerTurn,
+      long timeBudgetSeconds,
+      long quotaMaxTokens,
+      List<ScriptStep> script,
+      List<String> allowedWorkingDirs,
+      List<String> allowedSkills,
+      List<String> editableSkills,
+      List<String> allowedDocs,
+      List<String> editableDocs) {
+    this(
+        id,
+        description,
+        systemPrompt,
+        model,
+        token,
+        allowedTools,
+        deniedTools,
+        destructiveAllowed,
+        sensitiveAllowed,
+        readOnly,
+        maxTurns,
+        maxToolCallsPerTurn,
+        timeBudgetSeconds,
+        quotaMaxTokens,
+        script,
+        allowedWorkingDirs,
+        allowedSkills,
+        editableSkills,
+        allowedDocs,
+        editableDocs,
         null);
   }
 
@@ -402,7 +498,14 @@ public record AgentTemplate(
     }
   }
 
-  /** 映射为权限集（白名单含 {@code "*"} 时整体放通为 allowAll，与 AgentPermissionSet 的通配约定一致）。 */
+  /**
+   * 映射为权限集（白名单含 {@code "*"} 时整体放通为 allowAll，与 AgentPermissionSet 的通配约定一致）。
+   *
+   * <p><b>第 8 维（角色）刻意不在本方法里物化</b>：模板的角色是<b>基线</b>，而"没写"（不额外收窄）在 {@link AgentPermissionSet}
+   * 里表达不出来（那一维只有 ⊥ 与"一组具体角色"两种取值，没有"不表态"）。若这里把 null 读成 ⊥，一个父级有角色的部署会凭空把子体的角色清空； 若读成"照抄模板"，则 {@code
+   * toPermissionSet()} 单独看又是一个比调用者宽的集合——两种都不行。生效值只能由 spawn 链求交后显式挂上 （{@link SubagentManager} 的
+   * {@code 调用者 ∩ 模板 ∩ 请求}），子进程侧则由父侧 argv 下发的生效值挂上（见 {@code SubagentProcessMain}）。
+   */
   public AgentPermissionSet toPermissionSet() {
     AgentPermissionSet.Builder builder = AgentPermissionSet.builder(token);
     if (allowedTools.contains(AgentPermissionSet.ALL_TOOLS)) {
