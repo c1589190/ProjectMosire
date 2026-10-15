@@ -326,6 +326,9 @@ BashPluginMosire ────────────────────┘
 6. **密钥纪律**（同红线 6）：密钥值绝不进日志/异常/事件/argv/env/stdio/会话输出；读配置只打印路径 + 长度；
    真模型脚本只传数据目录，密钥由进程从 `<dataDir>/config.json` 自己读，**不复制进证据包/不打印**。
 7. 不要把本机工具目录（`.omo/`、`.work/`、`target/`、含密钥的配置）提交进库；提交前确认 `.gitignore` 仍覆盖它们。
+   ★ **唯一例外（2026-10-16 核实）**：`AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar` 是**刻意 force-track**
+   的（`git add -f`；先例 `246f326` / `ca604f3` / `3ba02c4` / `52b58c0`）——给消费方一个仓内可取用的产物。
+   刷新它的时机 = AgentLib 的**类集合或字节码**变化时；**只改 javadoc 不必刷**。除这一个文件外，`target/` 仍不入库。
 
 ---
 
