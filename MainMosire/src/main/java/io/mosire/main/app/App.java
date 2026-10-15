@@ -15,6 +15,7 @@ import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
 import io.mosire.agentlib.config.ConfigStore;
 import io.mosire.agentlib.config.FileConfigStore;
+import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -34,6 +35,7 @@ import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandModeHolder;
 import io.mosire.agentlib.permission.CommandModeLoader;
 import io.mosire.agentlib.permission.Operation;
+import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
 import io.mosire.agentlib.permission.RoleCatalogAudit;
@@ -53,6 +55,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
+import io.mosire.brain.decision.DecisionProposeTool;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
@@ -189,6 +192,14 @@ public final class App implements AutoCloseable {
   private static final String WORKSPACE_TOOL_SOURCE_ID = "workspace";
 
   /**
+   * builtin 供给源 id（{@code BuiltinToolSource} 的来源归属）：既有编排工具（{@code wireSubagents}）与 RB2a
+   * 的决策包提议工具共用它。
+   *
+   * <p>提成常量只为"同一个源名不在两处各写一遍"——值恒为 {@code "builtin"}，注册与"按源整组卸载"的口径逐字不变。
+   */
+  private static final String BUILTIN_TOOL_SOURCE_ID = "builtin";
+
+  /**
    * 技能根的能力 id（R2→R3b 交接项 2）：<b>只含 {@code skills: READ}</b>。
    *
    * <p>为什么不复用 {@code {skills, skills-edit}} 或直接声明 {@code skills} 能力：技能根的用途是"bash 侧只读/遮蔽"这一条， 而
@@ -253,6 +264,14 @@ public final class App implements AutoCloseable {
 
   /** 子进程生命周期兜底（同一条件装配：与 subagentManager 同生共死；红线 5：归装配层持有）。 */
   private final SubprocessManager subagentProcesses;
+
+  /**
+   * 决策包登记表（RB2a，设计 §5.9）：进程内<b>唯一</b>实例，装配层持有、注入提议工具。
+   *
+   * <p>RB2b（审批面投递）与 RB3（事件/HTTP 面）从本类取<b>同一个</b>实例——不造第二个表、不设静态单例： 两个表就会出现"这个包里有什么"的两个答案（同 {@code
+   * PendingApprovals} 的装配口径）。
+   */
+  private final DecisionPackages decisionPackages;
 
   /**
    * 插件面（工作束四）：{@code null} = 未装配（插件目录未启用/不存在——"没装插件"是正常部署态，设计 D4.4）。
@@ -578,6 +597,25 @@ public final class App implements AutoCloseable {
           workspaceRegistry.maskEntries().size(),
           DocsTools.NAMES,
           WorkspaceTools.NAMES);
+      // ★ RB2a（设计 §5.9 ① ②）：决策包<b>提议面</b>——包登记表 + 模型面提议工具 decision_propose。
+      //   本单只做"模型能提议、拿到 packageId"：审批面投递与裁决回填是 RB2b、事件与 HTTP 面是 RB3；
+      //   今天提议成功 ⇒ 包停在 PROPOSED（没人裁，到点由 DecisionPackages 惰性置 EXPIRED、零落盘）。
+      //   供给源口径与其它 builtin 工具同法（BuiltinToolSource + sourceId 归属）；
+      //   DecisionPackages 随 App 字段持有（见 App#decisionPackages），RB2b/RB3 取同一个实例——不造静态单例、
+      //   也不另建第二张表（两张表 = "这个包里有什么"有两个答案）。
+      DecisionPackages decisionPackages = new DecisionPackages();
+      BuiltinToolSource decisionToolSource =
+          new BuiltinToolSource(
+              BUILTIN_TOOL_SOURCE_ID,
+              List.of(new DecisionProposeTool(decisionPackages, tools, decisionValidators(tools))));
+      for (AgentTool decisionTool : decisionToolSource.listTools()) {
+        tools.register(decisionToolSource.id(), decisionTool);
+      }
+      LOG.info(
+          "决策包提议面已装配：工具={} 条目上限={} 裁决窗口={}ms（审批面投递=RB2b、事件/HTTP 面=RB3，本单未接）",
+          DecisionProposeTool.NAME,
+          DecisionProposeTool.MAX_ITEMS,
+          DecisionProposeTool.DEFAULT_DEADLINE_MILLIS);
       // S4-C 接线：快判链从空表改成设计 §2.3 的形状（DenyGate 不装——没有配置黑名单来源，硬拒由分类器的 Block 档
       // 在 authorizer 里终局，不该有第二份清单）。AutoApproveGate 是"会话级放行第二次不再问"的<b>唯一</b>读取方：
       // 不装它，APPROVE_SESSION 只会被登记而永远不会被读（V4 会红），且没有任何用例会报警。
@@ -645,7 +683,7 @@ public final class App implements AutoCloseable {
         subagentProcesses = rig.processes();
       }
       // ★ RA4（设计 §4.6「装订期：派生 + 审计」，不变量 A-4 / A-5）：注册表在这一点已是"对外服务前的完整面貌"
-      //   （插件 / 技能 / docs / 工作区 / 编排工具都已注册），把角色维扫一遍：
+      //   （插件 / 技能 / docs / 工作区 / 决策包提议工具 / 编排工具都已注册），把角色维扫一遍：
       //   ① 未登记角色名 ⇒ 下面响亮失败（拼错的角色 = 永远不可达的工具，"漂移无症状"）；
       //   ② 声明了角色但没有任何调用者配置能覆盖 ⇒ 一行报告（不失败）；
       //   ③ 派生 ⇔ 手抄对账只在宿主两样都给了时做——本装配今天不提供派生函数与手抄清单 ⇒ 跳过（不是"空跑通过"）。
@@ -816,7 +854,8 @@ public final class App implements AutoCloseable {
               setupServer,
               approvalServer,
               approvalTtyChannel,
-              approvalHttpChannel);
+              approvalHttpChannel,
+              decisionPackages);
 
       if (config.demo()) {
         String message = config.demoMessage().isEmpty() ? DEMO_USER_MESSAGE : config.demoMessage();
@@ -940,11 +979,46 @@ public final class App implements AutoCloseable {
             // 血缘登记缝：工作区模块不得依赖 Brain，而"拟建子体"的血缘只有 spawn 侧算得出来
             lineageRegistrar);
     BuiltinToolSource builtin =
-        new BuiltinToolSource("builtin", SubagentOrchestrationTools.of(manager));
+        new BuiltinToolSource(BUILTIN_TOOL_SOURCE_ID, SubagentOrchestrationTools.of(manager));
     for (AgentTool tool : builtin.listTools()) {
       tools.register(builtin.id(), tool);
     }
     return new SubagentRig(manager, processes);
+  }
+
+  /**
+   * RB2a：决策包条目的<b>装配注入校验器</b>（设计 §5.9 ② 的逐条校验、RB1 的 {@code ItemValidator} 注入点）。
+   *
+   * <p>三件事，按序：① 工具在不在目录里；② 它有没有声明 {@code DecisionProposable}；③ 调用者过不过 {@code
+   * PermissionChecker.allows}（<b>既有 oracle，不另写判定式</b>——可见面/判定面/提议面共用的那一个，设计 §4.8 的 A-6）。①② 的唯一实现点在
+   * {@link DecisionProposeTool#structuralDenial}，这里只调用、不抄规则。
+   *
+   * <p><b>★ 资源面准入是缺口（如实记，不许假称已判）</b>：{@code allows} 覆盖工具名级的七维（白名单/黑名单/桶/敏感/破坏/
+   * 只读/角色），<b>不</b>覆盖资源可达面——资源判定要"调用者权限集 × 工具声明的资源面"当场建出 {@code ResourceAuthorizer}（{@code
+   * ToolCallAuthorizer} 在执行前做的事），而提议发生在执行之前，今天没有对应输入能在
+   * 这里把它建出来。故本版<b>不判</b>资源面；B-5（包不绕单条闸链）不受影响：被批子集执行时照走完整判定链。
+   *
+   * <p><b>为什么按权限集产出、而不是固定一个校验器</b>：见 {@link DecisionProposeTool.ValidatorSource}——子 Agent 经父侧桥调用时
+   * {@code ToolContext.permissions()} 是<b>它自己</b>的权限集（父侧外发面已按它收窄）， 固定成主 Agent 的权限集就是权限放大。
+   */
+  private static DecisionProposeTool.ValidatorSource decisionValidators(ToolRegistry tools) {
+    return permissions ->
+        (toolName, args) -> {
+          Optional<String> structural = DecisionProposeTool.structuralDenial(tools, toolName);
+          if (structural.isPresent()) {
+            return structural;
+          }
+          // 结构面已确认工具在目录里；再查一次是刻意的重复查（同 AgentPipeline.executeToolCall 的口径：
+          // 判定式不搬到这里来，只调它）。真查不到只可能是注册表在两次查之间被改（插件装卸）⇒ 按拒处理（fail-closed）。
+          AgentTool tool = tools.find(toolName).orElse(null);
+          if (tool == null) {
+            return Optional.of("工具在两次校验之间从目录里消失: " + toolName);
+          }
+          if (!PermissionChecker.allows(permissions, toolName, tool.spec(), tool.roles())) {
+            return Optional.of("调用者权限不足（PermissionChecker.allows 拒绝）: " + toolName);
+          }
+          return Optional.empty();
+        };
   }
 
   /**
@@ -1255,7 +1329,8 @@ public final class App implements AutoCloseable {
       SetupHttpServer setupServer,
       ApprovalHttpEndpoint approvalServer,
       TtyApprovalChannel approvalTtyChannel,
-      HttpApprovalChannel approvalHttpChannel) {
+      HttpApprovalChannel approvalHttpChannel,
+      DecisionPackages decisionPackages) {
     this.events = events;
     this.conversations = conversations;
     this.bus = bus;
@@ -1277,6 +1352,7 @@ public final class App implements AutoCloseable {
     this.approvalServer = approvalServer;
     this.approvalTtyChannel = approvalTtyChannel;
     this.approvalHttpChannel = approvalHttpChannel;
+    this.decisionPackages = decisionPackages;
   }
 
   /** 阻塞直到 close()（由 shutdown 钩子触发）。 */
@@ -1330,6 +1406,16 @@ public final class App implements AutoCloseable {
   /** 子 Agent 实例快照（按实例 id 升序；未装配子 Agent 编排时为空表）。 */
   public List<SubagentInstance> subagents() {
     return subagentManager == null ? List.of() : subagentManager.list();
+  }
+
+  /**
+   * 决策包登记表（RB2b 审批面投递 / RB3 事件与 HTTP 面的取用口；进程内唯一实例，见字段注释）。
+   *
+   * <p>返回本体而不是快照：调用方（RB2b/RB3）要<b>写</b>它（decide/commit/expire），不是只读； 这与 {@link #runtime()} 返回
+   * Runtime 本体同一口径——装配层持有的对象由装配层交给需要它的那一层， 而不是让每一层各自去造一个（造出来就是第二处真相）。
+   */
+  public DecisionPackages decisionPackages() {
+    return decisionPackages;
   }
 
   /**
