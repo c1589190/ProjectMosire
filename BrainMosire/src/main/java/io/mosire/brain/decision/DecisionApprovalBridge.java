@@ -55,12 +55,31 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>怎么分辨"有人答了"与"没人答/没通道/编排故障"</b>：编排器把后者一律归为 {@code DENY} 并<b>摘掉登记项</b>（或不登记），
  * 而通道的硬约束是"答复必须先落进登记表再返回"（见 {@code ApprovalChannel}）。因此：{@code APPROVE_*} ⇒ 一定是答复； {@code DENY} ⇒
- * 只有 {@link PendingApprovals#get(String)} 还查得到这条请求时才算答复。查不到就<b>什么都不做</b>： 包保持 {@code PROPOSED}，到点由
- * RB1 的 deadline 惰性置 {@code EXPIRED}（零落盘）——本桥绝不会把"没人答"写成"整包驳"。
+ * 只有 {@link PendingApprovals#get(String)} 还查得到这条请求时才算答复。查不到 ⇒ <b>没人答复</b>：见下面「没人答复 =
+ * 当场作废」一节——本桥绝不会把"没人答" 写成"整包驳"。
+ *
+ * <h2>★ 没人答复 = 当场作废，不是"等包自己到点"（RB2c，设计 §5.12 裁定 B / §5.6）</h2>
+ *
+ * <p>没人答复的两条路——<b>审批窗口到期而无人答复</b>与<b>无可用通道</b>（编排器在投递前就拒）——都走 {@link
+ * DecisionPackages#expireNow(String, long)}：包<b>当场</b>置 {@code EXPIRED}（零落盘、不静默执行），并落<b>一行
+ * WARN</b>（含包 id 与原因）。这不是"提前过期"，而是 §5.6 本来就写的语义：「决策超时 / 无可用通道 ⇒ 整包 {@code EXPIRED}，零落盘」。
+ *
+ * <p><b>为什么必须当场作废</b>：审批窗口（缺省 300s）短于包的裁决窗口（缺省 30min，{@code
+ * DecisionProposeTool#DEFAULT_DEADLINE_MILLIS}），而"一实例一个未决包"只数 {@code
+ * PROPOSED}——不作废，这个早已无人可批的包会白占该实例的名额约 25 分钟（§5.12 裁定 B 的问题陈述）。作废 ⇒ 该 {@code proposerKey} 的未决名额即刻释放。
+ *
+ * <p><b>包的 deadline 仍是上限</b>：本桥只把"没人会答"的包提前收掉；{@link DecisionPackages#expire(long)} 那条按 deadline 扫的
+ * 惰性路径照旧，不由本桥替代。
+ *
+ * <p><b>两条路的区分只进日志</b>：{@code ApprovalCoordinator#decide} 只返回决定本身，{@code SOURCE_TIMEOUT} / {@code
+ * SOURCE_NO_CHANNEL} / {@code SOURCE_ERROR} 只进 {@code approval.decided} 事件的 {@code by}
+ * 字段（没有可编程出口，见下条 边界）。本桥按可观测的形状分：编排器在<b>请求窗口结束前</b>就返回"没人答复" ⇒ 它没等到窗口（无可用通道 / 编排兜底异常）； 到/过窗口才返回 ⇒
+ * 窗口到期而无人答复（判据与残差写在 {@link #noAnswerReason}）。
  *
  * <p><b>已知边界（如实记）</b>：闸链上终局的 {@code DENY}（例如将来装上一个按 classKey 拒的 DenyGate）同样不会留下登记项 ⇒
- * 与超时一样"不回填"。今天装配的链上 {@link AskKind#SENSITIVE} 走到人的那一段没有会出 {@code DENY} 的快判闸 （AutoApproveGate
- * 只会放行），所以这条边界今天不触发；要把它也回填成"整包驳"，得让审批层给出"谁拒的"这个可编程出口 —— 那是改审批链的公开面，不在本单范围。
+ * 与超时一样按"没人答复"处理（<b>当场作废</b>，只是 WARN 的原因文字会落进"无可用通道"那一档）：fail-closed 的一侧是"不执行"， 而它今天不触发——{@link
+ * AskKind#SENSITIVE} 走到人的那一段没有会出 {@code DENY} 的快判闸（AutoApproveGate 只会放行）。
+ * 要把它精确地归因成"谁拒的"，得让审批层给出这个可编程出口 —— 那是改审批链的公开面，不在本单范围。
  *
  * <h2>裁决之后：提交口是可选的</h2>
  *
@@ -92,6 +111,16 @@ public final class DecisionApprovalBridge {
    * approval.decided} 事件里，没有可编程出口——本层拿不到就<b>不编</b>。精确到通道的审计仍以那条事件为准； 这里只诚实记"审批面答的"。
    */
   public static final String BY_APPROVAL = "approval";
+
+  /** 没人答复的原因文字（RB2c）：审批窗口到期而无人答复——编排器的 {@code SOURCE_TIMEOUT} 那一档。只进 WARN。 */
+  private static final String REASON_WINDOW_EXPIRED = "审批窗口到期而无人答复";
+
+  /**
+   * 没人答复的原因文字（RB2c）：无可用通道——编排器在投递前就拒（{@code SOURCE_NO_CHANNEL}）那一档。只进 WARN。
+   *
+   * <p>文字里带上"窗口结束前即拒"这条判据本身，读日志的人才知道这个结论是<b>推出来的</b>，而不是编排器报的（见 {@link #noAnswerReason}）。
+   */
+  private static final String REASON_NO_CHANNEL = "无可用通道（审批面在窗口结束前即拒：投递前就没有通道）";
 
   private final DecisionPackages packages;
   private final ApprovalCoordinator coordinator;
@@ -149,11 +178,9 @@ public final class DecisionApprovalBridge {
           request.deadlineEpochMs());
       ApprovalDecision answer = coordinator.decide(request);
       if (!answered(request, answer)) {
-        LOG.info(
-            "决策包无人答复（无可用通道/到点没人答/编排故障）：不回填裁决，包保持 PROPOSED，"
-                + "到点由 RB1 惰性置 EXPIRED（零落盘） packageId={} answer={}",
-            proposed.id(),
-            answer);
+        // RB2c（设计 §5.12 裁定 B / §5.6）：没人答复 ⇒ 当场具名作废，不是"等包自己到点"——
+        // 不作废，这个早已无人可批的包会白占「一实例一个未决包」的名额到包自己的 30min 上限
+        expireUnanswered(proposed, request, answer);
         return;
       }
       backfill(proposed, answer);
@@ -211,6 +238,76 @@ public final class DecisionApprovalBridge {
       LOG.warn("查审批登记项失败，按「无人答复」处理（fail-closed：不回填、不执行） requestId={}", request.id(), failure);
       return false;
     }
+  }
+
+  /**
+   * 没人答复 ⇒ 具名作废（RB2c，设计 §5.12 裁定 B / §5.6）：{@code PROPOSED ⇒ EXPIRED}、零落盘，并落<b>一行 WARN</b>（包 id +
+   * 原因）。
+   *
+   * <p><b>谁调它</b>：{@link #deliver} 里 {@link #answered} 判为"没人答"的那一处——它同时覆盖两条路：审批窗口到期而无人答复，
+   * 与无可用通道（编排器在投递前就拒）。两条路的差别只在 WARN 的原因文字（见 {@link #noAnswerReason}），动作是同一个：作废。
+   *
+   * <p><b>为什么可以放心重复调</b>：{@link DecisionPackages#expireNow} 只动 {@code PROPOSED}，其余状态原样返回、不抛；
+   * 本方法对返回状态再判一次，非 {@code EXPIRED} 就只落 WARN、不声称做过什么（超时路径与别的作废路径可能同时走到这里）。
+   *
+   * <p><b>绝不报成已落定</b>：作废 = 零落盘（{@code expireNow} 没有提交口参数，结构上就落不了盘）；本方法也<b>不</b>调 {@code
+   * commit}——"没人批"不等于"被驳"，更不等于"落了什么"。
+   */
+  private void expireUnanswered(
+      DecisionPackage proposed, ApprovalRequest request, ApprovalDecision answer) {
+    long now = System.currentTimeMillis();
+    String reason = noAnswerReason(request, now);
+    DecisionPackage after;
+    try {
+      after = packages.expireNow(proposed.id(), now);
+    } catch (DecisionPackages.RejectionException refusal) {
+      // 本桥手里的包就是 propose 登记过的那个，且 v1 不淘汰终局包 ⇒ 这里理论上到不了；真到了就是"包没了"，
+      // 同样不报成已落定（包状态一个字也没被本桥改写）
+      LOG.warn(
+          "决策包没人答复 ⇒ 具名作废被拒（包状态未被本桥改写，也未被报成已落定） packageId={} reason={} code={} 理由={}",
+          proposed.id(),
+          reason,
+          refusal.code(),
+          refusal.getMessage());
+      return;
+    }
+    if (after.state() == PackageState.EXPIRED) {
+      LOG.warn(
+          "决策包没人答复 ⇒ 当场具名作废（EXPIRED、零落盘、不静默执行；该 proposerKey 的未决名额已释放）"
+              + " packageId={} reason={} answer={}",
+          proposed.id(),
+          reason,
+          answer);
+      return;
+    }
+    // 竞态：这个包已经被别的路径裁决/终局（expireNow 只动 PROPOSED）⇒ 原样保留，绝不覆盖既有的裁决或回执
+    LOG.warn(
+        "决策包没人答复，但包已不是 PROPOSED ⇒ 不作废、原样保留（不覆盖既有裁决/回执，也不报成已落定）"
+            + " packageId={} reason={} state={} answer={}",
+        proposed.id(),
+        reason,
+        after.state(),
+        answer);
+  }
+
+  /**
+   * 没人答复的原因文字（只进 WARN，不参与任何判定）。
+   *
+   * <p><b>为什么不直接问编排器"是谁拒的"</b>：{@code ApprovalCoordinator#decide} 只返回决定本身，{@code SOURCE_TIMEOUT} /
+   * {@code SOURCE_NO_CHANNEL} / {@code SOURCE_ERROR} 它们只进 {@code approval.decided} 事件的 {@code by}
+   * 字段——没有可编程出口（要它就得改审批链的公开面，RB2b 已把这条记成边界，本单不改）。本层可观测的只有两件事：编排器判定的<b>先后顺序</b> （无任何可用通道 ⇒ <b>立即</b>
+   * DENY；{@code await} 到点没人答 ⇒ DENY），以及这条请求自己的 {@code deadlineEpochMs}。
+   *
+   * <p><b>判据</b>：编排器在请求的窗口<b>结束前</b>就返回"没人答复" ⇒ 它没等到窗口 ⇒ {@link #REASON_NO_CHANNEL} （无可用通道 /
+   * 编排兜底异常）；到/过窗口才返回 ⇒ {@link #REASON_WINDOW_EXPIRED}。窗口 = {@code min(包的 deadline, 投递时刻 +
+   * coordinator.timeout())}（见 {@link #requestFor}），而超时路径必然等满 {@code coordinator.timeout()} 才返回 ⇒
+   * 超时绝不会落进"无可用通道"那一档（反过来说：窗口结束前返回的不可能是超时）。
+   *
+   * <p><b>已知残差（如实记）</b>：将来若装上一条会终局 {@code DENY} 的快判闸（今天的链上没有，见类注释"已知边界"）， 它的即时 DENY
+   * 也会落进"无可用通道"那一档——<b>动作不变</b>（一样当场作废），只是 WARN 的原因措辞不够精确。
+   */
+  private static String noAnswerReason(ApprovalRequest request, long nowEpochMs) {
+    return nowEpochMs >= request.deadlineEpochMs() ? REASON_WINDOW_EXPIRED : REASON_NO_CHANNEL;
   }
 
   /**

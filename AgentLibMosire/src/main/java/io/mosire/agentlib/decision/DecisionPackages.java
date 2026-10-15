@@ -14,7 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 决策包登记表（设计 §5.8 冻结形状）：内存态、线程安全，六个动作 {@code propose / decide / commit / find / pending / expire}。
+ * 决策包登记表（设计 §5.8 冻结形状 + RB2c 按 §5.12 裁定 B 追加的具名作废口）：内存态、线程安全，七个动作 {@code propose / decide / commit
+ * / find / pending / expire / expireNow}。
  *
  * <p><b>为什么不落库</b>（与 {@link io.mosire.agentlib.approval.PendingApprovals} 同口径）：包是
  * "当下这批调用的一次决策"，提议者与确认者都活在<b>当前进程</b>里——进程退出即失效是<b>对的</b>； 跨重启继承一个"上次批过"的包是错的。事件的留痕（{@code
@@ -408,6 +409,60 @@ public final class DecisionPackages {
     lock.lock();
     try {
       return expireLocked(nowEpochMs);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 具名作废口（RB2c，设计 §5.12 裁定 B）：把<b>指定的</b>包当场作废（{@code PROPOSED ⇒ EXPIRED}）。
+   *
+   * <p><b>它是干什么的</b>：「审批窗口到期而无人答复」与「无可用通道」这两条路上，包已经<b>没人会裁</b>了， 由调用方（审批桥 {@code
+   * DecisionApprovalBridge}）具名作废它。作废 = 零落盘、不静默执行——这正是 §5.6 失败语义表的口径： 「决策超时 / 无可用通道 ⇒ 整包 {@code
+   * EXPIRED}，零落盘（不静默执行）」。 没有本口时（RB2b 的现状）桥只能"零动作"， 让这个早已无人可批的包继续挂在 {@code PROPOSED} 上。
+   *
+   * <p><b>它不是「到点惰性过期」的替代品</b>：按 {@code deadlineEpochMs} 扫全表是 {@link #expire(long)} 的事 （那个出口由
+   * deadline 决定谁该过期）；本口是调用方<b>已经知道</b>这个包没救了之后的显式动作，与 deadline 无关。 包的 {@code deadlineEpochMs}
+   * 仍是<b>上限</b>（§5.12 裁定 B 第 3 条），不是唯一出口。
+   *
+   * <p><b>只动 {@code PROPOSED}</b>：已裁决/已终局的包带着裁决或回执，作废它们等于销毁证据。非 {@code PROPOSED} ⇒
+   * <b>原样返回当前包</b>、不抛、不改写——超时路径与别的作废路径可能都会走到这里，幂等是调用方敢重复调它的前提（不抛， 好让竞争里的第二次调用无害）。
+   *
+   * <p><b>作废 ⇒ 释放该 {@code proposerKey} 的未决名额</b>：{@link #propose} 的「一实例一个未决包」只数 {@code PROPOSED}
+   * （§5.11 第 4 条），所以包一进 {@code EXPIRED}，同一 {@code proposerKey} 立刻就能再提议。这正是本条要修的东西： 审批窗口（缺省
+   * 300s）短于包的裁决窗口（缺省 30min，{@code DecisionProposeTool#DEFAULT_DEADLINE_MILLIS}），
+   * 不作废的话那个"早已无人可批"的包会白占名额约 25 分钟（§5.12 裁定 B 的问题陈述）。
+   *
+   * <p><b>不顺带扫别的包</b>（那是 {@link #expire(long)} 的事）：具名口只回答"这个包作废了没有"。
+   * <b>零落盘是结构性的</b>：本方法没有提交口参数，<b>不可能</b>触发任何落盘。
+   *
+   * @param packageId 包 id（{@link #find} 取到的那个）
+   * @param nowEpochMs 调用方观测到的墙钟毫秒（只进日志与审计：它既不判定 deadline——那是 {@link #expire(long)} 的口径——也不改动作）
+   * @return 作废后的包快照（{@code EXPIRED}）；本来就是其它状态 ⇒ 原样返回当前包快照（幂等、不抛）
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND}（表里真的没有这个 id；已终局的包查得到，见 {@link #find}）
+   */
+  public DecisionPackage expireNow(String packageId, long nowEpochMs) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      Entry entry = require(packageId);
+      DecisionPackage current = entry.current;
+      if (current.state() != PackageState.PROPOSED) {
+        LOG.debug(
+            "决策包具名作废是空操作（非 PROPOSED，原样返回）id={} state={} nowEpochMs={}",
+            current.id(),
+            current.state(),
+            nowEpochMs);
+        return current;
+      }
+      entry.current = asExpired(current);
+      LOG.info(
+          "决策包具名作废 id={} proposerKey={} deadlineEpochMs={} nowEpochMs={} —— 零落盘，未决名额已释放",
+          current.id(),
+          current.proposerKey(),
+          current.deadlineEpochMs(),
+          nowEpochMs);
+      return entry.current;
     } finally {
       lock.unlock();
     }
