@@ -63,6 +63,7 @@
 ⇒ `op ∈ capabilities(caller) ∧ target ∈ subtree(caller)` 这条判据**今天判不了**（第二维无输入、第一维的 caller 也认不出）。
 更糟的是**读工具一旦注册就会被外发**：`AgentToMcpServer.start(tools, …)`（`App.java:252`）把**整个 ToolRegistry** 交给子体当 MCP 桥，
 `--mcp-expose` 一开，子体手里就有 `list_sub_agents` 这类编排工具的副本（U6 实测：`orch-probe` 子体列出了桥接进来的 3 个工具）。
+★ **2026-10-16 更正（A-6 落地后，用户裁定接受）**：本行的「3 个工具」已不成立——父侧外发面改按**判定面**收窄（见 `设计-角色与统一决策包.md` §4.8）：`orch-probe` 子体现在只看得见 `list_sub_agents`（spawn/kill 是破坏性工具而该模板 `destructiveAllowed=false`，本就一调就被拒 ⇒ 不再外发）。★ 但「整注册表外发」这个担忧**只是被削窄、不是被消除**：A-6 保证「外发的工具 ⊆ 该子体判定面放行的工具」，**不替代 `noExport`**（D30 的「读权力不外包」仍然必需）。原文保留为历史留痕。
 ⇒ 直接注册 `read_agent_context` = **每个子体都能读别家子体的上下文**，正是 D27 读侧明令禁止的事。
 
 **因此本工具的判定降级为「主子句柄」，并把 D27 的缝留在一处**：
