@@ -39,7 +39,13 @@ public class SkillException extends RuntimeException {
   /** 落盘失败（目录建不出来、临时文件写不动、原子替换失败）。 */
   public static final String SKILL_WRITE_FAILED = "SKILL_WRITE_FAILED";
 
-  /** 写入已成功但目录重扫失败——此刻盘上状态与快照不一致，必须响亮（不许“写成功、列表看不见”静默共存）。 */
+  /**
+   * 读取入口的目录重扫失败（{@code refresh()}）：扫描不出来就是响亮失败。
+   *
+   * <p>★ 2026-10-16 更正：<b>写路径不再抛本码</b>——写成功之后的重扫失败只降级为 {@code
+   * SkillAccess.WriteResult.disclosure()}（理由见 {@code SkillAccess} 类注释“写后不抛”： 文件已落盘却报失败，模型会重试并撞
+   * {@code SKILL_EXISTS}，两条账互相矛盾）。
+   */
   public static final String SKILL_RELOAD_FAILED = "SKILL_RELOAD_FAILED";
 
   private final String code;

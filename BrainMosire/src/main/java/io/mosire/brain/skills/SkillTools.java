@@ -280,7 +280,7 @@ public final class SkillTools {
             return ToolResult.error(SkillException.INVALID_ARGUMENTS, "name 与 description 为必填参数");
           }
           SkillAccess access = SkillAccess.of(context, catalog, skillsRoot);
-          Skill created =
+          SkillAccess.WriteResult created =
               access.create(
                   name,
                   description,
@@ -288,7 +288,7 @@ public final class SkillTools {
                       ? String.valueOf(context.arguments().get("body"))
                       : null,
                   toolSetArg(context, "allowedTools"));
-          return ToolResult.ok(toJson(metadataBody(created)));
+          return ToolResult.ok(writeBody(created));
         });
   }
 
@@ -320,7 +320,7 @@ public final class SkillTools {
             return ToolResult.error(SkillException.INVALID_ARGUMENTS, "name 为必填参数");
           }
           SkillAccess access = SkillAccess.of(context, catalog, skillsRoot);
-          Skill edited =
+          SkillAccess.WriteResult edited =
               access.edit(
                   name,
                   strArg(context, "description"),
@@ -331,8 +331,18 @@ public final class SkillTools {
                   context.arguments().containsKey("allowedTools")
                       ? toolSetArg(context, "allowedTools")
                       : null);
-          return ToolResult.ok(toJson(metadataBody(edited)));
+          return ToolResult.ok(writeBody(edited));
         });
+  }
+
+  /**
+   * 写结果的对外 JSON：技能元数据 + 可选**披露**（D1）。写成功但目录重扫失败时，结果里必须说清"写成了"—— 否则模型会把一次成功的写当成失败并重试（撞 {@code
+   * SKILL_EXISTS}，两条账互相矛盾）。
+   */
+  private static String writeBody(SkillAccess.WriteResult result) {
+    Map<String, Object> body = new LinkedHashMap<>(metadataBody(result.skill()));
+    result.disclosure().ifPresent(text -> body.put("disclosure", text));
+    return toJson(body);
   }
 
   private static Map<String, Object> metadataOf(SkillAccess access, Skill skill) {

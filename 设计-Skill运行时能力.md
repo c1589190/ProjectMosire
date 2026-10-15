@@ -142,11 +142,26 @@ ToolExecutionGuard（工具名级：白名单/拒绝名单/等级/敏感破坏�
 ## 5. 创建与编辑
 
 1. **范围**：目标 `SKILL.md` 必须落在可编辑面内（`requireWrite`）；技能名形态在拼接路径之前校验；`create` 不覆盖既有目录（`SKILL_EXISTS`）。
+   ★ **2026-10-16（D2，两次修订；第二版才成立）**：`create` 的**抢名**改用 **mkdir 原子占位** ——
+   `Files.createDirectory(<root>/<name>)`：`mkdir(2)` 撞名必 `EEXIST` ⇒ `FileAlreadyExistsException` ⇒ `SKILL_EXISTS`，
+   **"恰好一个赢家"由内核保证**（本机探针 `.work/probe-d2/ProbeMkdir.java`：双线程同时 `createDirectory` × 200 轮，非唯一赢家 **0** 轮）。
+   ⚠️ **第一版修法是错的，留痕**：曾改成" `Files.exists` 预检 + 不带 `REPLACE_EXISTING` 的 `ATOMIC_MOVE`"，以为"撞名由文件系统兜住"——
+   **探针实测 ATOMIC_MOVE 撞名在本平台静默替换**（JDK21/ext4：ATOMIC_MOVE 落到 `rename(2)`，而 POSIX `rename` 覆盖已存在目标且不抛；
+   普通 `move` 才抛）。实测约 **1/3 轮双方都返回成功**、盘上只剩一方正文 ⇒ 工具回执说谎。
+   判别用例：`SkillWriteContractTest#concurrentCreateOfTheSameNameYieldsExactlyOneWinner`（第一版下红、第二版下绿）。
+   删掉 `writeAtomically` 的 `replace` 位：目录已归我所有，改名只可能覆盖自己的半成品。
 2. **校验**：内容先经 `SkillLoader.parse`（**与读盘同一段解析**）——frontmatter 结构、`name` ≡ 目录名、`description` 1–1024、单行约束；失败即 `SKILL_INVALID`/`INVALID_ARGUMENTS`，**盘上不留半成品**（连目录都不建）。
 3. **原子写**：同目录临时文件 + `ATOMIC_MOVE`（不支持时 `REPLACE_EXISTING`），不会出现“写一半的 SKILL.md”被下一次扫描读到。
-4. **写完即重扫**：`refresh()` 失败 → `SKILL_RELOAD_FAILED`（“写成功但列表看不见”必须响亮）。
+   ★ **但 ATOMIC_MOVE 不负责"不覆盖"**（探针见第 1 条）：它保证的是"读者永远看到旧全文或新全文"；"撞名即拒"是 `create` 的 mkdir 抢名的职责。两件事别混（D2 第一版就是混了）。
+4. ~~**写完即重扫**：`refresh()` 失败 → `SKILL_RELOAD_FAILED`（“写成功但列表看不见”必须响亮）。~~
+   ★ **2026-10-16 取代（用户裁定"乙"）：写后不抛** —— 写成功之后的重扫是 **best-effort**：`refresh()` 失败**不改结论**，
+   只降级为写结果里的一条**披露**（`SkillAccess.WriteResult.disclosure()`；工具面 JSON 的 `disclosure` 字段）。
+   理由：文件已原子改名落盘、工具却回 `SKILL_RELOAD_FAILED`，模型会重试并撞 `SKILL_EXISTS` —— “写失败 + 已存在”
+   两条互相矛盾的账同时进事件库（隔壁 #2 的同一形状：`~/SimulatorMosire/docs/superpowers/plans/2026-10-15-batch-S-write-then-throw.md`）。
+   同时删除写后的 `catalog.lookup(...).orElseThrow(...)`：写前 `SkillLoader.parse` 的返回值**就是**“写成功后目录里那份”的元数据（同包测试 `SkillAccessTest` 守着）。
+   可见性不受影响：`search`/`loadBody`/`readResource` 入口内部重扫、`skill_list` 也先重扫，那几处失败依旧响亮。
 5. **宽容扫描但绝不静默**：扫描期坏掉的技能从快照消失（列不出、加载不到），但进 `SkillCatalog.broken()`，`skill_list`/`skill_search` 的结果里点名披露；其余健康技能照常可用。
-6. **可见性**：同一进程内写入立刻可见（写路径重扫）；**跨进程**写入在下一次技能工具读（`skill_list`/`skill_search`/`skill_load`/`skill_read_resource` 内部都会重扫）后可见。
+6. **可见性**：同一进程内写入立刻可见（写路径 **best-effort** 重扫，见第 4 条）；**跨进程**写入在下一次技能工具读（`skill_list`/`skill_search`/`skill_load`/`skill_read_resource` 内部都会重扫）后可见。
 
 ---
 

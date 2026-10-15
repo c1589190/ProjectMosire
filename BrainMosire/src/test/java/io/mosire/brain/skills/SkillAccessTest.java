@@ -174,7 +174,7 @@ class SkillAccessTest {
         .isInstanceOf(ResourceDeniedException.class);
 
     SkillAccess editable = access(ResourceScope.unlimited(), ResourceScope.unlimited());
-    Skill created = editable.create("newbie", "新技能", "正文内容", Set.of("Read", "Grep"));
+    Skill created = editable.create("newbie", "新技能", "正文内容", Set.of("Read", "Grep")).skill();
     assertThat(created.name()).isEqualTo("newbie");
     assertThat(created.allowedTools()).containsExactlyInAnyOrder("Read", "Grep");
 
@@ -234,11 +234,11 @@ class SkillAccessTest {
     writeSkill("alpha", "旧用途", "旧正文");
     SkillAccess access = access(ResourceScope.unlimited(), ResourceScope.unlimited());
 
-    Skill edited = access.edit("alpha", null, "新正文", null);
+    Skill edited = access.edit("alpha", null, "新正文", null).skill();
     assertThat(edited.description()).isEqualTo("旧用途");
     assertThat(access.loadBody("alpha")).contains("新正文").doesNotContain("旧正文");
 
-    Skill retitled = access.edit("alpha", "新用途：处理 Kafka", null, Set.of("Read"));
+    Skill retitled = access.edit("alpha", "新用途：处理 Kafka", null, Set.of("Read")).skill();
     assertThat(retitled.description()).isEqualTo("新用途：处理 Kafka");
     assertThat(retitled.allowedTools()).containsExactly("Read");
     assertThat(access.loadBody("alpha")).as("正文未给 ⇒ 保持不变").contains("新正文");

@@ -9,6 +9,7 @@ import io.mosire.agentlib.tool.ToolContext;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -40,9 +41,13 @@ import java.util.regex.Pattern;
  * <ol>
  *   <li><b>先校验后落盘</b>：内容过 {@link SkillLoader#parse}（与读盘同一段解析）才允许创建目录/写文件，失败时盘上不留半成品；
  *   <li><b>原子替换</b>：同目录临时文件 + {@code ATOMIC_MOVE}（不支持时退回 {@code REPLACE_EXISTING}），不存在“写一半的
- *       SKILL.md”被下一次扫描读到；
- *   <li><b>写完即重扫</b>：{@link #refresh()} 失败一律响亮（{@link SkillException#SKILL_RELOAD_FAILED}）——
- *       “写成功但列表里看不见”是本项目最坏的静默形态之一。
+ *       SKILL.md”被下一次扫描读到；★ 但 ATOMIC_MOVE <b>不保证免覆盖</b>（本平台实测撞名静默替换）——"创建不覆盖"由 {@link #create} 的
+ *       <b>mkdir 原子抢名</b>承担，不是由改名承担；
+ *   <li><b>写后不抛</b>（2026-10-16 裁定，取代原文“写完即重扫：{@code refresh()} 失败一律响亮”）：写成功之后的重扫是
+ *       <b>best-effort</b>——失败只降级为结果里的一条<b>披露</b>（{@link WriteResult#disclosure()}），绝不把已落盘的写
+ *       报成失败。理由：报失败会让模型重试并撞 {@code SKILL_EXISTS}，“写失败 + 已存在”两条互相矛盾的账会同时进事件库 （隔壁 #2
+ *       的同一形状）。可见性不受影响：{@link #search}/{@link #loadBody}/{@link #readResource} 入口内部重扫、 {@code
+ *       skill_list} 也先重扫，那几处失败本来就是响亮的。
  * </ol>
  *
  * <p><b>刷新时机</b>：工具面每次读之前重扫（{@link #search}/{@link #loadBody}/{@link #readResource} 内部重扫； {@code
@@ -165,6 +170,34 @@ public final class SkillAccess {
           SkillException.SKILL_RELOAD_FAILED, "技能目录无法扫描（" + root + "）: " + e.getMessage(), e);
     }
   }
+
+  /**
+   * 写成功之后的目录重扫（best-effort）：返回空 = 一切正常；非空 = **披露文案**（不是失败）。
+   *
+   * <p><b>纪律（D1，2026-10-16 用户裁定"乙"）</b>：写之后的代码不得把已落盘的写报成失败。此前这里是 {@code refresh()} + {@code
+   * catalog.lookup(...).orElseThrow(...)} 两步都能抛 {@code SKILL_RELOAD_FAILED}——
+   * 文件已经原子改名落盘，工具却回"写入后目录里读不到该技能"，模型据此重试、撞 {@code SKILL_EXISTS}， 事件库里于是同时有"写失败"与"已存在"两条互相矛盾的账（隔壁 #2
+   * 的同一形状）。
+   *
+   * <p><b>为什么不干脆不重扫</b>：重扫是"上一次写入立刻可见"的来源之一；保留它、把失败降级为披露，既不损失可见性， 也不制造假失败。读入口本来也会重扫（{@link
+   * #search}/{@link #loadBody}/{@link #readResource} 内部重扫、 {@code skill_list} 先调 {@link
+   * #refresh()}），那几处失败依旧响亮。
+   */
+  Optional<String> rescanDisclosure(String name) {
+    try {
+      refresh();
+      return Optional.empty();
+    } catch (RuntimeException e) {
+      return Optional.of("技能已写入 " + name + "，但目录重扫失败（列表可能暂时看不到它；下一次读入口会重扫）: " + e.getMessage());
+    }
+  }
+
+  /**
+   * 一次写的结果：技能元数据 + 可选的**披露**。
+   *
+   * <p><b>为什么披露在结果里而不是异常里</b>：写已经成功这一结论不允许被写之后的动作推翻；重扫失败是"缓存视图暂时陈旧"， 不是"这次写没成"——两者混在一个错误码里，模型就只能猜。
+   */
+  public record WriteResult(Skill skill, Optional<String> disclosure) {}
 
   /**
    * 最近一次扫描里<b>坏掉因而不可见</b>的技能（名字 → 原因）：工具面把它放进结果里披露。
@@ -325,30 +358,45 @@ public final class SkillAccess {
    * @param description 一句话用途（1–1024，单行）
    * @param body 正文（可空——空正文是合法技能，只是信息量少）
    * @param allowedTools 该技能声明的工具白名单（null = 不声明约束）；只影响技能自己声明的约束，不改变调用者的权限集
-   * @throws SkillException 参数非法 / 无编辑权限（走 {@code ResourceDeniedException}）/ 已存在 / 校验失败 / 写失败 / 重扫失败
+   * @throws SkillException 参数非法 / 无编辑权限（走 {@code ResourceDeniedException}）/ 已存在 / 校验失败 / 写失败
+   *     （重扫失败<b>不在其列</b>：见类注释"写后不抛"，它只进 {@link WriteResult#disclosure()}）
    */
-  public Skill create(String name, String description, String body, Set<String> allowedTools) {
+  public WriteResult create(
+      String name, String description, String body, Set<String> allowedTools) {
     Path file = targetFile(name);
+    Path directory = skillDirectory(name);
     requireWrite(file);
-    if (Files.exists(skillDirectory(name))) {
-      throw new SkillException(SkillException.SKILL_EXISTS, "技能已存在（要改内容请用 skill_edit）: " + name);
-    }
     String text = compose(name, description, body, allowedTools);
-    validate(text, skillDirectory(name));
+    // 写前解析：既做校验，又顺手拿到"写成功后目录里那份"的元数据（同一段解析器）——写之后不再回查目录
+    Skill created = parseChecked(text, directory);
+    // ★ 原子抢名（D2 真修，2026-10-16）：技能名 ≡ 目录名，而 mkdir(2) 撞名必 EEXIST ⇒ "恰好一个赢家"由内核保证。
+    //   本机探针（.work/probe-d2/ProbeMkdir.java，双线程同时 createDirectory × 200 轮）：非唯一赢家 0 轮。
+    //   ★ 曾经的写法是错的：Files.exists 预检 + 不带 REPLACE_EXISTING 的 ATOMIC_MOVE —— 探针实测 ATOMIC_MOVE
+    //   撞名在本平台**静默替换**（JDK21/ext4：ATOMIC_MOVE 落到 rename(2)，POSIX rename 覆盖已存在目标且不抛
+    //   FileAlreadyExistsException），两进程同时通过预检时后到者覆盖先到者：实测约 1/3 轮"双方都成功"，
+    //   盘上却只剩一方正文（工具回执说谎）。判别用例：
+    //   SkillWriteContractTest#concurrentCreateOfTheSameNameYieldsExactlyOneWinner。
     try {
-      Files.createDirectories(skillDirectory(name));
+      Files.createDirectory(directory);
+    } catch (FileAlreadyExistsException e) {
+      throw new SkillException(
+          SkillException.SKILL_EXISTS, "技能已存在（创建不覆盖；要改内容请用 skill_edit）: " + name, e);
     } catch (IOException e) {
       throw new SkillException(
-          SkillException.SKILL_WRITE_FAILED,
-          "技能目录创建失败（" + skillDirectory(name) + "）: " + e.getMessage(),
-          e);
+          SkillException.SKILL_WRITE_FAILED, "技能目录创建失败（" + directory + "）: " + e.getMessage(), e);
     }
-    writeAtomically(skillDirectory(name), file, text);
-    refresh();
-    return catalog
-        .lookup(parsedName(name))
-        .orElseThrow(
-            () -> new SkillException(SkillException.SKILL_RELOAD_FAILED, "写入后目录里读不到该技能: " + name));
+    try {
+      // 目录已归本次调用所有 ⇒ 改名只可能覆盖自己的半成品，用覆盖语义是安全的
+      writeAtomically(directory, file, text);
+    } finally {
+      // 写失败（任何原因）时不留空目录：扫描会把"没有 SKILL.md 的目录"读成坏技能（响亮但冤枉）。
+      // 用 finally + 存在性判断，而不是 catch(RuntimeException) + rethrow —— 后者会被 SpotBugs 判
+      // THROWS_METHOD_THROWS_RUNTIMEEXCEPTION（本仓 DiskDocFiles 用 @SuppressFBWarnings 换免；这里结构上避开）。
+      if (!Files.exists(file)) {
+        deleteDirectoryIfEmpty(directory);
+      }
+    }
+    return new WriteResult(created, rescanDisclosure(name));
   }
 
   /**
@@ -359,7 +407,7 @@ public final class SkillAccess {
    *
    * @throws SkillException 参数非法 / 无编辑权限 / 不存在（或不可见）/ 校验失败 / 写失败 / 重扫失败
    */
-  public Skill edit(String name, String description, String body, Set<String> allowedTools) {
+  public WriteResult edit(String name, String description, String body, Set<String> allowedTools) {
     Path file = targetFile(name);
     requireWrite(file);
     if (description == null && body == null && allowedTools == null) {
@@ -385,13 +433,9 @@ public final class SkillAccess {
     Set<String> nextTools = allowedTools == null ? existing.allowedTools() : allowedTools;
     String nextBody = body == null ? currentBody : body;
     String text = compose(name, nextDescription, nextBody, nextTools);
-    validate(text, skillDirectory(name));
+    Skill updated = parseChecked(text, skillDirectory(name));
     writeAtomically(skillDirectory(name), file, text);
-    refresh();
-    return catalog
-        .lookup(name)
-        .orElseThrow(
-            () -> new SkillException(SkillException.SKILL_RELOAD_FAILED, "写入后目录里读不到该技能: " + name));
+    return new WriteResult(updated, rescanDisclosure(name));
   }
 
   /** 可见性判定 + 元数据（未知与不可见同码，见类 javadoc）。 */
@@ -496,21 +540,28 @@ public final class SkillAccess {
     return stripped;
   }
 
-  /** 用读盘同一段解析校验待写入的文本；失败是 {@code SKILL_INVALID}（不落盘）。 */
-  private static void validate(String text, Path skillDirectory) {
+  /**
+   * 用读盘同一段解析校验待写入的文本；失败是 {@code SKILL_INVALID}（不落盘）。
+   *
+   * <p><b>返回值就是"写成功后目录里那份"的元数据</b>（D1）：写之前的解析与写之后的重扫走同一段 {@link SkillLoader#parse}，所以写成功之后没有必要再
+   * {@code catalog.lookup(...)} 回查——那一步是"写之后还能抛"的主要来源。
+   */
+  private static Skill parseChecked(String text, Path skillDirectory) {
     try {
-      SkillLoader.parse(text, skillDirectory);
+      return SkillLoader.parse(text, skillDirectory).metadata();
     } catch (IllegalArgumentException e) {
       throw new SkillException(SkillException.SKILL_INVALID, "技能文档校验失败: " + e.getMessage(), e);
     }
   }
 
-  /** 已校验过的技能名（{@link #skillDirectory(String)} 保证形态，这里只做去掉首尾空白）。 */
-  private static String parsedName(String name) {
-    return name.strip();
-  }
-
-  /** 临时文件 + 原子替换（同一目录内，保证同文件系统）；失败即 {@code SKILL_WRITE_FAILED}，不留半成品。 */
+  /**
+   * 临时文件 + 原子改名（同一目录内，保证同文件系统）；失败即 {@code SKILL_WRITE_FAILED}，不留半成品。
+   *
+   * <p><b>它<b>不</b>负责"撞名即拒"</b>：改名走 {@code ATOMIC_MOVE}，而本平台实测 ATOMIC_MOVE 撞名是<b>静默替换</b>—— 不抛
+   * {@code FileAlreadyExistsException}（探针 {@code .work/probe-d2/ProbeMkdir.java}：ATOMIC_MOVE 撞名"未抛，
+   * 内容=NEW"；普通 move 才抛）。所以调用方必须**先**原子地拿到这个名字（{@link #create} 的 mkdir 抢名），再调本方法；
+   * 把"不覆盖"的希望寄托在改名上是错的（D2 的第一版修法就栽在这里）。
+   */
   private static void writeAtomically(Path directory, Path file, String text) {
     Path temp = null;
     try {
@@ -533,6 +584,15 @@ public final class SkillAccess {
           // 临时文件清理失败不改变“写入失败”的结论；残留文件以 .SKILL- 前缀可见，不影响扫描（只扫子目录）
         }
       }
+    }
+  }
+
+  /** 删掉一个<b>空</b>目录（{@link #create} 刚建、写失败时用）；非空或删不掉都静默——误删比留着危险。 */
+  private static void deleteDirectoryIfEmpty(Path directory) {
+    try {
+      Files.delete(directory);
+    } catch (IOException ignored) {
+      // 非空（别人已经写进去了）或删不掉：留着比误删安全
     }
   }
 
