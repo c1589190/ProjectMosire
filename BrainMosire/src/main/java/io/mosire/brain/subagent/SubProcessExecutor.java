@@ -3,6 +3,7 @@ package io.mosire.brain.subagent;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.mcp.AgentToMcpServer;
 import io.mosire.agentlib.permission.AgentIdentity;
+import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.proc.ManagedProcess;
 import io.mosire.agentlib.proc.SpawnSpec;
 import io.mosire.agentlib.proc.SubprocessException;
@@ -37,6 +38,10 @@ import org.slf4j.LoggerFactory;
  *       GUEST/unrestricted；调用者身份=子体身份，父级 SYSTEM 权限不外借）；<b>链接上下文的 {@code ToolContext.config} 只补
  *       {@code read_agent_context} 需要的三键</b>（见 {@link #linkToolConfig}——不补则子体读谁都是 {@code
  *       CONTEXT_UNAVAILABLE}，"读侧同判"（V4）根本走不到判定之后那一步）。
+ *   <li><b>A-6 外发面收窄</b>（RA3c）：桥的<b>外发面</b>（子体经 MCP {@code tools/list} 看得见的名单）也按<b>该子体的</b>{@link
+ *       PermissionChecker#allows} 收窄——可见面与判定面同源，子体不再看见"一调就吃 {@code PERMISSION_DENIED}"的工具。谓词在每次
+ *       Registry 变更同步时现读 {@link ToolRegistry#find}，不缓存快照（新增工具仍进得来）；{@code noExport} 的求交仍在 {@link
+ *       AgentToMcpServer} 内（本类不重复那道判定）。
  * </ul>
  *
  * <p>进程级生命周期全委托 {@link SubprocessManager}（红线 5：进程句柄与管道归进程装配层持有， 本类只是委托入口，不外泄任何流/句柄给工具层）；启动命令按 Rul C
@@ -312,6 +317,19 @@ public final class SubProcessExecutor implements AgentExecutor {
                 // 以及审批请求里的 requesterId/goal（上级判定据此回答"谁在问、被派去干什么"）。
                 AgentIdentity.subagent(
                     instance.instanceId(), instance.mode(), instance.goal(), instance.depth())),
+            // A-6 父侧落点：外发面 = 该子体的判定面（只调 PermissionChecker.allows 这一个 oracle，不另写判定式），
+            // 再与 noExport 求交（求交在 AgentToMcpServer.exportable 里，本处不重复）。
+            // 不缓存快照：谓词跨 sync() 复用，每次现读 parentTools.find —— 缓存会让新增工具永远进不来。
+            // 子侧判不了敏感/破坏/角色（McpToolAdapter 的 spec() 恒 DEFAULT、roles() 恒空集），这几维只能在这里挡下，
+            // 否则子体会看见"一调就吃 PERMISSION_DENIED"的工具（设计 §4.8、不变量 A-6：可见面 ⊆ 判定面）。
+            name ->
+                parentTools
+                    .find(name)
+                    .map(
+                        t ->
+                            PermissionChecker.allows(
+                                instance.permissions(), name, t.spec(), t.roles()))
+                    .orElse(false),
             authorizer,
             managed.stdout().orElseThrow(() -> new SubagentLaunchException("子 Agent stdout 不可用")),
             managed.stdin().orElseThrow(() -> new SubagentLaunchException("子 Agent stdin 不可用")));

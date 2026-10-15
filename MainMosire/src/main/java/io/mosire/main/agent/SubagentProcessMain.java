@@ -17,6 +17,8 @@ import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.mcp.PipeMcpClientTransport;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.PermissionChecker;
+import io.mosire.agentlib.plugin.ToolSource;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
@@ -65,7 +67,8 @@ import java.util.function.Predicate;
  *
  * <p><strong>父链接（{@code --parent-link}）</strong>：stdin/stdout 是父进程建好的 MCP stdio 链路（标准换行帧、 一帧一
  * JSON-RPC），本进程以 <b>MCP client</b> 身份接管（{@link PipeMcpClientTransport}——官方 StdioClientTransport 只
- * spawn 不接管流），经 {@link McpSourceBridge}（按模板白名单过滤）把父级暴露面同步进本地 registry。
+ * spawn 不接管流），经 {@link McpSourceBridge}（按本进程权限集的<b>判定面</b>过滤：命中 = {@link
+ * io.mosire.agentlib.permission.PermissionChecker#allows} 放行）把父级暴露面同步进本地 registry。
  *
  * <p><strong>即退与终局记录（§2.1/§2.2，2026-09-13）</strong>：跑完目标回合后<b>不再</b>阻塞等"关停信号"（那会让子体答完还空转 ≥171 s，
  * 父侧全程看到 {@code RUNNING}）——{@code chat()} 返回 ⇒ 先把自己的终局（{@code agent.lifecycle/action=finished} +
@@ -158,8 +161,9 @@ public final class SubagentProcessMain {
         source = parentSource;
         transport = new PipeMcpClientTransport(McpJsonDefaults.getMapper(), System.in, protocolOut);
         parentSource.connect(transport);
-        // 白名单过滤：模板声名的工具集 ∩ 父侧暴露面——未命中的工具对子体不可见（同步即授权）
-        bridge = McpSourceBridge.bind(parentSource, registry, filterFor(permissions));
+        // 可见面过滤：父侧暴露面 ∩ 本进程的判定面（同一个 PermissionChecker.allows）——未命中的工具对子体不可见
+        // （同步即授权；A-6：可见面 ⊆ 判定面）
+        bridge = McpSourceBridge.bind(parentSource, registry, filterFor(permissions, parentSource));
       }
 
       // R-A2-1：--config-dir 缺席 ⇒ 逐字不变地走模板脚本假 LLM；在场 ⇒ 真模型（R-A2-2/R-A2-7：路由与密钥一律取自配置）
@@ -332,12 +336,28 @@ public final class SubagentProcessMain {
             .withNamespace(DocNamespaces.DOCS_EDIT, editable.narrowTo(visible)));
   }
 
-  /** 模板权限集 → 桥同步过滤器：白名单通配（{@code "*"}）不过滤，否则按名命中。 */
-  private static Predicate<String> filterFor(AgentPermissionSet permissions) {
-    if (permissions.allowedTools().contains(AgentPermissionSet.ALL_TOOLS)) {
-      return name -> true;
-    }
-    return permissions.allowedTools()::contains;
+  /**
+   * 本进程权限集 → 桥同步过滤器（A-6：可见面与判定面<b>同源</b>）。
+   *
+   * <p>命中 = {@link PermissionChecker#allows} 放行 —— 判定式<b>只此一处</b>（判定面 {@code ToolCallAuthorizer}
+   * 用的是同一个 oracle）。此前的白名单式过滤只看 allowed-tools 一维：只读、黑名单、桶、敏感/破坏各维在可见面上缺席，于是子体可能看见"一调就吃 {@code
+   * PERMISSION_DENIED}"的工具（烧 token 烧回合，而且那正是设计 §4.8 点名的"第二处真相"）。
+   *
+   * <p>★ <b>子侧这一面只看得到"权限集驱动"的维</b>：经父侧桥进来的工具是 {@code McpToolAdapter}（{@code spec()} 恒 {@code
+   * ToolSpec.DEFAULT}、{@code roles()} 恒空集）——外部 MCP 工具无法先知敏感性。真 spec/roles 只在父侧注册表里，故
+   * "敏感/破坏/角色"这几维的收窄要靠<b>父侧外发面</b>兜住，本谓词只保证父侧外发面之内不再出现"看得见却判不过"的名字。
+   *
+   * <p>★ <b>不缓存快照</b>：谓词跨多次 {@code sync()} 复用（目录变更要能带进新工具），故每次求值现读 {@link
+   * ToolSource#listTools()}——该快照是本地缓存（{@code McpToolSource} 在 connect 与 {@code tools/list_changed}
+   * 时刷新）， 不是网络往返。
+   */
+  private static Predicate<String> filterFor(AgentPermissionSet permissions, ToolSource source) {
+    return name ->
+        source.listTools().stream()
+            .filter(t -> t.name().equals(name))
+            .findFirst()
+            .map(t -> PermissionChecker.allows(permissions, name, t.spec(), t.roles()))
+            .orElse(false);
   }
 
   private static void closeQuietly(AutoCloseable resource) {

@@ -16,6 +16,7 @@ import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
@@ -443,6 +444,31 @@ public final class AgentPipeline {
   }
 
   /**
+   * 本回合的可见工具面（设计 §4.8「一次计算，两条面消费」）。
+   *
+   * <p>注册表全量 ∩ 权限判定面：这里与判定面（{@code ToolCallAuthorizer}）共用 {@link PermissionChecker#allows} 唯一
+   * oracle，不另写一份过滤式——可见面必须是判定面的子集（不变量 A-6），否则模型会看见"一调就吃 {@code PERMISSION_DENIED}"的工具（烧 token
+   * 烧回合，而且那正是"第二处真相"的形状）。主/子进程共用这一处代码。
+   *
+   * <p>被裁掉的数量落一条 INFO（每回合至多一次：本方法只在 {@link #run(String)} 的回合起点调用）——"工具悄悄没了"是最难查的账， 数量至少留下痕迹（设计 §4.8
+   * 第 4 条）。
+   */
+  private List<AgentTool> visibleTools() {
+    List<AgentTool> all = registry.list();
+    List<AgentTool> visible =
+        all.stream()
+            .filter(
+                tool ->
+                    PermissionChecker.allows(permissionSet, tool.name(), tool.spec(), tool.roles()))
+            .toList();
+    int dropped = all.size() - visible.size();
+    if (dropped > 0) {
+      LOG.info("本回合工具可见面按权限裁剪: 可见={} 总数={} 裁掉={}", visible.size(), all.size(), dropped);
+    }
+    return visible;
+  }
+
+  /**
    * 跑一回合：用户输入 →（LLM 循环 + 工具调用）→ 终止。
    *
    * <p>约定：方法是同步的（网络/子进程调用在工具内自行发生）；回合间共享 {@code history} （一个 Agent 实例的连续对话）。
@@ -457,7 +483,8 @@ public final class AgentPipeline {
 
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
-    List<AgentTool> tools = registry.list();
+    // 可见面 = 注册表 ∩ 判定面（唯一 oracle，A-6）：被裁掉的数量落 INFO，不静默消失
+    List<AgentTool> tools = visibleTools();
     // 回合起点：历史长度在组请求前取定——saveHistory 用同一份 messages 列表按下标推出本回合新增的尾部（不靠猜、
     // 不比对内容）；快照同时让"本回合"与历史后续变化解耦
     List<LlmMessage> replayedHistory = List.copyOf(history);

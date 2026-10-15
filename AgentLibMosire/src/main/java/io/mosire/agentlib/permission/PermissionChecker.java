@@ -100,6 +100,40 @@ public final class PermissionChecker {
     return Optional.empty();
   }
 
+  /**
+   * 可见面与判定面<b>共用的唯一 oracle</b>（设计 §4.8「一次计算，两条面消费」、§4.9 不变量 A-6）。
+   *
+   * <p>"这个调用者能不能用这个工具"只在这一处算：模型看得见的工具表（{@code AgentPipeline} 组请求前对 {@code registry.list()} 的过滤、MCP
+   * 桥的 include 谓词）与"调得动/调不动"的判定（{@link
+   * io.mosire.agentlib.tool.ToolCallAuthorizer}）都委托本方法。<b>禁止在可见面另写一份判定式</b>——两份判定式就是"第二处
+   * 真相"，可见面与判定面一旦分叉，模型就会看见"一调就吃 {@code PERMISSION_DENIED}"的工具（可见面必是判定面的子集：A-6）。
+   *
+   * <p><b>语义 = 拒绝理由为空</b>：本方法<b>就是</b> {@link #denialReason(AgentPermissionSet, String, ToolSpec,
+   * Collection)} 的布尔形态（委托，不抄判定式）；判定式的任何改动自动同时作用于两条面。故 {@code permissions == null} ⇒ {@code
+   * false}（fail-closed，同 denialReason 的第一条分支）。
+   *
+   * @param permissions 调用者权限集（装配层总给非 null；null 按 oracle 语义 ⇒ 拒）
+   * @param toolName 工具名
+   * @param spec 工具三要素（null 视为 {@link ToolSpec#DEFAULT}）
+   * @param toolRoles 工具的声明面（{@code AgentTool.roles()}）
+   * @return 放行 = {@code true}
+   */
+  public static boolean allows(
+      AgentPermissionSet permissions,
+      String toolName,
+      ToolSpec spec,
+      Collection<String> toolRoles) {
+    return denialReason(permissions, toolName, spec, toolRoles).isEmpty();
+  }
+
+  /**
+   * 不带工具角色声明的 {@link #allows(AgentPermissionSet, String, ToolSpec, Collection)}：等价于工具在第 8
+   * 维<b>不表态</b>（{@code toolRoles = Set.of()}），与 3 参 {@code denialReason} 同一口径。
+   */
+  public static boolean allows(AgentPermissionSet permissions, String toolName, ToolSpec spec) {
+    return allows(permissions, toolName, spec, Set.of());
+  }
+
   /** 声明面渲染（拒因文案用）：去空白、丢空白项、按字典序——与 {@link RoleSet#intersects} 的比对口径一致。 */
   private static String renderRoles(Collection<String> roles) {
     Set<String> names = new TreeSet<>();

@@ -200,10 +200,14 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
-   * 以给定的流对启动 + 自定义工具调用入口（W3b 父侧桥接的生产形态）。
+   * 以给定的流对启动 + 自定义工具调用入口（W3b 父侧桥接的生产形态）：外发面为<b>全量</b>（{@code include = name -> true}），逐字委托 {@link
+   * #start(ToolRegistry, String, String, ToolContext, Predicate, ToolCallAuthorizer,
+   * java.io.InputStream, java.io.OutputStream)}——行为与本重载引入该委托之前完全相同。
    *
    * @param authorizer 工具调用唯一入口（见 {@link #start(ToolRegistry, String, String, ToolContext,
    *     ToolCallAuthorizer)}）
+   * @see #start(ToolRegistry, String, String, ToolContext, Predicate, ToolCallAuthorizer,
+   *     java.io.InputStream, java.io.OutputStream)
    */
   public static AgentToMcpServer start(
       ToolRegistry registry,
@@ -213,13 +217,60 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolCallAuthorizer authorizer,
       java.io.InputStream in,
       java.io.OutputStream out) {
+    return start(registry, serverName, serverVersion, caller, name -> true, authorizer, in, out);
+  }
+
+  /**
+   * 以给定的<b>调用方持有的</b>流对启动 + 暴露过滤器 + 自定义工具调用入口：既有重载里"流"与"收窄"只能二选一，本重载是两者的<b>组合</b>。
+   *
+   * <p><b>为什么存在</b>（父侧子 Agent 桥接的 A-6 落点）：
+   *
+   * <ol>
+   *   <li><b>流必须由调用方给</b>：父侧为子 Agent 挂桥时，管道两端是子进程的 stdin/stdout（已被 {@code SubProcessExecutor} 接管）。带
+   *       {@code include} 的 {@link #start(ToolRegistry, String, String, ToolContext, Predicate)}
+   *       内部构造 {@code StdioServerTransportProvider} 的默认形态——那会用<b>本进程</b>的 {@link System#in}/{@link
+   *       System#out}：在子进程管道场景下，父侧自己的标准流会被当成桥的端点，整条链路错位。
+   *   <li><b>外发面必须收窄</b>：{@link #start(ToolRegistry, String, String, ToolContext,
+   *       ToolCallAuthorizer, java.io.InputStream, java.io.OutputStream)} 恒为全量外发。子体只看得到 {@code
+   *       McpToolAdapter}（{@code spec()} 恒 {@code ToolSpec.DEFAULT}、{@code roles()}
+   *       恒空集）——敏感/破坏/角色这几维在子侧<b>无法</b>判， 只能由父侧外发面按该子体的权限集挡下；否则子体会看见"一调就吃 {@code
+   *       PERMISSION_DENIED}"的工具（设计 §4.8 点名的" 第二处真相"，违 A-6：可见面 ⊆ 判定面）。
+   *   <li><b>不让调用方自己拼 transport</b>：{@code startWith} 能表达同一组合，但它的形参是 MCP SDK 的 {@link
+   *       McpServerTransportProvider}——调用方（Brain）用它就得直接 import MCP SDK 并改自己的 pom，撞模块边界（AGENTS
+   *       §0.1：工具包 AgentLib 才认识 MCP SDK）。故把"流 + 过滤器 + 入口"的组合收进本类公开面，调用方只给 {@link
+   *       java.io.InputStream}/{@link java.io.OutputStream} 与一个 {@link Predicate}。
+   * </ol>
+   *
+   * <p><b>谓词由调用方给，本类不实现判定式</b>：本类不认识权限模型，{@code include} 的语义完全归调用方（父侧传的就是 {@code
+   * PermissionChecker.allows} 那<b>一个</b> oracle，与判定面同源）。本类只承诺两件事：①初始注册与每次 {@code sync()}
+   * 用<b>同一个</b>谓词求值；②与 {@link ToolSpec#noExport()} 求交——命中 {@code include}
+   * 但标了"禁外发"的工具<b>永不</b>外发（判定见 {@link #exportable}，全类唯一一份）。
+   *
+   * <p><b>谓词要求</b>：保持纯函数且不缓存快照——初始注册与每次 Registry 变更同步都会重新求值（父侧因此能现读注册表，新增工具/权限变化都进得来）；
+   * 反过来，把调用方某一刻的快照塞进谓词会让外发面冻结在启动那一刻。{@code null} 谓词由装配段拒（{@link #assemble}）。
+   *
+   * @param include 工具名过滤器（命中才暴露）；语义与生命周期要求同 {@link #start(ToolRegistry, String, String,
+   *     ToolContext, Predicate)}
+   * @param authorizer 工具调用唯一入口（审批闸等横切判定都在其中）
+   * @param in 桥的输入流（父侧读子进程 stdout）
+   * @param out 桥的输出流（父侧写子进程 stdin）
+   */
+  public static AgentToMcpServer start(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer,
+      java.io.InputStream in,
+      java.io.OutputStream out) {
     return startWith(
         registry,
         serverName,
         serverVersion,
         caller,
         new StdioServerTransportProvider(McpJsonDefaults.getMapper(), in, out),
-        name -> true,
+        include,
         authorizer);
   }
 
