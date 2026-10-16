@@ -16,6 +16,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.ContextAssembler;
+import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
 import io.mosire.brain.decision.DecisionApprovalBridge;
 import java.util.Map;
 import java.util.Objects;
@@ -99,6 +100,95 @@ public final class AgentRuntime implements AutoCloseable {
       EventBus bus,
       AgentPermissionSet permissionSet) {
     this(new AgentSpec(config), llm, registry, guard, assembler, events, bus, permissionSet);
+  }
+
+  /**
+   * 全参装配（{@code AgentConfig} 形态 + 自定义守卫/上下文装配器）+ <b>跨进程收尾缝</b>（P3b）：除最后一个参数外与 上一条构造逐字相同，内部把 {@link
+   * AgentConfig} 包装为默认 {@link AgentSpec}。
+   *
+   * <p>子体进程接技能目录档时走的正是这一条（它手里是 {@code AgentConfig}，不是 {@code AgentSpec}）。
+   */
+  public AgentRuntime(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this(
+        new AgentSpec(config),
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        crossProcessSubmitter);
+  }
+
+  /**
+   * 便捷装配 + <b>跨进程收尾缝</b>（P3b）：默认守卫/上下文组装、不落库；除最后一个参数外与 6 参构造逐字相同。
+   *
+   * <p><b>子体进程走的就是这一条</b>（{@code SubagentProcessMain}）：它没有会话库（不落库那一档），但需要"回合收尾把队列 跨进程交回父侧"这条缝——见
+   * {@link io.mosire.brain.decision.CrossProcessDecisionSubmitter}。
+   *
+   * @param crossProcessSubmitter 跨进程收尾缝（非 null；未接线请用 6 参构造，语义等价但少一次分叉）
+   */
+  public AgentRuntime(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this(
+        new AgentSpec(config),
+        llm,
+        registry,
+        new ToolExecutionGuard(),
+        new BasicContextAssembler(),
+        events,
+        bus,
+        permissionSet,
+        crossProcessSubmitter);
+  }
+
+  /**
+   * 全参装配（{@link AgentSpec} + 自定义守卫/上下文装配器）+ <b>跨进程收尾缝</b>（P3b）：不落库形态。
+   *
+   * <p>为什么公开：子体进程接技能目录档时会传自己的 {@link ContextAssembler}，而它同时需要跨进程缝——两条需求要在同一条
+   * 构造上满足（否则装配层只能在"有组装器"与"有缝"之间二选一）。
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        null,
+        null,
+        Map.of(),
+        null,
+        null,
+        crossProcessSubmitter);
   }
 
   /**
@@ -312,6 +402,51 @@ public final class AgentRuntime implements AutoCloseable {
       Map<String, Object> toolConfig,
       ApprovalCoordinator coordinator,
       DecisionApprovalBridge decisionBridge) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        store,
+        conversationId,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        null);
+  }
+
+  /**
+   * 全参装配 + 审批桥 + <b>跨进程收尾缝</b>（P3b，设计 §5quinquies）：除最后一个参数外与上一条构造逐字相同。
+   *
+   * <p><b>{@code crossProcessSubmitter} 是什么</b>：子体这一侧的回合收尾口——把本轮队列<b>跨进程</b>交回父侧结算， 回执落进自己的包表与事件库（见
+   * {@link io.mosire.brain.decision.CrossProcessDecisionSubmitter}）。{@code null} = 未接线（主 Agent
+   * 的终态装配就是这一档）：收尾走桥那条既有路，行为逐字不变。
+   *
+   * <p><b>为什么由装配层注入而不是 Brain 自建</b>：缝要的那几件（子体自己的包表、本机执行者、实例身份与权限集）只有 <b>子体进程的装配点</b>拿得到；Brain
+   * 侧自建一份就会与装配层那一份分叉（身份/包表各两份）。
+   *
+   * <p><b>不落库分叉也接得进来</b>：子体进程的 runtime 正是 {@code store == null} 那一档，所以这条构造把缝同时透传给 "不落库 + 工具配置 +
+   * 缝"那条管线构造（没有它，子体要么接不上缝，要么被迫造一个不需要的会话库）。
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
     this.spec = Objects.requireNonNull(spec, "spec");
     AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
@@ -319,22 +454,36 @@ public final class AgentRuntime implements AutoCloseable {
     this.events = Objects.requireNonNull(events, "events");
     this.bus = Objects.requireNonNull(bus, "bus");
     this.permissionSet = Objects.requireNonNull(permissionSet, "permissionSet");
-    // P1b：桥只转发给管线（决定"本轮队列绑不绑"），本类不读它的状态；null = 未接线（见字段注释）
+    // P1b/P3b：桥与跨进程缝都只转发给管线（决定"本轮队列绑不绑、谁来收尾"），本类不读它们的状态；null = 未接线
     LlmClient client = Objects.requireNonNull(llm, "llm");
     this.pipeline =
         store == null
-            // 不落库分叉不接审批面（与 App 的 demo 分叉同口径）：{@code Ask} 在那里一律 fail-closed 拒——少一条路，不是放行
-            ? new AgentPipeline(
-                config,
-                client,
-                registry,
-                guard,
-                assembler,
-                events,
-                bus,
-                permissionSet.grantedToken(),
-                permissionSet,
-                toolConfig)
+            // 不落库分叉不接审批面（与 App 的 demo 分叉同口径）：{@code Ask} 在那里一律 fail-closed 拒——少一条路，不是放行。
+            // ★ P3b：跨进程缝接得进来（子体进程就是这一档）——没有它，子体的敏感调用在"没接审批面"之外还多一条"没人收尾"。
+            ? crossProcessSubmitter == null
+                ? new AgentPipeline(
+                    config,
+                    client,
+                    registry,
+                    guard,
+                    assembler,
+                    events,
+                    bus,
+                    permissionSet.grantedToken(),
+                    permissionSet,
+                    toolConfig)
+                : new AgentPipeline(
+                    config,
+                    client,
+                    registry,
+                    guard,
+                    assembler,
+                    events,
+                    bus,
+                    permissionSet.grantedToken(),
+                    permissionSet,
+                    toolConfig,
+                    crossProcessSubmitter)
             : new AgentPipeline(
                 config,
                 client,
@@ -351,7 +500,8 @@ public final class AgentRuntime implements AutoCloseable {
                 CompactSummarySlot.empty(),
                 toolConfig,
                 coordinator,
-                decisionBridge);
+                decisionBridge,
+                crossProcessSubmitter);
 
     // 起步即记录生命周期（事件词汇表 agent.lifecycle）
     // model 报的是【客户端实际在用的模型】（client.model()），不是装配层标签 config.model()：后者由

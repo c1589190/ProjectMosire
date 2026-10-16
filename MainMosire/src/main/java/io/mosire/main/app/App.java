@@ -59,9 +59,11 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
+import io.mosire.brain.decision.CrossProcessDecisionGateway;
 import io.mosire.brain.decision.DecisionApprovalBridge;
 import io.mosire.brain.decision.DecisionCascade;
 import io.mosire.brain.decision.DecisionHistoryTools;
+import io.mosire.brain.decision.SubmitDecisionPackageTools;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
@@ -138,6 +140,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import org.a2aproject.sdk.spec.AgentCapabilities;
 import org.a2aproject.sdk.spec.AgentCard;
 import org.a2aproject.sdk.spec.AgentInterface;
@@ -215,6 +219,14 @@ public final class App implements AutoCloseable {
   private static final String DECISION_HISTORY_TOOL_SOURCE_ID = "decision-history";
 
   /**
+   * 跨进程"提交决策包"工具的供给源 id（P3a，{@code submit_decision_package}）：与决策历史同族、不同源， 便于按源整组卸载与审计。
+   *
+   * <p>与 {@link #DECISION_HISTORY_TOOL_SOURCE_ID} 的区别是刻意的：那一个是<b>读</b>自己的历史，这一个是
+   * <b>把待裁定条目交回父侧结算</b>——两者的可见面/外发面要求正好相反（历史不外发、本工具必须外发给子体）。
+   */
+  private static final String SUBMIT_DECISION_PACKAGE_TOOL_SOURCE_ID = "decision-submit";
+
+  /**
    * 技能根的能力 id（R2→R3b 交接项 2）：<b>只含 {@code skills: READ}</b>。
    *
    * <p>为什么不复用 {@code {skills, skills-edit}} 或直接声明 {@code skills} 能力：技能根的用途是"bash 侧只读/遮蔽"这一条， 而
@@ -287,6 +299,16 @@ public final class App implements AutoCloseable {
    * PendingApprovals} 的装配口径）。
    */
   private final DecisionPackages decisionPackages;
+
+  /**
+   * 主 Agent 那一级（P3a，设计 §5quinquies ② + §5ter 裁定 13）：一份<b>装配期现读快照</b>（权限集 + 档位持有者） 加上"注册表取数缝"。
+   *
+   * <p><b>为什么它是独立的一件东西</b>：派生链的每一级都要能回答"它的权限集 / 档位 / 父级是什么"，而主 Agent <b>不是</b> {@code
+   * SubagentInstance}（注册表里没有它的条目）⇒ 它的那一级必须由装配层提供，且必须<b>只有一份</b>：
+   * 级联（谁有能力逐级预裁定）与跨进程结算口（核对提出者、建临时包）读的是同一个对象，否则会出现"核对了 A、 级联读了 B"。档位取持有者而不是快照值：运行期改档（{@code
+   * /api/commands/mode}）后，链上看的是<b>现读</b>档位 ——与 P2b 的装配口径逐字一致。
+   */
+  private final MainAgent mainAgent;
 
   /**
    * 插件面（工作束四）：{@code null} = 未装配（插件目录未启用/不存在——"没装插件"是正常部署态，设计 D4.4）。
@@ -692,19 +714,19 @@ public final class App implements AutoCloseable {
       //   WorkspaceRegistry.maskEntries() 连命名空间一起产出（M6：只返回装配期条目；运行期挂载不进遮蔽面）。
       toolConfig.put(SandboxMask.CONFIG_KEY, maskConfigOf(workspaceRegistry));
       toolConfig = Map.copyOf(toolConfig);
-      // ★ P2b（设计 §5ter 裁定 12 / §5quater）：逐级预裁定。本单只接<b>主进程内</b>那条链——提出者到主 Agent 这一级；
-      //   子 Agent 跨进程那条路（每个子体链接一个实例级队列、父侧在其回合末 flush）<b>未做</b>，缺口写在 P2b 报告里。
+      // ★ P3a（设计 §5quinquies ② + §5ter 裁定 13）：派生链视角<b>接上实例注册表</b>——这是跨进程那条路的
+      //   前提：子体经 MCP 桥提交的包，父侧要在<b>同一个</b>视角里核对"这个 proposerKey 在不在场"（防冒充）
+      //   并逐级上溯（子体 → 它的父 → … → 主 Agent）。
       //   链上的每一级给的是"它的权限集 + 现读档位 + 父级 id"：能力判据（权限面 ∩ 资源面 ∩ FULL 档）全在这三者上。
+      //   ★ 主 Agent 那一级：注册表里没有它的条目（它不是 SubagentInstance）⇒ 由 mainAgent 那一份现读快照提供；
+      //     它出现在链上时只可能是"从某个子体上溯来的"，所以权限面按<b>提问者 ∩ 主 Agent</b> 收窄（见 mainLevel）。
       AgentPermissionSet cascadePermissions = permissionSet;
-      DecisionCascade decisionCascade =
-          new DecisionCascade(
-              instanceId ->
-                  AgentIdentity.MAIN_ID.equals(instanceId)
-                      ? Optional.of(
-                          new DecisionCascade.Level(
-                              AgentIdentity.MAIN_ID, cascadePermissions, commandMode.get(), ""))
-                      : Optional.empty(),
-              tools::find);
+      // ★ 注册表取数缝（P3a）：装配顺序是"链先建、SubagentManager 后建"，而字段是 final ⇒ 取"调用那一刻现读"。
+      //   slot 先建（内容是"一律查不到"），App 构造期把它绑到 {@code App#levelOf} 上——链与工具对象<b>共用同一个
+      //   slot</b>（若把函数按值传给工具，绑定时只会换掉链手里的那一份，工具手里还留着空的 ⇒ 一律具名拒）。
+      RegistrySlot registrySlot = new RegistrySlot();
+      MainAgent mainAgent = new MainAgent(cascadePermissions, commandMode, registrySlot);
+      DecisionCascade decisionCascade = new DecisionCascade(mainAgent.chain(), tools::find);
       // ★ 本机形态的裁决包执行者（用户裁定 U10，设计 §5.3.1）：裁决之后由它逐条执行被批子集（调各条目自己的工具、
       //   走纯判定链 + 资源前置闸——裁决即授权，执行时不再过一次审批闸），把逐条执行结果收成一份统一回执。
       //   世界形态（隔壁 RC1）是同一个 SPI 的另一个实现：一次提交进世界 + 返回不透明 revisionRef。
@@ -756,6 +778,19 @@ public final class App implements AutoCloseable {
       // ★ P2b（裁定 5 的底线「下一轮要看结果直接调工具看」）：查自己的决策历史——读提出者自己的 events.db，
       //   按 proposerKey 只列自己的包（别人的与不存在的返回同一个空结果，无存在性 oracle）。
       tools.register(DECISION_HISTORY_TOOL_SOURCE_ID, DecisionHistoryTools.tool());
+      // ★ P3a（设计 §5quinquies ②）：父侧的跨进程"提交决策包"口——子体经 MCP 桥把本轮待裁定条目交回这里结算。
+      //   ★ 三件事刻意如此：
+      //     ① 三要素 = ToolSpec.DEFAULT（guest 级、非敏感非破坏、noExport=false）⇒ 子体经桥看得见它
+      //        （可见面 = 它的判定面，见 SubProcessExecutor 的那条谓词），主 Agent 也看得见（同一条链）；
+      //     ② 它是普通的 Ask-free 工具（gate() 保持缺省 ALLOW）：它做的事就是"替子体问"，自己再报 Ask
+      //        就会为"这次代问"再问一次 ⇒ 死循环（类注释里写死了这条）；
+      //     ③ 结算口与级联共用<b>同一个</b> MainAgent 快照（同一份注册表视角、同一份主 Agent 权限面）——
+      //        两处各建一份就会出现"核对了 A、级联读了 B"。
+      tools.register(
+          SUBMIT_DECISION_PACKAGE_TOOL_SOURCE_ID,
+          SubmitDecisionPackageTools.tool(
+              new CrossProcessDecisionGateway(
+                  mainAgent::level, decisionCascade, approvalCoordinator, pendingApprovals)));
       LOG.info(
           "决策包面已装配：裁决窗口={}ms（包缺省 deadline，裁定 10） 审批桥=已接（一条包=一条审批请求 classKey={}）"
               + " 提交口={} 事件面=已接（decision.package.* 四类） 决策面={} 上级代批={}",
@@ -978,7 +1013,8 @@ public final class App implements AutoCloseable {
               approvalServer,
               approvalTtyChannel,
               approvalHttpChannel,
-              decisionPackages);
+              decisionPackages,
+              mainAgent);
 
       if (config.demo()) {
         String message = config.demoMessage().isEmpty() ? DEMO_USER_MESSAGE : config.demoMessage();
@@ -1418,7 +1454,8 @@ public final class App implements AutoCloseable {
       ApprovalHttpEndpoint approvalServer,
       TtyApprovalChannel approvalTtyChannel,
       HttpApprovalChannel approvalHttpChannel,
-      DecisionPackages decisionPackages) {
+      DecisionPackages decisionPackages,
+      MainAgent mainAgent) {
     this.events = events;
     this.conversations = conversations;
     this.bus = bus;
@@ -1441,6 +1478,11 @@ public final class App implements AutoCloseable {
     this.approvalTtyChannel = approvalTtyChannel;
     this.approvalHttpChannel = approvalHttpChannel;
     this.decisionPackages = decisionPackages;
+    // ★ 注册表取数缝在这里落成（P3a）：链/工具在装配早期就建好了，而 SubagentManager 是 final 字段、装配后期
+    //   才赋值 ⇒ 只有"调用那一刻现读字段"才拿得到它（这也是它必须是槽、不能按值传函数的原因）。
+    //   注册表未装配（templatesDir 未配置）⇒ 一律空 = 一律拒。
+    this.mainAgent = mainAgent;
+    this.mainAgent.registry().bind(this::levelOf);
   }
 
   /** 阻塞直到 close()（由 shutdown 钩子触发）。 */
@@ -1699,6 +1741,127 @@ public final class App implements AutoCloseable {
 
   /** {@code plugin.lifecycle} 事件的 payload 组装（Jackson 仅用于这一处序列化；字段顺序 pluginId→version→state）。 */
   private static final ObjectMapper PLUGIN_PAYLOAD = new ObjectMapper();
+
+  /**
+   * <b>主 Agent 那一级</b>（P3a，设计 §5quinquies ② + §5ter 裁定 13）：装配期现读快照 + 注册表取数缝，
+   * 由级联与跨进程结算口<b>共用</b>（一个对象两处读，避免"核对了 A、级联读了 B"）。
+   *
+   * @param permissions 主 Agent 的权限集（装配完成后的那一份：系统级 + 工作区落格 + 技能面）
+   * @param mode 档位<b>持有者</b>（运行期改档后链上现读——不缓存档位值，与 P2b 口径一致）
+   * @param registry 实例注册表取数缝（{@code instanceId ⇒ 那一级}；装配顺序上注册表晚于链建好，故用函数延迟到调用那一刻）
+   */
+  /**
+   * <b>实例注册表取数缝的可绑定槽</b>（P3a）：装配顺序决定"链与工具对象先建好、{@code SubagentManager} 后建"， 而链与工具都要读<b>同一份</b>注册表 ⇒
+   * 两边共用这一个槽，槽在 {@code App} 构造期被绑到真实取数缝上。
+   *
+   * <p>缺省（未绑定）是"一律查不到" = <b>一律具名拒</b>（fail-closed）：装配中途就没有"合法的子体提交"这回事。 只有 {@link #bind}
+   * 会改它，且只被调用一次。
+   */
+  private static final class RegistrySlot
+      implements Supplier<Function<String, Optional<DecisionCascade.Level>>> {
+
+    private volatile Function<String, Optional<DecisionCascade.Level>> delegate =
+        instanceId -> Optional.empty();
+
+    void bind(Function<String, Optional<DecisionCascade.Level>> resolved) {
+      this.delegate = java.util.Objects.requireNonNull(resolved, "resolved");
+    }
+
+    @Override
+    public Function<String, Optional<DecisionCascade.Level>> get() {
+      return delegate;
+    }
+  }
+
+  private record MainAgent(
+      AgentPermissionSet permissions, CommandModeHolder mode, RegistrySlot registry) {
+
+    /** 派生链视角：主 Agent 那一级按"提问者 ∩ 主 Agent"收窄（见 {@link #level}）。 */
+    DecisionCascade.Chain chain() {
+      return this::level;
+    }
+
+    /**
+     * 实例 id ⇒ 那一级（P3a 的唯一一处解析点：级联上溯与跨进程提出者核对都走它）。
+     *
+     * <p>解析顺序：<b>先注册表、后主 Agent</b>——注册表里那个 key 才是"在场"的权威答案；主 Agent 的 id （{@code main}）不是 {@code
+     * SubagentInstance}，注册表里没有它，所以它是兜底那一支。反过来先判 {@code main} 就等于"任何自称 main 的调用者都直接拿到主 Agent
+     * 的权限面"，那是把防冒充让位给一个字符串比较。
+     */
+    Optional<DecisionCascade.Level> level(String instanceId) {
+      return level(instanceId, null);
+    }
+
+    /**
+     * 同上，但带<b>提问者那一级的权限集</b>（{@link DecisionCascade.Chain#level(String, AgentPermissionSet)} 的落点）。
+     *
+     * @param callerPermissions 上溯到这一级之前那一级的权限集；{@code null} = 没有（起点，或调用方不关心）
+     */
+    Optional<DecisionCascade.Level> level(String instanceId, AgentPermissionSet callerPermissions) {
+      if (instanceId == null || instanceId.isBlank()) {
+        return Optional.empty();
+      }
+      Optional<DecisionCascade.Level> registered = registry.get().apply(instanceId);
+      if (registered.isPresent()) {
+        // 注册表里那一级：权限集/档位/父级全部来自实例记录本身（不由调用者自报、不在这里改写）
+        return registered;
+      }
+      if (!AgentIdentity.MAIN_ID.equals(instanceId)) {
+        return Optional.empty();
+      }
+      return Optional.of(
+          new DecisionCascade.Level(
+              AgentIdentity.MAIN_ID,
+              mainLevel(callerPermissions),
+              mode.get(),
+              // 到顶：父级空串 = 链到此为止
+              ""));
+    }
+
+    /**
+     * 主 Agent 那一级在<b>本次上溯</b>里的权限面。
+     *
+     * <p><b>为什么按"提问者 ∩ 主 Agent"收窄</b>：这一级总是从某个子体上溯上来的，而这一级上"它有资格替这条调用
+     * 拍板吗"的问法是"<b>从子体出发，能不能够到</b>"——直接报主 Agent 的全权限面，就会把子体够不着的资源面
+     * （例如子体压根没有的技能范围）挂到一个从子体上溯到的层级上。收窄只会更保守：能力判据因此至多与不变量 （子体权限 ⊆ 主 Agent 权限）给出的答案一样宽。
+     *
+     * <p>{@code callerPermissions == null}（无提问者）⇒ 原样给主 Agent 的权限面（那是"主 Agent 自己提的包"那条路， 与 P2b
+     * 的既有行为逐字一致）。
+     */
+    AgentPermissionSet mainLevel(AgentPermissionSet callerPermissions) {
+      if (callerPermissions == null) {
+        return permissions;
+      }
+      return permissions.withResourceScopes(
+          permissions.resourceScopes().narrowTo(callerPermissions.resourceScopes()));
+    }
+  }
+
+  /**
+   * <b>实例注册表取数缝</b>（P3a）：{@code instanceId ⇒ 那一级}——只认<b>本进程真的派过</b>的子 Agent 实例 （{@code
+   * SubagentManager} 的注册表），查不到返回空。
+   *
+   * <p>它是跨进程那条路的防冒充落点：子体自报的 {@code proposerKey} 必须在这里解析得出，解析不出就具名拒 （见 {@link
+   * CrossProcessDecisionGateway#PROPOSER_UNKNOWN}）。权限集 / 档位 / 父级<b>全部取自这条记录</b>—— 入参里没有任何"我是谁 /
+   * 我有什么权限"的字段参与判定。
+   *
+   * <p>注册表未装配（{@code templatesDir} 未配置 ⇒ 进程内根本没有子 Agent 能力）⇒ 一律空 = 一律拒：那种部署下 不存在合法的子体提交，放行反而是错的。
+   */
+  private Optional<DecisionCascade.Level> levelOf(String instanceId) {
+    SubagentManager manager = subagentManager;
+    if (manager == null) {
+      return Optional.empty();
+    }
+    return manager
+        .get(instanceId)
+        .map(
+            instance ->
+                new DecisionCascade.Level(
+                    instance.instanceId(),
+                    instance.permissions(),
+                    instance.mode(),
+                    instance.parentInstanceId()));
+  }
 
   /**
    * <b>会话级放行的资格判据</b>（{@code ApprovalCoordinator} 的 {@code sessionGrantable} 注入缝；P2b，设计 §5ter 裁定

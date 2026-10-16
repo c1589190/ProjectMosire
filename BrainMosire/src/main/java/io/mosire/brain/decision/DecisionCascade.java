@@ -4,6 +4,7 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.decision.DecisionPackage;
 import io.mosire.agentlib.decision.PackageItem;
+import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
@@ -62,6 +63,13 @@ public final class DecisionCascade {
   private static final Logger LOG = LoggerFactory.getLogger(DecisionCascade.class);
 
   /**
+   * "哪里都不许"的权限集（{@link AgentPermissionSet#builder} 的空白名单 = deny-default）：取不到提出者那一级时的兜底，
+   * 只为让"上溯时带的那份提问者权限"永远不是一个"凭空放宽"的值（见 {@link Chain#level(String, AgentPermissionSet)}）。
+   */
+  private static final AgentPermissionSet NOTHING_ALLOWED =
+      AgentPermissionSet.builder(AccessToken.GUEST).build();
+
+  /**
    * "人"这一级的裁决者 id（进 {@link DecisionTrail#finalizedBy()} 与轨迹的一级）。
    *
    * <p>它<b>不是</b>进程内的权限主体：人批的包执行时取<b>提出者/主 Agent</b> 那一级的身份（本机形态见 {@code App} 的装配注释）。
@@ -97,12 +105,34 @@ public final class DecisionCascade {
   /**
    * <b>派生链视角</b>：实例 id ⇒ 那一级（含它的父级）。找不到 ⇒ 空（上溯到此为止，剩下的条目全部到人——fail-closed）。
    *
-   * <p>本单的装配只提供主进程内那一级（主 Agent）；子 Agent 的实例记录经 {@code SubagentManager} 的注册表接进来属于跨进程那条路，未做。
+   * <p>P2b 的装配只提供主进程内那一级（主 Agent）；子 Agent 的实例记录经 {@code SubagentManager} 的注册表接进来是 P3a 做的（跨进程那条路，见
+   * {@link Chain#level(String, AgentPermissionSet)}）。
    */
   @FunctionalInterface
   public interface Chain {
 
     Optional<Level> level(String instanceId);
+
+    /**
+     * <b>P3a 追加的上溯形状</b>：带着<b>提问者那一级的权限集</b>再解析一次。
+     *
+     * <p><b>为什么需要它</b>：级联的第一跳是<b>子 Agent 实例</b>（P3a 跨进程场景），而下一跳是<b>主 Agent</b>—— 主 Agent
+     * 的权限集住在装配层手里，注册表里<b>没有</b>它的条目（它不是一个 {@code SubagentInstance}）。装配层因此需要 {@code 子体的权限集 ∩ 主 Agent
+     * 的权限集} 才能如实报出"主 Agent 那一级的权限面"：只用子体的权限集会 <b>低报</b>（主 Agent 能力比子体大），只用主 Agent
+     * 的权限集会<b>越报</b>（把子体够不着的资源面挂到一个从子体上溯到的层级上）。
+     *
+     * <p><b>★ 权限单调性在这里是结构性的</b>：与 {@code SubagentManager} 的"逐层只减不增"同源—— 子体的权限集是主 Agent 权限集 ∩ 模板 ∩
+     * 请求 的子集，所以 {@code covers(caller)} 在合法装配下恒成立； 不成立（权限集被人手工拼反了）⇒ 求交退化成子体那一级，<b>只会更窄、不会更宽</b>。
+     *
+     * <p><b>兼容口径</b>：缺省实现直接转发 {@link #level(String)} —— 已有实现（含 P2b 的 {@code App} 装配与
+     * 全部既有用例）<b>一个字都不用改</b>，行为逐字不变。只有需要"按提问者的范围收窄上级那一级"的链才覆写它。
+     *
+     * @param instanceId 要解析的实例 id
+     * @param callerPermissions <b>上溯到它之前那一级</b>的权限集（起点 = 提出者的权限集；不为 null）
+     */
+    default Optional<Level> level(String instanceId, AgentPermissionSet callerPermissions) {
+      return level(instanceId);
+    }
   }
 
   /** 某一级对它有能力的那些条目的预裁定。 */
@@ -299,8 +329,13 @@ public final class DecisionCascade {
     String lastApprover = null;
     Set<String> visited = new LinkedHashSet<>();
     String cursor = pkg.proposerKey();
+    // ★ P3a：上溯时带上"提问者那一级的权限集"（起点 = 提出者那一级）——链实现据此为上级收窄权限面，
+    //   见 Chain#level(String, AgentPermissionSet)。取不到提出者那一级时退回"哪里都不许"（fail-closed，
+    //   不给链实现任何凭空放宽的机会）。
+    AgentPermissionSet callerPermissions =
+        chain.level(cursor).map(Level::permissions).orElse(NOTHING_ALLOWED);
     while (cursor != null && !cursor.isBlank() && visited.add(cursor)) {
-      Optional<Level> found = chain.level(cursor);
+      Optional<Level> found = chain.level(cursor, callerPermissions);
       if (found.isEmpty()) {
         LOG.debug("级联上溯：派生链上没有实例 {} 这一级 ⇒ 剩下的条目全部到人 packageId={}", cursor, pkg.id());
         break;
@@ -356,6 +391,8 @@ public final class DecisionCascade {
           }
         }
       }
+      // 下一跳的"提问者"就是本级：它的权限集成为上一级收窄的依据（见 Chain#level(String, AgentPermissionSet)）
+      callerPermissions = level.permissions();
       cursor = level.parentInstanceId();
     }
     Set<Integer> escalated = new LinkedHashSet<>();

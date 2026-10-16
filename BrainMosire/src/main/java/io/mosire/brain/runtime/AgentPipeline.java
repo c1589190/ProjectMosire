@@ -31,6 +31,7 @@ import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.Compactor;
 import io.mosire.brain.context.ContextAssembler;
 import io.mosire.brain.context.ContextLayer;
+import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
 import io.mosire.brain.decision.DecisionApprovalBridge;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -103,6 +104,23 @@ public final class AgentPipeline {
    * 表现为"敏感调用悄悄消失了"。故队列的绑定与桥的接线绑成一个开关：要么整条链路都在，要么整条链路保持旧行为。
    */
   private final DecisionApprovalBridge decisionBridge;
+
+  /**
+   * <b>跨进程收尾缝</b>（P3b，设计 §5quinquies ①/⑤）：子体这一侧的回合收尾口——把本轮队列交回<b>父进程</b>结算， 回执落进自己的包表与事件库（{@code
+   * CrossProcessDecisionSubmitter}）。
+   *
+   * <p><b>{@code null} = 未接线</b>（主 Agent 的终态装配、离线夹具、本单之前的全部路径）：收尾走 {@link #decisionBridge}
+   * 那条既有路，行为逐字不变。
+   *
+   * <p><b>与 {@code decisionBridge} 的关系（"有缝就走，没有就退回既有"）</b>：两者都是"回合收尾口"，都决定"本轮队列绑不绑"。
+   * 收尾时优先走本缝（{@link #flushPendingDecisions}）；缝不在（{@link CrossProcessDecisionSubmitter#available()}
+   * 为假）而桥在 ⇒ 走桥。两个都没接线 ⇒ 不绑队列，{@code ToolGate.Ask} 保持既有那一跳（问人 / fail-closed 拒）
+   * ——"没接线"绝不静默变成"敏感调用既不执行也没人裁"。
+   *
+   * <p><b>为什么必须显式注入</b>：本缝要的那几件（子体自己的包表、本机执行者、实例身份与权限集）只有<b>子体进程的装配点</b> 拿得到（主 Agent 的 {@code App}
+   * 不造它）：{@code Brain} 不自己 new 一份——那会变成"第二个真相"（包表/身份/执行者各两份）。
+   */
+  private final CrossProcessDecisionSubmitter crossProcessSubmitter;
 
   private final ContextAssembler assembler;
   private final EventStore events;
@@ -218,6 +236,46 @@ public final class AgentPipeline {
         null,
         CompactSummarySlot.empty(),
         toolConfig);
+  }
+
+  /**
+   * 不落库构造 + 工具配置注入 + <b>跨进程收尾缝</b>（P3b）：除最后一个参数外与上一条构造逐字节一致。
+   *
+   * <p><b>为什么需要它</b>：子体进程的 runtime 就是"不落库"那一档（它没有 {@code ConversationStore}），而 P3b 的跨进程缝
+   * 恰恰只能接在<b>子体</b>这一侧——没有这条构造，子体要么接不上缝，要么被迫先造一个它并不需要的会话库。
+   *
+   * @param crossProcessSubmitter 跨进程收尾缝（非 null；{@code null} 请用上一条构造，语义等价但少一次分叉）
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        DiscardingConversationStore.INSTANCE,
+        conversationIdOf(config),
+        null,
+        CompactSummarySlot.empty(),
+        toolConfig,
+        null,
+        null,
+        crossProcessSubmitter);
   }
 
   /**
@@ -400,12 +458,62 @@ public final class AgentPipeline {
    *
    * <p><b>为什么必须是显式参数而不是装配层回头 set</b>：管线要在<b>回合边界</b>拿到它（绑/收尾都在那里），
    * 而"装配完成后才塞进去"会让第一次回合有窗口期用不到它——那种间歇态最难查。装配层（{@code App}）在构造时就给全。
+   *
+   * <p>★ {@code EI_EXPOSE_REP2} 的抑制落在下面那条<b>终态构造</b>上（只有它真正持有这两个注入的协作者）：挂在本条只做委托的 重载上会被 SpotBugs
+   * 判成"无用抑制"。
    */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        null);
+  }
+
   /**
-   * ★ <b>{@code EI_EXPOSE_REP2} 抑制（写明理由）</b>：{@code decisionBridge} 是<b>注入的协作者</b>——管线在回合收尾必须调它
-   * （本轮待裁决调用收成包、同步投递、等裁决）。它与本类既有的 {@code events}/{@code bus}/{@code llm}/{@code guard}
-   * 完全同类：**故意的共享引用（依赖注入）**，不是"把内部状态漏出去"；为它做防御性拷贝既无意义（桥不可拷贝）也会拆掉
-   * 唯一写者。抑制只为压掉"存外部可变对象"这条对注入场景的误报，<b>不改</b>注入形状。
+   * 全参装配 + 审批桥 + <b>跨进程收尾缝</b>（P3b，设计 §5quinquies）：除最后一个参数外与上一条构造逐字相同。
+   *
+   * <p><b>{@code crossProcessSubmitter} 非 null</b> ⇒ 子体这一侧：回合开始时若缝<b>真的可用</b> （{@link
+   * CrossProcessDecisionSubmitter#available()}：父侧那个工具在 registry 里且本实例判定面放行它）就绑本轮队列， 收尾走跨进程提交；缝不可用 ⇒
+   * 一个字段都不改语义（不绑队列，{@code Ask} 走既有那一跳）。{@code null} ⇒ 与接线前逐字节一致。
+   *
+   * <p><b>为什么与桥并存而不是二选一</b>：装配层可能同时给两者（子体进程里挂一条本进程的桥做兜底，或反过来）； 谁走哪条路由 {@link
+   * #flushPendingDecisions} 现判（缝优先），不由构造顺序暗示。
+   *
+   * <p><b>{@code EI_EXPOSE_REP2} 抑制（写明理由）</b>：{@code decisionBridge} 与 {@code
+   * crossProcessSubmitter} 都是<b>注入的协作者</b>——管线在回合收尾必须调它们（收成包、投递/提交、等裁决、执行被批子集）。它们与本类既有的 {@code
+   * events}/{@code bus}/{@code llm}/{@code guard} 完全同类：<b>故意的共享引用（依赖注入）</b>，不是"把内部状态漏出去"；
+   * 为它们做防御性拷贝既无意义（两者都不可拷贝）也会拆掉唯一写者。抑制只为压掉"存外部可变对象"这条对注入场景的误报，
+   * <b>不改</b>注入形状；它落在<b>本条终态构造</b>上（只有它真正持有这两个引用）。
    */
   @SuppressFBWarnings("EI_EXPOSE_REP2")
   public AgentPipeline(
@@ -424,7 +532,9 @@ public final class AgentPipeline {
       CompactSummarySlot compactSummary,
       Map<String, Object> toolConfig,
       ApprovalCoordinator coordinator,
-      DecisionApprovalBridge decisionBridge) {
+      DecisionApprovalBridge decisionBridge,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this.crossProcessSubmitter = crossProcessSubmitter;
     this.decisionBridge = decisionBridge;
     this.toolConfig = Map.copyOf(Objects.requireNonNull(toolConfig, "toolConfig"));
     this.compactor = compactor;
@@ -551,8 +661,12 @@ public final class AgentPipeline {
   public TurnResult run(String userMessage) {
     Objects.requireNonNull(userMessage, "userMessage");
     // ★ P1b（设计 §5 裁定 1+2）：本轮的待裁决队列——回合开始时绑到当前线程，回合收尾（含异常/取消路径）解绑。
-    //   "绑了队列"和"有桥收尾"是同一个开关（见 decisionBridge 的注释）：没有桥就不绑，Ask 保持既有行为。
-    PendingDecisionQueue pendingDecisions = decisionBridge == null ? null : bindPendingDecisions();
+    //   "绑了队列"和"有人能收尾"是同一个开关（见 decisionBridge / crossProcessSubmitter 的注释）：
+    //   没有任何收尾口就不绑，Ask 保持既有行为。
+    // ★ P3b：跨进程缝在场时以它为准——缝"真的可用"（父侧工具在 registry 里且判定面放行）才绑。
+    //   缝不在 ⇒ 不绑队列 ⇒ Ask 走既有那一跳（子体进程里就是它本来的 fail-closed 判/拒），这是回归安全网。
+    PendingDecisionQueue pendingDecisions =
+        decisionBridge == null && !crossProcessSeamAvailable() ? null : bindPendingDecisions();
     // 上一次回合的取消请求到此为止：cancel() 只对当时正在跑的回合负责
     cancelled = false;
     // 压缩触发点：回合边界（组请求之前）。此处既没有在途的落库（上一回合早已 return），也没有并发的第二个 store
@@ -721,13 +835,30 @@ public final class AgentPipeline {
    * 绑上本轮的待裁决队列（设计 §5 裁定 1+2）：队列的身份取自<b>宿主已知</b>的调用者与实例 （{@link AgentIdentity#instanceId()}
    * 是"一个实例一个未决包"的键、也是包与历史的归属键，裁定 3），模型给不出也改不了。
    *
+   * <p><b>P3b：接上跨进程缝时，实例身份以缝里那一份为准</b>。理由是一个真实的口子：子体进程的 {@code toolConfig} 不带自身身份 （{@code
+   * SubagentProcessMain} 走的是最朴素的装配），{@link AgentIdentity#mainFrom(Map)} 于是算出 {@code main}
+   * ——本地包会记成"主 Agent 提的"，而父侧核注册表用的是子体自报的实例 id，两边对不上（更要紧的是归属错人）。缝里那份身份是
+   * 装配层按本进程实例绑的（模型给不出、本类不猜），所以它是唯一来源。
+   *
    * @return 刚绑上的队列（收尾要用它按身份解绑，见 {@link #clearPendingDecisions}）
    */
   private PendingDecisionQueue bindPendingDecisions() {
-    // 实例身份与每次工具调用上下文里的那份<b>同源</b>（AgentIdentity.mainFrom(toolConfig)）：两者若各算一份，
+    // 实例身份与每次工具调用上下文里的那份<b>同源</b>（AgentIdentity.mainFrom(toolConfig)：两者若各算一份，
     // "包是谁提的"（proposerKey）就会与"那次调用是谁发的"（ApprovalRequest.requesterId）对不上。
-    return DecisionTurnScope.bind(
-        new PendingDecisionQueue(AgentIdentity.mainFrom(toolConfig).instanceId(), caller));
+    String instanceId =
+        crossProcessSubmitter == null
+            ? AgentIdentity.mainFrom(toolConfig).instanceId()
+            : crossProcessSubmitter.proposerKey();
+    return DecisionTurnScope.bind(new PendingDecisionQueue(instanceId, caller));
+  }
+
+  /**
+   * 跨进程缝此刻可不可用（判据在 {@link CrossProcessDecisionSubmitter#available()}：现读 registry 与判定面）。
+   *
+   * <p>没接线（{@code null}）⇒ 假；接线了但缝不可用 ⇒ 也假——两者在 {@link #run(String)} 那里是同一个后果： 不绑队列。
+   */
+  private boolean crossProcessSeamAvailable() {
+    return crossProcessSubmitter != null && crossProcessSubmitter.available();
   }
 
   /**
@@ -750,7 +881,40 @@ public final class AgentPipeline {
    */
   private void flushPendingDecisions(PendingDecisionQueue queue) {
     if (queue == null) {
-      // 未接线（没有桥）：本回合本来就没绑队列，Ask 走的是既有审批闸——这里什么都不该做
+      // 未接线（没有桥也没有跨进程缝）：本回合本来就没绑队列，Ask 走的是既有审批闸——这里什么都不该做
+      return;
+    }
+    // ★ P3b：优先走跨进程（"有缝就走"）。两条判据：
+    //   ① 缝此刻可用 ⇒ 走它（子体的正常形态）；
+    //   ② 缝不可用但**根本没有桥** ⇒ 仍然走它：close() 自己 fail-closed 处理"缝没了"（TOOL_NOT_FOUND ⇒
+    //      当场作废 + WARN + expired 事件）。少了这一条，"绑队列时缝还在、收尾时缝没了"会变成"敏感调用悄悄消失"
+    //      ——那正是本仓最不想要的形状。
+    //   桥在场且缝不可用 ⇒ 退回桥那一条既有路（主 Agent 的终态装配就是"只有桥"这一档，行为逐字不变）。
+    if (crossProcessSubmitter != null && (crossProcessSeamAvailable() || decisionBridge == null)) {
+      try {
+        crossProcessSubmitter
+            .close(queue)
+            .ifPresent(
+                pkg ->
+                    LOG.info(
+                        "回合收尾：本轮待裁决调用已跨进程交回父侧并回填本实例（同步提交已结束） id={} state={} items={} proposerKey={}",
+                        pkg.id(),
+                        pkg.state(),
+                        pkg.items().size(),
+                        crossProcessSubmitter.proposerKey()));
+      } catch (RuntimeException failure) {
+        // 收尾不得改写本回合的出口（同下面桥那条路的口径）：本回合的 TurnResult 已经定了。
+        // ★ 不回退到桥：包可能已经建出来并提交出去了，再走一遍桥等于对同一批条目投第二次（可能再问人一次）。
+        LOG.error(
+            "回合收尾的跨进程提交失败（本回合的出口不变；本轮待裁决调用零落盘——既不执行也不静默放行）" + " proposerKey={}",
+            crossProcessSubmitter.proposerKey(),
+            failure);
+      }
+      return;
+    }
+    if (decisionBridge == null) {
+      // 理论上到不了（绑队列的前提是两者之一在场）：真到了就响亮说出来，别静默丢一批待裁决调用
+      LOG.error("回合收尾：本轮有待裁决调用，但既没有跨进程缝也没有审批桥 ⇒ 零落盘（这两者应当在装配期同进同退） items={}", queue.size());
       return;
     }
     try {

@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.mosire.agentlib.config.FileConfigStore;
+import io.mosire.agentlib.decision.DecisionCommitPort;
+import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.event.SqliteEventStore;
@@ -16,14 +18,18 @@ import io.mosire.agentlib.mcp.McpSourceBridge;
 import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.mcp.PipeMcpClientTransport;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.plugin.ToolSource;
+import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
+import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
@@ -36,6 +42,7 @@ import io.mosire.brain.subagent.AgentTemplate;
 import io.mosire.brain.subagent.AgentTemplateStore;
 import io.mosire.docs.DocNamespaces;
 import io.mosire.main.app.BootConfig;
+import io.mosire.main.decision.LocalDecisionCommitPort;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -175,18 +182,42 @@ public final class SubagentProcessMain {
       // “不预注入”，stderr 留痕）——一个手改坏的技能不该让所有子 Agent 都拉不起来（技能**工具**走父侧链路，
       // 那时会按 SkillCatalog 的既有语义响亮报错，边界仍在）。
       BasicContextAssembler assembler = skillAssembler(options, permissions, diagnostics);
+      // ★ P3b（设计 §5quinquies ①/⑤）：子体侧的<b>跨进程收尾缝</b>——回合收尾把本轮待裁决队列交回父侧结算，
+      //   回执落进<b>自己的</b>包表与事件库。三件必须在<b>本进程</b>装配（Brain 侧拿不到子体的实例身份与权限集，
+      //   主 Agent 的 App 也不造子体）：① 自己的包表；② 本机执行者（执行身份 = 本实例，红线 R7）；③ 提交口。
+      //   ★ 只在 --parent-link 时接：没有父链接连那个工具都看不见（registry 里不会有它），缝对它是空的——
+      //     于是 available() 判不在 ⇒ 不绑队列、Ask 走既有那一跳（与接线前逐字一致，这是回归安全网）。
+      CrossProcessDecisionSubmitter decisionSubmitter =
+          options.parentLink()
+              ? decisionSubmitter(
+                  registry, permissions, options.goal(), config, eventStore, eventBus)
+              : null;
       AgentRuntime agent =
-          assembler == null
-              ? new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions)
-              : new AgentRuntime(
-                  config,
-                  llm,
-                  registry,
-                  new ToolExecutionGuard(),
-                  assembler,
-                  eventStore,
-                  eventBus,
-                  permissions);
+          decisionSubmitter == null
+              ? assembler == null
+                  ? new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions)
+                  : new AgentRuntime(
+                      config,
+                      llm,
+                      registry,
+                      new ToolExecutionGuard(),
+                      assembler,
+                      eventStore,
+                      eventBus,
+                      permissions)
+              : assembler == null
+                  ? new AgentRuntime(
+                      config, llm, registry, eventStore, eventBus, permissions, decisionSubmitter)
+                  : new AgentRuntime(
+                      config,
+                      llm,
+                      registry,
+                      new ToolExecutionGuard(),
+                      assembler,
+                      eventStore,
+                      eventBus,
+                      permissions,
+                      decisionSubmitter);
       runtime = agent;
       TurnResult result = agent.chat(options.goal());
       diagnostics.println(
@@ -227,6 +258,72 @@ public final class SubagentProcessMain {
       closeQuietly(bus);
       closeQuietly(events);
     }
+  }
+
+  /**
+   * 子体侧的<b>跨进程收尾缝</b>（P3b，设计 §5quinquies ①/⑤）：包表 + 本机执行者 + 提交口三件，全部用<b>本进程</b>的身份与权限集建。
+   *
+   * <p><b>为什么这三件必须在子体侧 new（不能在 Brain 里给）</b>：
+   *
+   * <ol>
+   *   <li><b>包表</b>（{@link DecisionPackages}）：不变量 1 说"那一轮只有<b>子体自己的包</b>是决策单元"——父侧只跑一个不落历史的临时包
+   *       （{@code CrossProcessDecisionGateway}）。表若由父侧建，子体的历史就会变成父侧那份的影子；
+   *   <li><b>执行者</b>（{@link LocalDecisionCommitPort}）：它执行被批子集时用的权限集/身份必须是<b>本实例的</b> （红线
+   *       R7：子体不能沿父级权限执行）。"本实例的权限集"只有本进程手里这一份（父侧那份是同一个模板算出来的另一份拷贝）；
+   *   <li><b>提交工具调用</b>：走本进程 registry 里那个由父侧经 MCP 桥同步进来的 {@code submit_decision_package}
+   *       ——它是"父侧工具面"在本进程的代理，Brain 侧拿不到本进程的 registry 与判定面。
+   * </ol>
+   *
+   * <p><b>身份（{@code proposerKey} 的唯一来源）</b>：实例 id 取 {@link AgentConfig#id()}——它由 {@code
+   * template.toAgentConfig(options.instanceId())} 落成 {@code --id}，与父侧在 MCP 链接上绑的那个 id <b>逐字同源</b>
+   * （{@code SubProcessExecutor#launch} 的 {@code AgentIdentity.subagent(instance.instanceId(),
+   * …)}）；父侧还会拿它核实例注册表 （防冒充）。档位取子 Agent 缺省 {@link CommandMode#LIMITED}：argv
+   * <b>不下发档位</b>（父侧绑在链接上），而父侧的判定 <b>从不信</b>子体自报的档位（它用自己那一份）——这里取缺省只是"偏保守的一侧"，不影响任何判定。
+   *
+   * <p><b>执行者用的工具配置是空表</b>：子体进程当前<b>没有</b>装配期 {@code toolConfig}（既有形态，本单不改）， 所以"执行时注入同一份配置"在这里 =
+   * 两边都是空表（不是"提交口少注入了一份"）。这条是既有缺口，如实登记在 P3b 报告里。
+   *
+   * @param registry 本进程 registry（父侧工具面的代理在这一张里）
+   * @param permissions 本进程生效权限集（模板 ∩ 父侧 argv 下发值）
+   * @param goal 本实例目标（父侧给的任务；进身份，供本地判定面看清"我是谁"）
+   * @param config 本实例配置（{@code id} = 实例 id）
+   * @param eventStore 本进程事件库（{@code events.db}：五类包事件落这里）
+   * @param eventBus 本进程事件总线（旁路通知；子进程的总线没有落库订阅，落库由缝自己 append）
+   */
+  private static CrossProcessDecisionSubmitter decisionSubmitter(
+      ToolRegistry registry,
+      AgentPermissionSet permissions,
+      String goal,
+      AgentConfig config,
+      SqliteEventStore eventStore,
+      EventBus eventBus) {
+    AgentIdentity identity =
+        AgentIdentity.subagent(config.id(), CommandMode.LIMITED, goal == null ? "" : goal, 0);
+    DecisionPackages packages = new DecisionPackages();
+    // 执行身份 = 本实例（红线 R7 + 设计 §5quinquies ③）：按包 id 现取，但每一包都取同一份本实例身份——
+    // 父侧回传的 finalizedBy 只进记录面（"谁拍的板"），不参与"以谁的权限执行"。
+    DecisionCommitPort commitPort =
+        new LocalDecisionCommitPort(
+            registry,
+            // 纯判定链（不含审批闸）：裁决即授权，执行时不再问一次人——同 App 的装配口径
+            new ToolExecutionGuard(),
+            Map.of(),
+            packageId ->
+                new LocalDecisionCommitPort.ExecutingIdentity(
+                    permissions.grantedToken(), permissions, identity));
+    // 提交工具是 Ask-free 的（它做的事就是"替子体问"）：这条 authorizer 的 Ask 分支到不了它，
+    // 用 standard()（= 纯判定链）即可——与管线那条入口同源，本进程不新建第二套判定。
+    return new CrossProcessDecisionSubmitter(
+        packages,
+        java.util.Optional.of(commitPort),
+        registry,
+        ToolCallAuthorizer.standard(),
+        Map.of(),
+        permissions.grantedToken(),
+        permissions,
+        identity,
+        eventStore,
+        eventBus);
   }
 
   /**
