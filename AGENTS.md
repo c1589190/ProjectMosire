@@ -33,7 +33,8 @@ BashPluginMosire ────────────────────┘
 
 | 模块 | artifactId | 包前缀 | 允许依赖 / 要点 |
 |---|---|---|---|
-| `AgentLibMosire` | `agentlib-mosire` | `io.mosire.agentlib.*` | 通用 LLM 工具包/接口/协议（llm client、AgentTool、MCP 适配、权限模型、事件存储、配置、进程管理）。**无 Agent 假设**，可被其他程序单独依赖；**不得 import** `io.mosire.brain.*` / `io.mosire.main.*` |
+| `AgentLibMosire` | `agentlib-mosire` | `io.mosire.agentlib.*` | 通用 LLM 工具包/接口/协议（llm client、AgentTool、MCP 适配、权限模型、事件存储、配置、进程管理）。★ **2026-10-17 边界改写（用户裁定）**：原口径「**无 Agent 假设**」已**不再成立**——按用户裁定「AgentConfig 整个下沉」与「窗口的结构编排和基础运行本身作为完全可复用的项目下沉到 AgentLib」，本库现含 **Agent 描述符**（`io.mosire.agentlib.agent.AgentConfig`，10 组件含 maxTurns/timeBudget/quotaMaxTokens/工具白黑名单）与**上下文窗口的结构与基础操作**（`io.mosire.agentlib.context.{ContextWindow,ContextComposer,LlmRoundTrip}`；📄 `设计-上下文窗口下沉.md`）。
+新口径：**无运行流假设**——库**不含循环、编排、终止结算、压缩/技能/记忆的具体实现**（这些留在宿主 Brain）；可被其他程序单独依赖；**不得 import** `io.mosire.brain.*` / `io.mosire.main.*` |
 | `BrainMosire` | `brain-mosire` | `io.mosire.brain.*` | 具体对话、工具载入、上下文构造/压缩、子 Agent 编排、skills、记忆。只依赖 `agentlib-mosire`（+ Jackson/SLF4J）；不得依赖 `MainMosire` |
 | `MainMosire` | `main-mosire` | `io.mosire.main.*` | 进程组装、CLI、网关（AdminREST/A2A/AG-UI/MCP）、健康检查、发行。**不含 Agent 行为逻辑**；主代码不得 import `io.mosire.bash.*` |
 | `BashPluginMosire` | `bash-plugin-mosire` | `io.mosire.bash.*` | PF4J 插件。**main 只依赖 `AgentLibMosire`**（PF4J 为 provided）；测试面可再依赖 Brain（test scope）。宿主 main 代码不得 import/使用它（Main 的 provided 依赖只服务构建顺序，见下） |
@@ -98,7 +99,7 @@ BashPluginMosire ────────────────────┘
 | 文档 | 内容 / 现状 |
 |---|---|
 | `开发计划.md` | **现行计划**（2026-09-14 重写版）；§五“纪律”逐条有效 |
-| `设计-*.md`（仓库根） | **现行设计文档**：身份与血缘 / 子 Agent 终局 / 子 Agent 上下文 / Bash 围栏 / 审批与工具内权限 / 多 provider 路由 / 插件系统 / 配置引导 / MCP HTTP 传输 / **Skill 运行时** |
+| `设计-*.md`（仓库根） | **现行设计文档**：身份与血缘 / 子 Agent 终局 / 子 Agent 上下文 / Bash 围栏 / 审批与工具内权限 / 多 provider 路由 / 插件系统 / 配置引导 / MCP HTTP 传输 / Skill 运行时 / **决策包作为唯一决策单元** / **上下文窗口下沉**（`设计-上下文窗口下沉.md`：AgentLib 收 `ContextWindow`/`ContextComposer`/`LlmRoundTrip`/`AgentConfig`，分层机制与压缩线留 Brain） |
 | `Research/调查报告.md` | 2026-09-08 调查结论（协议选型、架构参考、技术栈、风险）；**不是**开发计划 |
 | `README.md` | 项目介绍；其“里程碑状态”是历史快照，数字可能陈旧，**不作实时状态依据** |
 | `docs/archive/2026-09-14-旧计划/` | 已归档、**不再修改**的旧计划；Java 注释里对它们的文字引用不逐处改写（引的是历史决定出处） |
