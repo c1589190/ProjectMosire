@@ -8,7 +8,7 @@
   "destructiveAllowed": false,
   "sensitiveAllowed": false,
   "readOnly": false,
-  "maxTurns": 4,
+  "maxTurns": 114514,
   "maxToolCallsPerTurn": 2,
   "timeBudgetSeconds": 90,
   "quotaMaxTokens": 12000
