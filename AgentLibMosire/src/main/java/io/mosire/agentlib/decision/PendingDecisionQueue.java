@@ -95,11 +95,28 @@ public final class PendingDecisionQueue {
    * @throws IllegalStateException 本队列已经产出过提议（登记必须发生在收尾之前）
    */
   public void register(String toolName, Map<String, Object> args, ToolGate.Ask ask) {
+    Objects.requireNonNull(ask, "ask");
+    register(toolName, args, ask.classKey(), ask.kind() == null ? AskKind.SENSITIVE : ask.kind());
+  }
+
+  /**
+   * ★ <b>父侧已把这次调用记进它那一轮队列</b>的登记口（P3d，设计 §5sexies③④）：子体侧的 {@code ToolCallAuthorizer} 见到 {@code
+   * DECISION_QUEUED} 具名码时调这里，语义与 {@link #register(String, Map, ToolGate.Ask)} <b>同一份队列</b>——
+   * 区别只在这条是"父侧记的账"，本侧照抄一条用于收尾建包与对账。
+   *
+   * <p><b>为什么 {@code classKey}/{@code askKind} 留空</b>：它们是父侧 defer 那一刻按参数<b>现算</b>出来的（闸位知识跟着真工具走），
+   * 那份才是权威；本侧既算不出也不该猜（P3d 起提交也不再带它们，见设计 §5sexies⑤）。★ <b>留空 = "不知道"，不是编一个值</b> ——{@code null}
+   * 只表示"本侧未获知"，它不参与任何判定、不进任何载荷。
+   */
+  public void registerDeferred(String toolName, Map<String, Object> args) {
+    register(toolName, args, null, null);
+  }
+
+  /** 登记内核（{@code classKey}/{@code askKind} 可为 null = 本侧未获知，见 {@link #registerDeferred}）。 */
+  private void register(String toolName, Map<String, Object> args, String classKey, AskKind kind) {
     Objects.requireNonNull(toolName, "toolName");
     Objects.requireNonNull(args, "args");
-    Objects.requireNonNull(ask, "ask");
     Map<String, Object> snapshot = Map.copyOf(args);
-    AskKind kind = ask.kind() == null ? AskKind.SENSITIVE : ask.kind();
     lock.lock();
     try {
       if (proposalMade) {
@@ -119,12 +136,12 @@ public final class PendingDecisionQueue {
               snapshot,
               DecisionItemDigest.argsDigest(snapshot),
               DecisionItemDigest.itemSummary(toolName, snapshot));
-      entries.add(new PendingEntry(toolName, snapshot, ask.classKey(), kind, item));
+      entries.add(new PendingEntry(toolName, snapshot, classKey, kind, item));
       LOG.debug(
           "待裁决调用已登记 index={} tool={} classKey={} kind={} proposerKey={}（本轮不执行、不阻塞、不走审批闸）",
           index,
           toolName,
-          ask.classKey(),
+          classKey,
           kind,
           proposerKey);
     } finally {
@@ -220,9 +237,10 @@ public final class PendingDecisionQueue {
    *
    * @param toolName 工具名
    * @param args 参数明文（顶层不可变快照；密钥纪律：只进包内条目与提交口）
-   * @param classKey 工具自报的闸位类键（会话级放行的归类键；P2 汇总包级类键要用）
-   * @param askKind 为什么问（{@link AskKind#SENSITIVE} 只到人 / {@link AskKind#MODE_LIMITED} 可交上级；P2
-   *     的上级判定要用）
+   * @param classKey 工具自报的闸位类键（会话级放行的归类键；P2 汇总包级类键要用）；<b>{@code null} = 本侧未获知</b> （父侧 defer
+   *     时记的那一份才是权威，见 {@link #registerDeferred}）
+   * @param askKind 为什么问（{@link AskKind#SENSITIVE} 只到人 / {@link AskKind#MODE_LIMITED}
+   *     可交上级）；<b>{@code null} = 本侧未获知</b>（同上）
    * @param packageItem 包内条目（index / toolName / args / argsDigest / summary）
    */
   public record PendingEntry(
@@ -235,8 +253,8 @@ public final class PendingDecisionQueue {
     public PendingEntry {
       Objects.requireNonNull(toolName, "toolName");
       Objects.requireNonNull(args, "args");
-      Objects.requireNonNull(classKey, "classKey");
-      Objects.requireNonNull(askKind, "askKind");
+      // classKey / askKind 允许为 null（= 本侧未获知，见 registerDeferred）：它们是"父侧那一刻算出来的那一份"的拷贝，
+      // 子体侧确实答不出。★ 不许在这里编一个值顶上去——那会把"不知道"伪装成"知道"。
       Objects.requireNonNull(packageItem, "packageItem");
       args = Map.copyOf(args);
     }

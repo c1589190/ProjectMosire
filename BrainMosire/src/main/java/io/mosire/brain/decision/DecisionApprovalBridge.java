@@ -432,7 +432,11 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
     List<PendingDecisionQueue.PendingEntry> entries = queue.snapshot();
     Map<Integer, AskKind> askKinds = new LinkedHashMap<>();
     for (PendingDecisionQueue.PendingEntry entry : entries) {
-      askKinds.put(entry.packageItem().index(), entry.askKind());
+      // 缺料（null = 本侧未获知，见 PendingDecisionQueue#registerDeferred）按 SENSITIVE 办：与 DecisionCascade 的
+      // "没说明为什么问 ⇒ 落进人手里"同源。走这条桥的（主 Agent 进程内）队列恒有闸位，这里只是不让可空契约变成 NPE。
+      askKinds.put(
+          entry.packageItem().index(),
+          entry.askKind() == null ? AskKind.SENSITIVE : entry.askKind());
     }
     return queue
         .toProposeRequest()

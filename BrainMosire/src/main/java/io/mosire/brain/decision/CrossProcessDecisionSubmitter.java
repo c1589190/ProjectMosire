@@ -48,17 +48,20 @@ import org.slf4j.LoggerFactory;
  *
  * <pre>
  * ① 队列非空 ⇒ 先在【自己的包表】里落一个 PROPOSED 包（拿到包 id；proposerKey = 本实例 id、caller = 本实例令牌）
- * ② 用该包 id 作 requestId 调 submit_decision_package（条目原样：toolName/args/classKey/askKind，顺序 = 登记顺序）
+ * ② 用该包 id 作 requestId 调 submit_decision_package（★ P3d 收窄：逐条只带 {index, toolName, digest}，不带明文/闸位）
  * ③ 回执 ⇒ 回填自己的包（decide）+ 执行被批子集（注入的提交口，执行身份 = 本实例）+ 落自己的事件
- * ④ deciderLevel=NONE（软拒）⇒ 建包但零批准、零落盘（这是一次"没有通过的裁决"，该进历史）
- * ⑤ 硬拒（ToolResult.error 带码）⇒ 提交没被受理：不留未决包（当场具名作废 + WARN + expired 事件）
+ * ④ ★ 没拿到明确同意（被驳 / 没人答 / 无通道 / 到点 / 提交被拒收 / 回执读不懂）⇒ **什么都不做**：零落盘、零副作用
  * </pre>
+ *
+ * <p>★ <b>④ 是用户裁定 14（2026-10-16）的落点</b>：行为只有两档——"拿到逐条明确同意 ⇒ 执行那些"与"其它一切 ⇒ 什么都不做"。 记录形态上仍分得开（从未被受理 /
+ * 没投递 ⇒ 包当场作废 {@code EXPIRED}；被受理但零批准 ⇒ {@code REJECTED}），但
+ * <b>两者不区分语义</b>；理由位只是选填的事后可读信息，不参与任何行为判定。
  *
  * <p>★ <b>为什么必须"先落本地包"</b>（⑤-3）：{@code requestId} 就是那个包的 id。先有它，父侧才有一个稳定的幂等键 （重试不会让人再答一遍，见 {@link
  * CrossProcessDecisionGateway} 的幂等缓存），而且"我的历史里有这个包"这件事在提交之前就成立
  * ——提交成功但落库前崩掉时，历史上不会出现一个"父侧批过、子体从没有过"的幽灵包。
  *
- * <p>★ <b>⑤ 与"硬拒 ⇒ 不建包"的字面冲突，如实记</b>：字面上"提交没被受理"就不该建包，但 ① 要求包在提交之前就存在 （上面那条理由）⇒
+ * <p>★ <b>④ 与"提交没被受理 ⇒ 不建包"的字面冲突，如实记</b>：字面上"提交没被受理"就不该建包，但 ① 要求包在提交之前就存在 （上面那条理由）⇒
  * 实现上只能"建了再当场作废"。作废（{@code PROPOSED ⇒ EXPIRED}、零落盘）+ 一条带原因的 {@code decision.package.expired}
  * 事件，读起来是"这个包提交没被受理"，不是一个悬着的未决包。
  *
@@ -229,6 +232,18 @@ public final class CrossProcessDecisionSubmitter {
   /**
    * 回合收尾：把本轮队列跨进程交回父侧结算，并把回执落进自己的包表与事件库（类注释的五步）。
    *
+   * <p><b>★ 唯一判据（裁定 14，用户 2026-10-16：「要么同意，执行，要么直接不干任何事…静默=拒绝」）</b>：走到了哪一步只决定
+   * <b>记录形态</b>，不决定行为多寡——行为只有两档：
+   *
+   * <ol>
+   *   <li><b>拿到了逐条明确同意</b>（回执里 {@code approvedIndexes} 非空且带裁决者）⇒ 执行被批的那些（{@link #apply}）；
+   *   <li><b>其它一切</b>（提交被拒收 / 没人答 / 没有可用通道 / 到点 / 被驳 / 回执读不懂 / 回合被打断或被回收）⇒ <b>什么都不做</b>
+   *       （零落盘、零副作用、零"部分生效"）。这些情形<b>不区分语义</b>：理由位只是事后可读，能填就填。
+   * </ol>
+   *
+   * <p><b>记录形态上仍分得开</b>（这是"不删、不新增记录类型"的那一半）：从未被受理 / 没投递出去的 ⇒ 包当场作废（{@code EXPIRED} +
+   * 选填理由）；被受理、只是没有一条被批 ⇒ {@code REJECTED}（"一次没有通过的裁决"，该进历史）。
+   *
    * <p><b>空队列 = 零副作用</b>：不建包、不发事件、不提交——返回 {@code Optional.empty()}（与桥的空队列口径逐字一致）。
    *
    * @param queue 本轮待裁决队列（非 null；管线在回合开始时建、收尾时交到这里）
@@ -281,7 +296,8 @@ public final class CrossProcessDecisionSubmitter {
       return expire(proposed, REASON_NOT_ACCEPTED + "：提交抛出异常");
     }
     if (!result.success()) {
-      // ⑤ 硬拒 / 工具不可达：这次提交没被受理 ⇒ 当场作废（绝不"当作零批准"，两者在历史里必须分得开）
+      // 提交被拒收（形状坏 / 身份没绑 / 冒充 / 两侧核对对不上账）：**观测上响亮**（具名码原样进作废理由），
+      // **行为上**同归"什么都没做"（裁定 14 第二档）——不是"零批准"，两者在历史里必须分得开。
       String code = result.code() == null ? "SUBMIT_REFUSED" : result.code();
       LOG.warn(
           "跨进程收尾：提交未被受理（零落盘，当场作废）packageId={} proposerKey={} code={} message={}",
@@ -304,15 +320,16 @@ public final class CrossProcessDecisionSubmitter {
   /**
    * ③/④：把回执落进自己的包（{@code decide}）⇒ 执行被批子集 ⇒ 落 {@code decided}/{@code committed} 事件。
    *
-   * <p>软拒（{@code deciderLevel=NONE}）与正常裁决在这里<b>只差一个集合</b>：前者被批子集为空 ⇒ {@code decide} 一次 零批准、{@code
-   * commit} 直接判 {@code REJECTED}（包层不调 port，结构上就落不了盘）。
+   * <p><b>★ "拿到明确同意了吗"就是这里的唯一分岔</b>（裁定 14）：被批子集为空（人拒 / 无人答 / 无通道 / 到点 / 级联一条都没批） ⇒
+   * 只落一次"未获同意"的裁决（{@code decide(∅)}），{@code commit} 在包层直接判 {@code REJECTED}（<b>结构上</b>不调提交口 ⇒
+   * 零落盘）；被批子集非空 ⇒ 一次提交、逐条去向。
    */
   private Optional<DecisionPackage> apply(DecisionPackage proposed, Verdict verdict) {
     Set<Integer> approved = verdict.approvedIndexes();
     String finalizedBy = verdict.finalizedBy();
     boolean none = CrossProcessDecisionGateway.DECIDER_NONE.equals(verdict.deciderLevel());
     if (!approved.isEmpty() && (finalizedBy == null || finalizedBy.isBlank())) {
-      // "批了东西却没人拍板" = 回执违反契约：不能编一个裁决人把它洗成合法裁决（fail-closed）
+      // "批了东西却没人拍板" = 回执违反契约：不能编一个裁决人把它洗成合法裁决（fail-closed ≡ 什么都没做）
       LOG.error(
           "跨进程收尾：回执批了 {} 条却没有裁决者（零落盘，当场作废）packageId={} proposerKey={}",
           approved.size(),
@@ -321,6 +338,7 @@ public final class CrossProcessDecisionSubmitter {
       return expire(proposed, REASON_NOT_ACCEPTED + "：回执缺少裁决者");
     }
     String by = finalizedBy == null || finalizedBy.isBlank() ? BY_NONE : finalizedBy;
+    // ★ 理由位是**选填**的（裁定 14 第 4 条）：能填就填（这里填得出"批了几条/为什么没批"），填不出也不影响任何行为判定。
     String note =
         "跨进程裁决回填：deciderLevel="
             + verdict.deciderLevel()
@@ -329,6 +347,7 @@ public final class CrossProcessDecisionSubmitter {
             + "/"
             + proposed.items().size()
             + " 条"
+            + (approved.isEmpty() ? "（未获明确同意 ⇒ 什么都不做：零落盘、零副作用）" : "")
             + (none ? "（fail-closed 零批准：提交被受理了，但没有任何裁决者）" : "");
     DecisionPackage decided;
     try {
@@ -414,8 +433,13 @@ public final class CrossProcessDecisionSubmitter {
   /**
    * ② 调父侧的 {@code submit_decision_package}（既有工具调用路径；见类注释）。
    *
-   * <p>入参的两个关键字面都不含身份声明以外的自由度：{@code proposerKey} 取本实例身份（模型给不出），{@code requestId} 取<b>刚建的包
-   * id</b>（①的产物）。条目顺序 = 队列登记顺序，{@code index} = 包内条目身份（两处同源，不重编号）。
+   * <p><b>★ P3d 收窄（设计 §5sexies⑤）</b>：逐条只带 {@code {index, toolName, digest}}——<b>不带</b>明文 {@code
+   * args}、 <b>不带</b> {@code classKey}/{@code askKind}。理由：父侧在 defer 那一刻就看见了明文并算出了闸位，那份才是权威；子体再送一份
+   * 既多开一条明文通路，也无从核对（另一个进程送来的数据不可信）。父侧拿这三件与它自己本轮队列逐条对账，对不上 ⇒ 具名拒 + 零批准（{@link
+   * CrossProcessDecisionGateway#ITEMS_MISMATCH}）。
+   *
+   * <p>入参里另外两个关键字面都不含自由度：{@code proposerKey} 取本实例身份（模型给不出），{@code requestId} 取<b>刚建的包
+   * id</b>（①的产物，也是一次性放行的键）。条目顺序 = 队列登记顺序，{@code index} = 包内条目身份（两处同源，不重编号）。
    */
   private ToolResult submit(
       DecisionPackage proposed, List<PendingDecisionQueue.PendingEntry> entries) {
@@ -427,15 +451,14 @@ public final class CrossProcessDecisionSubmitter {
       Map<String, Object> row = new LinkedHashMap<>();
       row.put("index", entry.packageItem().index());
       row.put("toolName", entry.toolName());
-      row.put("args", entry.args());
-      row.put("classKey", entry.classKey());
-      row.put("askKind", entry.askKind().name());
+      // 摘要两侧同一段代码（DecisionItemDigest）；它同时是父侧那份条目的对账键
+      row.put("digest", entry.packageItem().argsDigest());
       items.add(row);
     }
     arguments.put("items", items);
     ToolContext context = new ToolContext(caller, permissionSet, toolConfig, arguments, identity);
     LOG.info(
-        "跨进程收尾：提交本轮决策包 packageId={} proposerKey={} items={}（条目明文只进这次工具调用）",
+        "跨进程收尾：提交本轮决策包 packageId={} proposerKey={} items={}（只带 index/toolName/digest，不带明文）",
         proposed.id(),
         proposerKey(),
         entries.size());
@@ -483,7 +506,7 @@ public final class CrossProcessDecisionSubmitter {
    *
    * @param approvedIndexes 终局被批的条目（只准执行这些）
    * @param finalizedBy 拍板者（{@code null} = 没人拍板）
-   * @param deciderLevel {@code AUTO} / {@code HUMAN} / {@code NONE}
+   * @param deciderLevel {@code AUTO} / {@code HUMAN} / {@code SUPERIOR}（上级代批闸拍的板，P3e）/ {@code NONE}
    * @param trail 级联轨迹行（{@code null} = 没有；<b>原样</b>进 {@code decided} 事件载荷）
    */
   private record Verdict(

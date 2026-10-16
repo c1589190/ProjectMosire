@@ -63,6 +63,7 @@ import io.mosire.brain.decision.CrossProcessDecisionGateway;
 import io.mosire.brain.decision.DecisionApprovalBridge;
 import io.mosire.brain.decision.DecisionCascade;
 import io.mosire.brain.decision.DecisionHistoryTools;
+import io.mosire.brain.decision.ParentSubagentDecisionLedger;
 import io.mosire.brain.decision.SubmitDecisionPackageTools;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
@@ -139,6 +140,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -408,6 +410,33 @@ public final class App implements AutoCloseable {
     // ★ role.audit：装配期角色审计的留痕（同 §5.13(c)：它在装配失败抛异常<b>之前</b>经本订阅者同步落库）。
     bus.subscribe(event -> mirrorInfrastructureEvent(events, event));
     ToolRegistry tools = new ToolRegistry();
+    // ★ P3d：子 Agent 注册表的"后绑定"取数缝——簿子在 wireSubagents 之前就要建（工具桥那份 authorizer 要它），
+    //   而注册表本身在那之后才存在。查不到 ⇒ 不记账（退回逐条问人），不猜。
+    AtomicReference<SubagentManager> subagentManagerLookup = new AtomicReference<>();
+    // ★ P3d（设计 §5sexies③）：父侧的「该子体本轮队列」簿子——按子体实例 id 记这一轮被 defer 的 Ask 调用，
+    //   收尾结算完即清；另记"被批条目的一次性放行"（重复使用即拒）。它<b>不是</b>第二条决策路径：
+    //   不进 pending()、不落父侧历史、不发 decision.package.* 事件（正式记录只在子体自己的库与包表里）。
+    //   ★ 两个注入件都是"父侧本来就有的真相"：工具目录（判子体有没有提交口）+ 子体权限集（判它的判定面放不放行）。
+    //     ★ 这一问是**必需**的：模板 allowedTools 里没有 submit_decision_package 的子体提交不了，父侧若照记不误，
+    //       那条调用就会既没执行、也没人去裁（子体拿 DECISION_QUEUED 回去、本地队列却是空的）——最贵的假绿。
+    ParentSubagentDecisionLedger subagentDecisionLedger =
+        new ParentSubagentDecisionLedger(
+            tools,
+            instanceId -> {
+              SubagentManager manager = subagentManagerLookup.get();
+              return manager == null
+                  ? Optional.empty()
+                  : manager.get(instanceId).map(SubagentInstance::permissions);
+            });
+    // 回收订阅：agent.lifecycle 的终局动作（finished/failed/killed）⇒ 那台子体的簿子与未用放行一起清
+    // （设计 §5sexies③②）。解析不出动作的（非终局 / 形状变了）不动簿子——"拿不准就不清"与"清早了"相比，
+    // 前者最多多留一会儿内存（还有 TTL 与 LRU 兜底），后者会把一条正在等的待裁决调用清掉。
+    bus.subscribe(
+        event -> {
+          if (EventTypes.AGENT_LIFECYCLE.equals(event.type()) && isTerminalLifecycle(event)) {
+            subagentDecisionLedger.recycle(event.agent());
+          }
+        });
     McpLinks links;
     try {
       // 主 try 之前会抛非致命异常的两处调用（工具注册同名/空元素、链接装配）都在本兜底内：抛错时控制流直接逃出
@@ -669,6 +698,17 @@ public final class App implements AutoCloseable {
               App::sessionGrantable);
       ToolCallAuthorizer approvalAuthorizer =
           ToolCallAuthorizer.of(new ToolExecutionGuard(), approvalCoordinator);
+      // ★ P3d：子体桥那一份 authorizer 多接一个"父侧本轮队列"缝（设计 §5sexies③④⑥）——子体的工具全是经 MCP 桥来的代理
+      //   （不覆写 gate()、tools/list 不带闸位）⇒ "要不要裁决"的知识只在父侧；于是父侧把 Ask 记进该子体本轮队列并回
+      //   DECISION_QUEUED，收尾时整包结算，被批条目重调时按一次性放行放行。
+      //   ★ 只给子体桥用（外部 MCP 面仍用 approvalAuthorizer）：外部面的 identity 是 external-mcp、深度 0，
+      //     簿子本来也不会为它记账——两份分开是"这条缝只服务子体"的显式形态，不靠身份判定兜底。
+      ToolCallAuthorizer subagentBridgeAuthorizer =
+          ToolCallAuthorizer.of(
+              new ToolExecutionGuard(),
+              approvalCoordinator,
+              ToolCallAuthorizer::defaultDigest,
+              subagentDecisionLedger);
       if (approvalConfig.http()) {
         approvalServer =
             ApprovalHttpEndpoint.start(
@@ -768,12 +808,30 @@ public final class App implements AutoCloseable {
       // ★ RB3（设计 §5.13(f)）：决策面挂在<b>同一台</b>审批 server、同一端口上（不新起 server、不新造端点族）。
       //   POST 走桥的回填路径（DecisionSubmissionPort）：事件照发、提交口照调——直调状态机会让这两件事都不发生。
       //   ★ P2b：多传一个"上报视图"——列表只列上报给人的条目、逐条打 escalated 标记（§5quater ④）。
+      // ★ P3e（设计 §5sexies⑦ + ⑤★★）：父侧的跨进程结算口在 P3d 的五参之上多接一个件——<b>上级判定的同一个明细缝</b>
+      //   （decisionJudgeDetails，与上面的桥、LlmSuperiorJudgement 是同一个实例）：上报条目全是 MODE_LIMITED 时它才可能
+      //   被上级代批，且判定前登记进去的是**父侧自己那份**逐条明文；缝不在 ⇒ 一律退回 SENSITIVE（fail-closed，看不见就不给批）。
+      //   ★ 同一个对象还是决策面的"在途明文取数口"（InFlightDecisionPackages）：人按审批面 summary 里的 xp-… 到
+      //     GET /api/decision-packages/{id} 读到逐条明文。那是**只读**视图：不进 pending()、不进父侧历史、不落盘、
+      //     投递返回即消失，也不构成第二条决策路径（不变量 1）——见 CrossProcessDecisionGateway 的类注释。
+      CrossProcessDecisionGateway crossProcessGateway =
+          new CrossProcessDecisionGateway(
+              mainAgent::level,
+              decisionCascade,
+              approvalCoordinator,
+              pendingApprovals,
+              // ★ P3d（设计 §5sexies⑤⑥）：父侧本轮队列簿——接线之后结算**以它为准**：子体提交的条目只作对账
+              //   （index + toolName + digest），明文与 classKey/askKind 取父侧自己收到的那一份；被批条目记一次性放行。
+              subagentDecisionLedger,
+              Optional.of(decisionJudgeDetails));
       if (approvalServer != null) {
         DecisionPackagesHttpHandler.register(
             approvalServer,
             decisionPackages,
             decisionApprovalBridge,
-            packageId -> decisionApprovalBridge.escalatedItems(packageId).orElse(null));
+            packageId -> decisionApprovalBridge.escalatedItems(packageId).orElse(null),
+            // ★ P3e：详情面（GET）在包登记表未命中时再问它一次 ⇒ 跨进程临时包也读得到逐条明文（POST 不认它）
+            crossProcessGateway);
       }
       // ★ P2b（裁定 5 的底线「下一轮要看结果直接调工具看」）：查自己的决策历史——读提出者自己的 events.db，
       //   按 proposerKey 只列自己的包（别人的与不存在的返回同一个空结果，无存在性 oracle）。
@@ -788,9 +846,7 @@ public final class App implements AutoCloseable {
       //        两处各建一份就会出现"核对了 A、级联读了 B"。
       tools.register(
           SUBMIT_DECISION_PACKAGE_TOOL_SOURCE_ID,
-          SubmitDecisionPackageTools.tool(
-              new CrossProcessDecisionGateway(
-                  mainAgent::level, decisionCascade, approvalCoordinator, pendingApprovals)));
+          SubmitDecisionPackageTools.tool(crossProcessGateway));
       LOG.info(
           "决策包面已装配：裁决窗口={}ms（包缺省 deadline，裁定 10） 审批桥=已接（一条包=一条审批请求 classKey={}）"
               + " 提交口={} 事件面=已接（decision.package.* 四类） 决策面={} 上级代批={}",
@@ -818,7 +874,8 @@ public final class App implements AutoCloseable {
                 agentConfig,
                 permissionSet,
                 subagentConfigDir,
-                approvalAuthorizer,
+                // ★ P3d：子体桥用**带本轮队列缝**的那一份（子体的 Ask 由父侧记账），外部 MCP 面仍用上面那份
+                subagentBridgeAuthorizer,
                 commandMode,
                 subagentLimits,
                 skillSettings.root(),
@@ -830,6 +887,7 @@ public final class App implements AutoCloseable {
                 // 装配层把它接进注册表的取数缝（注册表不得依赖 Brain，设计 §3）
                 lineageIndex::put);
         subagentManager = rig.manager();
+        subagentManagerLookup.set(subagentManager);
         subagentProcesses = rig.processes();
       }
       // ★ RA4（设计 §4.6「装订期：派生 + 审计」，不变量 A-4 / A-5）：注册表在这一点已是"对外服务前的完整面貌"
@@ -1717,6 +1775,28 @@ public final class App implements AutoCloseable {
 
   /** 审批事件的类型前缀（B1 的 {@code ApprovalEventTypes} 只有两个常量，这里按前缀收口，不复制一份类型表）。 */
   private static final String APPROVAL_EVENT_PREFIX = "approval.";
+
+  /**
+   * {@code agent.lifecycle} 的终局动作（P3d 的回收订阅用）：与 {@code SubagentStatus} 的三个终态一一对应 （{@code finished}
+   * / {@code failed} / {@code killed}）；非终局动作是 {@code configured}/{@code spawning}/{@code
+   * running}/{@code terminating}。
+   *
+   * <p>为什么不按 {@code SubagentStatus} 判：那条路要拿到 {@code SubagentManager} 的引用（装配顺序上它是后建的），而事件 payload 里的
+   * {@code action} 就在手上——同一个事实的两处投影，取不需要额外时序假设的那一处。
+   */
+  private static final Set<String> TERMINAL_LIFECYCLE_ACTIONS =
+      Set.of("finished", "failed", "killed");
+
+  /** 这条 {@code agent.lifecycle} 是不是终局动作（解析不出 payload / 没有 {@code action} ⇒ 假：拿不准就不清，见订阅点注释）。 */
+  private static boolean isTerminalLifecycle(Event event) {
+    try {
+      JsonNode action = PLUGIN_PAYLOAD.readTree(event.payload()).get("action");
+      return action != null && TERMINAL_LIFECYCLE_ACTIONS.contains(action.asText());
+    } catch (RuntimeException | JsonProcessingException unreadable) {
+      LOG.debug("agent.lifecycle 载荷解析不出 action（按非终局办，不动簿子）: {}", event.payload());
+      return false;
+    }
+  }
 
   /** 决策包事件前缀（RB3；常量在 AgentLib {@code DecisionEventTypes}，这里只做落库收口）。 */
   private static final String DECISION_PACKAGE_EVENT_PREFIX = "decision.package.";

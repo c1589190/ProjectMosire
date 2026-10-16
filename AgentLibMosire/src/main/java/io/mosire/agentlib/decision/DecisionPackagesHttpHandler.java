@@ -34,6 +34,10 @@ import org.slf4j.LoggerFactory;
  *       {index,toolName,summary,args}}，<b>{@code args} 是明文</b>。这是用户 2026-10-16
  *       的明确要求（原话「肯定展示全部内容啊」）：人要看清自己批的是什么， 而脱敏摘要（{@code argsDigest}）回答不了"这条到底改什么"。明文<b>只</b>经本面（回环
  *       HTTP）出面——不进事件库、不进 {@code ApprovalRequest}、不进日志；
+ *       <p><b>★ 详情的两级取数（P3e）</b>：先查 {@link DecisionPackages#find(String)}，未命中再查<b>在途取数口</b> {@link
+ *       InFlightDecisionPackages}——跨进程那条路的临时包（{@code xp-…}，建即裁、不进包登记表，见设计 §5sexies）
+ *       由它回答，逐条仍是同一形状（{@code args} 是父侧自己收到的明文）。★ 这条回退<b>只服务 GET</b>：{@code POST}
+ *       与列表都不认在途包（它<b>不是</b>决策单元，不构成第二条决策路径——不变量 1）；
  *   <li>{@code POST /api/decision-packages/{id}} → body {@code {approveAll:true | rejectAll:true |
  *       items:{index:"approve"|"reject"}, by, note}}：成功 {@code 200} +
  *       回执（含<b>实际生效</b>的裁决与逐条去向）；未知/已过期 id {@code 404}；重复决议或不可决议状态 {@code 409}；坏 body {@code
@@ -64,7 +68,8 @@ import org.slf4j.LoggerFactory;
  * <p><b>过期不会被伪装成不存在</b>：详情面对已到点的包回 {@code 200} + {@code state=EXPIRED}（它查得到，且状态说得清 为什么没落盘）；只有
  * {@code POST} 把"未知"与"已过期"一并回 {@code 404}（设计 §5.11 第 11 条）， 并由响应体里的 {@code code} 把两者分开。
  *
- * <p><b>判定顺序（先查后决，同审批面口径）</b>：{@code find(id)} 为空 ⇒ 直接 {@code 404}（从未存在）；有值 ⇒ 解析 body ⇒
+ * <p><b>判定顺序（先查后决，同审批面口径）</b>：{@code POST} 上 {@code find(id)} 为空 ⇒ 直接 {@code
+ * 404}（从未存在；在途口<b>不</b>参与写路径）； {@code GET} 详情多一步在途回退（见 {@link #handleDetail}）；有值 ⇒ 解析 body ⇒
  * 交桥回填。桥抛的状态机具名拒按 {@code code} 映射状态码（{@code PACKAGE_NOT_FOUND}/{@code PACKAGE_EXPIRED} ⇒ 404、
  * {@code PACKAGE_NOT_PROPOSED} ⇒ 409、{@code INVALID_DECISION} ⇒ 400）；<b>认不出的拒码 ⇒ 500</b>
  * （那是缺陷，不该伪装成"客户端写错了"）。提交侧的失败（{@code COMMIT_FAILED}）不走异常：裁决已生效、包只是没落定， 回执里用 {@code warning} 说清楚。
@@ -100,12 +105,19 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
   private final Function<String, Set<Integer>> escalatedIndexes;
 
   /**
+   * <b>在途包取数口</b>（P3e，设计 §5sexies⑤★★）：{@code null}（缺省）= 没有这个口 ⇒ 详情面只认 {@link
+   * DecisionPackages}（本单之前的行为，逐字不变）。接了它之后，{@code GET /{id}} 在主表未命中时再问它一次—— 跨进程临时包（{@code
+   * xp-…}）因此也读得到逐条明文。<b>只有 GET 走这条回退</b>（见 {@link #handleDecide}）。
+   */
+  private final InFlightDecisionPackages inFlight;
+
+  /**
    * @param packages 决策包登记表（装配层持有的<b>那一个</b>实例：HTTP 面看到的必须是待裁决面看到的同一个表）
    * @param submissions 裁决提交口（实现方 = 决策包桥；见 {@link DecisionSubmissionPort} 的"为什么不能直调状态机"）
    */
   public DecisionPackagesHttpHandler(
       DecisionPackages packages, DecisionSubmissionPort submissions) {
-    this(packages, submissions, null);
+    this(packages, submissions, null, null);
   }
 
   /**
@@ -115,9 +127,23 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       DecisionPackages packages,
       DecisionSubmissionPort submissions,
       Function<String, Set<Integer>> escalatedIndexes) {
+    this(packages, submissions, escalatedIndexes, null);
+  }
+
+  /**
+   * 全参装配（P3e 新增）：在既有三件之外接上<b>在途包取数口</b>。
+   *
+   * @param inFlight 在途包取数口（{@code null} = 没有这个口，详情面只认包登记表）
+   */
+  public DecisionPackagesHttpHandler(
+      DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Function<String, Set<Integer>> escalatedIndexes,
+      InFlightDecisionPackages inFlight) {
     this.packages = Objects.requireNonNull(packages, "packages");
     this.submissions = Objects.requireNonNull(submissions, "submissions");
     this.escalatedIndexes = escalatedIndexes;
+    this.inFlight = inFlight;
   }
 
   /**
@@ -130,7 +156,7 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       ApprovalHttpEndpoint endpoint,
       DecisionPackages packages,
       DecisionSubmissionPort submissions) {
-    register(endpoint, packages, submissions, null);
+    register(endpoint, packages, submissions, null, null);
   }
 
   /** 带"上报视图"的注册（P2b）：列表只列上报条目、逐条打 {@code escalated} 标记，见 {@link #escalatedIndexes}。 */
@@ -139,13 +165,28 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       DecisionPackages packages,
       DecisionSubmissionPort submissions,
       Function<String, Set<Integer>> escalatedIndexes) {
+    register(endpoint, packages, submissions, escalatedIndexes, null);
+  }
+
+  /**
+   * 全参注册（P3e）：再带上<b>在途包取数口</b>——跨进程临时包因此也能在决策面上读到逐条明文（只读，见 {@link #inFlight}）。
+   *
+   * @param inFlight 在途包取数口（{@code null} = 不接）
+   */
+  public static void register(
+      ApprovalHttpEndpoint endpoint,
+      DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Function<String, Set<Integer>> escalatedIndexes,
+      InFlightDecisionPackages inFlight) {
     Objects.requireNonNull(endpoint, "endpoint");
     endpoint.createContext(
         PATH,
         new DecisionPackagesHttpHandler(
             Objects.requireNonNull(packages, "packages"),
             Objects.requireNonNull(submissions, "submissions"),
-            escalatedIndexes));
+            escalatedIndexes,
+            inFlight));
   }
 
   /** 路径后缀分发（同审批面 {@code handleApprovals} 的写法）：{@code ""} = 列表，{@code /{id}} = 详情或裁决。 */
@@ -209,15 +250,42 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
    * <p><b>详情面刻意列全部条目</b>（P2b）：人对整包有知情权（"这个包里还有哪些是下级已经批掉的"是判断的依据）， 所以这里不做过滤，只逐条打 {@code escalated}
    * 标记（{@code true} = 这条还需要你裁）。过滤只发生在列表那条工作清单上。
    *
+   * <p><b>两级取数（P3e）</b>：先 {@link DecisionPackages#find(String)}，未命中再问 {@link #inFlight}（在途的跨进程临时包，
+   * {@code xp-…}）。★ 两级都<b>只读</b>：不建包、不改状态、不进列表；非在途/已结算 ⇒ 与"从未存在"同一个 {@code 404}。 ★ {@code POST}
+   * <b>不</b>走这条回退（{@link #handleDecide} 仍只认包登记表）：在途包不是决策单元，不构成第二条决策路径（不变量 1）。
+   *
    * <p>未知 id ⇒ {@code 404}；已到点的包 ⇒ {@code 200} + {@code state=EXPIRED}（过期不伪装成不存在）。
    */
   private void handleDetail(HttpExchange exchange, String id) throws IOException {
     Optional<DecisionPackage> found = packages.find(id);
     if (found.isEmpty()) {
+      found = inFlightOf(id);
+    }
+    if (found.isEmpty()) {
       send(exchange, 404, Map.of("error", "未知的决策包 id"));
       return;
     }
     send(exchange, 200, detailRow(found.get()));
+  }
+
+  /**
+   * 在途包的取数（P3e）：没接口 / 查不到 / 接口自己炸了 ⇒ 空值（照旧 {@code 404}）。
+   *
+   * <p>接口异常按<b>取不到</b>办：在途视图是"多给一条看全文的路"，它坏了不该让详情面变成 500——但也不该静默，落一行 WARN （同 {@link #escalatedOf}
+   * 的口径）。
+   */
+  private Optional<DecisionPackage> inFlightOf(String id) {
+    if (inFlight == null) {
+      return Optional.empty();
+    }
+    Optional<DecisionPackage> found;
+    try {
+      found = inFlight.find(id);
+    } catch (RuntimeException failure) {
+      LOG.warn("取在途决策包失败（按未知 id 处理） packageId={}", id, failure);
+      return Optional.empty();
+    }
+    return found == null ? Optional.empty() : found;
   }
 
   /** 该包还需要人裁的条目（见 {@link #escalatedIndexes}；没有视图 / 查不到 ⇒ 空 Optional = 不过滤）。 */
@@ -299,7 +367,13 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     return row;
   }
 
-  /** 人的裁决：先查后决（未知 id 直接 404）⇒ 解析 body ⇒ 交桥回填 ⇒ 回执。 */
+  /**
+   * 人的裁决：先查后决（未知 id 直接 404）⇒ 解析 body ⇒ 交桥回填 ⇒ 回执。
+   *
+   * <p><b>★ 只认包登记表</b>（P3e 的边界）：{@link #inFlight} 那条在途口<b>不</b>参与 {@code POST}——在途的跨进程临时包 （{@code
+   * xp-…}）是"父侧为一次提交现造的临时包"，它没有状态机、没有提交口、也不该被这条 HTTP 路裁决。 让它可裁决就等于给跨进程那条路开出第二条决策路径（不变量 1）。在途包 id
+   * 在这里与未知 id 同归 {@code 404}。
+   */
   private void handleDecide(HttpExchange exchange, String id) throws IOException {
     Optional<DecisionPackage> found = packages.find(id);
     if (found.isEmpty()) {

@@ -47,6 +47,13 @@ import java.util.Objects;
  * <p>核对通过之后，级联用的权限集 / 档位 / 父级<b>全部取自注册表那一份</b>——入参里没有任何身份字段可被信任 （{@code items[].*} 一个都不参与"我是谁 /
  * 我能干什么"的判定）。
  *
+ * <h2>★ P3d：{@code items} 只带三件（index / toolName / digest），父侧以自己那份为准</h2>
+ *
+ * <p>父侧在<b>每次调用</b>的必经点上（{@code AgentToMcpServer}）就已经看见过这条 {@code Ask} 的参数明文 —— 那才是权威的一份。
+ * 子体再送一份明文既无必要（密钥纪律少一条通路），也无从核对（另一个进程送来的数据不可信）。于是提交里只有 {@code index/toolName/digest}
+ * 三件，父侧拿它与<b>自己本轮队列</b>逐条对账：对不上 ⇒ 具名拒 {@code ITEMS_MISMATCH} + 零批准、零执行（{@link
+ * CrossProcessDecisionGateway}）。裁决者照旧看全文：临时包里的明文来自父侧自己收到的那一份。
+ *
  * <h2>★ 出参（结构化 JSON，<b>不含参数明文</b>）</h2>
  *
  * <pre>
@@ -56,7 +63,7 @@ import java.util.Objects;
  *  "trail":{"levels":[{"decider":…,"mode":…,"approved":[…],"rejected":[…],"reason":…}],
  *           "escalatedToHuman":[…],"finalApproved":[…],"finalizedBy":…},
  *  "finalizedBy":"human",
- *  "deciderLevel":"HUMAN"}
+ *  "deciderLevel":"HUMAN"}   // HUMAN（人拍的板）/ SUPERIOR（上级代批闸拍的板，P3e）/ AUTO（级联整包批准）/ NONE（零批准）
  * </pre>
  *
  * <p>失败（无可用通道 / 无人答复 / 判定失败）⇒ <b>零批准</b>：{@code approvedIndexes} 为空、全部条目进 {@code
@@ -66,8 +73,8 @@ import java.util.Objects;
  *
  * <h2>密钥纪律（红线 6）</h2>
  *
- * <p>入参里的 {@code items[].args} 是明文，它只被搬进临时包内的条目（内存态，一趟调用即弃）；本类的出参、日志与 错误消息里<b>一个字节的明文都没有</b>（只有
- * index、工具名、理由与轨迹）。
+ * <p>本类的入参里<b>没有</b>参数明文（{@code items[].digest} 是脱敏摘要）；父侧那份明文只活在它自己本轮队列与临时包内条目里
+ * （内存态，一趟调用即弃）。本类的出参、日志与错误消息里<b>一个字节的明文都没有</b>（只有 index、工具名、理由与轨迹）。
  */
 public final class SubmitDecisionPackageTools {
 
@@ -101,6 +108,8 @@ public final class SubmitDecisionPackageTools {
         return "把本轮的待裁定条目跨进程交回父侧结算（父侧跑逐级预裁定、必要时问人），返回终局裁决："
             + "approvedIndexes（只准执行这些）/ rejectedIndexes / perItemReasons / trail（谁裁的）/ "
             + "finalizedBy / deciderLevel。proposerKey 必须是你自己的实例 id。"
+            + "items 只带 index/toolName/digest 三件（★ 不带明文参数、不带 classKey/askKind）："
+            + "父侧以它自己本轮收到的条目为准，本工具里的条目只用于对账。"
             + "父侧只回裁决、不替你执行；失败一律零批准（approvedIndexes 为空）。不含参数明文。";
       }
 
@@ -118,14 +127,16 @@ public final class SubmitDecisionPackageTools {
                     "type",
                     "string",
                     "description",
-                    "可选幂等键：你本地那个包的 id。父侧按它缓存上次裁决——重试同一个 requestId 不会让人再答一遍"
-                        + "（同一个 requestId 必须带同一批条目；换了条目请换 requestId）。省略 = 每次都是新请求。"),
+                    "幂等键：你本地那个包的 id（= 包 id）。父侧按它缓存上次裁决——重试同一个 requestId 不会让人再答一遍"
+                        + "（同一个 requestId 必须带同一批条目；换了条目请换 requestId）。父侧接线了本轮队列时它必填。"),
                 "items",
                 Map.of(
                     "type",
                     "array",
                     "description",
-                    "待裁定的条目（至少一条；index 是它在你自己包内的身份）",
+                    "待裁定的条目（至少一条；index 是它在你自己包内的身份）。★ 只带 index/toolName/digest，"
+                        + "不带明文参数、不带 classKey/askKind——父侧用它自己本轮收到的明文件裁决，这里那份只作对账"
+                        + "（对不上即具名拒 ITEMS_MISMATCH，零批准、零执行）。",
                     "items",
                     Map.of(
                         "type",
@@ -133,15 +144,12 @@ public final class SubmitDecisionPackageTools {
                         "properties",
                         Map.of(
                             "toolName", Map.of("type", "string", "description", "要执行的工具名"),
-                            "args", Map.of("type", "object", "description", "该次调用的参数（明文只进父侧临时包）"),
-                            "classKey", Map.of("type", "string", "description", "闸位类键（父侧不参与判定）"),
-                            "askKind",
+                            "digest",
                                 Map.of(
                                     "type",
                                     "string",
                                     "description",
-                                    "为什么问：MODE_LIMITED（可被逐级预裁定）| SENSITIVE（强制到人）；"
-                                        + "省略 = SENSITIVE"),
+                                    "该次调用参数的脱敏摘要（两侧同一段代码派生；父侧拿它与自己那份对账）"),
                             "index",
                                 Map.of(
                                     "type", "integer", "description", "条目在你包内的身份（省略 = 数组下标）"))))));
@@ -174,12 +182,14 @@ public final class SubmitDecisionPackageTools {
           CrossProcessDecisionGateway.Verdict verdict = gateway.submit(request);
           return ToolResult.ok(JSON.writeValueAsString(body(verdict)));
         } catch (IllegalArgumentException refused) {
-          // ★ 具名拒（提出者不在注册表 / 入参形状）——原样带回子体：同一个 JSON 形状照给，零批准照给
+          // ★ 具名拒（提出者不在注册表 / 入参形状 / 两侧核对不一致）——原样带回子体：同一个 JSON 形状照给，零批准照给
           String message = String.valueOf(refused.getMessage());
           String code =
               message.startsWith(CrossProcessDecisionGateway.PROPOSER_UNKNOWN)
                   ? CrossProcessDecisionGateway.PROPOSER_UNKNOWN
-                  : CrossProcessDecisionGateway.INVALID_ITEMS;
+                  : message.startsWith(CrossProcessDecisionGateway.ITEMS_MISMATCH)
+                      ? CrossProcessDecisionGateway.ITEMS_MISMATCH
+                      : CrossProcessDecisionGateway.INVALID_ITEMS;
           return error(code, message);
         } catch (JsonProcessingException impossible) {
           // 序列化自己的出参失败（理论上到不了：全是 String/List/Map）：响亮失败，绝不吞成"成功"
@@ -254,6 +264,7 @@ public final class SubmitDecisionPackageTools {
     }
     Object classKey = map.get("classKey");
     Object askKind = map.get("askKind");
+    Object digest = map.get("digest");
     return new CrossProcessDecisionGateway.Item(
         intOf(map.get("index"), position, "items[" + position + "].index"),
         String.valueOf(toolName).strip(),
@@ -262,7 +273,8 @@ public final class SubmitDecisionPackageTools {
         // 缺省 = SENSITIVE（强制到人）：没说明"为什么问"的条目落进人手里，不落进任何 Agent 的代批面
         askKind == null || String.valueOf(askKind).isBlank()
             ? AskKind.SENSITIVE
-            : askKindOf(String.valueOf(askKind).strip(), position));
+            : askKindOf(String.valueOf(askKind).strip(), position),
+        digest == null ? "" : String.valueOf(digest));
   }
 
   /** {@code askKind} 的取值（认不出的值**不**静默降级：响亮拒——静默降级会把它变成"可以交上级代批"那一侧）。 */

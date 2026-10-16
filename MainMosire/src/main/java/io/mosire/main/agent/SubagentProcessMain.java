@@ -30,6 +30,7 @@ import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
 import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
+import io.mosire.brain.decision.ReleaseMarkingCommitPort;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
@@ -302,15 +303,18 @@ public final class SubagentProcessMain {
     DecisionPackages packages = new DecisionPackages();
     // 执行身份 = 本实例（红线 R7 + 设计 §5quinquies ③）：按包 id 现取，但每一包都取同一份本实例身份——
     // 父侧回传的 finalizedBy 只进记录面（"谁拍的板"），不参与"以谁的权限执行"。
+    // ★ P3d（设计 §5sexies⑥）：被批条目的执行**只能再经一次 MCP**（工具是父侧代理）⇒ 外面套一层装饰器，给每条挂上
+    //   {packageId, index} 放行标记；父侧据此认出"包 P 第 i 条、已批且尚未执行"⇒ 放行并标记已用（重复使用具名拒）。
     DecisionCommitPort commitPort =
-        new LocalDecisionCommitPort(
-            registry,
-            // 纯判定链（不含审批闸）：裁决即授权，执行时不再问一次人——同 App 的装配口径
-            new ToolExecutionGuard(),
-            Map.of(),
-            packageId ->
-                new LocalDecisionCommitPort.ExecutingIdentity(
-                    permissions.grantedToken(), permissions, identity));
+        new ReleaseMarkingCommitPort(
+            new LocalDecisionCommitPort(
+                registry,
+                // 纯判定链（不含审批闸）：裁决即授权，执行时不再问一次人——同 App 的装配口径
+                new ToolExecutionGuard(),
+                Map.of(),
+                packageId ->
+                    new LocalDecisionCommitPort.ExecutingIdentity(
+                        permissions.grantedToken(), permissions, identity)));
     // 提交工具是 Ask-free 的（它做的事就是"替子体问"）：这条 authorizer 的 Ask 分支到不了它，
     // 用 standard()（= 纯判定链）即可——与管线那条入口同源，本进程不新建第二套判定。
     return new CrossProcessDecisionSubmitter(

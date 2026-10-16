@@ -271,17 +271,26 @@ class CrossProcessDecisionSubmitterTest {
 
     List<Map<String, Object>> items = itemsOf(args);
     assertThat(items)
-        .as("条目原样带上：顺序 = 登记顺序、index = 包内条目身份")
+        .as("条目顺序 = 登记顺序、index = 包内条目身份（对账键）")
         .extracting(row -> row.get("index"))
         .containsExactly(0, 1, 2);
     assertThat(items)
         .extracting(row -> row.get("toolName"))
         .containsExactly("bash", "bash", "doc_edit");
+    // ★ P3d（设计 §5sexies⑤）：提交**只带三件**——明文 args 与 classKey/askKind 一个都不许出现
+    //   （父侧 defer 那一刻自己收到的那份才是权威；子体再送一份等于多开一条明文通路，且无从核对）。
     assertThat(items)
-        .extracting(row -> row.get("askKind"))
-        .containsExactly("SENSITIVE", "MODE_LIMITED", "MODE_LIMITED");
-    assertThat(items.get(0).get("args"))
-        .isEqualTo(Map.of("command", "systemctl restart " + SECRET));
+        .as("逐条只带 index/toolName/digest（不带明文参数、不带闸位）")
+        .allSatisfy(
+            row ->
+                assertThat(row.keySet()).containsExactlyInAnyOrder("index", "toolName", "digest"));
+    assertThat(items)
+        .extracting(row -> row.get("digest"))
+        .as("摘要就是本地包内条目的 argsDigest（两侧同一段代码派生 ⇒ 可作对账键）")
+        .containsExactlyElementsOf(
+            packages.find(requestId).orElseThrow().items().stream()
+                .map(io.mosire.agentlib.decision.PackageItem::argsDigest)
+                .toList());
 
     assertThat(commitPort.batches).as("被批子集一次提交").hasSize(1);
     assertThat(commitPort.batches.get(0)).extracting(ResolvedCall::index).containsExactly(0, 2);
