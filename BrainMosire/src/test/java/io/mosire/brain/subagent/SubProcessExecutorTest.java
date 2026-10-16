@@ -7,6 +7,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.proc.ManagedProcess;
@@ -14,7 +15,6 @@ import io.mosire.agentlib.proc.SpawnSpec;
 import io.mosire.agentlib.proc.SubprocessException;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.tool.ToolRegistry;
-import io.mosire.brain.runtime.AgentConfig;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;

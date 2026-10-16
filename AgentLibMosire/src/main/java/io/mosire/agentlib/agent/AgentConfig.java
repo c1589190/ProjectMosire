@@ -1,4 +1,4 @@
-package io.mosire.brain.runtime;
+package io.mosire.agentlib.agent;
 
 import java.time.Duration;
 import java.util.Objects;

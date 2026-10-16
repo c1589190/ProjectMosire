@@ -2,9 +2,9 @@ package io.mosire.brain.subagent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
-import io.mosire.brain.runtime.AgentConfig;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;

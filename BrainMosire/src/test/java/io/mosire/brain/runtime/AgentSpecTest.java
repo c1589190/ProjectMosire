@@ -3,6 +3,7 @@ package io.mosire.brain.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.FakeLlmClient;

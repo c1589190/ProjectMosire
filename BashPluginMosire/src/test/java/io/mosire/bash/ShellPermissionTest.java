@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -19,7 +20,6 @@ import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.brain.context.BasicContextAssembler;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.StopReason;

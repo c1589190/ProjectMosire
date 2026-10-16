@@ -2,10 +2,10 @@ package io.mosire.brain.context;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmRequest;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillTestSupport;

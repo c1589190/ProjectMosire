@@ -3,6 +3,7 @@ package io.mosire.brain.runtime;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;

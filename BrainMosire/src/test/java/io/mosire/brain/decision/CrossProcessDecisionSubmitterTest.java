@@ -2,6 +2,7 @@ package io.mosire.brain.decision;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.ToolGate;
 import io.mosire.agentlib.decision.CommitReceipt;
@@ -31,7 +32,6 @@ import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import io.mosire.brain.context.BasicContextAssembler;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.StopReason;
 import io.mosire.brain.runtime.TurnResult;

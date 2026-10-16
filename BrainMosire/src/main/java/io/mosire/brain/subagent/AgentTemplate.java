@@ -2,6 +2,7 @@ package io.mosire.brain.subagent;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmException;
 import io.mosire.agentlib.llm.LlmRequest;
@@ -11,7 +12,6 @@ import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.RoleSet;
 import io.mosire.brain.permission.AgentRoles;
-import io.mosire.brain.runtime.AgentConfig;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;

@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
@@ -12,7 +13,6 @@ import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.permission.ResourceScopeMap;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.docs.DocNamespaces;
 import io.mosire.docs.DocsCapability;
 import io.mosire.workspace.CapabilityCatalog;

@@ -3,6 +3,7 @@ package io.mosire.brain.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import org.junit.jupiter.api.Test;
 
 class AgentConfigTest {

@@ -2,13 +2,13 @@ package io.mosire.brain.context;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
-import io.mosire.brain.runtime.AgentConfig;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 

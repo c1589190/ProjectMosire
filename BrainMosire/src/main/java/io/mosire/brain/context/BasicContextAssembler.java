@@ -1,12 +1,12 @@
 package io.mosire.brain.context;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.ToolDef;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.brain.memory.MemoryRecord;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
 import java.util.ArrayList;

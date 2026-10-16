@@ -3,9 +3,9 @@ package io.mosire.brain.subagent;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.SkillCatalog;
 import java.util.List;
 import org.junit.jupiter.api.Test;

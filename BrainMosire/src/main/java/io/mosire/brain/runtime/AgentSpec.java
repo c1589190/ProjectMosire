@@ -1,5 +1,6 @@
 package io.mosire.brain.runtime;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Set;

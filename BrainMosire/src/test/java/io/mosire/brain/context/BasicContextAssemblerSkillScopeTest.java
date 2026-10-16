@@ -2,11 +2,11 @@ package io.mosire.brain.context;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ResourceScope;
 import io.mosire.agentlib.tool.AgentTool;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.SkillAccess;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillPermissions;

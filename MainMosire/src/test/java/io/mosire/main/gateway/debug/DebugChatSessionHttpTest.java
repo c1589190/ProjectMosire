@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.ContentPart;
@@ -16,7 +17,6 @@ import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.ToolRegistry;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
 import java.net.URI;

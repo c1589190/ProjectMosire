@@ -1,9 +1,9 @@
 package io.mosire.brain.context;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.tool.AgentTool;
-import io.mosire.brain.runtime.AgentConfig;
 import java.util.List;
 
 /**

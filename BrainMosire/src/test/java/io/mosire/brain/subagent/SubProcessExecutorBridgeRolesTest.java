@@ -6,6 +6,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import io.modelcontextprotocol.json.McpJsonDefaults;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.mcp.McpToolSource;
 import io.mosire.agentlib.mcp.PipeMcpClientTransport;
 import io.mosire.agentlib.permission.AccessToken;
@@ -19,7 +20,6 @@ import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
-import io.mosire.brain.runtime.AgentConfig;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PipedInputStream;

@@ -2,6 +2,7 @@ package io.mosire.brain.runtime;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.SqliteEventStore;

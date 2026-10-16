@@ -1,6 +1,6 @@
 package io.mosire.brain.subagent;
 
-import io.mosire.brain.runtime.AgentConfig;
+import io.mosire.agentlib.agent.AgentConfig;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;

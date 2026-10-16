@@ -2,10 +2,10 @@ package io.mosire.main.gateway;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.permission.AgentPermissionSet;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.subagent.SubagentInstance;
 import io.mosire.brain.subagent.SubagentStatus;
 import io.mosire.main.Version;

@@ -2,9 +2,9 @@ package io.mosire.brain.subagent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
-import io.mosire.brain.runtime.AgentConfig;
 import java.nio.file.Path;
 import java.util.List;
 import org.junit.jupiter.api.Test;

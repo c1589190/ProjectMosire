@@ -4,13 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.brain.memory.MemoryRetriever;
 import io.mosire.brain.memory.MemoryStore;
-import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.skills.Skill;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillTestSupport;

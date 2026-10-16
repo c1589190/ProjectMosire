@@ -1,8 +1,8 @@
 package io.mosire.brain.subagent;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
-import io.mosire.brain.runtime.AgentConfig;
 
 /**
  * 子 Agent 实例快照：不可变数据 + status——状态变更时由 {@link SubagentManager} 整体替换记录 （record
