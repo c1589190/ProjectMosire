@@ -331,7 +331,13 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
    *
    * @param judgeDetails 明细缝（{@code Optional.empty()} = 未装配 ⇒ 跨进程请求一律只到人）；装配层必须把它交给<b>同一个实例</b>的
    *     {@code LlmSuperiorJudgement} 与 {@code DecisionApprovalBridge}
+   *     <p><b>为什么带 {@code EI_EXPOSE_REP2} 抑制</b>：{@code ledger} 是<b>注入的协作者</b>（接口 + 生产实现 {@code
+   *     ParentSubagentDecisionLedger}），不是数据持有者——本类只调它、从不把它交给任何调用方；对簿子做防御性拷贝
+   *     既无意义（它自己就是唯一写者）也会拆掉"唯一写者"这条不变量。与 {@code AgentPipeline} 的 16 参终态构造同一条口径。 ★
+   *     这条抑制<b>不是</b>为了"让它变绿"：clean 重编后 SpotBugs **真报过**它——它一度被增量编译留下的旧 class 误判成"抑制多余"而删掉（AGENTS
+   *     §三那条"判 SpotBugs 前先确证编译产物是新的"就是这么来的）。
    */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public CrossProcessDecisionGateway(
       LevelVerifier levelLookup,
       DecisionCascade cascade,
