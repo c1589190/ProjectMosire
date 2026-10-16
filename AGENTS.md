@@ -315,6 +315,15 @@ BashPluginMosire ────────────────────┘
    ⇒ 规矩：**求和前先确认报告目录里没有"源码中已不存在的测试类"**（或先 `rm -rf <模块>/target/surefire-reports` 再跑），
    并与**当轮 Maven 的 `Tests run:` 汇总**交叉核对；**两法不一致时以当轮 Maven 汇总为准**——
    不要反过来拿求和值去"更正"子 Agent 报的数字（同一晚此前还有一次 1 条的同类差额，机制未逐一取证）。
+11. ★★ **涉及时钟 / deadline / 超时的用例，禁止真实等待**（2026-10-17 用户指令「太变态了直接等30分钟，改！」）：
+   决策包的 **deadline 同时是"投递后等人答复"的等待上限**（裁定 10：等待窗口 = 包自己的 `deadlineEpochMs`，
+   不取 `approval.timeout()` 的较小者），而它一度是编译期常量
+   （`DecisionPackages.DEFAULT_DEADLINE_MILLIS = 30 * 60 * 1000L`）⇒ **一条"没人答复"的用例会真的挂满 30 分钟**。
+   规矩：① 被测物的时钟/窗口**必须可注入**（先例：`PendingDecisionQueue(proposerKey, caller, deadlineMillis)`，
+   缺省仍是 30 分钟，行为不变）；② 用例一律注入**毫秒级窗口**，或调显式的
+   `DecisionPackages.expire(long nowEpochMs)` 驱动到点；③ **禁止 `Thread.sleep` 等真实到点**
+   （`atMost(...)` 的上限也不许超过 10s）；④ 报告里凡"验了到点路径"必须写明**怎么驱动的时钟**。
+   ⇒ 反面教材：让一个用例等 30 分钟，既不是判据也不是耐心，而且会把子 Agent 卡死、让整批看起来"挺住了"。
 
 ---
 
