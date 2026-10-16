@@ -51,11 +51,27 @@ jobs:
             -pl .,AgentLibMosire,WorkspaceMosire,DocsMosire \
             deploy -DaltDeploymentRepository=pages::default::file://$PWD/target/pages
 
-      - name: 带上落地页（仓库根没有 index.html 会返回 GitHub 的 404 页）
-        # pages/index.html 是仓库内的源（改它要提交）；keep_files=true 让它在后续发布中保留，这里再显式带上更稳
+      - name: 带上落地页并把版本注入页面（仓库根没有 index.html 会返回 GitHub 的 404 页）
+        # pages/index.html 是仓库内的源（改它要提交）；keep_files=true 让它在后续发布中保留，这里再显式带上更稳。
+        # ★ 版本参数化（2026-10-17）：页面里凡是"当前版本"的地方都写成占位符 __MOSIRE_VERSION__，
+        #   在这里用本次发布的版本替换后再拷进暂存目录。起因：此前页面硬编码 0.1.0，
+        #   每次发布都把这张 0.1.0 的门面原样再传一遍（0.2.0 发布后门面仍写 0.1.0）。
+        #   历史版本的叙述（如"相对 0.1.0 的变更点"）保持字面量，不参与替换。
         run: |
           set -euo pipefail
-          cp pages/index.html target/pages/index.html
+          V="${PUBLISH_VERSION}"
+          test -n "${V}"
+          # 源页面必须仍有占位符：否则这条替换会变成静默空操作，门面又会漂回硬编码版本
+          grep -q '__MOSIRE_VERSION__' pages/index.html
+          sed "s|__MOSIRE_VERSION__|${V}|g" pages/index.html > target/pages/index.html
+          if grep -q '__MOSIRE_VERSION__' target/pages/index.html; then
+            echo "落地页里仍有未替换的版本占位符，发布中止"
+            exit 1
+          fi
+          # 页面上必须出现三库的 jar 链接（发布方自己先证明它是本版的门面）
+          grep -q "io/mosire/agentlib-mosire/${V}/" target/pages/index.html
+          echo "落地页版本：${V}"
+          grep -o "io/mosire/[a-z-]*/${V}/[a-z0-9.-]*\.jar" target/pages/index.html | sort -u
 
       - name: 核对暂存目录是合法仓库（父 pom 必须在，否则消费方解析不到子模块）
         run: |
