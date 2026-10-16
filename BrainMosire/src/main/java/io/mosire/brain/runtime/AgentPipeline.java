@@ -2,7 +2,12 @@ package io.mosire.brain.runtime;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.context.ContextComposer;
+import io.mosire.agentlib.context.ContextWindow;
+import io.mosire.agentlib.context.LlmRoundTrip;
 import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.decision.DecisionTurnScope;
 import io.mosire.agentlib.decision.PendingDecisionQueue;
@@ -16,6 +21,7 @@ import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmQuota;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.LlmResponse;
+import io.mosire.agentlib.llm.ToolDef;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
@@ -52,13 +58,17 @@ import org.slf4j.LoggerFactory;
  * <p>终止条件：模型无工具调用（FINISHED）或任一硬顶（计划 D10）。反幻觉护栏（伪造 [TOOL_RESULT]/finish_action/结果溢出暂存）为 GSimulator
  * 现成件，P0 下半程（M3）接入。
  *
- * <p><b>并发约定（R11 未尽项落定）</b>：{@link #history} 非线程安全——调用方必须保证任意时刻只跑一个回合： 每任务一个 runtime
+ * <p><b>并发约定（R11 未尽项落定）</b>：{@link #window} 非线程安全——调用方必须保证任意时刻只跑一个回合： 每任务一个 runtime
  * 实例，或对外（A2A/AG-UI 等）按提交序串行化调度。选择"每任务一 runtime"= 会话隔离（各任务独立历史）； 选择"串行化"= 一个 Agent 实例的连续对话（A2A
  * 任务续接自然延续上下文）。{@link ConversationStore} 不是并发方案——它只保证"每次调用自身原子"， 上述契约不因持久化而放宽。
  *
  * <p><b>会话持久化（T16）</b>：带 {@code (store, conversationId)} 的构造把历史落到 {@link ConversationStore}——构造时
  * {@code load} 灌入内存工作集（重启续聊），每回合只把<b>新增的尾部</b>追加进去（prompt-cache 不变量：已落库的消息永不改写）。不带 store
  * 的构造委派到"不落库"实现，行为与持久化接入前逐字节一致。
+ *
+ * <p><b>上下文窗口（窗口下沉）</b>：会话状态自本批起由库侧的 {@link ContextWindow} 承载（一类一真相：窗口就是"此刻看得见的那串消息"
+ * 本身，本类不再另建一份列表）；每次 LLM 往返都经 {@link LlmRoundTrip} 从窗口现组请求——请求永远派生自窗口，不缓存第二份真相。 该往返方法把"本轮输入 +
+ * 答复"的写回当作往返的一部分（见 {@link AssemblerComposer} 与 {@link #saveHistory}）。
  *
  * <p><b>会话重置（D26）</b>：{@link #resetConversation(String)} 换新会话 id +
  * 清空内存工作集，旧会话在库里原样留档。重置<b>不是</b>重建管线： 本实例持有的 store/装配器/摘要槽一律沿用，"换会话"只落在会话级状态上。与回合一样受串行调用约定约束（R11）。
@@ -145,15 +155,19 @@ public final class AgentPipeline {
   private final ConversationStore store;
 
   /**
-   * 当前会话标识：<b>非 final</b>——{@link #resetConversation(String)}（D26：重置 = 换新会话 id）要在实例存活期间改掉它。
-   * 持久化按它寻址（{@link #saveHistory} 的 {@code append}、{@link #snapshotBaseline} 的 {@code
-   * load}），故切换即"此后一切读写都算新会话"。
+   * <b>本会话的上下文窗口</b>（窗口下沉批）：它<b>同时承载会话标识与消息工作集</b>——{@link #conversationId()} 读的是 {@link
+   * ContextWindow#id()}，历史读写走 {@link ContextWindow#messages()} /append/replace，落库走 {@link
+   * ContextWindow#unsavedTail()}。为什么把这两件事并到一个对象里：它们本来就必须一起换（重置 = 换 id + 清内存），分两个字段就有
+   * "换了一半"的中间态可写；合成一条后，「换会话」只有一个落点。
    *
-   * <p>{@code volatile} 与 {@link #uncoveredHiddenContent} 同口径：本类的并发约定只要求调用方<b>串行</b>（不要求同一线程——见类
-   * Javadoc），重绑（重置）与回合可能发生在<b>不同</b>线程上（管线被共享执行器串行驱动），跨线程交接由它保证可见性；这也是 {@code
-   * AT_STALE_THREAD_WRITE_OF_PRIMITIVE} 的正当处理——把一个跨回合必须存活的判据消掉才是错的。
+   * <p><b>为什么不再需要 {@code volatile}</b>：前身是一个 {@code volatile String conversationId} +
+   * 一个普通字段列表。窗口整体是一个 final 引用，而"重置与回合可能在不同线程上发生"这件事由调用方的<b>串行化点</b>保证（见类 Javadoc：
+   * 每任务一实例，或按提交序串行调度）——串行执行器的任务提交本身就是 happens-before 边，交接可见性由它承担，不再是单字段的职责。 反过来，如果保留单字段 volatile
+   * 而消息列表不 volatile，那才是不成立的可见性口径。
+   *
+   * <p><b>并发语义与既有口径一致</b>：非线程安全，调用方串行（同 {@link ContextWindow} 的类注）。
    */
-  private volatile String conversationId;
+  private final ContextWindow window;
 
   /** 会话压缩器；{@code null} = 未接线（既有构造的取法，行为与压缩接线前逐字节一致）。 */
   private final Compactor compactor;
@@ -166,9 +180,6 @@ public final class AgentPipeline {
    * 没有取槽方法），故由 {@link #requireSummaryVisibleInAssembler} 在压缩落地当刻用同源的 {@code composition} 反向验证。
    */
   private final CompactSummarySlot compactSummary;
-
-  /** 会话历史（不含 system 头，进程内累积 + 每回合把新增尾部落库，供下一回合原样回灌）；构造时由 {@link #store} 灌入。 */
-  private final List<LlmMessage> history = new ArrayList<>();
 
   /**
    * 工具自身配置（D30）：每次工具调用经 {@link ToolContext#config()} 下发（空 map = 什么都不注入，既有装配不变）。
@@ -524,13 +535,20 @@ public final class AgentPipeline {
    * <p><b>为什么与桥并存而不是二选一</b>：装配层可能同时给两者（子体进程里挂一条本进程的桥做兜底，或反过来）； 谁走哪条路由 {@link
    * #flushPendingDecisions} 现判（缝优先），不由构造顺序暗示。
    *
-   * <p><b>为什么不给 {@code decisionBridge}/{@code crossProcessSubmitter} 挂 {@code EI_EXPOSE_REP2}
-   * 抑制</b>： 它们是<b>注入的协作者</b>（管线在回合收尾必须调它们：收成包、投递/提交、等裁决、执行被批子集），与本类既有的 {@code events}/{@code
-   * bus}/{@code llm}/{@code guard} 完全同类——<b>故意的共享引用（依赖注入）</b>，不是"把内部状态漏出去"。 ★
-   * 这里此前挂过一条抑制，<b>2026-10-17 clean 重编（先 {@code rm -rf target/classes}）实测它是多余的</b>： 去掉抑制、只跑
-   * SpotBugs（跳开 checkstyle）⇒ {@code BugInstance size is 0}，没有任何 {@code EI_EXPOSE_REP2} 告警 ⇒ 按
-   * AGENTS §三"抑制多余也是要修的告警"删掉它。若将来真报了，再按当时的事实重新加回来并写明理由。
+   * <p><b>为什么 {@code decisionBridge}/{@code crossProcessSubmitter} 带 {@code EI_EXPOSE_REP2}
+   * 抑制</b>：它们是<b>注入的协作者</b> （管线在回合收尾必须调它们：收成包、投递/提交、等裁决、执行被批子集），与本类既有的 {@code events}/{@code
+   * bus}/{@code llm}/{@code guard} 完全同类——<b>故意的共享引用（依赖注入）</b>，不是"把内部状态漏出去"；字段是 {@code private
+   * final}，本类不外传、不暴露取值口。
+   *
+   * <p><b>这条抑制今天来回过一次，把经过与口径写在这里，免得后人再来回</b>：它此前挂过同样一条，2026-10-17 一次「清 {@code target/classes} 后只跑
+   * SpotBugs」的检查给出 {@code BugInstance size is 0}，于是按 AGENTS §三「抑制多余也是要修的告警」删掉，
+   * 并留下「若将来真报了再按当时的事实加回来」的话；同日**上下文窗口下沉批次**（采纳 {@code ContextWindow}/{@code LlmRoundTrip}）
+   * 完成后的<b>清源重编 + 全量 {@code verify}</b> 又报出 {@code EI_EXPOSE_REP2}（{@code BugInstance size is
+   * 1}，此外无其它告警） ⇒ 按当时写下的话加回来。⇒ **口径：这条告警的可见性依赖构建状态**（增量 vs 全清、aux classpath 里 {@code
+   * DecisionApprovalBridge} 是否被一并分析），一次「没报」不足以证明抑制多余——**要动它的状态，先做一次「清源重编 + 全量 {@code verify}」**，
+   * 不要拿一次 {@code spotbugs:check} 的 0 就删。
    */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public AgentPipeline(
       AgentConfig config,
       LlmClient llm,
@@ -569,9 +587,10 @@ public final class AgentPipeline {
     String requestedId = Objects.requireNonNull(conversationId, "conversationId");
     // 会话指针优先（D26 续）：库上记着"上次活动会话"就用它——重置后重启必须接着<b>重置出的新会话</b>，而不是用固定初始 id
     // 回到重置前那条（那等于把用户已经清掉的历史重新灌回工作集，正是 D26 拒绝"只清内存"的理由）。无指针（首次启动/不持久化实现）⇒ 用调用方给的 id。
-    this.conversationId = this.store.currentConversationId().orElse(requestedId);
-    // hydrate：既有会话（进程重启前落的库）先灌回内存工作集，否则"重启续聊"名存实亡
-    history.addAll(this.store.load(this.conversationId));
+    String effectiveId = this.store.currentConversationId().orElse(requestedId);
+    // hydrate：既有会话（进程重启前落的库）先灌回内存工作集，否则"重启续聊"名存实亡。
+    // 构造进来的内容在窗口口径里算"已处置"（unsavedTail 为空）——库里已有的那份不该被再 append 一遍。
+    this.window = new ContextWindow(effectiveId, this.store.load(effectiveId));
   }
 
   /** 不落库构造的会话 id 取法：Store 是空实现，id 只用于占位，取配置里的 Agent id（与生产接线同源）。 */
@@ -597,9 +616,8 @@ public final class AgentPipeline {
    * <ol>
    *   <li><b>会话指针落库</b>（{@link ConversationStore#setCurrentConversationId}）：这是"重置跨进程有效"的载体——指针不落库，
    *       重启就回到固定初始 id，把用户已清掉的历史重新灌回来（"重置被重启撤销"）。<b>先落库再切换内存</b>，见下"失败方向"；
-   *   <li>{@link #conversationId} ← {@code newConversationId}：此后落库/读库都按新 id 寻址（旧会话的行一条不动）；
-   *   <li>{@link #history} 清空（就地 {@code clear()}——列表是 final，就地改是本类既定口径，见 {@link
-   *       #replaceWorkingSet}）： 否则下一回合会把上一个会话的历史原样回灌给模型；
+   *   <li><b>窗口换 id</b>（{@link ContextWindow#reset(String)}）：此后落库/读库都按新 id 寻址（旧会话的行一条不动）；
+   *   <li><b>窗口清空</b>（同一次 {@code reset}）：否则下一回合会把上一个会话的历史原样回灌给模型；
    *   <li>{@link #uncoveredHiddenContent} 归 {@code false}：该判据描述的是"<b>本会话</b>工作集有覆盖缺口"，会话换了即失效——
    *       留着会让下一个会话的档 3 摘要基准回退到 {@code store.load(新 id)}（空）而不是工作集；
    *   <li>{@link #compactSummary} 清空：槽里挂的是上一个会话的摘要，留着它新会话就会带着一段描述旧对话的记忆开场（槽与装配器共用同一实例， {@code
@@ -613,7 +631,7 @@ public final class AgentPipeline {
    * <p><b>失败方向（指针写在前）</b>：指针写入失败 ⇒ 直接抛出、内存<b>不切</b>——运行期与重启后一致地停在旧会话（"重置没生效"，用户可重试）；
    * 反过来先把内存切了再写指针，一旦写失败就得到最难排查的那种态：重启前看着已经重置，重启后旧历史复活。
    *
-   * <p><b>并发约定</b>：与 {@link #run(String)} 一样只要求调用方<b>串行</b>——重置改的是实例级共享、非线程安全的 {@code history}，
+   * <p><b>并发约定</b>：与 {@link #run(String)} 一样只要求调用方<b>串行</b>——重置改的是实例级共享、非线程安全的 {@link #window}，
    * 必须与回合排在同一串行化点上（例如同一个单线程执行器），<b>不得</b>在另一个线程上与在途回合并发调用（见类 Javadoc 的 R11）。
    *
    * @param newConversationId 新会话标识（非 null、显式给定——管线不生成 id，也不猜）
@@ -622,8 +640,8 @@ public final class AgentPipeline {
     Objects.requireNonNull(newConversationId, "newConversationId");
     // 指针先落库、内存后切换：写失败时宁可不切（"重置未生效"）也不切换（那会留下"运行期看着已重置、重启却复活旧历史"的分裂态）
     store.setCurrentConversationId(newConversationId);
-    this.conversationId = newConversationId;
-    history.clear();
+    // 窗口的 reset 一次性完成"换 id + 清空"（见 ContextWindow#reset：它只负责内存那一半，存储指针归宿主，正是上面那一行）
+    window.reset(newConversationId);
     uncoveredHiddenContent = false;
     // compactSummary 的非空由构造器的 requireNonNull 保证（本类没有第二条赋值路径），故无需空值分支
     compactSummary.clear();
@@ -632,11 +650,14 @@ public final class AgentPipeline {
   /**
    * 当前会话标识（重置后即为新 id）——装配层据此向调用方回报"重置前的会话是哪个"。
    *
-   * <p>读的是 {@code volatile} 字段的即时值：在共享串行执行器上，它反映的是"最后一次已执行的重置/构造"。重置的<b>请求</b>排进执行器到真正执行之间， 本方法仍返回旧
+   * <p><b>本批的落点变化</b>：id 由 {@link ContextWindow#id()} 承载（会话标识与工作集是同一个对象的两面，见 {@link #window}
+   * 的注释），本方法只是转发；签名与语义一字未动。
+   *
+   * <p>读的是窗口的即时值：在共享串行执行器上，它反映的是"最后一次已执行的重置/构造"。重置的<b>请求</b>排进执行器到真正执行之间， 本方法仍返回旧
    * id（切换是一个动作，不是一个声明）。
    */
   public String conversationId() {
-    return conversationId;
+    return window.id();
   }
 
   /**
@@ -667,7 +688,12 @@ public final class AgentPipeline {
   /**
    * 跑一回合：用户输入 →（LLM 循环 + 工具调用）→ 终止。
    *
-   * <p>约定：方法是同步的（网络/子进程调用在工具内自行发生）；回合间共享 {@code history} （一个 Agent 实例的连续对话）。
+   * <p>约定：方法是同步的（网络/子进程调用在工具内自行发生）；回合间共享 {@link #window} （一个 Agent 实例的连续对话）。
+   *
+   * <p><b>组请求的形状（本批的关键）</b>：请求不再是"回合起点算一次、此后复用同一个列表"，而是<b>每次往返都从窗口现组</b>（{@link LlmRoundTrip#call}
+   * 的契约）。头部由 {@link AssemblerComposer} 承担：它每回合算<b>一次</b> system 头（与旧行为逐字节一致—— 旧行为里 {@code
+   * buildRequest} 也是每回合只调一次），此后每次往返复用同一个头 —— 因此请求恒为 {@code [头] + 窗口}， 本轮 user 只在第 1 轮的 {@code
+   * turnInput} 里出现一次，不会被追加两遍。
    *
    * <p><b>P1b 追加的回合作用域</b>（设计 §5 裁定 1+2）：回合开始时把本轮的待裁决队列绑到当前线程，收尾时（{@code finally}，
    * 含取消/超限/异常各条出口）把队列收成一个决策包、<b>同步</b>投递并等裁决——所以"回合返回"意味着裁决与执行都已经发生 （代价：慢裁决会占住这条线程，见 {@link
@@ -692,17 +718,14 @@ public final class AgentPipeline {
     Instant deadline = Instant.now().plus(config.timeBudget());
     // 可见面 = 注册表 ∩ 判定面（唯一 oracle，A-6）：被裁掉的数量落 INFO，不静默消失
     List<AgentTool> tools = visibleTools();
-    // 回合起点：历史长度在组请求前取定——saveHistory 用同一份 messages 列表按下标推出本回合新增的尾部（不靠猜、
-    // 不比对内容）；快照同时让"本回合"与历史后续变化解耦
-    List<LlmMessage> replayedHistory = List.copyOf(history);
-    int replayedSize = replayedHistory.size();
-    // 历史回灌：assembler 契约保证 messages[0] 是 system、history 紧随其后、本轮 user 收尾
-    List<LlmMessage> messages =
-        new ArrayList<>(
-            assembler.buildRequest(config, userMessage, replayedHistory, tools).messages());
+    // 每回合一个编排器：头部只算一次、回合内复用（见 AssemblerComposer 的类注）；本轮 user 作为 turnInput 随第 1 轮往返写回
+    ContextComposer composer = new AssemblerComposer(assembler, config, userMessage);
+    // 本回合的输入（相对窗口新增的部分）：第 1 轮是这条 user，此后窗口里已经有了它（也含工具结果），故为空——
+    // 若每轮都带上它，请求里就会出现两条同样的 user（这正是本批要避开的形状）
+    List<LlmMessage> turnInput = List.of(LlmMessage.user(userMessage));
 
     try {
-      return runTurn(userMessage, deadline, quota, tools, messages, replayedSize);
+      return runTurn(composer, turnInput, userMessage, deadline, quota, tools);
     } finally {
       // ★ 先解绑取数口，再收包——顺序不能反（2026-10-18 实测踩到）：
       //   收包那条路会**同步执行被批子集**（提交口在同一个线程上跑各条目自己的工具）。若此刻队列还绑着，
@@ -723,43 +746,63 @@ public final class AgentPipeline {
    * {@code return} 出口（{@code CANCELLED} ×2 / {@code TURN_LIMIT} / {@code TIME_BUDGET} / {@code
    * LLM_ERROR} / {@code QUOTA} / {@code TOOL_CALL_LIMIT} / 正常 {@code FINISHED}）一个都不用改，
    * 也不可能漏掉某个新增出口（新增出口自动落进同一个 finally）。
+   *
+   * <p><b>写回与落库的分工（新形状）</b>：消息的写回是往返的一部分（{@link LlmRoundTrip#call} 成功后窗口已含本轮输入与答复）， 本循环不再自己 {@code
+   * add} 任何东西——工具结果与悬空 {@code tool_call} 的占位失败结果都走 {@code window.append(...)}； 每个出口照旧先 {@link
+   * #saveHistory()} 再 return（顺序与旧实现一致）。
+   *
+   * @param composer 本回合的编排器（头部只在它的首次 {@code compose} 里算一次，回合内复用同一个实例——见 {@link AssemblerComposer}）
+   * @param turnInput 本回合的输入：第 1 轮是这条 user，此后逐轮传空（窗口里已经有了它，见 {@link #run(String)}）
+   * @param userMessage 本轮用户原文（<b>只为事件 payload</b>）：与旧实现一样原样透传，不从窗口或 turnInput 反推—— {@code
+   *     CONVERSATION_TURN} 的 {@code input} 与迁移前逐字节相同
    */
   private TurnResult runTurn(
+      ContextComposer composer,
+      List<LlmMessage> turnInput,
       String userMessage,
       Instant deadline,
       LlmQuota quota,
-      List<AgentTool> tools,
-      List<LlmMessage> messages,
-      int replayedSize) {
+      List<AgentTool> tools) {
     int turns = 0;
     int totalToolCalls = 0;
     String finalText = "";
+    boolean firstRound = true;
 
     while (true) {
       if (cancelled) {
         emitDecision("CANCELLED", Map.of());
-        saveHistory(messages, replayedSize);
+        saveHistory();
         return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
       }
       if (turns >= config.maxTurns()) {
         emitDecision("TURN_LIMIT", Map.of("maxTurns", config.maxTurns()));
-        saveHistory(messages, replayedSize);
+        saveHistory();
         return new TurnResult(StopReason.TURN_LIMIT, turns, totalToolCalls, finalText);
       }
       if (Instant.now().isAfter(deadline)) {
         emitDecision("TIME_BUDGET", Map.of("timeBudget", config.timeBudget().toString()));
-        saveHistory(messages, replayedSize);
+        saveHistory();
         return new TurnResult(StopReason.TIME_BUDGET, turns, totalToolCalls, finalText);
       }
+
+      // 本轮输入：只在第 1 轮带 user——此后窗口里已有它，重复带上会让模型看到两条同样的用户消息
+      List<LlmMessage> roundInput = firstRound ? turnInput : List.of();
+      firstRound = false;
 
       LlmResponse response;
       long startedNanos = System.nanoTime();
       try {
-        response = llm.chat(new LlmRequest(List.copyOf(messages), toolsDefs(tools)));
+        // 一次往返 = 组请求（从窗口现取）+ 发信 + 写回（本轮输入在前、答复在后）：窗口回来时已含这一问一答
+        response = LlmRoundTrip.call(llm, window, composer, roundInput, tools);
       } catch (io.mosire.agentlib.llm.LlmException e) {
-        // LlmClient 契约只抛 LlmException；此刻 assistant 消息尚未入列，历史以工具结果干净收尾
+        // LlmClient 契约只抛 LlmException。★ 失败路径的接线要求（设计 §5.2）：LlmRoundTrip 在 chat 抛出时
+        //   "窗口一个字节都没动"（写回是成功后才发生的），所以本轮 user 必须由宿主自己补写回再落库——
+        //   否则第 1 轮失败时"用户说过什么"就丢了（旧行为里本轮 user 在组请求时就已进列表，故落库的那份含它）。
+        //   第 ≥2 轮 roundInput 为空，appendAll 天然是空操作（旧行为同样不新增任何东西）。
+        window.appendAll(roundInput);
+        // 此刻 assistant 消息尚未入列，历史以工具结果干净收尾（与旧行为一致）
         emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(e.getMessage())));
-        saveHistory(messages, replayedSize);
+        saveHistory();
         return new TurnResult(StopReason.LLM_ERROR, turns, totalToolCalls, finalText);
       }
       long latencyMs = Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
@@ -786,14 +829,20 @@ public final class AgentPipeline {
         try {
           quota.record(response.inputTokens(), response.outputTokens());
         } catch (io.mosire.agentlib.llm.QuotaExceededException e) {
+          // ★ 已知行为变更（设计 §5.1，控制方裁定）：本出口<b>保留</b>模型答复。
+          //   旧行为：配额判定发生在 messages.add(assistant) 之前 ⇒ 超限时答复既不进历史、也不落库，只留 llm.call 记账。
+          //   新行为：写回是往返的一部分（LlmRoundTrip 在 chat 成功后立即 append）⇒ 终止时答复已在窗口内，
+          //   下面的 saveHistory() 会把它落库。这不是疏漏，是有意选择的语义：token 已经花了、答复已经产生了，
+          //   把它从历史里丢掉并不对称——其余所有"已产生答复"的出口（FINISHED / TOOL_CALL_LIMIT / TURN_LIMIT /
+          //   TIME_BUDGET / CANCELLED）本来都保留答复，QUOTA 曾是唯一的例外。
+          //   ★ 禁止用"把刚 append 的答复再删掉"之类反向 hack 去凑旧行为（那会把窗口的只追加语义破掉）。
           emitDecision("QUOTA", Map.of("reason", e.getMessage()));
-          saveHistory(messages, replayedSize);
+          saveHistory();
           return new TurnResult(StopReason.QUOTA, turns, totalToolCalls, finalText);
         }
       }
 
-      // 追加 assistant 消息 + 回合事件
-      messages.add(response.assistantMessage());
+      // 追加 assistant 消息 + 回合事件（答复的写回已由 LlmRoundTrip 完成，这里只是落事件）
       emit(
           EventTypes.CONVERSATION_TURN,
           Map.of(
@@ -813,7 +862,7 @@ public final class AgentPipeline {
               .toList();
 
       if (toolCalls.isEmpty()) {
-        saveHistory(messages, replayedSize);
+        saveHistory();
         return new TurnResult(
             StopReason.FINISHED, turns, totalToolCalls, response.textPart().orElse(""));
       }
@@ -825,11 +874,11 @@ public final class AgentPipeline {
         // 悬空 tool_call 修复：本回合一个都没执行，回灌前为每个调用补占位失败结果——
         // 否则历史里存在无应答的 tool_call，下一回合部分供应商会拒收请求
         for (ContentPart.ToolCall call : toolCalls) {
-          messages.add(
+          window.append(
               LlmMessage.tool(
                   new ContentPart.ToolResult(call.id(), call.name(), null, "回合因单次响应工具调用数超限中止")));
         }
-        saveHistory(messages, replayedSize);
+        saveHistory();
         return new TurnResult(
             StopReason.TOOL_CALL_LIMIT, turns, totalToolCalls, response.textPart().orElse(""));
       }
@@ -837,11 +886,11 @@ public final class AgentPipeline {
       for (ContentPart.ToolCall call : toolCalls) {
         if (cancelled) {
           emitDecision("CANCELLED", Map.of());
-          saveHistory(messages, replayedSize);
+          saveHistory();
           return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
         }
         totalToolCalls++;
-        executeToolCall(messages, call);
+        executeToolCall(call);
       }
     }
   }
@@ -1032,7 +1081,7 @@ public final class AgentPipeline {
       return;
     }
     Compactor.Result result =
-        compactor.compact(history, compactSummary.current(), snapshotBaseline());
+        compactor.compact(window.messages(), compactSummary.current(), snapshotBaseline());
     if (result.summarizerCall() != null) {
       // R7：摘要是额外 LLM 调用——不记账的话，P2-3 的 token 汇总看不见压缩成本（D18 名不副实）
       Compactor.SummarizerCall call = result.summarizerCall();
@@ -1117,19 +1166,20 @@ public final class AgentPipeline {
    */
   private List<LlmMessage> snapshotBaseline() {
     if (!uncoveredHiddenContent) {
-      return history;
+      // 窗口快照（不可变）：这正是这份基准要的形态——它是只读输入，不会被下游改写
+      return window.messages();
     }
-    List<LlmMessage> stored = store.load(conversationId);
+    List<LlmMessage> stored = store.load(window.id());
     // 取不到（空实现/空会话）时退回工作集：不把"读不到"当成"没有内容"——真要是空会话，档 3 的落库守卫会另行响亮失败
-    return stored.isEmpty() ? history : stored;
+    return stored.isEmpty() ? window.messages() : stored;
   }
 
   /**
    * 档 2 的可见性守卫（F2）：摘要<b>已写入槽</b>，但装配器渲染出的 {@code COMPACT_SUMMARY} 层里看不见它 → 接线失配，响亮失败。
    *
    * <p>必须失败而不是继续：档 2 落地后工作集只剩尾部，被丢弃的中段既不在工作集里、又没进层——请求里"无摘要、无占位"，头部与中段
-   * <b>静默消失</b>（本项目最坏的失败模式）。失配的成因不是运行期数据问题，而是<b>编程契约违反</b>（管线的槽与装配器读的槽不是同一个实例）， 照 {@code
-   * saveHistory} 守卫与 {@link #persistSnapshot} 空会话守卫的纪律抛 {@link IllegalStateException}。
+   * <b>静默消失</b>（本项目最坏的失败模式）。失配的成因不是运行期数据问题，而是<b>编程契约违反</b>（管线的槽与装配器读的槽不是同一个实例）， 照 {@link
+   * #saveHistory()} 守卫与 {@link #persistSnapshot} 空会话守卫的纪律抛 {@link IllegalStateException}。
    *
    * <p><b>判据为什么用 {@code composition} 而不是 {@code buildRequest}</b>：接口把 {@code composition} 定为与
    * {@code buildRequest} <b>同源</b>（同一输入 → 同一组段落），装配器读哪个槽它就反映哪个槽，且不必解析消息文本、不必猜头部/尾部（那条路
@@ -1140,21 +1190,25 @@ public final class AgentPipeline {
   private void requireSummaryVisibleInAssembler(String userMessage) {
     Integer layerTokens =
         assembler
-            .composition(config, userMessage, List.copyOf(history), List.of())
+            .composition(config, userMessage, window.messages(), List.of())
             .estimatedTokens()
             .get(ContextLayer.COMPACT_SUMMARY);
     if (layerTokens == null || layerTokens <= 0) {
       throw new IllegalStateException(
           "压缩摘要已写入槽，但装配器的 COMPACT_SUMMARY 层为空——管线持有的摘要槽与装配器读取的槽不是同一个实例"
               + "（接线必须用 assembler.compactSummarySlot() 取槽，拒绝静默丢弃被压缩的历史）: "
-              + conversationId);
+              + window.id());
     }
   }
 
-  /** 换掉内存工作集（{@link #history} 是 final 字段，只能就地替换内容）。 */
+  /**
+   * 换掉内存工作集（= {@link ContextWindow#replaceAll(List)}）：压缩三档都用它落"新的工作集形态"。
+   *
+   * <p>替换后窗口的未落库尾部为空（"整体替换 = 已处置"，见 {@link ContextWindow#replaceAll(List)} 的类注）——这正是压缩的语义： 档 1/2
+   * 换的是内存视图（库里仍是全量，靠 {@code load} 对齐），档 3 换的是刚 {@code compact} 过、与存储同源的那份。
+   */
   private void replaceWorkingSet(List<LlmMessage> workingSet) {
-    history.clear();
-    history.addAll(workingSet);
+    window.replaceAll(workingSet);
   }
 
   /**
@@ -1166,65 +1220,41 @@ public final class AgentPipeline {
    * 没接受压缩（例如"不落库"的空实现被误接了压缩器）→ 响亮失败，绝不静默把工作集清空。
    */
   private void persistSnapshot(Compactor.Result result) {
-    store.compact(conversationId, result.summary().render());
-    List<LlmMessage> rehydrated = store.load(conversationId);
+    store.compact(window.id(), result.summary().render());
+    List<LlmMessage> rehydrated = store.load(window.id());
     if (rehydrated.isEmpty()) {
       throw new IllegalStateException(
-          "压缩已落库但 load 回来是空会话——store 未接线压缩记录（拒绝静默清空工作集）: " + conversationId);
+          "压缩已落库但 load 回来是空会话——store 未接线压缩记录（拒绝静默清空工作集）: " + window.id());
     }
     replaceWorkingSet(rehydrated);
     compactSummary.clear();
   }
 
   /**
-   * 把本回合<b>新增的尾部</b>追加进历史：内存 {@link #history} 与 {@link #store} 都只追加，绝不重写已有前缀。
+   * 把本回合的<b>未落库尾部</b>追加进存储：{@link ContextWindow#unsavedTail()} → 逐条 {@code store.append} → {@link
+   * ContextWindow#markSaved()}。
    *
-   * <p>为什么不是"清空重写全量"：机制上的 clear+addAll 直译到持久层就变成每回合 DELETE + 全量 INSERT——行标识与插入 时序每回合全变，是
-   * prompt-cache 前缀稳定的隐性敌人。这里改成内容与机制一致的 append-only。
+   * <p><b>为什么不再按下标切片</b>：旧实现靠 {@code messages.subList(replayedSize + 1, size)} 从"组装器返回的那份列表"
+   * 里推本回合新增的部分，为此要在切片前校验"历史被原样回灌、本轮 user 恰好紧随"。窗口把这件事变成了它自己的不变量——尾部永远是 {@code [unsavedFrom, size)}
+   * 这个后缀，宿主取尾部不需要推导、也不需要自己记下标。位置契约的判别力没有丢：它移到了 {@link AssemblerComposer#compose}
+   * 的首次校验上（组请求当刻、任何写入之前）。
    *
-   * <p><b>增量怎么算</b>：{@code messages} 的结构恒为 {@code [system] + 回合起点历史 + 本回合新增...}（assembler 契约：第一条必为
-   * system、回合起点历史<b>原样</b>紧随其后、本轮 user 收尾），故 {@code messages[replayedSize + 1]} 起就是本回合新增的部分——
-   * 用同一份列表按下标推出，不比对内容（{@code replayedSize} 是组请求前取定的历史长度）。推导式本身是精确算术，不靠猜。
+   * <p><b>为什么不是"清空重写全量"</b>：机制上的 clear+addAll 直译到持久层就变成每回合 DELETE + 全量 INSERT——行标识与插入 时序每回合全变，是
+   * prompt-cache 前缀稳定的隐性敌人。这里保持库侧的 append-only（与今天逐条 append 的语义一致）。
    *
-   * <p><b>但下标推导有条件</b>：本轮 user 必须<b>恰好</b>落在 {@code replayedSize + 1}。assembler 少回灌历史（该下标落到别处）或在头部
-   * 多插一条（下标整体前移）都会让切片错位，表现从"静默丢弃本回合尾部"到"把已落库的历史当新增重复追加"（append-only 库里留下重复前缀）不等；
-   * 且错位多数<b>不</b>落在越界上——不抛任何异常，只是写错（越界时 {@code ArrayList.subList} 抛的也是 {@link
-   * IllegalArgumentException}，不是 {@link IndexOutOfBoundsException}）。故切片前先按契约校验（见下），把静默错写一律变成响亮失败。
+   * <p><b>落库失败（磁盘/DB 异常）不吞</b>：窗口内容已追加（往返时或失败分支里），异常向上抛，回合以失败告终而不是静默丢持久化。 尾部是逐条 append（Store
+   * 只保证单次调用原子，见 {@link ConversationStore}）——中途失败会留下"已落库的前缀"，重启后正是从那个前缀续起。 注意此时 {@link
+   * ContextWindow#markSaved()} 不会被执行：尾部仍然是"未处置"，下一次落库会从那条失败的消息重新试（这正是"库里有前缀、 内存有全量"这条既定语义的形状）。
    *
-   * <p><b>前置守卫不误伤合法压缩</b>：合法压缩（T17 三档都算：档 3 走 {@link ConversationStore#compact} 落库后重灌，档 1/2
-   * 只换内存工作集）改的都是 {@code history} 本身，而 {@code replayedSize} 取的是<b>组请求前</b>的实际长度——回灌长度随之一同变短，
-   * 守卫只看"回灌长度是否被原样尊重"、不看长短，故不响。被守卫拦下的是"assembler <b>擅自</b>改回灌长度/本轮 user 位置"，与压缩无关。
-   *
-   * <p><b>守卫的辨识范围（别把它想得比实际宽）</b>：它<b>只</b>校验两点——{@code size ≥ replayedSize + 2}，且 {@code
-   * messages[replayedSize + 1]} 这条的 role 是 {@code user}。落在其外的情形<b>不</b>被辨识：等长的内容改写/重排（与"不比对内容"的
-   * 设计取舍相抵）、在本轮 user <b>之后</b>再插消息（回合内本就会追加 assistant/tool，无法与之区分）。它拦的是"assembler
-   * <b>擅自</b>改变回灌长度或本轮 user 位置"这一类<b>编程契约违反</b>，不是运行期数据状态，故抛 {@link IllegalStateException}
-   * 而非参数类异常。守卫在任何内存/落库写入<b>之前</b>求值——不满足时不留下半截写入。
-   *
-   * <p>七条终止路径（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR/CANCELLED）都必须先经过这里再
-   * return——否则下一回合回灌的历史残缺，Agent 就会失忆。
-   *
-   * <p>落库失败（磁盘/DB 异常）不吞：内存历史已追加、异常向上抛，回合以失败告终而不是静默丢持久化。尾部是逐条 append（Store 只保证 单次调用原子，见 {@link
-   * ConversationStore}）——中途失败会留下"已落库的前缀"，重启后正是从那个前缀续起。
+   * <p><b>七个终止路径</b>（FINISHED/TOOL_CALL_LIMIT/TURN_LIMIT/TIME_BUDGET/QUOTA/LLM_ERROR/CANCELLED）
+   * 都必须先经过这里再 return——否则下一回合回灌的历史残缺，Agent 就会失忆。
    */
-  private void saveHistory(List<LlmMessage> messages, int replayedSize) {
-    // assembler 契约校验：本轮 user 必须恰好是 messages[replayedSize + 1]。最小合法长度 = [system] + 回灌历史
-    // （replayedSize 条）+ 本轮 user = replayedSize + 2（此刻本回合尚未产生任何新消息）；长度不足或该位不是
-    // user → 下标推导失去意义，响亮失败
-    if (messages.size() < replayedSize + 2
-        || !LlmMessage.ROLE_USER.equals(messages.get(replayedSize + 1).role())) {
-      throw new IllegalStateException(
-          "assembler 违反契约：历史未按其长度原样回灌、本轮 user 未紧随其后（replayedSize="
-              + replayedSize
-              + ", size="
-              + messages.size()
-              + "）");
+  private void saveHistory() {
+    for (LlmMessage message : window.unsavedTail()) {
+      store.append(window.id(), message);
     }
-    List<LlmMessage> appended = messages.subList(replayedSize + 1, messages.size());
-    history.addAll(appended);
-    for (LlmMessage message : appended) {
-      store.append(conversationId, message);
-    }
+    // 到达这里即"尾部已处置"（落库成功）；失败时上一行就抛了，markSaved 不会执行
+    window.markSaved();
   }
 
   /**
@@ -1253,7 +1283,155 @@ public final class AgentPipeline {
     }
   }
 
-  private void executeToolCall(List<LlmMessage> messages, ContentPart.ToolCall call) {
+  /**
+   * <b>本管线的编排器</b>：把库侧的 {@link ContextComposer} 契约接到既有的 {@link ContextAssembler} 上——装配器 SPI 一行不改，
+   * 窗口只认"头部 + 窗口内容 + 本轮输入"这个形状。
+   *
+   * <p><b>★ 为什么头部必须"每回合只算一次"（这是本类唯一有讲究的地方）</b>：{@code buildRequest} 的签名要一个 {@code userMessage}
+   * 并把它作为请求的<b>收尾</b>，而新形状下本轮 user 属于 {@code turnInput}（窗口还不含它）。若每次往返都拿 {@code windowMessages} 再调一次
+   * {@code buildRequest(config, userMessage, windowMessages, tools)}，第 2 轮起 {@code windowMessages}
+   * 里已经含了本轮 user ⇒ 请求变成 {@code [头] + 窗口 + [本轮 user]}，模型会看到<b>两条</b>相同的用户消息。 因此这里只在<b>首次</b> {@code
+   * compose} 时调一次装配器（用当时<b>不含</b>本轮 user 的窗口内容），取它的第 0 条（system 头）缓存下来， 之后每次往返都用它拼 {@code [头] + 窗口
+   * + 本轮输入}。合法性来自装配器的既有契约：头部只由 {@code config} + 工具目录 + 内容源（技能/记忆/摘要槽） + 本轮 user
+   * 派生，<b>与历史无关</b>；而且旧实现里 {@code buildRequest} 本来也是"每回合算一次、随后复用"——两边的字节因此完全一致。
+   *
+   * <p><b>契约守卫（判别力与原 {@code saveHistory} 的下标守卫对应）</b>：首次组请求时校验装配器返回的序列<b>确实是</b>{@code [头] +
+   * 窗口(逐条原样) + 本轮输入(逐条原样)}——尺寸、第 0 条是 system、窗口段逐条 {@code equals}、本轮输入段逐条 {@code equals}。不满足即
+   * {@link IllegalStateException}（编程契约违反，不是运行期数据问题），且在任何写入与发信之前。
+   */
+  private static final class AssemblerComposer implements ContextComposer {
+
+    private final ContextAssembler assembler;
+    private final AgentConfig config;
+    private final String userMessage;
+
+    /**
+     * 本回合的 system 头（首次 {@code compose} 时算出来，此后复用）。
+     *
+     * <p>{@code null} = 还没算过。为什么用"懒初始化"而不是构造时就算：构造发生在回合开始的组请求之前，而旧实现是"取完可见工具面再算"——
+     * 保持同一个时刻，头部里若将来带上工具面相关的东西（今天已经是"工具目录"了）才不会有先后差异。
+     */
+    private LlmMessage head;
+
+    /**
+     * @param assembler 每回合的头部来源（{@code buildRequest} 只在首次 {@code compose} 时被调一次，见类注）
+     * @param config 传给装配器的配置（每回合固定）
+     * @param userMessage 本轮用户输入（每回合固定；它同时是装配器的收尾参数与 {@code turnInput} 的内容）
+     */
+    AssemblerComposer(ContextAssembler assembler, AgentConfig config, String userMessage) {
+      this.assembler = Objects.requireNonNull(assembler, "assembler");
+      this.config = Objects.requireNonNull(config, "config");
+      this.userMessage = Objects.requireNonNull(userMessage, "userMessage");
+    }
+
+    @Override
+    public LlmRequest compose(
+        List<LlmMessage> windowMessages, List<LlmMessage> turnInput, List<AgentTool> tools) {
+      List<AgentTool> turnTools = List.copyOf(Objects.requireNonNull(tools, "tools"));
+      if (head == null) {
+        // 首次：此刻 windowMessages 还不含本轮 user（写回发生在 chat 成功之后），正是装配器契约要的形状
+        LlmRequest assembled =
+            assembler.buildRequest(config, userMessage, windowMessages, turnTools);
+        verifyPositionContract(assembled.messages(), windowMessages, turnInput);
+        head = assembled.messages().get(0);
+      }
+      // 每次往返现组：头部（缓存）+ 窗口内容（原样）+ 本轮输入（原样）——不缓存整份请求，窗口是唯一真相
+      List<LlmMessage> requestMessages = concat(List.of(head), windowMessages, turnInput);
+      return new LlmRequest(requestMessages, toolsDefs(turnTools));
+    }
+
+    /**
+     * 位置契约校验（判别力与旧 {@code saveHistory} 的前置守卫一一对应，见 {@link AssemblerComposer} 的类注）。
+     *
+     * <p>旧守卫拦的是"装配器<b>擅自</b>少回灌历史 / 在头部多插一条 ⇒ 本回合新增的尾部被静默丢光或重复落库"这一类编程契约违反；
+     * 新守卫拦的是同一类违反，判据换成"装配器返回的序列必须逐条等于 [头] + 窗口 + 本轮输入"——比旧判据<b>更严</b>： 旧判据只看长度与 {@code
+     * messages[replayedSize + 1]} 的 role，看不见"等长改写/重排历史"这一档（旧注释自己写明了这一点）， 新判据逐条 {@code equals}
+     * 比对，那一档也拦得住。
+     *
+     * <p><b>异常消息里保留旧措辞的两个字面量</b>（{@code "assembler 违反契约"}、{@code "replayedSize=<窗口条数>"}）： 既有用例
+     * {@code AgentPipelineConversationStoreTest} 的 {@code ContractViolatingAssembler} 两条断言正是按这四个字段
+     * （措辞 + replayedSize + size）判别的，而本批<b>不许改测试</b>。{@code replayedSize} 在此就等于"窗口当前条数"，与旧实现的
+     * "回合起点历史长度"是同一个量——旧守卫看的是"历史是否被原样回灌"，窗口就是那份历史的载体。详细定位信息（各段的起止下标） 一并带上，便于从异常直接看出是哪一段错位。
+     */
+    private static void verifyPositionContract(
+        List<LlmMessage> messages, List<LlmMessage> windowMessages, List<LlmMessage> turnInput) {
+      int windowSize = windowMessages.size();
+      int inputSize = turnInput.size();
+      int expectedSize = 1 + windowSize + inputSize;
+      String locator =
+          "（messages="
+              + messages.size()
+              + ": 头部 1 条 + 窗口 [1, "
+              + (1 + windowSize)
+              + ") 共 "
+              + windowSize
+              + " 条 + 本轮输入 ["
+              + (1 + windowSize)
+              + ", "
+              + expectedSize
+              + ") 共 "
+              + inputSize
+              + " 条）";
+      if (messages.size() != expectedSize) {
+        throw contractViolation(
+            "返回的序列长度不等于 [头] + 窗口 + 本轮输入", windowSize, messages.size(), 0, locator);
+      }
+      if (!LlmMessage.ROLE_SYSTEM.equals(messages.get(0).role())) {
+        throw contractViolation(
+            "messages[0] 不是 system 头（头部必须恰好一条、且在第 0 位）", windowSize, messages.size(), 0, locator);
+      }
+      for (int i = 0; i < windowSize; i++) {
+        if (!messages.get(1 + i).equals(windowMessages.get(i))) {
+          throw contractViolation(
+              "窗口内容未被原样回灌（第 " + i + " 条起不再相同）", windowSize, messages.size(), i, locator);
+        }
+      }
+      for (int i = 0; i < inputSize; i++) {
+        if (!messages.get(1 + windowSize + i).equals(turnInput.get(i))) {
+          throw contractViolation(
+              "本轮输入未被原样置于窗口之后（第 " + i + " 条起不再相同）", windowSize, messages.size(), i, locator);
+        }
+      }
+    }
+
+    /**
+     * 契约违反的统一出口：异常类型与旧守卫一致（{@link IllegalStateException}——这是编程契约违反，不是参数类异常），
+     * 首句措辞与旧实现相同（既有用例按它判别），并带上尺寸与下标等定位信息。
+     *
+     * <p>{@code replayedSize} 沿用旧的字段名与含义（"被回灌的历史长度"），值取窗口条数；{@code size} 取装配器返回的条数—— 于是"窗口 n
+     * 条、却返回了别的形状"这件事在异常里一眼可读。
+     */
+    private static IllegalStateException contractViolation(
+        String what, int windowSize, int messageCount, int offset, String locator) {
+      return new IllegalStateException(
+          "assembler 违反契约：历史未按其长度原样回灌、本轮 user 未紧随其后（replayedSize="
+              + windowSize
+              + ", size="
+              + messageCount
+              + "）："
+              + what
+              + "，首处错位=第 "
+              + offset
+              + " 条"
+              + locator);
+    }
+
+    /** 三段拼接（头 + 窗口 + 本轮输入）；入参都已是不可变快照。 */
+    private static List<LlmMessage> concat(
+        List<LlmMessage> first, List<LlmMessage> second, List<LlmMessage> third) {
+      List<LlmMessage> merged = new ArrayList<>(first.size() + second.size() + third.size());
+      merged.addAll(first);
+      merged.addAll(second);
+      merged.addAll(third);
+      return List.copyOf(merged);
+    }
+  }
+
+  /**
+   * 执行一次工具调用并把结果落到窗口（本批只改了落点：{@code messages.add(...)} → {@code window.append(...)}，
+   * 事件顺序、脱敏、判定链一字未动）。
+   */
+  private void executeToolCall(ContentPart.ToolCall call) {
     // ★ S4-C 脱敏（红线 4：命令明文不进事件库）：tool.call 的 args 取工具自报的参数视图（AgentTool.ledgerArgs）。
     //   ToolContext 的构造<b>上移</b>到 emit 之前——它是纯的（只做 requireNonNull + Map.copyOf，无副作用），
     //   于是"先建上下文、再按上下文脱敏、最后写事件"这个顺序成立，且既有工具（不覆写 ledgerArgs）行为逐字不变。
@@ -1303,7 +1481,7 @@ public final class AgentPipeline {
     // ContentPart.ToolResult 要求 content 与 error 恰好一个非空：成功走 content（error 置空）、失败走 error（content 置空）
     String content = result.success() ? result.message() : null;
     String error = result.success() ? null : result.message();
-    messages.add(
+    window.append(
         LlmMessage.tool(new ContentPart.ToolResult(call.id(), call.name(), content, error)));
   }
 
@@ -1313,7 +1491,7 @@ public final class AgentPipeline {
    * <p>与 {@link #run(String)} 内部消息序列的关系：{@code [system] + lastHistory()} 即完整请求消息。
    *
    * <p><b>契约冻结</b>：接 {@link ConversationStore} 之后本方法读的仍是内存工作集（不是库），形状与语义与持久化前一致—— 不含 system
-   * 头、返回不可变快照（后续回合不回改已发出的快照）。
+   * 头、返回不可变快照（后续回合不回改已发出的快照）。窗口下沉后本方法只是转发 {@link ContextWindow#messages()}。
    *
    * <p><b>压缩之后的形状（按实例状态分两种，勿混为一谈）</b>：{@code "摘要 + 压缩点之后的消息"} 只对<b>新实例 hydrate 之后</b>为真（构造时 {@code
    * store.load(...)} 灌入，故进程重启即反映最近一次压缩）。<b>活实例</b>的工作集只在构造时灌一次——T17
@@ -1322,13 +1500,11 @@ public final class AgentPipeline {
    * 仍不会被回灌——那是"另一个写者"的情形，不在本类契约内。
    */
   public List<LlmMessage> lastHistory() {
-    return List.copyOf(history);
+    return window.messages();
   }
 
-  private static List<io.mosire.agentlib.llm.ToolDef> toolsDefs(List<AgentTool> tools) {
-    return tools.stream()
-        .map(t -> new io.mosire.agentlib.llm.ToolDef(t.name(), t.description(), t.jsonSchema()))
-        .toList();
+  private static List<ToolDef> toolsDefs(List<AgentTool> tools) {
+    return tools.stream().map(t -> new ToolDef(t.name(), t.description(), t.jsonSchema())).toList();
   }
 
   private void emit(String type, Object payload) {

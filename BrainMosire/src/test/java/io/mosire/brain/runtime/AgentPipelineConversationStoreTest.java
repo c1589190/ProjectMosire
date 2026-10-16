@@ -3,6 +3,7 @@ package io.mosire.brain.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.SqliteEventStore;
@@ -231,11 +232,16 @@ class AgentPipelineConversationStoreTest {
   }
 
   /**
-   * M3 判别性用例 2：assembler 保留全量历史、但在 system 之后多插一条摘要 → 守卫响亮失败，而不是把已落库的历史当新增重复追加。
+   * M3 判别性用例 2：assembler 保留全量历史、但在 system 之后多插一条摘要 → 守卫响亮失败，而不是让那段多出来的内容静默消失。
    *
-   * <p>去掉守卫后本用例必红：本轮的 assistant 已入列，{@code messages} = {@code [system, 摘要, 历史×2, user, assistant]}
-   * 共 6 条，切片下标整体前移一位——{@code subList(replayedSize + 1, size)} = {@code subList(3, 6)}
-   * 会把<b>已落库的历史尾条</b>连同本轮 user 与 assistant 再 append 一次，append-only 库里出现重复前缀， 且不抛任何异常。
+   * <p><b>新形状下的判据</b>（守卫由 {@code saveHistory} 前移到首次 compose，见 {@code 设计-上下文窗口下沉.md} §5.3）：装配器返回
+   * {@code [system, 摘要, 历史×2, user]} 共 5 条，而位置契约要求恰好 {@code [头] + 窗口×2 + 本轮输入×1} = 4 条 ⇒ 尺寸不等、响亮失败
+   * （异常消息里的 {@code size=5} 即这 5 条；旧实现看到的是它 + 本轮 assistant = 6 条，故本断言的字面量由 6 改为 5）。
+   *
+   * <p><b>去掉守卫后本用例必红</b>：装配器的返回值只有 {@code messages[0]} 会被当作头部使用，多出来的那段摘要会被
+   * <b>静默丢弃</b>（请求照发、不抛异常）——正是「内容悄悄没了」这一最难查的形态，守卫把它变成响亮失败。 旧形状下的失败形态是另一种（下标切片 ⇒ 把已落库的历史尾条连同本轮 user
+   * 与 assistant 再 append 一次，append-only 库里出现重复前缀）； 改成窗口形状后那条路已在结构上不可达（落库只取 {@link
+   * io.mosire.agentlib.context.ContextWindow#unsavedTail()}）， 故守卫的价值落在「不许静默丢内容」。
    */
   @Test
   void assemblerPrependingSummaryOverFullHistoryIsRejectedLoudlyInsteadOfDuplicatingPrefix() {
@@ -256,13 +262,16 @@ class AgentPipelineConversationStoreTest {
               store,
               new ContractViolatingAssembler(ContractBreach.PREPEND_SUMMARY));
 
-      // [system, 摘要, 历史×2, user, assistant] = 6 条：长度够，但 messages[replayedSize + 1] 是回灌历史的尾条
-      // （assistant）而非本轮 user
+      // 装配器返回 [system, 摘要, 历史×2, user] = 5 条：契约要求 [头] + 窗口×2 + 本轮输入×1 = 4 条，
+      // 多出来的正是被插在 system 之后的那条摘要 ⇒ 尺寸不等，守卫在首次 compose 即响亮失败
       assertThatThrownBy(() -> pipeline.run("问题二"))
           .isInstanceOf(IllegalStateException.class)
           .hasMessageContaining("assembler 违反契约")
           .hasMessageContaining("replayedSize=2")
-          .hasMessageContaining("size=6");
+          // ★ 守卫求值点由 saveHistory 前移到首次 compose（设计 §5.3）：此刻 assistant 尚未产生、尚未入列，
+          // 故装配器返回的序列是 5 条（旧守卫看到的是它 + assistant = 6 条）⇒ size 由 6 变 5。
+          // 这不构成放宽：本断言仍逐字钉住 size 字段；同用例其余三条断言与“无写入”断言一个字未动。
+          .hasMessageContaining("size=5");
 
       assertThat(pipeline.lastHistory()).hasSize(2);
       assertThat(store.load(CONV)).hasSize(2);
