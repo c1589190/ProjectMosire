@@ -134,6 +134,10 @@ owned 形态的 ②→③ 顺序不能颠倒：先 `server.close()` 让 provider
 
 **裁决**：审批端点沿用 MainMosire 既有 `/api/approvals`（GET 列表）与 `/api/approvals/{id}`（POST 决议）。**不采用**需求书示例里的 `/pending`、`/decide`。
 
+> ★ **追加标注（2026-10-17，不删上文）**：该面**已被用户裁定 16 判为"彻底删除"**——
+> 逐字原话、口径、连带点与受影响清单见 `设计-决策包作为唯一决策单元.md` §5octies。
+> 本节是**历史留痕**；`设计-决策包作为唯一决策单元.md` §5octies② 另注明"**审批面退役 ≠ 审批内核退役**"（`PendingApprovals`/协调器/闸链/通道保留作投递与唤醒机制）。
+
 理由：MainMosire 的 `ApprovalHttpServer` 已把 `/api/approvals` 系列定死并有 UI/脚本消费（`GET /api/approvals` 返回 `{"pending":[...]}`；`POST /api/approvals/{id}` body `{"decision":"approve|deny","scope":"once|session","by":"..."}`，200 / 404 / 409 三态可辨）。改名会破坏 MainMosire 既有界面，而 P1-C 的目标是**消灭重复**、不是**改协议**。
 
 **`/api/commands/mode`（S6 档位端点）留在 MainMosire 侧薄包装**：
