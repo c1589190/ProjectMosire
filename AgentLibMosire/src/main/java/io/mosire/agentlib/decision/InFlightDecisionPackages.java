@@ -1,5 +1,6 @@
 package io.mosire.agentlib.decision;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -36,4 +37,31 @@ public interface InFlightDecisionPackages {
    *     DecisionPackagesHttpHandler}）
    */
   Optional<DecisionPackage> find(String packageId);
+
+  /**
+   * ★ <b>两档查看（用户裁定 15 ①）的落点</b>：{@code full = false} ⇒ 快照里逐条的 {@code args} 被<b>抹掉</b>（只留 {@code
+   * index/toolName/summary}）；{@code full = true} ⇒ 原样给明文。
+   *
+   * <p><b>为什么由取数口回答"要不要明文"，而不是让渲染侧丢掉 args</b>：脱敏必须在<b>取数的最内侧</b>发生——
+   * 渲染侧丢字段是"读到了再假装没读"，任何一处漏丢（日志、异常消息、上层缓存）都会把明文带出去。 默认实现保守地返回 {@link #find(String)} 的明文快照：口没实现这一档 ⇒
+   * 渲染侧仍必须按 {@code full} 决定要不要输出（两层都拦，任一层漏了还有另一层）。
+   *
+   * @param full {@code true} = 显式要求明文（调用方必须落一条 {@link DecisionReadAudit} 审计）
+   */
+  default Optional<DecisionPackage> find(String packageId, boolean full) {
+    return find(packageId);
+  }
+
+  /**
+   * ★ <b>此刻所有在途包</b>（用户裁定 15：父侧/人"拿到一个决策包，首先查看决策包"）。
+   *
+   * <p>跨进程那条路上，包只活在"提出者正阻塞在裁决上"的那段窗口里——没有这个口，决策面列表就<b>看不到</b>它， 人只有一个 {@code xp-…} 的 id 与一行摘要（P3e
+   * 之前连详情都读不到）。默认实现返回空列表：口没实现这一档 ⇒ 列表照旧只列包表里的那些， 行为与本能力引入前逐字一致。
+   *
+   * <p>与 {@link #find(String)} 同一条纪律：<b>只读</b>——不进 {@code pending()}、不落盘、不发事件；返回的快照<b>不含</b>明文
+   * （列表是概览面，明文只走 {@link #find(String, boolean)} 的 {@code full} 那一档）。
+   */
+  default List<DecisionPackage> list() {
+    return List.of();
+  }
 }

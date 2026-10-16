@@ -63,10 +63,13 @@ import io.mosire.brain.decision.CrossProcessDecisionGateway;
 import io.mosire.brain.decision.DecisionApprovalBridge;
 import io.mosire.brain.decision.DecisionCascade;
 import io.mosire.brain.decision.DecisionHistoryTools;
+import io.mosire.brain.decision.DecisionItemTools;
+import io.mosire.brain.decision.DecisionWindows;
 import io.mosire.brain.decision.ParentSubagentDecisionLedger;
 import io.mosire.brain.decision.SubmitDecisionPackageTools;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
+import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
 import io.mosire.brain.runtime.EventTypes;
@@ -227,6 +230,14 @@ public final class App implements AutoCloseable {
    * <b>把待裁定条目交回父侧结算</b>——两者的可见面/外发面要求正好相反（历史不外发、本工具必须外发给子体）。
    */
   private static final String SUBMIT_DECISION_PACKAGE_TOOL_SOURCE_ID = "decision-submit";
+
+  /**
+   * 条目级裁决 + 执行命令两个工具的供给源 id（裁定 15，{@code decide_decision_item} / {@code commit_decision_package}）。
+   *
+   * <p>与另外两个源分开是刻意的：那两个一个只读自己的历史、一个只把条目交回父侧；<b>本源是"裁决动作"</b> （表态与执行），可见面要求是"只给包住在本进程的
+   * Agent"（两处三要素都带 {@code noExport}）。
+   */
+  private static final String DECISION_ITEM_TOOL_SOURCE_ID = "decision-item";
 
   /**
    * 技能根的能力 id（R2→R3b 交接项 2）：<b>只含 {@code skills: READ}</b>。
@@ -491,6 +502,19 @@ public final class App implements AutoCloseable {
       // 装载期校验（坏值 ⇒ 装载失败 ⇒ 启动响亮失败），宿主不再读它（D5：宿主不认识 bash 的配置 schema）。
       pluginTools = wirePlugins(configStore, tools, events);
       ApprovalConfig approvalConfig = ApprovalConfigLoader.load(configStore);
+      // ★ 裁定 15 ④（2026-10-17 用户指令「这玩意他妈不是可配置项吗？」）：决策链路的两个等待窗做成配置项——
+      //   decision.package.deadlineMs（等人答复，同时是包 deadline；缺省 30 分钟）/ decision.commit.waitMs
+      //   （等执行命令；缺省 30 秒）。缺省即现状（两个缺省常量仍归各自的所有者），项存在但值非法 ⇒ 启动响亮失败。
+      //   本处读出的两个值分别下发：deadline 经 toolConfig → AgentPipeline → PendingDecisionQueue；
+      //   commitWait 直接进网关的七参构造（它只在父进程这一侧存在）。
+      DecisionWindows decisionWindows = DecisionWindows.load(configStore);
+      LOG.info(
+          "决策窗口: 等人答复={}ms（decision.package.deadlineMs）等执行命令={}ms（decision.commit.waitMs）"
+              + "——缺省分别是 {}ms / {}ms",
+          decisionWindows.deadlineMillis(),
+          decisionWindows.commitWaitMillis(),
+          DecisionPackages.DEFAULT_DEADLINE_MILLIS,
+          CrossProcessDecisionGateway.DEFAULT_COMMIT_WAIT_MILLIS);
       PendingApprovals pendingApprovals = new PendingApprovals();
       approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
       approvalHttpChannel = new HttpApprovalChannel(pendingApprovals);
@@ -753,6 +777,11 @@ public final class App implements AutoCloseable {
       // ★ 这里不再写死 ("skills", <技能根>) 字面：技能根本身就是一个装配期 REFERENCE 挂载，它的条目由
       //   WorkspaceRegistry.maskEntries() 连命名空间一起产出（M6：只返回装配期条目；运行期挂载不进遮蔽面）。
       toolConfig.put(SandboxMask.CONFIG_KEY, maskConfigOf(workspaceRegistry));
+      // ★ 裁定 15 ④：本轮待裁决队列的窗口（等人答复 = 包 deadline）经同一条工具配置缝下发给 AgentPipeline
+      //   （它在绑定本轮队列时取这个键；键不在 / 值不可用 ⇒ 队列自己的缺省 30 分钟，行为逐字不变）。
+      //   放在这里而不是给 AgentPipeline 加构造参数：本表正是"装配层 → 管线工具面"的既有配置通道，且子体进程
+      //   那条最朴素的构造也收它（子体自己的包窗口因此同样可配）。
+      toolConfig.put(AgentPipeline.CONFIG_DECISION_DEADLINE_MS, decisionWindows.deadlineMillis());
       toolConfig = Map.copyOf(toolConfig);
       // ★ P3a（设计 §5quinquies ② + §5ter 裁定 13）：派生链视角<b>接上实例注册表</b>——这是跨进程那条路的
       //   前提：子体经 MCP 桥提交的包，父侧要在<b>同一个</b>视角里核对"这个 proposerKey 在不在场"（防冒充）
@@ -823,19 +852,37 @@ public final class App implements AutoCloseable {
               // ★ P3d（设计 §5sexies⑤⑥）：父侧本轮队列簿——接线之后结算**以它为准**：子体提交的条目只作对账
               //   （index + toolName + digest），明文与 classKey/askKind 取父侧自己收到的那一份；被批条目记一次性放行。
               subagentDecisionLedger,
-              Optional.of(decisionJudgeDetails));
+              Optional.of(decisionJudgeDetails),
+              // ★ 裁定 15 ④（2026-10-17）：第二段"等执行命令"的窗口独立于"等人答复"的包窗口（配置决定；缺省 30 秒）。
+              //   不接它就会退回 P4 之前那个挂死形状：每个没下 commit 的跨进程调用白挂满包的 30 分钟。
+              decisionWindows.commitWaitMillis());
       if (approvalServer != null) {
         DecisionPackagesHttpHandler.register(
             approvalServer,
             decisionPackages,
             decisionApprovalBridge,
             packageId -> decisionApprovalBridge.escalatedItems(packageId).orElse(null),
-            // ★ P3e：详情面（GET）在包登记表未命中时再问它一次 ⇒ 跨进程临时包也读得到逐条明文（POST 不认它）
-            crossProcessGateway);
+            // ★ P3e：详情面（GET）在包登记表未命中时再问它一次 ⇒ 跨进程临时包也读得到逐条明文
+            crossProcessGateway,
+            // ★ 裁定 15 ②③：在途包（跨进程临时包）也接受**条目级表态**与**执行命令**——"看一条、裁一条、
+            //   再下执行命令"这条链在真子进程场景里必须同样成立，否则人只能整包批/驳（回到裁定 15 之前）。
+            //   它仍不是第二条决策路径：不进包表、不进 pending()、不落父侧历史（不变量 1）。
+            crossProcessGateway,
+            // ★ 裁定 15 ①：每一次 full（明文）读取都落一条审计事件（只记谁/哪个包/哪些 index）——
+            //   桥是决策包事件的唯一写者，所以这条口也由它实现（不另开第二个发射点）。
+            decisionApprovalBridge);
       }
       // ★ P2b（裁定 5 的底线「下一轮要看结果直接调工具看」）：查自己的决策历史——读提出者自己的 events.db，
       //   按 proposerKey 只列自己的包（别人的与不存在的返回同一个空结果，无存在性 oracle）。
       tools.register(DECISION_HISTORY_TOOL_SOURCE_ID, DecisionHistoryTools.tool());
+      // ★ 裁定 15 ②③（2026-10-17）：条目级裁决与执行命令两个工具（用户口中的"event 命令"与"裁决包执行命令"）。
+      //   ★ 三要素 noExport = true：它们只对"包真正住在本进程"的 Agent 成立——子体面由父侧桥填充，而子体自己的包
+      //     走跨进程提交与回执流程（裁定 11：子体是执行者不是裁决者），把这两个工具外发只会让它对改不了的簿子发命令。
+      //   ★ 同一个 DecisionSubmissionPort 实例（decisionApprovalBridge）：表态与执行共用一处写口，不造第二套。
+      tools.register(
+          DECISION_ITEM_TOOL_SOURCE_ID, DecisionItemTools.decideTool(decisionApprovalBridge));
+      tools.register(
+          DECISION_ITEM_TOOL_SOURCE_ID, DecisionItemTools.commitTool(decisionApprovalBridge));
       // ★ P3a（设计 §5quinquies ②）：父侧的跨进程"提交决策包"口——子体经 MCP 桥把本轮待裁定条目交回这里结算。
       //   ★ 三件事刻意如此：
       //     ① 三要素 = ToolSpec.DEFAULT（guest 级、非敏感非破坏、noExport=false）⇒ 子体经桥看得见它

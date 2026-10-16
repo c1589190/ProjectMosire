@@ -8,7 +8,6 @@ import io.mosire.agentlib.approval.ApprovalEventTypes;
 import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.ToolGate;
 import io.mosire.agentlib.decision.DecisionEventTypes;
-import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.decision.DecisionPackagesHttpHandler;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventQuery;
@@ -149,8 +148,12 @@ class ChildCrossProcessDecisionE2ETest {
     Path dataDir = tempDir.resolve("data");
     Files.createDirectories(dataDir);
     // 审批窗口给足（人要在这段时间里从 HTTP 面答一次）；HTTP 面缺省开、端口由系统分配（0）
+    // ★ 决策链路的两个窗压到**毫秒级**（用户指令「肯定在测试环境都改成毫秒级啊」+ AGENTS §四 第 11 条）：
+    //   这里是真子进程 E2E，按缺省（30 分钟 / 30 秒）跑的话，任何"没人下执行命令"的收尾都要白等分钟级。
     Files.writeString(
-        dataDir.resolve("config.json"), "{\"approval\":{\"http\":true,\"timeoutSeconds\":60}}");
+        dataDir.resolve("config.json"),
+        "{\"approval\":{\"http\":true,\"timeoutSeconds\":60},"
+            + "\"decision\":{\"package\":{\"deadlineMs\":8000},\"commit\":{\"waitMs\":400}}}");
 
     BootConfig config =
         new BootConfig(0, dataDir, false, "", null, false, "127.0.0.1", 0, templates);
@@ -175,7 +178,7 @@ class ChildCrossProcessDecisionE2ETest {
           .isEqualTo("sensitive_probe");
       assertThat(executed).as("人还没答：三条一条都不许跑").isEmpty();
 
-      // ---- ★ P3e 判据①：决策面按审批面 summary 里的 xp-… 读得到**逐条明文**（与子体原始参数一致）----
+      // ---- ★ 两档查看（裁定 15 ①）：默认概览无明文；显式 full=1 才有，且落 detail_read 审计 ----
       String packageId = crossProcessPackageIdOf(request);
       HttpResponse<String> detail =
           get(app.approvalPort(), DecisionPackagesHttpHandler.PATH + "/" + packageId);
@@ -188,25 +191,29 @@ class ChildCrossProcessDecisionE2ETest {
       List<Map<String, Object>> plaintext = new ArrayList<>();
       for (JsonNode item : detailBody.get("items")) {
         assertThat(item.get("toolName").asText()).isEqualTo("sensitive_probe");
-        assertThat(item.get("summary").asText()).as("人读摘要也在（明文不是唯一的字段）").isNotBlank();
         assertThat(item.get("escalated").asBoolean()).as("三条都上报到人").isTrue();
+        // ★ 裁定 15 ①：默认 = 概览——明文与"人读摘要"（它就是截断后的参数）都不在这里
+        assertThat(item.has("args")).as("默认概览不含明文（用户裁定 15 ①）").isFalse();
+        assertThat(item.has("summary")).as("默认概览连人读摘要都不给").isFalse();
+        assertThat(item.get("overview").asText()).as("概览给「哪个工具、几个参数」").contains("sensitive_probe");
+      }
+      // 显式 full=1 才给明文（逐条）
+      for (int index = 0; index < 3; index++) {
+        HttpResponse<String> full =
+            get(
+                app.approvalPort(),
+                DecisionPackagesHttpHandler.PATH + "/" + packageId + "/items/" + index + "?full=1");
+        assertThat(full.statusCode()).as("full=1 读得到这一条").isEqualTo(200);
         @SuppressWarnings("unchecked")
-        Map<String, Object> args = JSON.convertValue(item.get("args"), Map.class);
+        Map<String, Object> args =
+            JSON.convertValue(JSON.readTree(full.body()).get("args"), Map.class);
         plaintext.add(args);
       }
       assertThat(plaintext)
-          .as("★ 逐条明文 = 父侧自己收到的那一份，与子体的原始参数逐字一致")
+          .as("★ full 档的逐条明文 = 父侧自己收到的那一份，与子体的原始参数逐字一致")
           .containsExactly(Map.of("text", "一"), Map.of("text", "二"), Map.of("text", "三"));
 
-      // ---- ★ P3e：在途包**只读**：决策面的写路径（POST）不认它（它没有状态机、也不是决策单元）----
-      HttpResponse<String> refused =
-          postJson(
-              app.approvalPort(),
-              DecisionPackagesHttpHandler.PATH + "/" + packageId,
-              "{\"approveAll\":true}");
-      assertThat(refused.statusCode()).as("★ POST 不认在途包（不构成第二条决策路径）").isEqualTo(404);
-      assertThat(JSON.readTree(refused.body()).get("code").asText())
-          .isEqualTo(DecisionPackages.PACKAGE_NOT_FOUND);
+      // ---- ★ 只读纪律：在途包不进 pending() 列表（不变量 1：包登记表里没有它）----
       assertThat(
               JSON.readTree(get(app.approvalPort(), DecisionPackagesHttpHandler.PATH).body())
                   .get("pending"))
@@ -307,8 +314,11 @@ class ChildCrossProcessDecisionE2ETest {
     Path dataDir = tempDir.resolve("data");
     Files.createDirectories(dataDir);
     // 审批窗口 2s：本用例要的正是"父侧逐条问人"这一步——没人答 ⇒ 到点 ⇒ fail-closed 拒
+    // ★ 两个决策窗同样毫秒级（本用例连包都不该建，但配置口径与全类一致，避免"哪条按缺省等"这种说不清的形态）。
     Files.writeString(
-        dataDir.resolve("config.json"), "{\"approval\":{\"http\":true,\"timeoutSeconds\":2}}");
+        dataDir.resolve("config.json"),
+        "{\"approval\":{\"http\":true,\"timeoutSeconds\":2},"
+            + "\"decision\":{\"package\":{\"deadlineMs\":8000},\"commit\":{\"waitMs\":400}}}");
 
     BootConfig config =
         new BootConfig(0, dataDir, false, "", null, false, "127.0.0.1", 0, templates);

@@ -8,9 +8,12 @@ import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.JudgementItem;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeDetailRegistry;
+import io.mosire.agentlib.decision.Decision;
 import io.mosire.agentlib.decision.DecisionItemDigest;
 import io.mosire.agentlib.decision.DecisionPackage;
 import io.mosire.agentlib.decision.DecisionPackages;
+import io.mosire.agentlib.decision.DecisionSubmission;
+import io.mosire.agentlib.decision.InFlightDecisionActions;
 import io.mosire.agentlib.decision.InFlightDecisionPackages;
 import io.mosire.agentlib.decision.PackageItem;
 import io.mosire.agentlib.decision.PackageState;
@@ -139,7 +142,8 @@ import org.slf4j.LoggerFactory;
  * DecisionItemDigest} 派生一次（唯一实现点），日志与返回值只出现包 id、工具名、条目 index、级联轨迹与理由文字， <b>没有任何一处</b>把 {@code args}
  * 写进消息或日志。
  */
-public final class CrossProcessDecisionGateway implements InFlightDecisionPackages {
+public final class CrossProcessDecisionGateway
+    implements InFlightDecisionPackages, InFlightDecisionActions {
 
   private static final Logger LOG = LoggerFactory.getLogger(CrossProcessDecisionGateway.class);
 
@@ -228,6 +232,23 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
    *
    * <p>为什么是 256：一次提交一条，条目本身很小（几个 index + 一份轨迹）；256 覆盖"一个部署里最近 256 次提交"， 足够挡住重试重放，也不会让内存随运行时长增长。
    */
+  /**
+   * 条目级表态在<b>临时包视图</b>里的裁决人标识（用户裁定 15 ②）：临时包不进包登记表，所以它没有 {@code
+   * DecisionPackages#DECIDED_BY_ITEM_VERDICTS} 那条累积路径，由本类自己拼一个同形的 {@link Decision}。
+   */
+  public static final String DECIDED_BY_ITEM_VERDICTS = "item-decisions";
+
+  /** 临时包视图的终结说明（父侧只回裁决、不执行：真正的执行在子体，见类注释）。 */
+  private static final String TRANSIENT_COMMIT_NOTE =
+      "临时包（跨进程）的门面：裁决已交回提出者；执行在提出者进程里（父侧不替子体执行，设计 §5quinquies ①）";
+
+  /** 临时包视图的逐条表态说明（累积中，不是终局）。 */
+  private static final String TRANSIENT_DECIDING_NOTE =
+      "临时包（跨进程）的门面：逐条表态累积中——全部条目都表了态、或有人下执行命令之后才终结";
+
+  /** 幂等：临时包结算之后仍保留在在途面里的条数上限（见 {@link #inFlight}）。 */
+  private static final int MAX_SETTLED_IN_FLIGHT = 64;
+
   public static final int IDEMPOTENCY_CACHE_LIMIT = 256;
 
   /**
@@ -279,11 +300,16 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
   private final Optional<SuperiorJudgeDetailRegistry> judgeDetails;
 
   /**
+   * 第二段"等执行命令"的窗口（毫秒，缺省 {@link #DEFAULT_COMMIT_WAIT_MILLIS}）——见 {@link #awaitAnswer} 里那段
+   * 注释：它与"等人答复"的包窗口（30 分钟，裁定 10）**分开**，否则任何没下 commit 的调用都会白挂半小时。
+   */
+  private final long commitWaitMillis;
+
+  /**
    * <b>在途明文面</b>（P3e）：{@code xp-…} ⇒ 那个"正等人裁"的临时包（见类注释）。 {@link Collections#synchronizedMap}
    * 包一层：每个子体一条 MCP 传输线程 ⇒ 多台子体可并发结算；锁的粒度 = 一次放/取/删。
    */
-  private final Map<String, DecisionPackage> inFlight =
-      Collections.synchronizedMap(new InFlightCache());
+  private final Map<String, Waiting> inFlight = Collections.synchronizedMap(new InFlightCache());
 
   /**
    * 幂等缓存（{@code proposerKey + requestId ⇒ 内容指纹 + 裁决}）：有界 LRU，见类注释。
@@ -337,7 +363,6 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
    *     这条抑制<b>不是</b>为了"让它变绿"：clean 重编后 SpotBugs **真报过**它——它一度被增量编译留下的旧 class 误判成"抑制多余"而删掉（AGENTS
    *     §三那条"判 SpotBugs 前先确证编译产物是新的"就是这么来的）。
    */
-  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public CrossProcessDecisionGateway(
       LevelVerifier levelLookup,
       DecisionCascade cascade,
@@ -345,12 +370,43 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
       PendingApprovals pending,
       SubagentDecisionLedger ledger,
       Optional<SuperiorJudgeDetailRegistry> judgeDetails) {
+    this(
+        levelLookup,
+        cascade,
+        coordinator,
+        pending,
+        ledger,
+        judgeDetails,
+        DEFAULT_COMMIT_WAIT_MILLIS);
+  }
+
+  /**
+   * 同上，但显式给定<b>执行等待窗</b>（毫秒）——即"表态完只差下执行命令"那一段的上界（仍受包 deadline 兜底）。
+   *
+   * <p><b>用例必须用这个构造</b>：注入毫秒级窗口，别让任何用例按缺省等（2026-10-17 用户指令 「太变态了直接等30分钟，改！」，AGENTS §四 第 11
+   * 条）。生产装配用六参构造即可（缺省 {@link #DEFAULT_COMMIT_WAIT_MILLIS}）。
+   *
+   * @param commitWaitMillis 执行等待窗（毫秒，必须为正）
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
+  public CrossProcessDecisionGateway(
+      LevelVerifier levelLookup,
+      DecisionCascade cascade,
+      ApprovalCoordinator coordinator,
+      PendingApprovals pending,
+      SubagentDecisionLedger ledger,
+      Optional<SuperiorJudgeDetailRegistry> judgeDetails,
+      long commitWaitMillis) {
     this.levelLookup = Objects.requireNonNull(levelLookup, "levelLookup");
     this.cascade = cascade;
     this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
     this.pending = Objects.requireNonNull(pending, "pending");
     this.ledger = ledger;
     this.judgeDetails = Objects.requireNonNull(judgeDetails, "judgeDetails");
+    if (commitWaitMillis <= 0) {
+      throw new IllegalArgumentException("commitWaitMillis 必须为正（毫秒）: " + commitWaitMillis);
+    }
+    this.commitWaitMillis = commitWaitMillis;
   }
 
   /**
@@ -361,10 +417,44 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
    */
   @Override
   public Optional<DecisionPackage> find(String packageId) {
+    return find(packageId, true);
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * <p><b>★ 两档查看（用户裁定 15 ①）</b>：{@code full = false} ⇒ 逐条的 {@code args} <b>在这里就被抹掉</b>（渲染侧拿到的东西
+   * 本身就没有明文——"读到了再假装没读"不算脱敏）。{@code full = true} ⇒ 原样给父侧自己收到的那一份明文。
+   */
+  @Override
+  public Optional<DecisionPackage> find(String packageId, boolean full) {
     if (packageId == null) {
       return Optional.empty();
     }
-    return Optional.ofNullable(inFlight.get(packageId));
+    Waiting waiting = inFlight.get(packageId);
+    if (waiting == null) {
+      return Optional.empty();
+    }
+    return Optional.of(viewOf(waiting, full));
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * <p><b>★ 用户裁定 15：人要先"看到这个包"才能逐条裁它</b>——临时包只活在等待窗口里，列表是它唯一的入口（id 形如 {@code
+   * xp-…}）。这里返回的是<b>概览</b>（逐条无明文），与 {@link #find(String, boolean)} 的 {@code full} 那一档分工明确。
+   */
+  @Override
+  public List<DecisionPackage> list() {
+    List<Waiting> snapshot;
+    synchronized (inFlight) {
+      snapshot = new ArrayList<>(inFlight.values());
+    }
+    List<DecisionPackage> rows = new ArrayList<>(snapshot.size());
+    for (Waiting waiting : snapshot) {
+      rows.add(viewOf(waiting, false));
+    }
+    return List.copyOf(rows);
   }
 
   /**
@@ -421,7 +511,7 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
    * 在途明文面的有界 LRU（P3e）：满了淘汰最久未用的那一个<b>只是</b>让人少看一个包的全文（不影响判定、不影响放行条）—— 它在正常情况下恒为空（登记与释放在同一次 {@link
    * #settle} 里成对），所以"满"本身就是异常信号，落 WARN。
    */
-  private static final class InFlightCache extends LinkedHashMap<String, DecisionPackage> {
+  private static final class InFlightCache extends LinkedHashMap<String, Waiting> {
 
     private static final long serialVersionUID = 1L;
 
@@ -430,7 +520,7 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
     }
 
     @Override
-    protected boolean removeEldestEntry(Map.Entry<String, DecisionPackage> eldest) {
+    protected boolean removeEldestEntry(Map.Entry<String, Waiting> eldest) {
       boolean evict = size() > MAX_IN_FLIGHT;
       if (evict) {
         LOG.warn(
@@ -783,10 +873,12 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
           DECIDER_AUTO);
     }
     ApprovalRequest approvalRequest = requestFor(transientPackage, escalated, request.items());
-    // ★ P3e：把这张"正等人裁"的临时包挂进在途明文面——此时它才真的摆在人（或上级判定闸）面前，
-    //   决策面按 xp-… 取得到逐条明文；投递返回（含异常返回）即释放（见 finally）。它是**只读**视图：
-    //   不进 DecisionPackages、不进 pending()、不落盘、不发事件（不变量 1 一个字不动）。
-    inFlight.put(transientPackage.id(), transientPackage);
+    // ★ P3e + 裁定 15：把这张"正等人裁"的临时包挂进在途面——此时它才真的摆在人（或上级判定闸）面前，
+    //   决策面按 xp-… 取得到概览 / 逐条明文，也能对它做**条目级表态**（InFlightDecisionActions）。
+    //   它是**门面**：不进 DecisionPackages、不进 pending()、不落盘、不发 decision.package.* 事件（不变量 1 一个字不动）。
+    Waiting waiting =
+        new Waiting(transientPackage, approvalRequest.id(), escalated, request.proposerKey());
+    inFlight.put(transientPackage.id(), waiting);
     ApprovalDecision answer;
     try {
       // ★ 明细登记必须早于 coordinator.decide：上级判定闸就在那条调用的调用栈上读它（读不到 = 盲判）。
@@ -803,7 +895,7 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
           escalated,
           approvalRequest.kind(),
           judgeDetails.isPresent() ? "已登记（上级判定面读得到逐条明文）" : "未装配（明细缝不在 ⇒ 只到人）");
-      answer = coordinator.decide(approvalRequest);
+      answer = awaitAnswer(waiting, approvalRequest);
     } catch (RuntimeException failure) {
       LOG.error(
           "跨进程决策包投审批面异常 ⇒ 零批准（fail-closed）：proposerKey={} requestId={}",
@@ -813,10 +905,16 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
       return failClosed(request.items(), SETTLEMENT_FAILED, "审批面投递异常");
     } finally {
       // ★ 明文（args）的生命周期到此为止：判定已读完，立刻释放（密钥纪律；释放幂等，跑在 finally 里）。
-      //   在途面同理——"正在等人裁"的窗口一结束，决策面上就再查不到这个临时包。
+      //   ★ 裁定 15：在途面**不立刻摘除**——刚被裁完的包要能被"再 GET 一次 / 再 commit 一次（幂等）"读到；
+      //     移除只发生在结算真正返回之后（见 finally 之外的 inFlight.remove，在保留窗口里由 resolve 标记）。
       judgeDetails.ifPresent(details -> details.release(approvalRequest.id()));
-      inFlight.remove(transientPackage.id());
     }
+    if (waiting.committed) {
+      // ★ 裁定 15 ③：人（或父侧 Agent）下了**执行命令** ⇒ 这就是终局裁决：已批准的那些按表态，没表态的按裁定 14 = 拒绝。
+      //   本类**不执行**（执行在子体，用子体自己的权限与身份——设计 §5quinquies ①）。
+      return committedVerdict(request, waiting, transientPackage);
+    }
+    inFlight.remove(transientPackage.id());
     boolean answered =
         answer == ApprovalDecision.APPROVE_ONCE || answer == ApprovalDecision.APPROVE_SESSION;
     // ★ P3e：这条答复是**谁**给的（与 DecisionApprovalBridge 同一把判据）——登记项还在 = 人答的（通道答复不摘登记项）；
@@ -832,14 +930,38 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
           byHuman ? "在（人答的）" : "不在（无通道/超时/闸链终局拒）");
       return failClosed(request.items(), APPROVAL_UNAVAILABLE, "没有拿到放行答复");
     }
-    String decider = byHuman ? DecisionCascade.HUMAN_DECIDER : DecisionCascade.SUPERIOR_DECIDER;
+    // 走到这里 byHuman 必为假（人答的那条路上面就返回了）——保留变量是为了让"谁拍的板"只有一处表达。
+    String decider = DecisionCascade.SUPERIOR_DECIDER;
+    if (byHuman) {
+      // ★★ 审批面上的"批准" = 人自己的执行命令（用户裁定 15 ③ 在跨进程这条路上的落点，2026-10-17 收口）。
+      //   人按下审批面那个批准键，就是在说"这一包可以做"——它本来就是**第二段**的执行命令，只是形状是审批答复
+      //   而不是 POST /{id}/commit。⇒ 记成 committed（{@link Waiting#commit}），终局统一由 {@link
+      // #committedVerdict}
+      //   产出：① 与决策面那条路**同一套**终局语义（已批按表态、未表态按裁定 14 = 拒绝），不再"两条路两种算法"；
+      //   ② 在途门面快照从此与人看到的动作一致——人批过之后决策面立刻显示"这一条被批"（此前 waiting.verdicts
+      //      恒空 ⇒ 同一时刻决策面还显示 PROPOSED/未表态，"动作做完了、门面说没做"）；
+      //   ③ 与无人在环那条路（{@link #isAutoApproval}）的分界保持不变：那里没有人能敲任何键，由闸链的批准代为
+      //      commit；这里是人亲手敲的（判别力：去掉这一段 ⇒ 人批了但没再敲 commit 的包按"已批未执行"作废，
+      //      而提出者线程恰恰是被这次批准放行的——放行了却什么都不执行）。
+      //   ★ 记法统一：**被批准的那些**逐条写进 {@link Waiting#verdicts}（与"人在决策面逐条表态 + 下执行命令"
+      //     那条路**同一个表示**），再置 committed ⇒ 终局装配只有一处算法（{@link #committedVerdict} 读 verdicts）。
+      //     不这么做就会得到一份"committed 但一条都没表态"的终局，被裁定 14 读成"零批准"。
+      waiting.commitApproved(escalated, DECIDER_HUMAN);
+      LOG.info(
+          "跨进程决策包由人在审批面批准（= 执行命令）⇒ 交回提出者执行 proposerKey={} packageId={} requestId={} approved={}",
+          request.proposerKey(),
+          transientPackage.id(),
+          approvalRequest.id(),
+          escalated);
+      return committedVerdict(request, waiting, transientPackage);
+    }
     // 答复 = 上报集合里的条目全批（本类不提供逐条例外的第二套形状：逐条例外走决策面 HTTP 那条既有路）
     Set<Integer> humanApproved = escalated;
     if (trail.isEmpty()) {
       // 没有级联 ⇒ 没有轨迹可补齐，"批了上报的那些"就是终局（与 P2b 之前"整包到人"的行为同形）
       LOG.info(
           "跨进程决策包由{}整包批准（无级联）proposerKey={} packageId={} requestId={} approved={}",
-          byHuman ? "人" : "上级代批闸",
+          "上级代批闸",
           request.proposerKey(),
           transientPackage.id(),
           approvalRequest.id(),
@@ -850,7 +972,7 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
           reasons(request.items(), humanApproved, humanApproved),
           null,
           decider,
-          byHuman ? DECIDER_HUMAN : DECIDER_SUPERIOR);
+          DECIDER_SUPERIOR);
     }
     DecisionCascade.DecisionTrail completed =
         completeTrail(transientPackage.id(), humanApproved, approvalRequest, decider);
@@ -873,7 +995,529 @@ public final class CrossProcessDecisionGateway implements InFlightDecisionPackag
         reasons(request.items(), approved, humanApproved),
         completed,
         completed.finalizedBy(),
-        byHuman ? DECIDER_HUMAN : DECIDER_SUPERIOR);
+        DECIDER_SUPERIOR);
+  }
+
+  /**
+   * <b>等裁决：人/上级答一次，或有人在决策面下了执行命令</b>（用户裁定 15 ③ 的协调点）。
+   *
+   * <p><b>为什么不是简单地"调一次 coordinator.decide 就完"</b>：裁定 15 让人可以<b>逐条表态</b>、最后再下执行命令。
+   * 若这里一直阻塞在协调器上，人的逐条表态就永远等不到"可以终结"的那一刻——而"执行命令"根本投不进协调器（它不是审批答复，
+   * 是一条<b>新的命令</b>）。所以等法是"<b>一段一段地问，每段之间可以被表态/执行命令唤醒</b>"：
+   *
+   * <ol>
+   *   <li>{@link #step} 已经拿到终局（人答了、上级代批了、没人答 ⇒ 零批准）⇒ 直接用它；
+   *   <li>有人在决策面下了<b>执行命令</b> ⇒ {@link Waiting#committed}（终局裁决按表态算，见 {@link #committedVerdict}）；
+   *   <li>都还没有 ⇒ 调一次 {@code coordinator.decide}（它自己会在通道上等一段），返回后回到 ①。
+   * </ol>
+   *
+   * <p><b>窗口上界 = 包自己的 deadline</b>（裁定 10）：到点就停问（还没人答 ⇒ 零批准；已经逐条批过但没有执行命令 ⇒
+   * 同样按"没拿到执行命令"办，与临时包"人不执行就不落盘"同侧）。
+   *
+   * <p><b>★★ 无人在环的自动裁决 ⇒ 表态即 commit</b>（2026-10-17 控制方裁定，用户可推翻；落地见 {@link #isAutoApproval}）：
+   * <b>上级代批闸 / AutoApprove</b> 给出的批准没有任何"人"参与（审批面上从来没有过登记项，也就没有人能看到这条、能敲 commit）⇒
+   * 若也要求显式执行命令，每一个自动批准的包都要白等到窗口结束再按"已批未执行"作废，自动路径等于失效。 故：闸链批准 ⇒ 当场置 committed（{@link
+   * Waiting#autoCommitted}），裁决者如实记 {@link #DECIDER_SUPERIOR}； <b>有人参与（上报到人、人经通道答）⇒ 仍然只表态、等显式
+   * commit</b>——那是用户裁定 15 ③ 的原意。
+   */
+  private ApprovalDecision awaitAnswer(Waiting waiting, ApprovalRequest request) {
+    ApprovalDecision answer = null;
+    boolean everAnswered = false;
+    // 第二段（等执行命令）的独立上界：第一次进入第二段时定下来（min(执行等待窗, 包 deadline)）。
+    long commitDeadlineEpochMs = Long.MAX_VALUE;
+    while (true) {
+      if (waiting.committed || waiting.expired()) {
+        return answer == null ? ApprovalDecision.DENY : answer;
+      }
+      if (answer == null) {
+        // 第一段：交给既有协调器（闸链 ⇒ 通道 ⇒ 等人）。明细登记已由 settle 在调用本方法之前做完。
+        try {
+          answer = coordinator.decide(request);
+        } catch (RuntimeException failure) {
+          LOG.error(
+              "跨进程决策包投审批面异常 ⇒ 零批准（fail-closed）：proposerKey={} requestId={}",
+              waiting.proposerKey,
+              request.id(),
+              failure);
+          return ApprovalDecision.DENY;
+        }
+        Optional<ApprovalDecision> evidence = evidenceOf(request, answer);
+        if (evidence.isPresent()) {
+          waiting.record(evidence);
+          everAnswered = true;
+        }
+        if (everAnswered) {
+          return answer;
+        }
+        if (isAutoApproval(answer, request)) {
+          // ★★ 无人在环的自动裁决 ⇒ **表态即 commit**（2026-10-17 控制方裁定，用户可推翻；见本方法 javadoc 里那一段）：
+          //   这条答复来自闸链（上级代批 / AutoApprove），审批面上**从来没有过登记项**（approval.requested 都没发），
+          //   所以要等的那位"人"不存在——再等一等就等于把窗口白等满，最后按"已批未执行"收尾，等于让自动路径失去意义。
+          //   ⇒ 当场把上报集合记成已批 + 置 committed，由 settle 交回提出者执行（**执行仍在提出者**，本类不执行）。
+          //   ★ 与"人的路径"的分界就是 registered(...)：人答的那条路登记项一直在（通道答复不摘登记项）。
+          waiting.commitApproved(waiting.escalated, DECIDER_SUPERIOR);
+          LOG.info(
+              "跨进程决策包由闸链自动裁决 ⇒ 表态即 commit（无人在环：没有登记项、没有人可敲执行命令）"
+                  + " proposerKey={} packageId={} requestId={} approved={}",
+              waiting.proposerKey,
+              waiting.pkg.id(),
+              request.id(),
+              waiting.escalated);
+          return answer;
+        }
+        continue;
+      }
+      // ★ 第二段（裁定 15）：协调器已经返回"不是答复"（无通道 / 超时 / 闸链终局拒）。这时**不再重进协调器**
+      //   ——同一条 requestId 已经结算过，第二次投递没有意义（还会把"没人答"多问一遍）。改为等人下**执行命令**：
+      //   人可以在决策面继续逐条表态，最后 commit；commit 会把正阻塞在协调器里的线程结算掉（见 commitPackage），
+      //   所以把等待切成小段是为了"到点就走"这条上界，而不是为了轮询。
+      // ★★ 2026-10-17 用户指令「太变态了直接等30分钟，改！」：这一段等的是"人已经在表态、**只差下执行命令**"，
+      //   不能继承"等人答复"的 30 分钟包窗口（裁定 10）——否则每个没 commit 的用例/调用都白挂 30 分钟
+      //   （实测：`CrossProcessDecisionKindAndPlaintextTest:194` 就卡在这里，线程停在 Waiting.awaitCommand）。
+      //   ⇒ 用**独立、短、可注入**的执行等待窗（缺省 {@link #DEFAULT_COMMIT_WAIT_MILLIS}），仍受包 deadline 兜底；
+      //   窗口内没等到 commit ⇒ 按裁定 15 ④ 的"已批未执行"收尾（**零落盘**，绝不替人执行）。
+      if (commitDeadlineEpochMs == Long.MAX_VALUE) {
+        commitDeadlineEpochMs =
+            Math.min(waiting.deadlineEpochMs(), System.currentTimeMillis() + commitWaitMillis);
+      }
+      long nowMs = System.currentTimeMillis();
+      if (nowMs >= commitDeadlineEpochMs) {
+        LOG.warn(
+            "等执行命令超时 ⇒ 已批未执行（零落盘，裁定 15 ④）：proposerKey={} requestId={} 执行等待窗={}ms",
+            waiting.proposerKey,
+            request.id(),
+            commitWaitMillis);
+        return ApprovalDecision.DENY;
+      }
+      waiting.awaitCommand(
+          Math.min(WAIT_SLICE_MILLIS, Math.max(1L, commitDeadlineEpochMs - nowMs)));
+    }
+  }
+
+  /** 等执行命令的切片长度：够短（到点能及时收），够长（不空转）。 */
+  private static final long WAIT_SLICE_MILLIS = 500L;
+
+  /**
+   * 第二段"等执行命令"的**缺省**窗口（毫秒）——与人答复窗口（包 deadline，缺省 30 分钟， {@link
+   * DecisionPackages#DEFAULT_DEADLINE_MILLIS}）**分开**：人答复可能要离开一会儿，而"表态完只差敲一下
+   * 执行命令"不该按小时算。真要用长窗的可经七参构造覆盖。
+   */
+  public static final long DEFAULT_COMMIT_WAIT_MILLIS = 30_000L;
+
+  /** 这一次协调器调用<b>算不算一次答复</b>（与 {@link #settle} 原先那段判据同源：登记项还在 = 人答的）。 */
+  private Optional<ApprovalDecision> evidenceOf(ApprovalRequest request, ApprovalDecision answer) {
+    if (answer == ApprovalDecision.APPROVE_ONCE || answer == ApprovalDecision.APPROVE_SESSION) {
+      return Optional.of(answer);
+    }
+    return registered(request) ? Optional.of(answer) : Optional.empty();
+  }
+
+  /**
+   * 这一次答复是不是<b>无人在环的自动裁决</b>（闸链给的批准，没有任何"人"参与）。
+   *
+   * <p><b>判据 = 批准 + 审批面上没有登记项</b>：{@code ApprovalCoordinator} 只在"确实要去问人"那条路上 {@code
+   * pending.submit(...)}（发 {@code approval.requested}）；闸链命中（{@link
+   * io.mosire.agentlib.approval.SuperiorJudgeGate} 代批、{@code AutoApproveGate}）与"无通道"都<b>不登记</b>。
+   * 于是"批准 + 没有登记项"这个组合只可能是闸链给的——人答的那条路登记项一直在（通道答复不摘登记项，见 {@link #registered}）。
+   *
+   * <p>它<b>不</b>包含 {@code DENY}：闸链终局拒 / 到点没人答 / 无通道一律走 {@link #failClosed}（零批准、零落盘）， 与裁定 14
+   * 同侧——这里判的是"谁来敲那一下执行命令"，不是"批没批"。
+   */
+  private boolean isAutoApproval(ApprovalDecision answer, ApprovalRequest request) {
+    boolean approved =
+        answer == ApprovalDecision.APPROVE_ONCE || answer == ApprovalDecision.APPROVE_SESSION;
+    return approved && !registered(request);
+  }
+
+  /**
+   * <b>执行命令之后的终局裁决</b>（用户裁定 15 ③ + 裁定 14）：已批准的那些按表态执行，没表态的按"静默 = 拒绝"归成被驳。
+   *
+   * <p>本类<b>不执行</b>任何东西：它把裁决交回提出者（子体），由子体用自己的权限与身份执行被批子集（设计 §5quinquies ①）。 轨迹按"人拍板"补齐（{@link
+   * DecisionCascade#HUMAN_DECIDER}）——是人的表态把这一包定下来的，记录必须说真话。
+   */
+  private Verdict committedVerdict(
+      Request request, Waiting waiting, DecisionPackage transientPackage) {
+    Set<Integer> approved = new LinkedHashSet<>();
+    Set<Integer> humanApproved = new LinkedHashSet<>();
+    for (Item item : request.items()) {
+      if (Boolean.TRUE.equals(waiting.verdicts.get(item.index()))) {
+        approved.add(item.index());
+        if (waiting.escalated.contains(item.index())) {
+          humanApproved.add(item.index());
+        }
+      }
+    }
+    // ★ 那一级是谁：人下的执行命令 ⇒ 人；闸链自动裁决的"表态即 commit" ⇒ 上级（见 Waiting#autoCommitted）。
+    //   轨迹跟着同一个值走：把代批记成"人拍的板"就是记录说谎（与 settle 里 byHuman 那条判据同源）。
+    String decider = waiting.deciderNow();
+    DecisionCascade.DecisionTrail completed = null;
+    if (!waiting.escalated.isEmpty()) {
+      completed = completeTrail(transientPackage.id(), humanApproved, null, decider);
+    }
+    if (completed != null) {
+      approved = new LinkedHashSet<>(completed.finalApproved());
+    }
+    int rejected = request.items().size() - approved.size();
+    if (rejected > 0) {
+      LOG.info(
+          "跨进程决策包由执行命令终结：{} 条未获明确同意（未表态按裁定 14 = 拒绝，零落盘）proposerKey={} packageId={} approved={} decider={}",
+          rejected,
+          request.proposerKey(),
+          transientPackage.id(),
+          approved.size(),
+          decider);
+    } else {
+      LOG.info(
+          "跨进程决策包由执行命令终结：全部 {} 条都被明确同意 proposerKey={} packageId={} decider={}",
+          approved.size(),
+          request.proposerKey(),
+          transientPackage.id(),
+          decider);
+    }
+    return new Verdict(
+        approved,
+        complement(request.items(), approved),
+        reasons(request.items(), approved, humanApproved),
+        completed,
+        // ★ 用 equals 而不是 ==：decider 是**值**（String），比引用会把代批记成"人拍的板"
+        DECIDER_SUPERIOR.equals(decider)
+            ? DecisionCascade.SUPERIOR_DECIDER
+            : DecisionCascade.HUMAN_DECIDER,
+        decider);
+  }
+
+  /**
+   * 临时包的<b>门面快照</b>（用户裁定 15 ②）：把内存态的逐条表态映射成一个 {@link DecisionPackage}，于是决策面的渲染、
+   * "已表态/未表态"标记、状态机词汇（{@code PROPOSED}/{@code DECIDING}/{@code DECIDED}）三处与真包<b>同形</b>——
+   * 人看到的两个面不是两套东西。
+   *
+   * <p>{@code full = false} ⇒ 逐条 {@code args} 在这里就被换掉（概览面<b>结构上</b>拿不到明文）。
+   */
+  private static DecisionPackage viewOf(Waiting waiting, boolean full) {
+    DecisionPackage pkg = waiting.pkg;
+    List<PackageItem> items = new ArrayList<>(pkg.items().size());
+    for (PackageItem item : pkg.items()) {
+      items.add(
+          full
+              ? item
+              : new PackageItem(
+                  item.index(), item.toolName(), Map.of(), item.argsDigest(), item.summary()));
+    }
+    PackageState state;
+    if (waiting.committed) {
+      state = PackageState.DECIDED;
+    } else if (waiting.verdicts.isEmpty()) {
+      state = PackageState.PROPOSED;
+    } else if (waiting.allDecided()) {
+      state = PackageState.DECIDED;
+    } else {
+      state = PackageState.DECIDING;
+    }
+    return new DecisionPackage(
+        pkg.id(),
+        pkg.proposerKey(),
+        pkg.caller(),
+        items,
+        pkg.createdAtEpochMs(),
+        pkg.deadlineEpochMs(),
+        state,
+        // ★ {@code PROPOSED} 态**必须**是 null decision（{@link DecisionPackage} 的构造期不变量：两个字段表达同一件事
+        //   "裁没裁"，不一致就会让"谁在等裁决"出现两个答案）。这里过去无条件填 {@code decisionOf()} ⇒ 一个"还没有任何
+        //   表态、正等人裁"的在途包一被门面快照到就抛 IllegalArgumentException——而快照的调用方正是**上级判定**：
+        //   它在自己那条回调里读一次在途明文面（人/上级"此刻能查到的那一份"），异常顺着判定线程上抛 ⇒
+        //   LlmSuperiorJudgement 按"判定调用失败"降级为拒 ⇒ 整个 MODE_LIMITED 包变成零批准。
+        //   实测（2026-10-17）：CrossProcessDecisionKindAndPlaintextTest 的第 ① 条就是这么红的（它才是那条红的**根因**，
+        //   而不是"代批没执行"）。DECIDING / DECIDED / 已下执行命令三档照旧给 {@code decisionOf()}。
+        state == PackageState.PROPOSED ? null : waiting.decisionOf());
+  }
+
+  /** {@inheritDoc}（裁定 15 ②：决策面按它渲染"这一条定了没有、谁定的"）。 */
+  @Override
+  public List<DecisionPackages.ItemVerdict> itemVerdicts(String packageId) {
+    if (packageId == null) {
+      return List.of();
+    }
+    Waiting waiting = inFlight.get(packageId);
+    return waiting == null ? List.of() : waiting.verdictRows();
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * <p><b>裁定 15 ②：在途包的条目级表态</b>——人可以从决策面按 {@code index} 一条一条地看、一条一条地裁， 而包始终只有这一个（不进 {@code
+   * DecisionPackages}、不落盘、不发事件）。全部条目都表了态 ⇒ 门面快照变 {@code DECIDED}， 但<b>裁决还没交出去</b>：要等执行命令（见 {@link
+   * #commitPackage}）——两段式在跨进程这条路上同样成立。
+   */
+  @Override
+  public DecisionSubmission itemDecided(
+      String packageId, int index, boolean approve, String by, String note) {
+    Objects.requireNonNull(packageId, "packageId");
+    Waiting waiting = inFlight.get(packageId);
+    if (waiting == null) {
+      throw new DecisionPackages.RejectionException(
+          DecisionPackages.PACKAGE_NOT_FOUND, "未知或已结算的在途决策包 id=" + packageId);
+    }
+    if (!waiting.has(index)) {
+      throw new DecisionPackages.RejectionException(
+          DecisionPackages.INVALID_ITEM_INDEX,
+          "表态引用了包内不存在的条目 index="
+              + index
+              + "（包 "
+              + packageId
+              + " 共 "
+              + waiting.pkg.items().size()
+              + " 条）");
+    }
+    if (waiting.verdicts.containsKey(index)) {
+      throw new DecisionPackages.RejectionException(
+          DecisionPackages.ITEM_ALREADY_DECIDED,
+          "条目 index=" + index + " 已经表过态（裁决唯一：一条一次）包=" + packageId);
+    }
+    waiting.recordItem(index, approve, by);
+    LOG.info(
+        "跨进程在途包条目级表态 packageId={} index={} approve={} 已表态={}/{} by={}",
+        packageId,
+        index,
+        approve,
+        waiting.verdicts.size(),
+        waiting.pkg.items().size(),
+        by);
+    DecisionPackage view = viewOf(waiting, false);
+    return new DecisionSubmission(view, null, "逐条表态已记下（还不是执行）：全部条目表态完、或有人下执行命令之后，裁决才会交回提出者");
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * <p><b>裁定 15 ③：执行命令 = "就这些了"</b>——没表态的条目按裁定 14（静默 = 拒绝）归成被驳，已批准的照常交回提出者执行 （执行在子体，父侧不替它做）。重复下命令 ⇒
+   * <b>幂等</b>（第二次拿到同一份门面快照，不重复结算、不再问人一次）。
+   */
+  @Override
+  public DecisionSubmission commitPackage(String packageId, String by) {
+    Objects.requireNonNull(packageId, "packageId");
+    Waiting waiting = inFlight.get(packageId);
+    if (waiting == null) {
+      throw new DecisionPackages.RejectionException(
+          DecisionPackages.PACKAGE_NOT_FOUND, "未知或已结算的在途决策包 id=" + packageId);
+    }
+    boolean anyApproved = waiting.verdicts.containsValue(Boolean.TRUE);
+    if (!anyApproved && !waiting.committed) {
+      throw new DecisionPackages.RejectionException(
+          DecisionPackages.NO_ITEM_DECIDED, "包里没有一条被批准（在途包 " + packageId + "）⇒ 不下执行命令、零落盘");
+    }
+    if (waiting.committed) {
+      // 重复下执行命令 ⇒ 幂等：不重复结算、不再问人一次（裁定 15 ⑪）
+      LOG.info("跨进程在途包重复收到执行命令（幂等：不重复结算）packageId={} by={}", packageId, by);
+      return new DecisionSubmission(viewOf(waiting, false), null, TRANSIENT_COMMIT_NOTE);
+    }
+    waiting.commit();
+    // ★ 把正阻塞在审批通道上的提出者线程<b>立刻</b>放行（与 DecisionApprovalBridge#settleApprovalRequest 同一手法）：
+    //   执行命令不是"审批通道上的答复"，协调器不会自己醒；不结算的话这一包要等满窗口才交得回去。
+    settleApproval(waiting.requestId, anyApproved);
+    LOG.info(
+        "跨进程在途包收到执行命令 packageId={} 已批={} 未表态按拒绝={} by={}",
+        packageId,
+        waiting.verdicts.values().stream().filter(Boolean.TRUE::equals).count(),
+        waiting.pkg.items().size() - waiting.verdicts.size(),
+        by);
+    DecisionPackage view = viewOf(waiting, false);
+    return new DecisionSubmission(view, null, TRANSIENT_COMMIT_NOTE);
+  }
+
+  /**
+   * 用"同一结论"结算审批面上那条请求（同 {@code DecisionApprovalBridge#settleApprovalRequest} 的手法与理由）： {@code
+   * pending.decide} 让通道拿到一个<b>决定</b>（而不是"这条没了"），编排器因此立刻返回。
+   *
+   * <p>失败只 WARN：结算不成功最多让提出者多等一段（它的窗口仍由包 deadline 兜底），不该把一次已经生效的执行命令变成异常。
+   */
+  private void settleApproval(String requestId, boolean approved) {
+    if (requestId == null || requestId.isBlank()) {
+      return;
+    }
+    try {
+      boolean settled =
+          pending.decide(
+              requestId,
+              approved ? ApprovalDecision.APPROVE_ONCE : ApprovalDecision.DENY,
+              DecisionApprovalBridge.DECISION_FACE_SOURCE);
+      LOG.info(
+          "跨进程在途包结算审批面请求（提出者线程立即放行，不再等窗口）requestId={} decision={} settled={}",
+          requestId,
+          approved ? "APPROVE_ONCE" : "DENY",
+          settled);
+    } catch (RuntimeException failure) {
+      LOG.warn("结算审批面请求失败（提出者侧将等它自己的窗口） requestId={}", requestId, failure);
+    }
+  }
+
+  /**
+   * <b>一张正在等人裁的临时包</b>（裁定 15 起它多了"逐条表态的累积"）：
+   *
+   * <ul>
+   *   <li>{@link #pkg} = 父侧自己收到的那份条目（含明文，只在内存里，结算完即释放）；
+   *   <li>{@link #verdicts} = 逐条表态（{@code index ⇒ 批准？}；<b>没表态的条目不在其中</b>——未表态 ≠ 拒绝）；
+   *   <li>{@link #decision} / {@link #evidence} = "协调器这一次给的答复"与"逐条表态是否已经把它定下来了"（见 {@link #step}）；
+   *   <li>{@link #committed} = 有人下过执行命令（终局：裁决按表态算完交回提出者）。
+   * </ul>
+   *
+   * <p><b>锁的边界</b>：本类只锁自己的三个字段；{@code coordinator.decide} 在锁<b>外</b>跑（在 {@link #awaitAnswer} 里）——
+   * 否则人的一次条目级 POST 会被"正阻塞在审批通道上的线程"挡住，裁定 15 想要的操作就不成立了。
+   */
+  private final class Waiting {
+
+    private final DecisionPackage pkg;
+    private final String requestId;
+    private final Set<Integer> escalated;
+    private final String proposerKey;
+    private final Map<Integer, Boolean> verdicts = new LinkedHashMap<>();
+    private Optional<ApprovalDecision> evidence = Optional.empty();
+    private boolean committed;
+
+    /**
+     * 这一包的<b>终局裁决者</b>（{@link #DECIDER_HUMAN} / {@link #DECIDER_SUPERIOR}）：缺省"人"——执行命令由人下；
+     * 闸链自动裁决那条路（{@link #autoCommitted}）改记 {@link #DECIDER_SUPERIOR}。
+     */
+    private String decider = DECIDER_HUMAN;
+
+    Waiting(DecisionPackage pkg, String requestId, Set<Integer> escalated, String proposerKey) {
+      this.pkg = pkg;
+      this.requestId = requestId;
+      this.escalated = Set.copyOf(escalated);
+      this.proposerKey = proposerKey;
+    }
+
+    synchronized boolean has(int index) {
+      for (PackageItem item : pkg.items()) {
+        if (item.index() == index) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    synchronized void recordItem(int index, boolean approve, String by) {
+      verdicts.put(index, approve);
+      notifyAll();
+    }
+
+    synchronized void commit() {
+      committed = true;
+      notifyAll();
+    }
+
+    /**
+     * <b>"这些条目被批准了，而且执行命令也算下过了"</b>——两个调用方共用同一套表示（这正是本方法存在的理由）：
+     *
+     * <ol>
+     *   <li><b>无人在环的自动裁决</b>（上级代批闸 / AutoApprove；2026-10-17 控制方裁定，用户可推翻）：把上报集合记成 已批准并置
+     *       committed——没有人能来敲执行命令，再等只会白等满窗口、最后按"已批未执行"作废；
+     *   <li><b>人在审批面按下批准</b>（用户裁定 15 ③ 在跨进程这条路上的落点）：那个键本来就是第二段的执行命令， 它还负责放行正阻塞在提交口上的提出者线程。
+     * </ol>
+     *
+     * <p><b>为什么必须把逐条表态写进 {@link #verdicts}</b>（而不是只置 committed）：{@link #committedVerdict} 是终局的
+     * <b>唯一</b>装配处，它按 {@code verdicts} 逐条算"哪些被明确同意"（裁定 14）。一份"committed 但 verdicts 为空"的
+     * 状态会被读成<b>零批准</b>——包被静默作废，而提出者线程还恰恰是被这次批准放行的。实测（2026-10-17）： {@code
+     * aHumanApprovalOnTheApprovalFaceIsTheCommitCommand} 就是这么红的。
+     *
+     * @param approvedIndexes 被批准的那些条目（闸链 = 上报集合；人批 = 上报集合）
+     * @param by {@link #DECIDER_SUPERIOR} / {@link #DECIDER_HUMAN}——记录必须说真话（谁拍的板）
+     */
+    synchronized void commitApproved(Set<Integer> approvedIndexes, String by) {
+      for (Integer index : approvedIndexes) {
+        verdicts.put(index, Boolean.TRUE);
+      }
+      decider = by;
+      committed = true;
+      notifyAll();
+    }
+
+    /** 这一包的终局裁决者（持锁读：写全在 synchronized 方法里，读也必须持锁，否则就是"半同步"字段）。 */
+    synchronized String deciderNow() {
+      return decider;
+    }
+
+    synchronized boolean allDecided() {
+      return verdicts.size() >= pkg.items().size();
+    }
+
+    /** 这一包的到点时刻（墙钟毫秒）——等待上界（裁定 10：等待窗口 = 包自己的 deadline）。 */
+    synchronized long deadlineEpochMs() {
+      return pkg.deadlineEpochMs();
+    }
+
+    /**
+     * 等人下执行命令（一小段；超时 / 被 {@link #commit} 唤醒都会返回）。
+     *
+     * <p><b>这里的 {@code WA_NOT_IN_LOOP} 是误报（显式抑制，写明理由）</b>：本方法有意<b>只等一小段</b>——循环在调用方 （{@link
+     * #awaitAnswer} 的 {@code while (true)}），那段循环每轮都要重新判断"执行命令窗到点没有"；把 {@code wait}
+     * 套进本方法的循环里会让"到点就走"这条上界失效（那正是 2026-10-17 之前"白挂 30 分钟"的形状）。
+     */
+    @SuppressFBWarnings(
+        value = "WA_NOT_IN_LOOP",
+        justification = "有意只等一段：循环（含到点判断）在调用方 awaitAnswer 的 while(true) 里，见方法注释")
+    synchronized void awaitCommand(long millis) {
+      try {
+        wait(Math.max(1L, millis));
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    }
+
+    /** 窗口到点（上界 = 包自己的 deadline；协调器自己的 timeout 只决定它每一段等多久）。 */
+    synchronized boolean expired() {
+      return System.currentTimeMillis() >= pkg.deadlineEpochMs();
+    }
+
+    /** 记下一次协调器答复（{@code evidence} 为空 = "这次不算有人答"）⇒ true 表示这就是终局答复。 */
+    synchronized boolean record(Optional<ApprovalDecision> answer) {
+      evidence = answer;
+      notifyAll();
+      return answer.isPresent();
+    }
+
+    /**
+     * 拿"此刻能不能终结"：
+     *
+     * <ol>
+     *   <li>执行命令下过 ⇒ 空（由 {@link #committedVerdict} 按逐条表态产出终局）；
+     *   <li>协调器答复在 ⇒ 直接用（人批准/驳回、上级代批、无人答 ⇒ 零批准）；
+     *   <li>否则 ⇒ 空（继续等）。
+     * </ol>
+     */
+    synchronized Optional<ApprovalDecision> step() {
+      if (committed) {
+        return Optional.empty();
+      }
+      return evidence;
+    }
+
+    /** 门面快照里的裁决快照：累积中就给"已批准哪些"的临时形；执行命令下过就按裁定 14 归成终局形。 */
+    synchronized Decision decisionOf() {
+      Set<Integer> approved = new LinkedHashSet<>();
+      for (Map.Entry<Integer, Boolean> entry : verdicts.entrySet()) {
+        if (Boolean.TRUE.equals(entry.getValue())) {
+          approved.add(entry.getKey());
+        }
+      }
+      if (!committed && !allDecided()) {
+        return new Decision(approved, DECIDED_BY_ITEM_VERDICTS, TRANSIENT_DECIDING_NOTE);
+      }
+      return new Decision(approved, DECIDED_BY_ITEM_VERDICTS, TRANSIENT_COMMIT_NOTE);
+    }
+
+    /** 逐条表态行（决策面按 index 渲染"这一条定了没有、谁定的"）。 */
+    synchronized List<DecisionPackages.ItemVerdict> verdictRows() {
+      List<DecisionPackages.ItemVerdict> rows = new ArrayList<>(verdicts.size());
+      for (PackageItem item : pkg.items()) {
+        Boolean approved = verdicts.get(item.index());
+        if (approved != null) {
+          rows.add(
+              new DecisionPackages.ItemVerdict(
+                  item.index(), approved, DECIDED_BY_ITEM_VERDICTS, ""));
+        }
+      }
+      return List.copyOf(rows);
+    }
   }
 
   /**

@@ -4,14 +4,17 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.decision.DecisionEventTypes;
+import io.mosire.agentlib.decision.DecisionItemDigest;
 import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.event.Event;
+import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.ToolSpec;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolResult;
+import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.subagent.AgentContextReader;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -100,24 +103,37 @@ public final class DecisionHistoryTools {
       @Override
       public String description() {
         return "查自己的决策历史（决策包）：列最近若干个包的逐条去向（COMMITTED/NOT_COMMITTED/REJECTED/PENDING/NOT_SETTLED）、"
-            + "可空理由、裁决者与逐级预裁定轨迹。只能查自己提的包；不含参数明文。无参=最近若干条，给 packageId=看某一个包。";
+            + "可空理由、裁决者与逐级预裁定轨迹；给 packageId + index 可以只看其中一条。"
+            + "★ 默认是概览（不含参数明文）；要看明文必须显式给 full=true（看明文会在你自己的调用事件里留痕）。"
+            + "只能查自己提的包。无参=最近若干条，给 packageId=看某一个包，再加 index=看其中一条。";
       }
 
       @Override
       public Map<String, Object> jsonSchema() {
-        return Map.of(
-            "type",
-            "object",
-            "properties",
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("packageId", Map.of("type", "string", "description", "只看这个包（省略 = 列最近若干条）"));
+        properties.put(
+            "index",
             Map.of(
-                "packageId",
-                Map.of("type", "string", "description", "只看这个包（省略 = 列最近若干条）"),
-                "limit",
-                Map.of(
-                    "type",
-                    "integer",
-                    "description",
-                    "最多列几个包（缺省 " + DEFAULT_LIMIT + "，上限 " + MAX_LIMIT + "）")));
+                "type",
+                "integer",
+                "description",
+                "只看这个包里的第 index 条（条目的身份，不是数组下标；必须与 packageId 一起给）"));
+        properties.put(
+            "full",
+            Map.of(
+                "type",
+                "boolean",
+                "description",
+                "true = 给参数明文（缺省 false = 概览：只有 index/toolName/摘要/去向，没有参数）"));
+        properties.put(
+            "limit",
+            Map.of(
+                "type",
+                "integer",
+                "description",
+                "最多列几个包（缺省 " + DEFAULT_LIMIT + "，上限 " + MAX_LIMIT + "）"));
+        return Map.of("type", "object", "properties", Map.copyOf(properties));
       }
 
       @Override
@@ -142,12 +158,84 @@ public final class DecisionHistoryTools {
                   dbPath,
                   context.identity().instanceId(),
                   strArg(context, "packageId"),
+                  nullableIntArg(context, "index"),
+                  boolArg(context, "full"),
                   intArg(context, "limit", DEFAULT_LIMIT));
           return ToolResult.ok(JSON.writeValueAsString(body));
         } catch (IllegalArgumentException bad) {
           return ToolResult.error("INVALID_ARGUMENTS", bad.getMessage());
         } catch (IllegalStateException | UncheckedIOException | JsonProcessingException failure) {
           LOG.warn("decision_history 读取失败", failure);
+          return ToolResult.error("HISTORY_UNAVAILABLE", String.valueOf(failure.getMessage()));
+        }
+      }
+    };
+  }
+
+  /**
+   * <b>绑定实例与自身事件库的那一份</b>（用户裁定 15 ⑤：子 Agent 进程本地注册同一个工具，读<b>它自己的</b>库）。
+   *
+   * <p><b>为什么不复用 {@link #tool()} 的 {@code context.config()} 那一路</b>：子体进程里那条缝还没有装配期 {@code
+   * toolConfig}（{@code SubagentProcessMain} 走的是最朴素的装配），而从 {@code toolConfig} 推出来的实例身份是 {@code
+   * main}——用它去过滤 {@code proposerKey}，子体自己的包<b>一条都匹配不上</b>（包是按子体实例 id 提的）。 所以这里把两件事在
+   * <b>注册那一刻</b>就钉死：库路径 = 本进程自己那份 {@code events.db}；身份 = 本进程的实例 id。
+   *
+   * <p><b>与父侧那一份的关系</b>：同一个工具名、两份实现、<b>各读各的库</b>（父侧那份 {@code noExport = true}，外发即越权）。 本份的 {@code
+   * noExport = false} 只是"它就是给本进程用的"这一点在类型上的如实表达——它进的是子体自己的 registry， 不经任何 MCP 外发面。
+   *
+   * <p>明文纪律不变：默认概览（无明文），要明文得显式 {@code full=true}——而那时读到的是<b>它自己库里那些 {@code tool.call}
+   * 事件</b>（本来就是它自己的调用记录，不出本进程）。
+   *
+   * @param selfEventsDb 本进程事件库路径（{@code SubagentProcessMain} 自己打开的那一个）
+   * @param selfInstanceId 本实例 id（父侧在链接上绑的那个；模型给不出）
+   */
+  public static AgentTool localTool(Path selfEventsDb, String selfInstanceId) {
+    Objects.requireNonNull(selfEventsDb, "selfEventsDb");
+    Objects.requireNonNull(selfInstanceId, "selfInstanceId");
+    AgentTool base = tool();
+    return new AgentTool() {
+      @Override
+      public String name() {
+        return base.name();
+      }
+
+      @Override
+      public String description() {
+        return base.description();
+      }
+
+      @Override
+      public Map<String, Object> jsonSchema() {
+        return base.jsonSchema();
+      }
+
+      @Override
+      public ToolSpec spec() {
+        // 与父侧那份的唯一差别：本份不外发也不需要外发（它读的就是本进程的库），所以不置 noExport
+        return ToolSpec.level(AccessToken.DEFAULT, false, false, false);
+      }
+
+      @Override
+      public ToolResult execute(ToolContext context) {
+        try {
+          if (!Files.isRegularFile(selfEventsDb)) {
+            throw new IllegalStateException("事件库不存在（本进程尚未落任何事件）: " + selfEventsDb);
+          }
+          Map<String, Object> body =
+              read(
+                  selfEventsDb,
+                  selfInstanceId,
+                  strArg(context, "packageId"),
+                  nullableIntArg(context, "index"),
+                  boolArg(context, "full"),
+                  intArg(context, "limit", DEFAULT_LIMIT));
+          return ToolResult.ok(JSON.writeValueAsString(body));
+        } catch (IllegalArgumentException bad) {
+          return ToolResult.error("INVALID_ARGUMENTS", bad.getMessage());
+        } catch (IllegalStateException
+            | java.io.UncheckedIOException
+            | JsonProcessingException failure) {
+          LOG.warn("decision_history（子体本地）读取失败", failure);
           return ToolResult.error("HISTORY_UNAVAILABLE", String.valueOf(failure.getMessage()));
         }
       }
@@ -164,16 +252,32 @@ public final class DecisionHistoryTools {
    * @return 结构化返回体（可直接 JSON 序列化）；查不到（不存在 / 不是自己的）⇒ 空列表（无存在性 oracle）
    * @throws IllegalStateException 库打不开
    */
-  static Map<String, Object> read(Path dbPath, String selfId, String packageId, int limit) {
+  public static Map<String, Object> read(
+      Path dbPath, String selfId, String packageId, Integer index, boolean full, int limit) {
     Objects.requireNonNull(dbPath, "dbPath");
     Objects.requireNonNull(selfId, "selfId");
     int capped = Math.max(1, Math.min(limit, MAX_LIMIT));
+    if (index != null && index < 0) {
+      throw new IllegalArgumentException("index 必须是非负整数（条目在包内的身份），收到: " + index);
+    }
     List<Event> events = new ArrayList<>();
+    Map<String, String> plaintextByDigest = new LinkedHashMap<>();
     try (SqliteEventStore store = SqliteEventStore.openReadOnly(dbPath)) {
       // 每类各取"按 correlationId 分组的最新一条"，再在内存里按包并起来：
       // 一个包一个 correlationId（桥的事件 correlationId = 包 id），所以这就是"每个包每类一条"
       for (String type : DECISION_EVENT_TYPES) {
         events.addAll(store.queryLatestByCorrelation(type, PER_TYPE_SCAN, 0));
+      }
+      // ★ 两档查看（用户裁定 15 ①）：明文**不**在决策事件里（事件面永不写明文）。要看明文就得回提出者
+      //   自己那份 tool.call 事件——参数本来就在那里（工具调用本来就会落库）。所以 full 那一档多扫一次。
+      if (full) {
+        for (Event call :
+            store.query(new EventQuery("", EventTypes.TOOL_CALL, "", -1, PER_TYPE_SCAN))) {
+          String args = payloadField(call.payload(), "args");
+          if (args != null) {
+            plaintextByDigest.putIfAbsent(DecisionItemDigest.argsDigest(parseArgs(args)), args);
+          }
+        }
       }
     }
     Map<String, List<Event>> byPackage = new LinkedHashMap<>();
@@ -194,7 +298,8 @@ public final class DecisionHistoryTools {
         // 点了名的包：只找它（别人的 / 不存在的 ⇒ 一行都不产出，与"查不到"逐字同形）
         continue;
       }
-      Map<String, Object> row = rowOf(id, byPackage.get(id), selfId).orElse(null);
+      Map<String, Object> row =
+          rowOf(id, byPackage.get(id), selfId, index, full, plaintextByDigest).orElse(null);
       if (row == null) {
         // 不是自己的包 / payload 认不出归属：不出现（"查别人的"与"查不到"返回同一个结果）
         continue;
@@ -208,6 +313,11 @@ public final class DecisionHistoryTools {
     body.put("self", selfId);
     body.put("packages", rows);
     body.put("count", rows.size());
+    // ★ 两档查看的自我说明：读的人（模型）必须知道"这次给的是概览还是明文"，否则它会把"没明文"读成"没有参数"
+    body.put("detailLevel", full ? "FULL（含参数明文）" : "OVERVIEW（概览：不含参数明文）");
+    if (index != null) {
+      body.put("index", index);
+    }
     return body;
   }
 
@@ -227,7 +337,12 @@ public final class DecisionHistoryTools {
    * （{@code decided} 且一条都没批 ⇒ {@code REJECTED}；有批 ⇒ {@code DECIDED} 等提交）&gt; {@code proposed}。
    */
   private static Optional<Map<String, Object>> rowOf(
-      String packageId, List<Event> events, String selfId) {
+      String packageId,
+      List<Event> events,
+      String selfId,
+      Integer onlyIndex,
+      boolean full,
+      Map<String, String> plaintextByDigest) {
     Map<String, Event> latest = new LinkedHashMap<>();
     for (Event event : events) {
       latest.put(event.type(), event);
@@ -267,6 +382,39 @@ public final class DecisionHistoryTools {
       state = "PROPOSED";
     }
 
+    // ★ 条目级查看（用户裁定 15 ②）：只点了名的包 + 点了名的 index ⇒ 只回这一条（不回整包）
+    if (onlyIndex != null) {
+      Event itemDecided = latestItemEvent(events, onlyIndex);
+      Map<String, Object> single =
+          singleItemRow(
+              base,
+              committed != null ? committed : conflicted,
+              expired,
+              decided,
+              onlyIndex,
+              full,
+              plaintextByDigest,
+              itemDecided);
+      if (single == null) {
+        // 包是我的，但没有这个 index ⇒ 空结果（与"不是我的包"同形？不——这里**有**行，只是条目为空，
+        // 由调用方按 items 为空看出来；不编一条不存在的条目）
+        return Optional.of(singleItemEnvelope(packageId, state, itemCount, onlyIndex));
+      }
+      Map<String, Object> row = new LinkedHashMap<>();
+      row.put("packageId", packageId);
+      row.put("state", state);
+      row.put("itemCount", itemCount);
+      row.put("approvedCount", approvedCount);
+      row.put("rejectedCount", intOf(base, "rejectedCount"));
+      row.put("toolNames", strings(base.get("toolNames")));
+      row.put("finalizedBy", trail == null ? null : text(trail, "finalizedBy"));
+      row.put("escalatedToHuman", trail == null ? List.of() : ints(trail.get("escalatedToHuman")));
+      row.put("trail", trailRow(trail));
+      Event lastEvent = newest(events);
+      row.put("ts", lastEvent == null ? "" : lastEvent.ts().toString());
+      row.put("items", List.of(single));
+      return Optional.of(row);
+    }
     Map<String, Object> row = new LinkedHashMap<>();
     row.put("packageId", packageId);
     row.put("state", state);
@@ -279,8 +427,108 @@ public final class DecisionHistoryTools {
     row.put("trail", trailRow(trail));
     Event last = newest(events);
     row.put("ts", last == null ? "" : last.ts().toString());
-    row.put("items", itemRows(base, committed != null ? committed : conflicted, expired, decided));
+    List<Map<String, Object>> items =
+        itemRows(base, committed != null ? committed : conflicted, expired, decided);
+    if (full) {
+      for (Map<String, Object> item : items) {
+        attachPlaintext(item, base, plaintextByDigest);
+      }
+    }
+    row.put("items", items);
     return Optional.of(row);
+  }
+
+  /** 只给某个 index 的空信封（包在、条目不在）：不编造条目，也不假装整包读不到。 */
+  private static Map<String, Object> singleItemEnvelope(
+      String packageId, String state, int itemCount, int index) {
+    Map<String, Object> row = new LinkedHashMap<>();
+    row.put("packageId", packageId);
+    row.put("state", state);
+    row.put("itemCount", itemCount);
+    row.put("requestedIndex", index);
+    row.put("items", List.of());
+    row.put("note", "这个包里没有 index=" + index + " 的条目（包在、条目不在——不编造一条）");
+    return row;
+  }
+
+  /** 包内某条的表态事件（{@code item_decided} 里 index 命中的最新一条；没有 ⇒ null）。 */
+  private static Event latestItemEvent(List<Event> events, int index) {
+    Event found = null;
+    for (Event event : events) {
+      if (!DecisionEventTypes.ITEM_DECIDED.equals(event.type())) {
+        continue;
+      }
+      JsonNode payload = parse(event.payload());
+      if (payload != null
+          && intOf(payload, "index") == index
+          && (found == null || event.seq() > found.seq())) {
+        found = event;
+      }
+    }
+    return found;
+  }
+
+  /**
+   * 单条投影（用户裁定 15 ②）：去向 + 可空理由 + <b>这条是谁表的态</b>（{@code item_decided} 事件）。
+   *
+   * <p>明文的来源与整包那条路同一条：{@code tool.call} 事件（按 {@code argsDigest} 对上）。{@code full = false} 时
+   * <b>根本不去取</b>（caller 也不会把明文表传进来时才有内容）。
+   */
+  private static Map<String, Object> singleItemRow(
+      JsonNode base,
+      Event receiptEvent,
+      Event expired,
+      Event decided,
+      int index,
+      boolean full,
+      Map<String, String> plaintextByDigest,
+      Event itemDecidedEvent) {
+    List<Map<String, Object>> all = itemRows(base, receiptEvent, expired, decided);
+    for (Map<String, Object> item : all) {
+      if (!Integer.valueOf(index).equals(item.get("index"))) {
+        continue;
+      }
+      JsonNode decidedPayload = itemDecidedEvent == null ? null : parse(itemDecidedEvent.payload());
+      item.put("verdict", decidedPayload == null ? null : nullableText(decidedPayload, "verdict"));
+      item.put("by", decidedPayload == null ? null : nullableText(decidedPayload, "by"));
+      item.put("note", decidedPayload == null ? null : nullableText(decidedPayload, "note"));
+      if (full) {
+        attachPlaintext(item, base, plaintextByDigest);
+      }
+      return item;
+    }
+    return null;
+  }
+
+  /**
+   * 把明文挂进条目行（<b>只有 {@code full} 那一档才会走到这里</b>）：按条目顺序取 {@code toolNames} 对应的摘要去找 {@code tool.call}
+   * 事件里同一段摘要的那一次调用。
+   *
+   * <p>对不上（事件被清理 / 摘要算法不同代）⇒ 挂 {@code args: null} + {@code argsNote} 说明"取不到"，<b>不编</b>一份参数。
+   */
+  private static void attachPlaintext(
+      Map<String, Object> item, JsonNode base, Map<String, String> plaintextByDigest) {
+    JsonNode digests = base.get("digests");
+    int position = positionOf(base, item);
+    String digest =
+        digests != null && digests.isArray() && position >= 0 && position < digests.size()
+            ? digests.get(position).asText("")
+            : "";
+    String plaintext = digest.isEmpty() ? null : plaintextByDigest.get(digest);
+    item.put("args", plaintext);
+    if (plaintext == null) {
+      item.put("argsNote", "取不到这一条的明文（提出者的事件库里没有摘要匹配的 tool.call：可能已被清理，或该条不是经工具调用产生的）");
+    }
+  }
+
+  /** 条目在包内的顺序位（{@code index} 不一定从 0 连续，所以位置要靠 {@code indexes} 数组查）。 */
+  private static int positionOf(JsonNode base, Map<String, Object> item) {
+    List<Integer> indexes = ints(base.get("indexes"));
+    Object index = item.get("index");
+    if (index instanceof Integer value) {
+      return indexes.indexOf(value);
+    }
+    return -1;
   }
 
   /** 轨迹行（逐级"谁批/驳了哪些条、可空理由"+ 上报集合 + 终局）；载荷里没有 {@code trail} ⇒ null。 */
@@ -461,6 +709,61 @@ public final class DecisionHistoryTools {
       return text.isBlank() ? null : text.strip();
     }
     return String.valueOf(value);
+  }
+
+  /** 可空整数参数（{@code index}）：缺席 ⇒ {@code null}（"没点名哪一条"，不是 0）。 */
+  private static Integer nullableIntArg(ToolContext context, String name) {
+    Object value = context.arguments().get(name);
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof Number number) {
+      return number.intValue();
+    }
+    try {
+      return Integer.parseInt(String.valueOf(value).strip());
+    } catch (NumberFormatException bad) {
+      throw new IllegalArgumentException(name + " 必须是整数，收到: " + value);
+    }
+  }
+
+  /**
+   * 布尔参数（{@code full}）：缺席 / {@code false} / {@code "false"} ⇒ 假（缺省 = 概览，不猜）。
+   *
+   * <p>{@code "true"}/{@code "1"} 也认（模型有时把布尔写成字符串）；其余字符串 ⇒ {@code false} ——<b>不</b>抛异常：
+   * "要不要给明文"这一问上，读不懂的取值应当落在<b>保守</b>那一侧（不给明文），而不是让整次查询失败。
+   */
+  private static boolean boolArg(ToolContext context, String name) {
+    Object value = context.arguments().get(name);
+    if (value instanceof Boolean flag) {
+      return flag;
+    }
+    if (value instanceof Number number) {
+      return number.intValue() != 0;
+    }
+    return value != null && "true".equalsIgnoreCase(String.valueOf(value).strip());
+  }
+
+  /** 事件载荷里的某个文本字段（缺 / null ⇒ {@code null}）。 */
+  private static String payloadField(String payload, String field) {
+    JsonNode node = parse(payload);
+    JsonNode value = node == null ? null : node.get(field);
+    return value == null || value.isNull() ? null : value.toString();
+  }
+
+  /** {@code tool.call} 载荷里的 {@code args} 是一个 JSON 对象文本；解不出 ⇒ 空表（宁可摘要对不上，也不编）。 */
+  private static Map<String, Object> parseArgs(String argsJson) {
+    try {
+      JsonNode node = JSON.readTree(argsJson);
+      if (node == null || !node.isObject()) {
+        return Map.of();
+      }
+      @SuppressWarnings("unchecked")
+      Map<String, Object> args = JSON.convertValue(node, Map.class);
+      return args;
+    } catch (IOException notJson) {
+      return Map.of();
+    }
   }
 
   private static int intArg(ToolContext context, String name, int fallback) {

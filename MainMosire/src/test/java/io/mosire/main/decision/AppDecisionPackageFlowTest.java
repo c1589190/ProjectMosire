@@ -137,9 +137,21 @@ class AppDecisionPackageFlowTest {
             postPackageDecision(
                 app.approvalPort(), packageId, "{\"approveAll\":true,\"by\":\"case-human\"}");
         assertThat(receipt.statusCode()).isEqualTo(200);
-        JsonNode body = JSON.readTree(receipt.body());
+        JsonNode decidedNow = JSON.readTree(receipt.body());
+        // ★ 用户裁定 15 ③（两段式）：决策面"批"只是**表态** ⇒ 这一步只到 DECIDED，一条都不执行
+        assertThat(decidedNow.get("state").asText())
+            .as("★ 表态 ≠ 执行：裁决面批完是 DECIDED（等执行命令）")
+            .isEqualTo("DECIDED");
+        assertThat(decidedNow.get("decision").get("by").asText()).isEqualTo("case-human");
+        assertThat(runsA.get() + runsB.get() + runsC.get()).as("还没下执行命令 ⇒ 三条都不许跑").isZero();
+
+        // ★ 第二段：显式下执行命令 ⇒ 被批子集恰好执行一次、包落 COMMITTED
+        HttpResponse<String> commit =
+            postPackageDecision(
+                app.approvalPort(), packageId + "/commit", "{\"by\":\"case-human\"}");
+        assertThat(commit.statusCode()).as("执行命令被受理").isEqualTo(200);
+        JsonNode body = JSON.readTree(commit.body());
         assertThat(body.get("state").asText()).isEqualTo("COMMITTED");
-        assertThat(body.get("decision").get("by").asText()).isEqualTo("case-human");
         assertThat(body.get("commit").get("outcomes")).as("B-7：三条各有去向").hasSize(3);
         assertThat(body.get("commit").get("revisionRef").asText()).isNotEmpty();
         assertThat(runsA).hasValue(1);

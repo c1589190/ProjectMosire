@@ -53,6 +53,24 @@ public final class DecisionEventTypes {
    */
   public static final String EXPIRED = "decision.package.expired";
 
+  /**
+   * <b>条目级表态</b>之后（用户裁定 15 ②，2026-10-17）：{@code {packageId, index, approve|reject, by}}。
+   *
+   * <p><b>为什么单列一条事件</b>：逐条表态是"一次裁决的分段表达"——裁决本身仍只由 {@link #DECIDED} 收口（包只有一份裁决），
+   * 但"这一条是谁在什么时候定的"必须逐条可审计，否则分段裁决等于把审计面退回"谁拍的板说不清"。 本事件只回答"哪一条、批还是驳、谁"，<b>不含</b> {@link
+   * PackageItem#args()} 明文，也不含参数摘要之外的内容 —— 理由（{@code note}）是可选的人读一行， 与{@code outcomes}
+   * 的取舍一致：它是"人的话"，不是参数（参数永远只在决策面与内存态里）。
+   */
+  public static final String ITEM_DECIDED = "decision.package.item_decided";
+
+  /**
+   * <b>全文读取审计</b>（用户裁定 15 ①）：有人显式要求看某包某些条目的<b>明文</b>时落一条，载荷只有 {@code {packageId, indexes, by}}。
+   *
+   * <p><b>为什么不记明文本身</b>：这条事件存在的意义正是"明文被谁看过"，把明文抄进来就等于把审计面变成了第二个泄漏面 （密钥纪律）。它记的是<b>读的动作</b>：谁、哪个包、哪些
+   * index、何时（{@code ts} 由事件存储给）。
+   */
+  public static final String DETAIL_READ = "decision.package.detail_read";
+
   private DecisionEventTypes() {
     throw new AssertionError("No instances");
   }

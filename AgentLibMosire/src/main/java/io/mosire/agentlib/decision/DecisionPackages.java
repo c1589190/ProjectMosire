@@ -66,6 +66,30 @@ public final class DecisionPackages {
   /** 拒码：包不在待裁决态（重复裁决、已裁决、已终局）。 */
   public static final String PACKAGE_NOT_PROPOSED = "PACKAGE_NOT_PROPOSED";
 
+  /**
+   * 拒码：包<b>已经进入分段裁决</b>（{@code DECIDING}），整包一次性裁决不再可用。
+   *
+   * <p><b>为什么不让整包裁决去"推翻"已表态的条目</b>：逐条表态是<b>一次裁决</b>的分段表达（用户裁定 15 ②），
+   * 中途来一次整包裁决就必须回答"已表态的那几条还算不算数"——两个答案都会让"这一条到底谁定的"出现两处真相。 所以分段开始之后，路只有两条：继续逐条表态，或等到点（未表态按裁定 14 =
+   * 拒绝）。fail-closed 且没有歧义。
+   */
+  public static final String PARTIAL_DECISION = "PARTIAL_DECISION";
+
+  /**
+   * 拒码：包里的条目<b>一条都还没表态</b>，却在不表态就要执行的口上（用户裁定 15）。
+   *
+   * <p><b>为什么它与 {@link #PACKAGE_NOT_DECIDED} 分开</b>：{@code PACKAGE_NOT_DECIDED} 说的是"这个包还没进入裁决"
+   * （整包裁决未回填 / 逐条裁决未开始），本码说的是"逐条裁决<b>已经开始了</b>，但一条批准都没有"。 两者在行为上都是零落盘（fail-closed
+   * 同侧），分开是为了让人/模型读到的理由准确：前者要"先裁"，后者要"先批至少一条， 或直说不批"——把后者报成前者，等于说"你没裁过"，而事实是你裁过、且一条没批。
+   */
+  public static final String NO_ITEM_DECIDED = "NO_ITEM_DECIDED";
+
+  /** 拒码：重复对<b>同一条</b>表态（裁决唯一：一条一次，重复表态不是"改主意"的入口）。 */
+  public static final String ITEM_ALREADY_DECIDED = "ITEM_ALREADY_DECIDED";
+
+  /** 拒码：表态引用了包内不存在的条目 index（不静默忽略——同 {@link #INVALID_DECISION} 的方向）。 */
+  public static final String INVALID_ITEM_INDEX = "INVALID_ITEM_INDEX";
+
   /** 拒码：包还没裁决就想提交。 */
   public static final String PACKAGE_NOT_DECIDED = "PACKAGE_NOT_DECIDED";
 
@@ -91,6 +115,38 @@ public final class DecisionPackages {
   public static final String REJECTED_ITEM_REASON = "该条未被裁决批准（被驳，零落盘）";
 
   /**
+   * 逐条表态组装出的裁决人标识（用户裁定 15）：{@code Decision.by} 记的是"这一次裁决是谁拍板的"， 而分段表态没有单一的拍板人——每一条各有其人（{@link
+   * ItemVerdict#by()}）。 本常量只出现在<b>终局快照</b>里，逐条那一位不会被它盖掉。
+   */
+  public static final String DECIDED_BY_ITEM_VERDICTS = "item-decisions";
+
+  /**
+   * 分段裁决里"没表态"的条目的被驳理由（用户裁定 15 ④ + 裁定 14）：<b>到点 / 显式执行</b>时才把未决条目归成被驳，
+   * 且理由要如实说清是"没表态"而不是"被投了反对票"——两者在记录里必须分得开（否则"我没看到那一条"会被读成"我否了它"）。
+   */
+  public static final String UNSTATED_ITEM_REASON = "分段裁决终结时仍未表态（静默 = 拒绝，零落盘）";
+
+  /**
+   * 到点原因：<b>裁决已作出，但没人下执行命令</b>（用户裁定 15 ④）。
+   *
+   * <p>它与"没人裁"必须分得开：前者是"批了没跑"（记录面要把它单列一档，别让它看不见），后者是"从来没人管"。 两者都零落盘、都不静默执行，但读记录的人要能一眼看出区别。
+   */
+  public static final String EXPIRED_DECIDED_NOT_EXECUTED =
+      "到点作废：裁决已作出但未执行（没有人下执行命令）——被批子集零落盘，不静默执行";
+
+  /** 到点原因：窗口内<b>一条都没裁</b>（{@code PROPOSED}）——与"批了没跑"是两件事。 */
+  public static final String EXPIRED_NO_DECISION = "到点作废：窗口内没有任何裁决（一条都没裁）——零落盘";
+
+  /**
+   * 具名作废原因：<b>分段裁到一半</b>就没人会接着答了（提出者被回收、审批窗口先到点、无可用通道）。
+   *
+   * <p>它与前两条的区别是"<b>作废不是裁决</b>"：没表态的条目<b>不</b>被写成驳回（{@link #UNSTATED_ITEM_REASON} 只用在 "终结成
+   * DECIDED"那两条路上），历史里读到的是"这个包没裁完就被作废了"。
+   */
+  public static final String EXPIRED_DECIDING_VOIDED =
+      "具名作废：分段裁决进行中而裁决者不再答复（提出者被回收 / 审批窗口先到点 / 无可用通道）——零落盘，未表态的条目不算被驳";
+
+  /**
    * 包缺省的裁决窗口（毫秒）：{@code deadline = now + 这个值}。30 分钟——够人看一眼，也不让包挂到天荒地老。
    *
    * <p><b>为什么这个常量住在包层</b>：它描述的是<b>包</b>能等多久（设计 §5 裁定 10：「用包的」），不是某个工具的参数。 显式提议口 {@code
@@ -100,6 +156,15 @@ public final class DecisionPackages {
 
   private final ReentrantLock lock = new ReentrantLock();
   private final Map<String, Entry> entries = new LinkedHashMap<>();
+
+  /**
+   * 包 id ⇒ <b>最近一次到点</b>的原因（{@link #expiryReason} 的落点；用户裁定 15 ④）。
+   *
+   * <p>只增不删：包表本身也不淘汰终局包（见类注释），两者同寿命。值只有 {@link #EXPIRED_DECIDED_NOT_EXECUTED} 与 {@link
+   * #EXPIRED_NO_DECISION} 两种，都不是明文（密钥纪律：它们是固定文案，不含参数）。
+   */
+  private final Map<String, String> expiredReasons = new LinkedHashMap<>();
+
   private final AtomicLong minted = new AtomicLong();
 
   /** 建一张空表（进程内单例由宿主装配决定；本类无静态状态）。 */
@@ -274,37 +339,110 @@ public final class DecisionPackages {
   }
 
   /**
-   * 提交：把<b>被批子集</b>当<b>一次</b>提交交给 {@link DecisionCommitPort}，返回<b>一份</b>统一结果。
+   * 条目级表态（用户裁定 15 ②⑤：用户口中的"event 命令看一条、裁一条"）。
    *
-   * <p><b>为什么 port 恰好只调一次</b>（红线 4 / B-1）：原子性的作用域 = 被批子集（U6）。N 条被批的调用必须 落成<b>一条</b>
-   * revision，宿主才能把它们当同一个命令处理；把 N 条拆成 N 次调用，就把"整批要么全落 要么全不落"降级成"N 次各自的成败"——那正是隔壁 #1/#2
-   * 两笔出血的形状。所以：{@code DECIDED} 且被批子集 非空 ⇒ 调一次；拿到回执后<b>记账</b>（{@link Entry#receipt}），此后同一包再 commit
-   * <b>不再调 port</b>、 直接返回同一份回执（B-4：同包重放不重复落盘）。
+   * <p><b>它为什么不是第二条决策路径</b>：它<b>不建包</b>、不投递、不执行——只把"这一条怎么定"记进<b>这个包</b>的累积里。
+   * 逐条表态是<b>一次裁决</b>的分段表达（用户原话「裁决是自动归进裁决包」）：包始终只有一个，状态机也只有这一处写口。
    *
-   * <p><b>为什么被驳条目不进 calls</b>（红线 5 / B-2）：被驳 = 零落盘。把被驳条目也交给 port，
-   * 就得指望宿主"记得别落它们"——宿主漏看一个标志位，被驳的条目就落盘了，而包层还以为它被拒了。 从<b>数据结构</b>上让被驳条目到不了 port（它们没有对应的 {@link
-   * ResolvedCall}）才是 fail-closed。 若一条都没批：直接 {@code REJECTED}，<b>根本不碰 port</b>。
+   * <p><b>三种状态迁移</b>（其余一律具名拒）：
    *
-   * <p><b>port 抛异常怎么办</b>（红线 6）：<b>不</b>记成 {@code COMMITTED}，也<b>不</b>编一份"未落定"的回执——
-   * 宿主可能已经写了才抛（契约违规），把不确定说成"没落"同样是假话。本方法保持 {@code DECIDED}、 不记回执，把失败包成 {@code COMMIT_FAILED}
-   * 抛给调用方；之后可以再 commit （提交口的幂等键是 {@code packageId}，见 {@link DecisionCommitPort} 契约第 4 条）。
+   * <ol>
+   *   <li>{@code PROPOSED} + 本条表态 ⇒ {@code DECIDING}（裁决累积中）；
+   *   <li>{@code DECIDING} + 本条表态 ⇒ 还有条目没表态就留在 {@code DECIDING}，全部表态完 ⇒ {@code DECIDED}；
+   *   <li>{@code DECIDED} 及一切终局 ⇒ 拒（{@link #PACKAGE_NOT_PROPOSED}）：裁决唯一，重复表态不是"改主意"的入口。
+   * </ol>
    *
-   * <p><b>持锁调用 port（本类唯一一处）</b>：不持锁就无法保证"同一包不会被两个线程各提交一次"， 而"恰好一次"是 B-1。代价是 port
-   * 慢会阻塞本表其它读写——原子性优先于延迟是这个责任区的取舍； 提交口不得从<b>另一个线程</b>回调本实例（会自堵），同线程重入是安全的（可重入锁）。
+   * <p><b>★ 未表态 ≠ 拒绝</b>（用户裁定 15 ④）：本方法<b>绝不</b>把没表态的条目写进"被驳"——{@link
+   * ItemDecisionResult#undecidedCount()} 如实报还剩几条。把它们归成被驳只发生在两个显式时刻：{@link #commit}（人下执行命令）与 {@link
+   * #expire(long)}（到点）。
    *
-   * <p><b>回执里的逐条 outcomes</b>：与包内 {@code items()} 一一对应、同序（B-7：批 4 驳 1 ⇒ 5 条各有去向）。 宿主回执的 outcomes 按
-   * {@code calls} 顺序对回被批条目；被驳条目的 {@link CommitReceipt.ItemOutcome#REJECTED} 由本层填（设计
-   * §5.3）。宿主少报的条目按回执 {@code status} 推导（{@code COMMITTED} ⇒ 该条 COMMITTED，其余 ⇒
-   * NOT_COMMITTED）并告警；多报的条目忽略并告警。
+   * <p><b>为什么不做"累加式追认"的第二次表态</b>：一条条目只有一次表态（{@link #ITEM_ALREADY_DECIDED}）。允许改口就要回答
+   * "以哪一次为准"，而两次表态之间的那个"已生效但被推翻"的状态没有落点——本版把它挡在门外，fail-closed。
    *
-   * <p><b>冲突后怎么办</b>：{@code CONFLICTED} 是终局——红线 4 规定 commit 只在 {@code DECIDED} 上调 port， 而冲突后的包已不是
-   * {@code DECIDED}，所以同一个包再 commit 只会拿回同一份冲突回执（裁决与冲突摘要都在， 见 {@link
-   * #find}）。要重提，由调用方在解决冲突后<b>重新提议</b>（包 id 由本表发放，{@code propose} 不接受外部 id）——"可同 id 重提"的取舍登记在 RB1
-   * 报告里，本版以红线 4 为准。
+   * @param packageId 包 id
+   * @param index 条目在包内的身份
+   * @param approve {@code true} = 批准这一条，{@code false} = 驳回这一条
+   * @param by 表态人（空白 ⇒ 拒：查不出表态人的记录等于没有审计面）
+   * @param note 可空理由
+   * @return 表态后的包快照 + 已表态条目 + 是否已终结 + 还剩几条未表态
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_EXPIRED} / {@code
+   *     PACKAGE_NOT_PROPOSED} / {@code INVALID_ITEM_INDEX} / {@code ITEM_ALREADY_DECIDED}
+   */
+  public ItemDecisionResult itemDecided(
+      String packageId, int index, boolean approve, String by, String note) {
+    Objects.requireNonNull(packageId, "packageId");
+    Objects.requireNonNull(by, "by");
+    ItemVerdict verdict = new ItemVerdict(index, approve, by, note);
+    lock.lock();
+    try {
+      expireLocked(System.currentTimeMillis());
+      Entry entry = require(packageId);
+      DecisionPackage current = entry.current;
+      if (current.state() != PackageState.PROPOSED && current.state() != PackageState.DECIDING) {
+        throw itemDecideRefusal(current);
+      }
+      if (!knownIndexes(current).contains(index)) {
+        throw new RejectionException(
+            INVALID_ITEM_INDEX,
+            "表态引用了包内不存在的条目 index="
+                + index
+                + "（包 "
+                + current.id()
+                + " 共 "
+                + current.items().size()
+                + " 条）");
+      }
+      if (entry.verdicts.containsKey(index)) {
+        throw new RejectionException(
+            ITEM_ALREADY_DECIDED,
+            "条目 index=" + index + " 已经表过态（裁决唯一：一条一次，重复表态不是改主意）包=" + current.id());
+      }
+      entry.verdicts.put(index, verdict);
+      entry.current =
+          withState(current, PackageState.DECIDING, accumulated(current, entry.verdicts));
+      boolean finalized = false;
+      int undecided = undecidedCount(current, entry.verdicts);
+      if (undecided == 0) {
+        // 全部条目都已表态 ⇒ 包自动进 DECIDED（用户裁定 15 ③）。注：分段表态没有"填未表态"这回事，所以理由位留空
+        finalized = finalizeLocked(entry, "");
+      }
+      LOG.debug(
+          "决策包条目级表态 id={} index={} approve={} by={} 已表态={} 未表态={} state={}",
+          current.id(),
+          index,
+          approve,
+          by,
+          entry.verdicts.size(),
+          undecided,
+          entry.current.state());
+      return new ItemDecisionResult(
+          entry.current, verdictsOf(current, entry.verdicts), finalized, undecided);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 显式执行被批子集（用户裁定 15 ③：用户口中的"裁决包执行命令"）。
+   *
+   * <p><b>与"裁决即执行"的分界</b>：本方法<b>只</b>在有人下执行命令（HTTP {@code POST /{id}/commit} / 工具 {@code
+   * commit_decision_package}）时被调到。裁决回填（{@link #decide}）与逐条表态（{@link #itemDecided}）都<b>不</b>调它——
+   * 这就是用户要"两条命令分开"的直接含义。
+   *
+   * <p><b>可执行的两种态</b>：
+   *
+   * <ul>
+   *   <li>{@code DECIDED}：照旧（被批子集恰好一次提交，B-1/B-2 一个字不变）；
+   *   <li>{@code DECIDING}：<b>显式执行命令即"就这些了"</b>——没表态的条目按用户裁定 14「静默 = 拒绝」归成被驳（零落盘，理由用 {@link
+   *       #UNSTATED_ITEM_REASON}，如实说明是"没表态"而不是"被投了反对票"），已批准的那些照常提交。 一个批准都没有 ⇒ 具名拒 {@link
+   *       #NO_ITEM_DECIDED}，<b>不碰提交口</b>——"执行命令"不是"替人批一条"的入口。
+   * </ul>
+   *
+   * <p>{@code PROPOSED}（一条都没表态）⇒ 拒：没有裁决就没有执行。终局态 ⇒ 照旧拿回同一份回执（{@link #commit} 的幂等，B-4）。
    *
    * @return 统一结果：一份回执，逐条给去向（不出现"部分失败"的第二个错误码，B-7）
    * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_NOT_DECIDED} / {@code
-   *     PACKAGE_EXPIRED} / {@code COMMIT_FAILED}
+   *     NO_ITEM_DECIDED} / {@code PACKAGE_EXPIRED} / {@code COMMIT_FAILED}
    */
   public CommitReceipt commit(String packageId, DecisionCommitPort port) {
     Objects.requireNonNull(packageId, "packageId");
@@ -317,6 +455,21 @@ public final class DecisionPackages {
       if (entry.receipt != null) {
         // B-4：重放直接返回第一次的回执，不再碰 port——幂等不该由调用方负责
         return entry.receipt;
+      }
+      if (current.state() == PackageState.DECIDING) {
+        // ★ 用户裁定 15 ③④：显式执行命令 = "就这些了"。没表态的按裁定 14 归成被驳（零落盘），已批准的照常提交。
+        //   一个批准都没有 ⇒ 具名拒且不碰 port：执行命令不是"替人批一条"的入口（fail-closed 同侧，但理由说清楚）
+        if (entry.verdicts.values().stream().noneMatch(ItemVerdict::approved)) {
+          throw new RejectionException(
+              NO_ITEM_DECIDED,
+              "包里没有一条被批准（已表态 " + entry.verdicts.size() + " 条、全部驳回）⇒ 不执行、零落盘：包 id=" + current.id());
+        }
+        finalizeLocked(entry, UNSTATED_ITEM_REASON);
+        current = entry.current;
+        LOG.info(
+            "决策包执行命令先终结分段裁决 id={} 未表态按拒绝（零落盘）已批={}",
+            current.id(),
+            current.decision().approvedIndexes().size());
       }
       if (current.state() != PackageState.DECIDED) {
         throw commitRefusal(current);
@@ -385,6 +538,144 @@ public final class DecisionPackages {
   }
 
   /**
+   * 该包<b>已表态</b>的条目（用户裁定 15 ②⑤的读口）：按包内条目顺序，<b>未表态的条目不在其中</b>。
+   *
+   * <p>它是给决策面/历史面拼"这一条定了没有、谁定的"用的只读投影：{@code DECIDED} 之后累积已并进裁决，本方法改答"按裁决反推的表态" ——
+   * 两个阶段对同一条目给出同一结论，读的人不会看到"刚裁完的包突然没有逐条记录了"。
+   *
+   * <p>未知 id ⇒ 空列表（{@link #find} 那一路才回答"有没有这个包"）；不抛。
+   */
+  public List<ItemVerdict> itemVerdicts(String packageId) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      expireLocked(System.currentTimeMillis());
+      Entry entry = entries.get(packageId);
+      if (entry == null) {
+        return List.of();
+      }
+      return verdictsOf(entry.current, entry.verdicts);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /** 单条表态的内存态展开（按包内条目顺序；未表态的条目不出现在结果里）。 */
+  private static List<ItemVerdict> verdictsOf(
+      DecisionPackage pkg, Map<Integer, ItemVerdict> accumulated) {
+    List<ItemVerdict> verdicts = new ArrayList<>(pkg.items().size());
+    for (PackageItem item : pkg.items()) {
+      ItemVerdict verdict = accumulated.get(item.index());
+      if (verdict != null) {
+        verdicts.add(verdict);
+        continue;
+      }
+      Decision decision = pkg.decision();
+      if (decision == null) {
+        // 还在分段中且这一条没表过态 ⇒ 它未决（不编一条"驳回"——未表态不是驳回）
+        continue;
+      }
+      verdicts.add(
+          new ItemVerdict(
+              item.index(), decision.approves(item.index()), decision.by(), decision.note()));
+    }
+    return List.copyOf(verdicts);
+  }
+
+  /**
+   * 分段累积 → 一份裁决快照（用户裁定 15 ①：包内每一条只有三档——已批准 / 已驳回 / 未表态）。
+   *
+   * <p>累积态下的 {@code approvedIndexes} 只含<b>已批准</b>的条目：没表态的条目既不在批准集合里，也不在任何"被驳"名单里 （"缺席 = 驳回"这条
+   * fail-closed 方向只在<b>终结</b>时生效，见 {@link #commit} 与 {@link #expireLocked}）。
+   */
+  private static Decision accumulated(DecisionPackage current, Map<Integer, ItemVerdict> verdicts) {
+    Set<Integer> approved = new LinkedHashSet<>();
+    String by = DECIDED_BY_ITEM_VERDICTS;
+    long approvedCount = 0;
+    String lastNote = "";
+    for (PackageItem item : current.items()) {
+      ItemVerdict verdict = verdicts.get(item.index());
+      if (verdict == null) {
+        continue;
+      }
+      if (verdict.approved()) {
+        approved.add(item.index());
+        approvedCount++;
+      }
+      by = verdict.by();
+      if (!verdict.note().isBlank()) {
+        lastNote = verdict.note();
+      }
+    }
+    StringBuilder summary = new StringBuilder();
+    summary
+        .append("分段裁决累积中：已表态 ")
+        .append(verdicts.size())
+        .append('/')
+        .append(current.items().size())
+        .append(" 条，其中批准 ")
+        .append(approvedCount)
+        .append(" 条");
+    if (!lastNote.isBlank()) {
+      summary.append("；最近一条理由：").append(lastNote);
+    }
+    return new Decision(approved, by, summary.toString());
+  }
+
+  /** 未表态的条目数（{@code index → 表态} 里没有的条目数）。 */
+  private static int undecidedCount(DecisionPackage pkg, Map<Integer, ItemVerdict> verdicts) {
+    int undecided = 0;
+    for (PackageItem item : pkg.items()) {
+      if (!verdicts.containsKey(item.index())) {
+        undecided++;
+      }
+    }
+    return undecided;
+  }
+
+  /** 包内全部条目 index（顺序 = 条目顺序）。 */
+  private static Set<Integer> knownIndexes(DecisionPackage pkg) {
+    Set<Integer> known = new LinkedHashSet<>();
+    for (PackageItem item : pkg.items()) {
+      known.add(item.index());
+    }
+    return known;
+  }
+
+  /**
+   * 把分段累积<b>终结</b>成一份 {@link Decision} 并置 {@code DECIDED}（调用方持锁）。
+   *
+   * <p>未表态的条目在这里被归成<b>被驳</b>——这是"静默 = 拒绝"（裁定 14）的唯一落点，只在<b>终结</b>时刻发生： ① 全部条目都表了态（{@code
+   * finalizeNote} 为空）；② 有人下了执行命令 / 包到点（{@code finalizeNote} = {@link #UNSTATED_ITEM_REASON}，如实记因）。
+   *
+   * @return 是否<b>本次</b>真的发生了迁移（{@code false} = 调用方的前提不成立，包已不在分段态）
+   */
+  private boolean finalizeLocked(Entry entry, String finalizeNote) {
+    DecisionPackage current = entry.current;
+    if (current.state() != PackageState.DECIDING && current.state() != PackageState.PROPOSED) {
+      return false;
+    }
+    Set<Integer> approved = new LinkedHashSet<>();
+    for (PackageItem item : current.items()) {
+      ItemVerdict verdict = entry.verdicts.get(item.index());
+      if (verdict != null && verdict.approved()) {
+        approved.add(item.index());
+      }
+    }
+    String note = finalizeNote == null ? "" : finalizeNote;
+    Decision decision = new Decision(approved, DECIDED_BY_ITEM_VERDICTS, note);
+    entry.current = withState(current, PackageState.DECIDED, decision);
+    entry.verdicts.clear();
+    LOG.debug(
+        "决策包分段裁决终结 id={} approved={} 未表态按拒绝={} 理由={}",
+        current.id(),
+        approved.size(),
+        current.items().size() - approved.size(),
+        note.isBlank() ? "（无：全部条目都已表态）" : note);
+    return true;
+  }
+
+  /**
    * 按 id 取包快照；未知 id 返回空。
    *
    * <p><b>终局包也查得到</b>（这与 {@code PendingApprovals#get} 对已决议项的处理同向）：B-4 的 "重放拿同一份回执"、B-7 的"统一结果"、RB3
@@ -400,6 +691,49 @@ public final class DecisionPackages {
       expireLocked(System.currentTimeMillis());
       Entry entry = entries.get(packageId);
       return entry == null ? Optional.empty() : Optional.of(entry.current);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 全表快照（按登记顺序）：终局包也在其中——{@link #find} 的会话式读口。
+   *
+   * <p><b>为什么决策面列表需要它</b>（用户裁定 15 ④）：{@code pending()} 只列"还没人裁"的包，而"<b>已批未执行</b>"的包 （{@code
+   * DECIDED}）既不在 pending、也不在"已落盘"那一档——没有这个方法，决策面就无法把它<b>单列一档</b>， 于是"批了没跑"在人的工作清单上彻底看不见。
+   *
+   * <p>只读：不改变任何状态（惰性到点扫描照旧先跑一次，到期的一样如实进 {@code EXPIRED}）。
+   */
+  public List<DecisionPackage> all() {
+    lock.lock();
+    try {
+      expireLocked(System.currentTimeMillis());
+      List<DecisionPackage> snapshot = new ArrayList<>(entries.size());
+      for (Entry entry : entries.values()) {
+        snapshot.add(entry.current);
+      }
+      return List.copyOf(snapshot);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 该包<b>最近一次到点</b>的原因（{@code Optional.empty()} = 不是到点终局、或本进程还没观测到那次到点）。
+   *
+   * <p><b>为什么原因要留在包表里</b>（用户裁定 15 ④）：{@link DecisionPackage} 的冻结形状里没有"为什么过期"这个字段，
+   * 而记录面必须如实写出「<b>已批未执行</b>」与「<b>没人裁</b>」的区别——两者都零落盘、都不静默执行，但读记录的人要能一眼看出是哪一种。
+   * 所以原因留在包表的一张<b>只增</b>小表里：它只服务读口（事件载荷与决策面列表），不参与任何判定——判定永远只看状态机。
+   *
+   * <p>取值只有三种固定文案（{@link #EXPIRED_DECIDED_NOT_EXECUTED} / {@link #EXPIRED_NO_DECISION} / {@link
+   * #EXPIRED_DECIDING_VOIDED}），都不是明文（密钥纪律）。
+   */
+  public Optional<String> expiryReason(String packageId) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      expireLocked(System.currentTimeMillis());
+      return Optional.ofNullable(expiredReasons.get(packageId));
     } finally {
       lock.unlock();
     }
@@ -428,16 +762,16 @@ public final class DecisionPackages {
   }
 
   /**
-   * 扫一遍超时（{@code nowEpochMs >= deadlineEpochMs} 即到点，与 {@code PendingApprovals#prune} 同口径），
-   * 把<b>还没人裁</b>的包置为 {@link PackageState#EXPIRED}。
+   * 惰性过期（调用方持锁）：只动"还没人裁完"的包——{@code PROPOSED}（一条都没裁）与 {@code DECIDING}（裁到一半）。
+   *
+   * <p><b>★ 用户裁定 15 ④：{@code DECIDING} 到点不是"作废了事"</b>——没表态的条目按裁定 14「静默 = 拒绝」归成被驳、
+   * 已表态的按表态，包在这一刻<b>终结为 {@code DECIDED}</b>；紧接着 {@code DECIDED} 那一档生效：<b>已批但没人下执行命令</b> ⇒ 当场 {@code
+   * EXPIRED} + 如实记因"审批已作出但未执行"，被批子集<b>零落盘</b>。 两条规则在同一次扫描里顺序生效，所以"批了没跑"既不会被悄悄执行，也不会被说成"从没人裁过"。
    *
    * <p><b>零落盘是结构性的</b>：本方法没有提交口参数，它<b>不可能</b>触发任何落盘（§5.6 的 "超时 ⇒ 整包 EXPIRED，零落盘"因此不靠自觉）。
    *
-   * <p><b>为什么不把已裁决的包也一起过期</b>：裁决一旦作出就该保留可查（§5.6 冲突行的"裁决保留"），
-   * 而且冲突之后的重走流程需要那份裁决还在。过期只回答"还没人裁的包，到点就不算了"—— 与审批内核"到点没人答 = 不是放行"同向。
-   *
-   * <p>{@link #propose}/{@link #decide}/{@link #commit}/{@link #find}/{@link #pending} 在各自入口都做
-   * <b>同一次</b>惰性扫描，所以"过期项不在 pending 里、decide/commit 得到具名拒"几处口径一致。
+   * <p>{@link #propose}/{@link #decide}/{@link #commit}/{@link #find}/{@link #pending}/{@link
+   * #itemDecided} 在各自入口都做 <b>同一次</b>惰性扫描，所以"过期项不在 pending 里、decide/commit 得到具名拒"几处口径一致。
    *
    * @param nowEpochMs 判定用的墙钟毫秒（由调用方注入，便于测试与时钟漂移排查）
    * @return 本次<b>新</b>置为 EXPIRED 的包数（本来就是 EXPIRED 的不重复计数）
@@ -452,7 +786,8 @@ public final class DecisionPackages {
   }
 
   /**
-   * 具名作废口（RB2c，设计 §5.12 裁定 B）：把<b>指定的</b>包当场作废（{@code PROPOSED ⇒ EXPIRED}）。
+   * 具名作废口（RB2c，设计 §5.12 裁定 B）：把<b>指定的</b>包当场作废（{@code PROPOSED}/{@code DECIDING} ⇒ {@code
+   * EXPIRED}）。
    *
    * <p><b>它是干什么的</b>：「审批窗口到期而无人答复」与「无可用通道」这两条路上，包已经<b>没人会裁</b>了， 由调用方（审批桥 {@code
    * DecisionApprovalBridge}）具名作废它。作废 = 零落盘、不静默执行——这正是 §5.6 失败语义表的口径： 「决策超时 / 无可用通道 ⇒ 整包 {@code
@@ -462,8 +797,10 @@ public final class DecisionPackages {
    * deadline 决定谁该过期）；本口是调用方<b>已经知道</b>这个包没救了之后的显式动作，与 deadline 无关。 包的 {@code deadlineEpochMs}
    * 仍是<b>上限</b>（§5.12 裁定 B 第 3 条），不是唯一出口。
    *
-   * <p><b>只动 {@code PROPOSED}</b>：已裁决/已终局的包带着裁决或回执，作废它们等于销毁证据。非 {@code PROPOSED} ⇒
-   * <b>原样返回当前包</b>、不抛、不改写——超时路径与别的作废路径可能都会走到这里，幂等是调用方敢重复调它的前提（不抛， 好让竞争里的第二次调用无害）。
+   * <p><b>只动 {@code PROPOSED} / {@code DECIDING}</b>：已裁决/已终局的包带着裁决或回执，作废它们等于销毁证据。其它状态 ⇒
+   * <b>原样返回当前包</b>、不抛、不改写——超时路径与别的作废路径可能都会走到这里，幂等是调用方敢重复调它的前提（不抛， 好让竞争里的第二次调用无害）。 ★ <b>{@code
+   * DECIDING} 也在动之内</b>（用户裁定 15）：分段裁到一半而"没人会答"了，包不能挂着——它当场作废（零落盘），
+   * 未表态的条目<b>不</b>被写成驳回（作废不是裁决），历史里那条 {@code expired} 事件负责说清原因。
    *
    * <p><b>作废 ⇒ 释放该 {@code proposerKey} 的未决名额</b>：{@link #propose} 的「一实例一个未决包」只数 {@code PROPOSED}
    * （§5.11 第 4 条），所以包一进 {@code EXPIRED}，同一 {@code proposerKey} 立刻就能再提议。这正是本条要修的东西： 审批窗口（缺省
@@ -484,40 +821,58 @@ public final class DecisionPackages {
     try {
       Entry entry = require(packageId);
       DecisionPackage current = entry.current;
-      if (current.state() != PackageState.PROPOSED) {
+      if (current.state() != PackageState.PROPOSED && current.state() != PackageState.DECIDING) {
         LOG.debug(
-            "决策包具名作废是空操作（非 PROPOSED，原样返回）id={} state={} nowEpochMs={}",
+            "决策包具名作废是空操作（非 PROPOSED/DECIDING，原样返回）id={} state={} nowEpochMs={}",
             current.id(),
             current.state(),
             nowEpochMs);
         return current;
       }
+      boolean deciding = current.state() == PackageState.DECIDING;
       entry.current = asExpired(current);
+      // 具名作废的原因：分段态与非分段态要分得开（前者是"裁到一半没人答/被回收"，后者是"窗口内没人裁"）
+      expiredReasons.put(current.id(), deciding ? EXPIRED_DECIDING_VOIDED : EXPIRED_NO_DECISION);
       LOG.info(
-          "决策包具名作废 id={} proposerKey={} deadlineEpochMs={} nowEpochMs={} —— 零落盘，未决名额已释放",
+          "决策包具名作废 id={} proposerKey={} deadlineEpochMs={} nowEpochMs={} 原状态={} —— 零落盘，未决名额已释放",
           current.id(),
           current.proposerKey(),
           current.deadlineEpochMs(),
-          nowEpochMs);
+          nowEpochMs,
+          current.state());
       return entry.current;
     } finally {
       lock.unlock();
     }
   }
 
-  /** 惰性过期（调用方持锁）：只动"还没人裁"的包。 */
+  /** 惰性过期（调用方持锁）：只动"还没人裁完"的包（口径见 {@link #expire(long)}）。 */
   private int expireLocked(long now) {
     int expired = 0;
     for (Entry entry : entries.values()) {
       DecisionPackage current = entry.current;
-      if (current.state() == PackageState.PROPOSED && now >= current.deadlineEpochMs()) {
+      if (current.state() == PackageState.DECIDING && now >= current.deadlineEpochMs()) {
+        // ★ 裁定 15 ④：没表态的按裁定 14 = 拒绝，已表态的按表态 ⇒ 这一刻终结为 DECIDED；
+        //   下面 DECIDED 那一档会在同一次扫描里接着把它判成 EXPIRED（已批未执行，零落盘）
+        finalizeLocked(entry, UNSTATED_ITEM_REASON);
+        current = entry.current;
+      }
+      if ((current.state() == PackageState.PROPOSED || current.state() == PackageState.DECIDED)
+          && now >= current.deadlineEpochMs()) {
+        // ★ 裁定 15 ④：DECIDED 到点 = "已批但没人下执行命令" ⇒ EXPIRED + 如实记因 + 被批子集零落盘。
+        //   既不悄悄执行一个没人管的批次，也不假装它执行过（回执面不会出现 COMMITTED）
+        boolean approvedButNotExecuted = current.state() == PackageState.DECIDED;
         entry.current = asExpired(current);
+        expiredReasons.put(
+            current.id(),
+            approvedButNotExecuted ? EXPIRED_DECIDED_NOT_EXECUTED : EXPIRED_NO_DECISION);
         expired++;
         LOG.debug(
-            "决策包超时 id={} proposerKey={} deadlineEpochMs={} —— 零落盘",
+            "决策包超时 id={} proposerKey={} deadlineEpochMs={} 原状态={} —— 零落盘",
             current.id(),
             current.proposerKey(),
-            current.deadlineEpochMs());
+            current.deadlineEpochMs(),
+            current.state());
       }
     }
     return expired;
@@ -548,6 +903,10 @@ public final class DecisionPackages {
                   + "——超时零落盘，不静默执行");
       case DECIDED ->
           throw new IllegalStateException("DECIDED 是可提交态，不该走到这里（包 id=" + current.id() + "）");
+      case DECIDING ->
+          // {@link #commit} 在分段态上先终结再走 DECIDED 那一档；走到这里说明终结没发生（内部不变量被破坏）
+          throw new IllegalStateException(
+              "DECIDING 应当已被 commit 终结为 DECIDED，不该走到这里（包 id=" + current.id() + "）");
       case COMMITTED, REJECTED, CONFLICTED ->
           // 这三个态在本表里必然已有回执（见 commit 的记账点）；没有回执就到不了这里
           throw new IllegalStateException(
@@ -568,6 +927,10 @@ public final class DecisionPackages {
                   + " deadlineEpochMs="
                   + current.deadlineEpochMs()
                   + "——超时零落盘，不静默执行");
+      case DECIDING ->
+          new RejectionException(
+              PARTIAL_DECISION,
+              "决策包已进入分段裁决（DECIDING）：id=" + current.id() + "——整包裁决不再可用，请按条目继续表态（或等到点 ⇒ 未表态按拒绝）");
       case DECIDED, COMMITTED, REJECTED, CONFLICTED ->
           new RejectionException(
               PACKAGE_NOT_PROPOSED,
@@ -576,6 +939,31 @@ public final class DecisionPackages {
                   + " state="
                   + current.state()
                   + "（decide 一次终局，重复裁决不覆盖首次）");
+    };
+  }
+
+  /** 条目级表态不可用的态 ⇒ 具名拒（穷尽 switch，理由同 {@link #commitRefusal}）。 */
+  private static RejectionException itemDecideRefusal(DecisionPackage current) {
+    return switch (current.state()) {
+      case PROPOSED, DECIDING ->
+          throw new IllegalStateException(
+              "PROPOSED / DECIDING 是可表态态，不该走到这里（包 id=" + current.id() + "）");
+      case EXPIRED ->
+          new RejectionException(
+              PACKAGE_EXPIRED,
+              "决策包已超时（EXPIRED）：id="
+                  + current.id()
+                  + " deadlineEpochMs="
+                  + current.deadlineEpochMs()
+                  + "——超时零落盘，不再接受表态");
+      case DECIDED, COMMITTED, REJECTED, CONFLICTED ->
+          new RejectionException(
+              PACKAGE_NOT_PROPOSED,
+              "决策包已终结，不再接受条目级表态：id="
+                  + current.id()
+                  + " state="
+                  + current.state()
+                  + "（裁决唯一：一条一次，重复表态不是改主意）");
     };
   }
 
@@ -717,8 +1105,58 @@ public final class DecisionPackages {
     private DecisionPackage current;
     private CommitReceipt receipt;
 
+    /**
+     * 逐条表态的累积（用户裁定 15）：index ⇒ 表态。{@code PROPOSED} 态为空；表态一条就多一条； 包一进终局就清空（终局态读的是 {@link #current}
+     * 里的 {@link Decision}）。
+     */
+    private final Map<Integer, ItemVerdict> verdicts = new LinkedHashMap<>();
+
     Entry(DecisionPackage initial) {
       this.current = initial;
+    }
+  }
+
+  /**
+   * 一条条目上的表态（用户裁定 15 ②：{@code itemDecided} 的输入与读口形状）。
+   *
+   * <p><b>为什么它是独立记录</b>：{@link Decision} 的冻结形状只有"哪些被批"，答不出"这一条是谁批的、为什么"——
+   * 而分段表态必须逐条可审计（每一条都可能是不同的人在不同时刻拍的板）。本记录只进<b>内存态</b>与回执面，不进事件载荷 （事件只带 index/verdict/by，见 {@code
+   * DecisionEventTypes#ITEM_DECIDED}）。
+   *
+   * @param index 条目在包内的身份（非负）
+   * @param approved {@code true} = 批准，{@code false} = 驳回（没有第三种取值：静默不属于表态，它由"根本没有本记录"表达）
+   * @param by 表态人（通道名 / 实例 id / 工具名；只进审计，不参与判定）
+   * @param note 可空理由（只进内存态与回执；无理由 = 空串）
+   */
+  public record ItemVerdict(int index, boolean approved, String by, String note) {
+
+    public ItemVerdict {
+      if (index < 0) {
+        throw new IllegalArgumentException("index 不得为负（它是条目在包内的身份）：" + index);
+      }
+      Objects.requireNonNull(by, "by");
+      if (by.isBlank()) {
+        throw new IllegalArgumentException("by 不得为空白（「谁表的态」必须能对账）");
+      }
+      note = note == null ? "" : note;
+    }
+  }
+
+  /**
+   * 一次条目级表态的结果（{@link #itemDecided} 的返回值）：把"投递方要不要发事件、要不要接着提交"所需的四件事一次给全。
+   *
+   * @param pkg 表态后的包快照
+   * @param verdicts 该包<b>已表态</b>的条目（按包内条目顺序；未表态的条目<b>不在</b>其中——"缺席 ≠ 驳回"）
+   * @param decidedNow 这一次表态是否把包推到了 {@link PackageState#DECIDED}（投递方据此发 {@code decided} 并走提交）
+   * @param undecidedCount 此刻仍未表态的条目数（{@code DECIDED} 态恒为 0）
+   */
+  public record ItemDecisionResult(
+      DecisionPackage pkg, List<ItemVerdict> verdicts, boolean decidedNow, int undecidedCount) {
+
+    public ItemDecisionResult {
+      Objects.requireNonNull(pkg, "pkg");
+      Objects.requireNonNull(verdicts, "verdicts");
+      verdicts = List.copyOf(verdicts);
     }
   }
 

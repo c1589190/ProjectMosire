@@ -21,60 +21,55 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 决策包的<b>决策面 HTTP 端点</b>（设计 §5.10② + §5.13(e)(f)）：未决包列表、包详情（逐条<b>明文</b>）、提交统一裁决。
+ * 决策包的<b>决策面 HTTP 端点</b>（设计 §5.10② + §5.13(e)(f) + §5septies，用户裁定 15 · 2026-10-17）：
+ * 未决包列表（含"已批未执行"单列一档）、包/条目两级查看（<b>默认概览、{@code full=1} 才给明文</b>）、 条目级表态、执行命令（两段式）。
  *
  * <p>端点（与既有审批面<b>同端口、同安全基线</b>——用 {@link ApprovalHttpEndpoint#createContext(String, HttpHandler)}
  * 挂在<b>同一台</b> server 上，<b>不</b>另起第二台 server/端口）：
  *
  * <ul>
- *   <li>{@code GET /api/decision-packages} → {@code
- *       {"pending":[{id,proposerKey,itemCount,items:[{index,toolName,summary}],createdAtEpochMs,deadlineEpochMs}]}}
- *       ——未决（{@code PROPOSED}）包的快照，<b>不含参数</b>；
+ *   <li>{@code GET /api/decision-packages} → {@code {"pending":[…],"awaitingCommit":[…]}} ——
+ *       未决（{@code PROPOSED}）包 + <b>已批未执行</b>（{@code DECIDED}）包各一档；逐条只给 {@code
+ *       {index,toolName,summary}}， <b>不含参数</b>；
  *   <li>{@code GET /api/decision-packages/{id}} → 包详情：逐条 {@code
- *       {index,toolName,summary,args}}，<b>{@code args} 是明文</b>。这是用户 2026-10-16
- *       的明确要求（原话「肯定展示全部内容啊」）：人要看清自己批的是什么， 而脱敏摘要（{@code argsDigest}）回答不了"这条到底改什么"。明文<b>只</b>经本面（回环
- *       HTTP）出面——不进事件库、不进 {@code ApprovalRequest}、不进日志；
- *       <p><b>★ 详情的两级取数（P3e）</b>：先查 {@link DecisionPackages#find(String)}，未命中再查<b>在途取数口</b> {@link
- *       InFlightDecisionPackages}——跨进程那条路的临时包（{@code xp-…}，建即裁、不进包登记表，见设计 §5sexies）
- *       由它回答，逐条仍是同一形状（{@code args} 是父侧自己收到的明文）。★ 这条回退<b>只服务 GET</b>：{@code POST}
- *       与列表都不认在途包（它<b>不是</b>决策单元，不构成第二条决策路径——不变量 1）；
+ *       {index,toolName,summary,escalated,verdict}}； {@code ?full=1} 才逐条附带 {@code
+ *       args}（<b>明文</b>），且每一次 full 读取落一条 {@code decision.package.detail_read} 审计事件（只记谁/哪个包/哪些
+ *       index，<b>不记明文</b>）；
+ *   <li>{@code GET /api/decision-packages/{id}/items/{index}} → 条目详情（同一套两档口径，{@code ?full=1} 才给明文）；
  *   <li>{@code POST /api/decision-packages/{id}} → body {@code {approveAll:true | rejectAll:true |
- *       items:{index:"approve"|"reject"}, by, note}}：成功 {@code 200} +
- *       回执（含<b>实际生效</b>的裁决与逐条去向）；未知/已过期 id {@code 404}；重复决议或不可决议状态 {@code 409}；坏 body {@code
- *       400}；方法不符 {@code 405}（带 {@code Allow} 头，同既有惯例）。
+ *       items:{index:"approve"|"reject"}, by, note}}：<b>只表态、不执行</b>（两段式的第一段）；
+ *   <li>{@code POST /api/decision-packages/{id}/items/{index}} → body {@code
+ *       {verdict:"approve"|"reject", by, note}}：条目级表态（"event 命令看一条、裁一条"的人侧形态）；
+ *   <li>{@code POST /api/decision-packages/{id}/commit} → body {@code
+ *       {by}}（可空）：<b>执行命令</b>（两段式的第二段）。
  * </ul>
  *
- * <p><b>★ 写路径必须经桥</b>（设计 §5.13(e)）：{@code POST} 调的是注入的 {@link DecisionSubmissionPort}（实现方 = 决策包桥），
- * <b>不</b>直调 {@link DecisionPackages#decide(String, Decision)}。直调会让 {@code
- * decision.package.decided} 不落、 提交口不被调、{@code COMMITTED}/{@code CONFLICTED} 永不产生，而 HTTP 面还会回报
- * 200——那是最坏的一类假成功。 读路径（列表/详情）走 {@link DecisionPackages#pending()}/{@link
- * DecisionPackages#find(String)}：读不是写， 它不改变任何状态机状态。
+ * <p><b>★ 为什么"裁决即执行"被拆成两段</b>（用户裁定 15 ③）：{@code approveAll}/{@code rejectAll}/{@code items}/
+ * 条目级表态<b>都只表态</b>；只有 {@code commit} 会让被批子集落盘。全部条目都表态 ⇒ 包自动进 {@code DECIDED}（等执行）； {@code DECIDED}
+ * 一直没人下执行命令、到点 ⇒ {@code EXPIRED} + 如实记因"已批未执行" + 零落盘（见 {@code DecisionPackages#expire(long)}）。
  *
- * <p><b>裁决形态三选一</b>：
+ * <p><b>★ 明文纪律（本类的落点）</b>：只有 {@code full=1} 的详情响应带明文；列表、默认详情、日志<b>一行明文都不打印</b>。 每次 full 读取都把"被返回的那些
+ * index"报给 {@link DecisionReadAudit}（{@code null} = 未装配 ⇒ 不落审计，见那个接口）。
  *
- * <ul>
- *   <li>{@code "approveAll":true} —— 整包批（条目集合由<b>包自己</b>回答：处理器只把 id 对应的 index 展开成显式集合，
- *       发编号之后包内条目不可变，所以这里不存在"与包内容不一致的第二处真相"）；
- *   <li>{@code "rejectAll":true} —— 整包驳（零落盘，包以 {@code REJECTED} 终局）；
- *   <li>{@code "items":{"0":"approve","2":"reject"}} —— 逐条例外：<b>只有列出 {@code approve} 的条目被批</b>，
- *       没列出的、以及列成 {@code reject} 的，一律按被驳处理（与 {@link Decision#approvedIndexes()} 的 fail-closed
- *       方向一致：缺席 = 驳回，不是放行）。{@code items} 为空对象是非法 body（要整包驳请用 {@code rejectAll}）——
- *       不让"我一条都没勾"和"我全驳"长得一样。
- * </ul>
+ * <p><b>★ 写路径必须经桥</b>（设计 §5.13(e)）：{@code POST} 调的是注入的 {@link DecisionSubmissionPort} / {@link
+ * InFlightDecisionActions}，<b>不</b>直调 {@link DecisionPackages#decide(String, Decision)}。直调会让 {@code
+ * decision.package.*} 事件不落、提交口不被调、{@code COMMITTED}/{@code CONFLICTED} 永不产生，而 HTTP 面还会回报
+ * 200——那是最坏的一类假成功。
  *
- * <p>{@code by} 只是审计注记（原样进 {@link Decision#by()} 与回执，<b>不参与</b>任何判定——不存在"body 里自称 root
- * 所以放行"这类路径），缺省填 {@code "http"}（本通道名）。{@code note} 同理，只进 {@link Decision#note()}（内存态提示面）。
+ * <p><b>★ 两级取数（P3e）与"条目级操作也作用在在途包上"（裁定 15）</b>：先查 {@link DecisionPackages#find(String)}，
+ * 未命中再查<b>在途取数口</b> {@link InFlightDecisionPackages}（跨进程那条路的临时包 {@code xp-…}）。写路径同理： 包表未命中时问 {@link
+ * InFlightDecisionActions}（{@code null} = 没有这个口 ⇒ 在途包不可写，与 P3e 的行为逐字一致）。 两条回退都<b>不</b>改变不变量
+ * 1：在途包不进包表、不进 {@code pending()}、不落盘、不发事件。
  *
  * <p><b>过期不会被伪装成不存在</b>：详情面对已到点的包回 {@code 200} + {@code state=EXPIRED}（它查得到，且状态说得清 为什么没落盘）；只有
  * {@code POST} 把"未知"与"已过期"一并回 {@code 404}（设计 §5.11 第 11 条）， 并由响应体里的 {@code code} 把两者分开。
  *
- * <p><b>判定顺序（先查后决，同审批面口径）</b>：{@code POST} 上 {@code find(id)} 为空 ⇒ 直接 {@code
- * 404}（从未存在；在途口<b>不</b>参与写路径）； {@code GET} 详情多一步在途回退（见 {@link #handleDetail}）；有值 ⇒ 解析 body ⇒
- * 交桥回填。桥抛的状态机具名拒按 {@code code} 映射状态码（{@code PACKAGE_NOT_FOUND}/{@code PACKAGE_EXPIRED} ⇒ 404、
- * {@code PACKAGE_NOT_PROPOSED} ⇒ 409、{@code INVALID_DECISION} ⇒ 400）；<b>认不出的拒码 ⇒ 500</b>
- * （那是缺陷，不该伪装成"客户端写错了"）。提交侧的失败（{@code COMMIT_FAILED}）不走异常：裁决已生效、包只是没落定， 回执里用 {@code warning} 说清楚。
- *
- * <p><b>明文纪律（本类的落点）</b>：只有详情/列表响应与回执带内容；日志只记 id / 状态 / 条数 / 裁决人，<b>一行明文都不打印</b>。
+ * <p><b>判定顺序（先查后决，同审批面口径）</b>：{@code POST} 上 {@code find(id)} 为空且在途口也认不出 ⇒ 直接 {@code 404}；有值 ⇒ 解析
+ * body ⇒ 交桥/在途口回填。桥抛的状态机具名拒按 {@code code} 映射状态码（{@code PACKAGE_NOT_FOUND}/{@code PACKAGE_EXPIRED} ⇒
+ * 404、{@code PACKAGE_NOT_PROPOSED}/{@code ITEM_ALREADY_DECIDED} ⇒ 409、{@code
+ * INVALID_DECISION}/{@code INVALID_ITEM_INDEX}/{@code NO_ITEM_DECIDED} ⇒ 400）；<b>认不出的拒码 ⇒
+ * 500</b>（那是缺陷，不该伪装成"客户端写错了"）。提交侧的失败（{@code COMMIT_FAILED}）不走异常：裁决已生效、包只是没落定， 回执里用 {@code warning}
+ * 说清楚。
  */
 public final class DecisionPackagesHttpHandler implements HttpHandler {
 
@@ -83,6 +78,12 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
 
   /** 决策面根路径（{@code GET} 列表；{@code GET}/{@code POST} + {@code /{id}} 详情与裁决）。 */
   public static final String PATH = "/api/decision-packages";
+
+  /** 条目级详情/表态的子路径段（{@code /{id}/items/{index}} 与 {@code /{id}/commit}）。 */
+  public static final String ITEMS_SEGMENT = "items";
+
+  /** 执行命令的子路径段（{@code /{id}/commit}）。 */
+  public static final String COMMIT_SEGMENT = "commit";
 
   /** 请求体上限（byte）：逐条例外最多 20 条 + 一行 note，给足余量后超限直接 400（不做流式解析）。 */
   private static final int MAX_BODY_BYTES = 65536;
@@ -111,13 +112,19 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
    */
   private final InFlightDecisionPackages inFlight;
 
+  /** <b>在途包的写口</b>（裁定 15 ②③）：{@code null} = 没有这个口 ⇒ 在途包的条目级表态与执行命令都回 {@code 404} （与本能力引入前逐字一致）。 */
+  private final InFlightDecisionActions inFlightActions;
+
+  /** 明文读取审计口（裁定 15 ①）：{@code null} = 未装配 ⇒ 明细面照常给明文、不落审计事件（见 {@link DecisionReadAudit}）。 */
+  private final DecisionReadAudit readAudit;
+
   /**
    * @param packages 决策包登记表（装配层持有的<b>那一个</b>实例：HTTP 面看到的必须是待裁决面看到的同一个表）
    * @param submissions 裁决提交口（实现方 = 决策包桥；见 {@link DecisionSubmissionPort} 的"为什么不能直调状态机"）
    */
   public DecisionPackagesHttpHandler(
       DecisionPackages packages, DecisionSubmissionPort submissions) {
-    this(packages, submissions, null, null);
+    this(packages, submissions, null, null, null, null);
   }
 
   /**
@@ -127,7 +134,7 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       DecisionPackages packages,
       DecisionSubmissionPort submissions,
       Function<String, Set<Integer>> escalatedIndexes) {
-    this(packages, submissions, escalatedIndexes, null);
+    this(packages, submissions, escalatedIndexes, null, null, null);
   }
 
   /**
@@ -140,10 +147,28 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       DecisionSubmissionPort submissions,
       Function<String, Set<Integer>> escalatedIndexes,
       InFlightDecisionPackages inFlight) {
+    this(packages, submissions, escalatedIndexes, inFlight, null, null);
+  }
+
+  /**
+   * 全参装配（裁定 15 · 2026-10-17）：再带上<b>在途包的写口</b>与<b>明文读取审计口</b>。
+   *
+   * @param inFlightActions 在途包的条目级表态 / 执行命令口（{@code null} = 在途包不可写）
+   * @param readAudit 明文读取审计口（{@code null} = 不落审计事件；生产装配必须接，见 {@link DecisionReadAudit}）
+   */
+  public DecisionPackagesHttpHandler(
+      DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Function<String, Set<Integer>> escalatedIndexes,
+      InFlightDecisionPackages inFlight,
+      InFlightDecisionActions inFlightActions,
+      DecisionReadAudit readAudit) {
     this.packages = Objects.requireNonNull(packages, "packages");
     this.submissions = Objects.requireNonNull(submissions, "submissions");
     this.escalatedIndexes = escalatedIndexes;
     this.inFlight = inFlight;
+    this.inFlightActions = inFlightActions;
+    this.readAudit = readAudit;
   }
 
   /**
@@ -156,7 +181,7 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       ApprovalHttpEndpoint endpoint,
       DecisionPackages packages,
       DecisionSubmissionPort submissions) {
-    register(endpoint, packages, submissions, null, null);
+    register(endpoint, packages, submissions, null, null, null, null);
   }
 
   /** 带"上报视图"的注册（P2b）：列表只列上报条目、逐条打 {@code escalated} 标记，见 {@link #escalatedIndexes}。 */
@@ -165,7 +190,7 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       DecisionPackages packages,
       DecisionSubmissionPort submissions,
       Function<String, Set<Integer>> escalatedIndexes) {
-    register(endpoint, packages, submissions, escalatedIndexes, null);
+    register(endpoint, packages, submissions, escalatedIndexes, null, null, null);
   }
 
   /**
@@ -179,6 +204,24 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       DecisionSubmissionPort submissions,
       Function<String, Set<Integer>> escalatedIndexes,
       InFlightDecisionPackages inFlight) {
+    register(endpoint, packages, submissions, escalatedIndexes, inFlight, null, null);
+  }
+
+  /**
+   * 全参注册（裁定 15）：在 P3e 的五参之上再带<b>在途包的写口</b>与<b>明文读取审计口</b>—— 条目级操作与"看了明文留痕"因此对在途包同样成立（见 {@link
+   * InFlightDecisionActions} / {@link DecisionReadAudit}）。
+   *
+   * @param inFlightActions 在途包的条目级表态 / 执行命令口（{@code null} = 在途包不可写）
+   * @param readAudit 明文读取审计口（{@code null} = 不落审计事件）
+   */
+  public static void register(
+      ApprovalHttpEndpoint endpoint,
+      DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Function<String, Set<Integer>> escalatedIndexes,
+      InFlightDecisionPackages inFlight,
+      InFlightDecisionActions inFlightActions,
+      DecisionReadAudit readAudit) {
     Objects.requireNonNull(endpoint, "endpoint");
     endpoint.createContext(
         PATH,
@@ -186,10 +229,15 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
             Objects.requireNonNull(packages, "packages"),
             Objects.requireNonNull(submissions, "submissions"),
             escalatedIndexes,
-            inFlight));
+            inFlight,
+            inFlightActions,
+            readAudit));
   }
 
-  /** 路径后缀分发（同审批面 {@code handleApprovals} 的写法）：{@code ""} = 列表，{@code /{id}} = 详情或裁决。 */
+  /**
+   * 路径后缀分发（裁定 15 起支持四种形状）：{@code ""} = 列表，{@code /{id}} = 详情或整包裁决， {@code /{id}/items/{index}} =
+   * 条目级详情或表态，{@code /{id}/commit} = 执行命令。
+   */
   @Override
   public void handle(HttpExchange exchange) throws IOException {
     String path = exchange.getRequestURI().getPath();
@@ -205,12 +253,32 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       handleList(exchange);
       return;
     }
-    // 只认 "/{id}"：多余的路径段（/a/b）与裸斜杠（/）都不猜，一律 404
-    if (suffix.length() < 2 || suffix.charAt(0) != '/' || suffix.indexOf('/', 1) >= 0) {
+    // 只认 "/{id}"、"/{id}/items/{index}"、"/{id}/commit"：其余（/a/b/c、裸斜杠 /）都不猜，一律 404
+    if (suffix.length() < 2 || suffix.charAt(0) != '/') {
       send(exchange, 404, Map.of("error", "未知路径"));
       return;
     }
-    String id = suffix.substring(1);
+    String[] segments = suffix.substring(1).split("/", -1);
+    if (segments.length == 1 && !segments[0].isEmpty()) {
+      handlePackage(exchange, segments[0]);
+      return;
+    }
+    if (segments.length == 3
+        && !segments[0].isEmpty()
+        && ITEMS_SEGMENT.equals(segments[1])
+        && !segments[2].isEmpty()) {
+      handleItem(exchange, segments[0], segments[2]);
+      return;
+    }
+    if (segments.length == 2 && !segments[0].isEmpty() && COMMIT_SEGMENT.equals(segments[1])) {
+      handleCommit(exchange, segments[0]);
+      return;
+    }
+    send(exchange, 404, Map.of("error", "未知路径"));
+  }
+
+  /** 包级：{@code GET} 详情，{@code POST} 整包/逐条表态（<b>不执行</b>）。 */
+  private void handlePackage(HttpExchange exchange, String id) throws IOException {
     switch (exchange.getRequestMethod()) {
       case "GET" -> handleDetail(exchange, id);
       case "POST" -> handleDecide(exchange, id);
@@ -218,74 +286,418 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     }
   }
 
-  /** 未决包快照：源就是登记表（不读副本——副本会与人的裁决分叉）；每项只带工具名与条目人读摘要，<b>不带参数</b>。 */
+  /**
+   * 未决包 + <b>已批未执行</b>包两档快照：源就是登记表（不读副本——副本会与人的裁决分叉）；每项只带工具名与条目人读摘要， <b>不带参数</b>。
+   *
+   * <p><b>★ 用户裁定 15 ④：「已批未执行」单列一档</b>：{@code DECIDED} 的包既不在 {@code pending()}（它不是"还没人裁"）， 也不在
+   * {@code committed}（还没落盘）——不单列就<b>看不见</b>，而"批了没跑"恰恰是最需要被看见的一档。
+   */
   private void handleList(HttpExchange exchange) throws IOException {
-    send(exchange, 200, Map.of("pending", packageRows()));
+    List<Map<String, Object>> pending = new ArrayList<>();
+    List<Map<String, Object>> awaiting = new ArrayList<>();
+    for (DecisionPackage pkg : packages.pending()) {
+      pending.add(packageRow(pkg));
+    }
+    for (DecisionPackage pkg : awaitingCommit()) {
+      awaiting.add(packageRow(pkg));
+    }
+    Map<String, Object> body = new LinkedHashMap<>();
+    body.put("pending", pending);
+    body.put("awaitingCommit", awaiting);
+    send(exchange, 200, body);
   }
 
-  /** 未决包列表行（{@link DecisionPackages#pending()} 的顺序 = 登记顺序）。 */
-  private List<Map<String, Object>> packageRows() {
-    List<Map<String, Object>> rows = new ArrayList<>();
-    for (DecisionPackage pkg : packages.pending()) {
-      Map<String, Object> row = new LinkedHashMap<>();
-      row.put("id", pkg.id());
-      row.put("proposerKey", pkg.proposerKey());
-      row.put("itemCount", pkg.items().size());
-      Optional<Set<Integer>> escalated = escalatedOf(pkg);
-      row.put("escalated", escalated.map(DecisionPackagesHttpHandler::sorted).orElse(null));
-      // ★ P2b：列表是"人的工作清单" ⇒ 只列上报给他的条目（§5quater ④「决策面只列被上报的那些条目」）；
-      //   没有上报视图（未装配级联 / 该包查不到）⇒ 照旧列全部（宁可多显示，不静默藏条目）
-      row.put("items", itemRows(pkg, false, escalated.orElse(null)));
-      row.put("createdAtEpochMs", pkg.createdAtEpochMs());
-      row.put("deadlineEpochMs", pkg.deadlineEpochMs());
-      rows.add(row);
+  /** 已批未执行的包（{@code DECIDED}）：订单 = 登记顺序（与 {@code pending()} 同口径）。 */
+  private List<DecisionPackage> awaitingCommit() {
+    List<DecisionPackage> rows = new ArrayList<>();
+    for (DecisionPackage pkg : packages.all()) {
+      if (pkg.state() == PackageState.DECIDED) {
+        rows.add(pkg);
+      }
+    }
+    for (DecisionPackage pkg : inFlightList()) {
+      if (pkg.state() == PackageState.DECIDED || pkg.state() == PackageState.DECIDING) {
+        rows.add(pkg);
+      }
     }
     return rows;
   }
 
+  /** 未决包列表行（{@link DecisionPackages#pending()} 的顺序 = 登记顺序）。 */
+  private Map<String, Object> packageRow(DecisionPackage pkg) {
+    Map<String, Object> row = new LinkedHashMap<>();
+    row.put("id", pkg.id());
+    row.put("proposerKey", pkg.proposerKey());
+    row.put("state", pkg.state().name());
+    row.put("itemCount", pkg.items().size());
+    Optional<Set<Integer>> escalated = escalatedOf(pkg);
+    row.put("escalated", escalated.map(DecisionPackagesHttpHandler::sorted).orElse(null));
+    row.put("decided", verdictRows(pkg));
+    row.put("undecided", undecidedIndexes(pkg));
+    // ★ P2b：列表是"人的工作清单" ⇒ 只列上报给他的条目（§5quater ④「决策面只列被上报的那些条目」）；
+    //   没有上报视图（未装配级联 / 该包查不到）⇒ 照旧列全部（宁可多显示，不静默藏条目）
+    row.put("items", itemRows(pkg, false, escalated.orElse(null)));
+    row.put("createdAtEpochMs", pkg.createdAtEpochMs());
+    row.put("deadlineEpochMs", pkg.deadlineEpochMs());
+    // ★ 裁定 15 ④：到点原因要读得到（"已批未执行"与"没人裁"必须分得开）
+    packages.expiryReason(pkg.id()).ifPresent(reason -> row.put("expiryReason", reason));
+    return row;
+  }
+
   /**
-   * 包详情：逐条 {@code {index,toolName,summary,args,escalated}}——{@code args} <b>明文</b>（用户 2026-10-16
-   * 的要求）。
+   * 包详情：逐条 {@code {index,toolName,summary,escalated,verdict,decidedBy}}； {@code ?full=1} 才附带 {@code
+   * args}（<b>明文</b>，并落审计事件）。
+   *
+   * <p><b>★ 两档查看（用户裁定 15 ①）</b>：默认<b>概览</b>（不含明文）——用户原话「肯定是笼统的，除非要求 {@code full} 查看」。 这<b>收窄</b>了
+   * 2026-10-16「肯定展示全部内容啊」的落地口径：旧原话仍有效（裁决者<b>能</b>看全文）， 新口径管的是"默认不给、要来才给"。
    *
    * <p><b>详情面刻意列全部条目</b>（P2b）：人对整包有知情权（"这个包里还有哪些是下级已经批掉的"是判断的依据）， 所以这里不做过滤，只逐条打 {@code escalated}
    * 标记（{@code true} = 这条还需要你裁）。过滤只发生在列表那条工作清单上。
    *
    * <p><b>两级取数（P3e）</b>：先 {@link DecisionPackages#find(String)}，未命中再问 {@link #inFlight}（在途的跨进程临时包，
-   * {@code xp-…}）。★ 两级都<b>只读</b>：不建包、不改状态、不进列表；非在途/已结算 ⇒ 与"从未存在"同一个 {@code 404}。 ★ {@code POST}
-   * <b>不</b>走这条回退（{@link #handleDecide} 仍只认包登记表）：在途包不是决策单元，不构成第二条决策路径（不变量 1）。
+   * {@code xp-…}）。两级都<b>只读</b>：不建包、不改状态、不进列表；非在途/已结算 ⇒ 与"从未存在"同一个 {@code 404}。
    *
    * <p>未知 id ⇒ {@code 404}；已到点的包 ⇒ {@code 200} + {@code state=EXPIRED}（过期不伪装成不存在）。
    */
   private void handleDetail(HttpExchange exchange, String id) throws IOException {
+    boolean full = wantsFull(exchange);
     Optional<DecisionPackage> found = packages.find(id);
     if (found.isEmpty()) {
-      found = inFlightOf(id);
+      found = inFlightOf(id, full);
     }
     if (found.isEmpty()) {
       send(exchange, 404, Map.of("error", "未知的决策包 id"));
       return;
     }
-    send(exchange, 200, detailRow(found.get()));
+    DecisionPackage pkg = found.get();
+    auditFullRead(id, pkg, full);
+    send(exchange, 200, detailRow(pkg, full));
   }
 
   /**
-   * 在途包的取数（P3e）：没接口 / 查不到 / 接口自己炸了 ⇒ 空值（照旧 {@code 404}）。
+   * 条目级：{@code GET} 单条详情，{@code POST} 单条表态。
+   *
+   * <p>它是用户口中"用 event 命令查看某一条具体的决策，进行裁决"的<b>人侧形态</b>（Agent 侧是 {@code decision_history{index}} +
+   * {@code decide_decision_item}）。
+   */
+  private void handleItem(HttpExchange exchange, String id, String rawIndex) throws IOException {
+    int index;
+    try {
+      index = Integer.parseInt(rawIndex.strip());
+    } catch (NumberFormatException notANumber) {
+      send(exchange, 400, Map.of("error", "条目 index 必须是非负整数，收到: " + rawIndex));
+      return;
+    }
+    if (index < 0) {
+      send(exchange, 400, Map.of("error", "条目 index 必须是非负整数，收到: " + rawIndex));
+      return;
+    }
+    switch (exchange.getRequestMethod()) {
+      case "GET" -> handleItemDetail(exchange, id, index);
+      case "POST" -> handleItemDecide(exchange, id, index);
+      default -> methodNotAllowed(exchange, "GET, POST");
+    }
+  }
+
+  /** 条目详情：与包详情同一套两档口径（{@code ?full=1} 才给明文并落审计）。 */
+  private void handleItemDetail(HttpExchange exchange, String id, int index) throws IOException {
+    boolean full = wantsFull(exchange);
+    Optional<DecisionPackage> found = packages.find(id);
+    if (found.isEmpty()) {
+      found = inFlightOf(id, full);
+    }
+    if (found.isEmpty()) {
+      send(exchange, 404, Map.of("error", "未知的决策包 id"));
+      return;
+    }
+    DecisionPackage pkg = found.get();
+    PackageItem item = itemOf(pkg, index);
+    if (item == null) {
+      send(
+          exchange,
+          404,
+          Map.of("error", "该包里没有这个条目 index", "code", DecisionPackages.INVALID_ITEM_INDEX));
+      return;
+    }
+    if (full) {
+      auditFullRead(id, pkg, true);
+    }
+    // 单条详情也带 escalated 标记（口径与包详情一致：没有上报视图 ⇒ 一律 true）
+    boolean escalated = escalatedOf(pkg).map(indexes -> indexes.contains(index)).orElse(true);
+    send(exchange, 200, itemRow(pkg, item, full, escalated));
+  }
+
+  /**
+   * 整包裁决（{@code POST /{id}}）：<b>只表态</b>（用户裁定 15 ③）。
+   *
+   * <p><b>★ 只认包登记表或在途写口</b>（P3e 的边界 + 裁定 15 的扩展）：在途包（{@code xp-…}）没有状态机、不进包表，
+   * 但它是"人此刻正在裁决的那个包"——没有在途写口（{@code null}）时它与未知 id 同归 {@code 404}（与本能力引入前逐字一致）。
+   */
+  private void handleDecide(HttpExchange exchange, String id) throws IOException {
+    Optional<DecisionPackage> found = packages.find(id);
+    if (found.isEmpty()) {
+      if (inFlightActions == null || inFlightOf(id, false).isEmpty()) {
+        send(
+            exchange,
+            404,
+            Map.of("error", "未知的决策包 id", "code", DecisionPackages.PACKAGE_NOT_FOUND));
+        return;
+      }
+      decideInFlightPackage(exchange, id);
+      return;
+    }
+    Decision decision;
+    try {
+      decision = readDecision(exchange, found.get());
+    } catch (BadBody badBody) {
+      send(exchange, 400, Map.of("error", badBody.getMessage()));
+      return;
+    }
+    DecisionSubmission submission;
+    try {
+      submission = submissions.submitDecision(id, decision);
+    } catch (DecisionPackages.RejectionException refusal) {
+      refuseByCode(exchange, refusal);
+      return;
+    } catch (RuntimeException failure) {
+      // 兜底：编排/桥的意外异常不得让连接悬着，也不得被说成"客户端写错了"
+      LOG.warn("决策面裁决提交异常（未落定） packageId={} 异常={}", id, failure.toString());
+      send(exchange, 500, Map.of("error", "裁决提交失败（服务器侧异常）"));
+      return;
+    }
+    LOG.info(
+        "决策面收到裁决 packageId={} state={} approved={} rejected={} by={}（两段式：表决权不在本步执行）",
+        id,
+        submission.pkg().state(),
+        approvedIndexes(submission.pkg()).size(),
+        rejectedIndexes(submission.pkg()).size(),
+        decision.by());
+    send(exchange, 200, receiptRow(submission));
+  }
+
+  /** 在途包的整包/逐条表态：拆成逐条调在途写口（在途包没有"整包一次裁"的状态机，逐条就是它的等价形态）。 */
+  private void decideInFlightPackage(HttpExchange exchange, String id) throws IOException {
+    Map<Integer, String> perItem;
+    String by;
+    String note;
+    try {
+      JsonNode node = readBody(exchange);
+      boolean approveAll = flag(node, "approveAll").orElse(false);
+      boolean rejectAll = flag(node, "rejectAll").orElse(false);
+      JsonNode itemsNode = node.get("items");
+      if (itemsNode != null && !itemsNode.isObject()) {
+        throw new BadBody("items 必须是对象 {index: approve|reject}");
+      }
+      int forms = (approveAll ? 1 : 0) + (rejectAll ? 1 : 0) + (itemsNode == null ? 0 : 1);
+      if (forms == 0) {
+        throw new BadBody(
+            "缺少裁决形态：三选一——approveAll:true / rejectAll:true / items:{index:approve|reject}");
+      }
+      if (forms > 1) {
+        throw new BadBody("裁决形态只能三选一：approveAll / rejectAll / items 不得同时给（不猜人的意思）");
+      }
+      by = textField(node, "by", DEFAULT_BY);
+      note = textField(node, "note", "");
+      perItem = new LinkedHashMap<>();
+      if (approveAll || rejectAll) {
+        Optional<DecisionPackage> pkg = inFlightOf(id, false);
+        if (pkg.isEmpty()) {
+          send(
+              exchange,
+              404,
+              Map.of("error", "未知或已结算的在途决策包 id", "code", DecisionPackages.PACKAGE_NOT_FOUND));
+          return;
+        }
+        for (PackageItem item : pkg.get().items()) {
+          perItem.put(item.index(), approveAll ? APPROVE : REJECT);
+        }
+      } else {
+        for (Map.Entry<String, JsonNode> entry : itemsNode.properties()) {
+          String key = entry.getKey() == null ? "" : entry.getKey().strip();
+          int index;
+          try {
+            index = Integer.parseInt(key);
+          } catch (NumberFormatException e) {
+            throw new BadBody("items 的键必须是非负整数 index（条目在包内的身份），收到: " + key);
+          }
+          JsonNode value = entry.getValue();
+          if (value == null || !value.isTextual()) {
+            throw new BadBody("items[" + key + "] 必须是文本 approve|reject");
+          }
+          String verdict = value.asText().strip();
+          if (!APPROVE.equals(verdict) && !REJECT.equals(verdict)) {
+            throw new BadBody("items[" + key + "] 只接受 approve|reject，收到: " + verdict);
+          }
+          perItem.put(index, verdict);
+        }
+        if (perItem.isEmpty()) {
+          throw new BadBody("items 不得为空：要整包驳请用 rejectAll；未列出的条目一律按未表态处理");
+        }
+      }
+    } catch (BadBody badBody) {
+      send(exchange, 400, Map.of("error", badBody.getMessage()));
+      return;
+    }
+    DecisionSubmission last = null;
+    try {
+      for (Map.Entry<Integer, String> entry : perItem.entrySet()) {
+        last =
+            inFlightActions.itemDecided(
+                id, entry.getKey(), APPROVE.equals(entry.getValue()), by, note);
+      }
+    } catch (DecisionPackages.RejectionException refusal) {
+      refuseByCode(exchange, refusal);
+      return;
+    } catch (RuntimeException failure) {
+      LOG.warn("决策面在途包裁决异常（未落定） packageId={} 异常={}", id, failure.toString());
+      send(exchange, 500, Map.of("error", "裁决提交失败（服务器侧异常）"));
+      return;
+    }
+    if (last == null) {
+      send(exchange, 400, Map.of("error", "没有可表态的条目"));
+      return;
+    }
+    LOG.info("决策面收到在途包裁决 packageId={} state={} 条数={}", id, last.pkg().state(), perItem.size());
+    send(exchange, 200, receiptRow(last));
+  }
+
+  /**
+   * 条目级表态（{@code POST /{id}/items/{index}}）：body {@code {verdict:"approve"|"reject", by, note}}。
+   *
+   * <p>包表命中 ⇒ 走桥的 {@link DecisionSubmissionPort#itemDecided}；未命中 ⇒ 问在途写口。两条路都<b>只表态、不执行</b>。
+   */
+  private void handleItemDecide(HttpExchange exchange, String id, int index) throws IOException {
+    boolean approve;
+    String by;
+    String note;
+    try {
+      JsonNode node = readBody(exchange);
+      JsonNode verdictNode = node.get("verdict");
+      if (verdictNode == null || !verdictNode.isTextual()) {
+        throw new BadBody("verdict 必须是文本 approve|reject");
+      }
+      String verdict = verdictNode.asText().strip();
+      if (!APPROVE.equals(verdict) && !REJECT.equals(verdict)) {
+        throw new BadBody("verdict 只接受 approve|reject，收到: " + verdict);
+      }
+      approve = APPROVE.equals(verdict);
+      by = textField(node, "by", DEFAULT_BY);
+      note = textField(node, "note", "");
+    } catch (BadBody badBody) {
+      send(exchange, 400, Map.of("error", badBody.getMessage()));
+      return;
+    }
+    DecisionSubmission submission;
+    try {
+      if (packages.find(id).isPresent()) {
+        submission = submissions.itemDecided(id, index, approve, by, note);
+      } else if (inFlightActions != null && inFlightOf(id, false).isPresent()) {
+        submission = inFlightActions.itemDecided(id, index, approve, by, note);
+      } else {
+        send(
+            exchange,
+            404,
+            Map.of("error", "未知的决策包 id", "code", DecisionPackages.PACKAGE_NOT_FOUND));
+        return;
+      }
+    } catch (DecisionPackages.RejectionException refusal) {
+      refuseByCode(exchange, refusal);
+      return;
+    } catch (RuntimeException failure) {
+      LOG.warn("决策面条目级表态异常（未落定） packageId={} index={} 异常={}", id, index, failure.toString());
+      send(exchange, 500, Map.of("error", "条目级表态失败（服务器侧异常）"));
+      return;
+    }
+    LOG.info(
+        "决策面条目级表态 packageId={} index={} approve={} state={} by={}",
+        id,
+        index,
+        approve,
+        submission.pkg().state(),
+        by);
+    send(exchange, 200, receiptRow(submission));
+  }
+
+  /**
+   * 执行命令（{@code POST /{id}/commit}）：<b>两段式的第二段</b>（用户裁定 15 ③）。
+   *
+   * <p>只有这一步会让被批子集落盘。重复 {@code commit} ⇒ 幂等（包层 {@code entry.receipt} 早返回，第二次不重复执行）； 非可执行态（{@code
+   * PROPOSED} / 一条都没批的分段态 / 已终局）⇒ 具名拒，由 {@link #refuseByCode} 映射状态码。
+   */
+  private void handleCommit(HttpExchange exchange, String id) throws IOException {
+    if (!requireMethod(exchange, "POST")) {
+      return;
+    }
+    String by;
+    try {
+      JsonNode node = readBody(exchange);
+      by = node == null ? DEFAULT_BY : textField(node, "by", DEFAULT_BY);
+    } catch (BadBody badBody) {
+      send(exchange, 400, Map.of("error", badBody.getMessage()));
+      return;
+    }
+    DecisionSubmission submission;
+    try {
+      if (packages.find(id).isPresent()) {
+        submission = submissions.commitPackage(id, by);
+      } else if (inFlightActions != null && inFlightOf(id, false).isPresent()) {
+        submission = inFlightActions.commitPackage(id, by);
+      } else {
+        send(
+            exchange,
+            404,
+            Map.of("error", "未知的决策包 id", "code", DecisionPackages.PACKAGE_NOT_FOUND));
+        return;
+      }
+    } catch (DecisionPackages.RejectionException refusal) {
+      refuseByCode(exchange, refusal);
+      return;
+    } catch (RuntimeException failure) {
+      LOG.warn("决策面执行命令异常（未落定） packageId={} 异常={}", id, failure.toString());
+      send(exchange, 500, Map.of("error", "执行命令失败（服务器侧异常）"));
+      return;
+    }
+    LOG.info(
+        "决策面收到执行命令 packageId={} state={} 落定={} by={}",
+        id,
+        submission.pkg().state(),
+        submission.receipt() == null ? "未落定（见 warning）" : submission.receipt().status(),
+        by);
+    send(exchange, 200, receiptRow(submission));
+  }
+
+  /**
+   * 在途包的取数（P3e + 裁定 15 ①）：没接口 / 查不到 / 接口自己炸了 ⇒ 空值（照旧 {@code 404}）。
    *
    * <p>接口异常按<b>取不到</b>办：在途视图是"多给一条看全文的路"，它坏了不该让详情面变成 500——但也不该静默，落一行 WARN （同 {@link #escalatedOf}
    * 的口径）。
    */
-  private Optional<DecisionPackage> inFlightOf(String id) {
+  private Optional<DecisionPackage> inFlightOf(String id, boolean full) {
     if (inFlight == null) {
       return Optional.empty();
     }
     Optional<DecisionPackage> found;
     try {
-      found = inFlight.find(id);
+      found = full ? inFlight.find(id, true) : inFlight.find(id);
     } catch (RuntimeException failure) {
       LOG.warn("取在途决策包失败（按未知 id 处理） packageId={}", id, failure);
       return Optional.empty();
     }
     return found == null ? Optional.empty() : found;
+  }
+
+  /** 在途包列表（概览面，<b>不含</b>明文）：接口不在 / 炸了 ⇒ 空列表（列表不因此变 500）。 */
+  private List<DecisionPackage> inFlightList() {
+    if (inFlight == null) {
+      return List.of();
+    }
+    try {
+      List<DecisionPackage> rows = inFlight.list();
+      return rows == null ? List.of() : rows;
+    } catch (RuntimeException failure) {
+      LOG.warn("列在途决策包失败（按空列表处理）", failure);
+      return List.of();
+    }
   }
 
   /** 该包还需要人裁的条目（见 {@link #escalatedIndexes}；没有视图 / 查不到 ⇒ 空 Optional = 不过滤）。 */
@@ -303,8 +715,8 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     return indexes == null ? Optional.empty() : Optional.of(indexes);
   }
 
-  /** 详情行：包级身份与状态 + 逐条明文 + 已有裁决（用于"这个包后来怎么了"）。 */
-  private Map<String, Object> detailRow(DecisionPackage pkg) {
+  /** 详情行：包级身份与状态 + 逐条（默认概览 / {@code full} 才带明文）+ 已有裁决 + 条目级表态。 */
+  private Map<String, Object> detailRow(DecisionPackage pkg, boolean full) {
     Map<String, Object> row = new LinkedHashMap<>();
     row.put("id", pkg.id());
     row.put("proposerKey", pkg.proposerKey());
@@ -314,18 +726,28 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     row.put("createdAtEpochMs", pkg.createdAtEpochMs());
     row.put("deadlineEpochMs", pkg.deadlineEpochMs());
     row.put("decision", decisionRow(pkg));
+    row.put("decided", verdictRows(pkg));
+    row.put("undecided", undecidedIndexes(pkg));
+    packages.expiryReason(pkg.id()).ifPresent(reason -> row.put("expiryReason", reason));
     // 详情面：列全部条目（人对整包有知情权），但逐条带 escalated 标记；没有上报视图（未装配级联）⇒ 全标 true
-    row.put("items", itemRows(pkg, true, escalatedOf(pkg).orElse(null)));
+    row.put("items", itemRows(pkg, full, escalatedOf(pkg).orElse(null)));
     return row;
   }
 
   /**
-   * 条目行：{@code plaintext == false} 时省略 {@code args}（列表面不带明文，只有详情与判定提示带）； {@code escalatedFilter} 非
-   * null ⇒ 只列该集合里的条目（P2b 的列表过滤）。
+   * 条目行：{@code plaintext == false} ⇒ <b>概览档</b>——只给 {@code {index, toolName, overview}}， {@code
+   * args} 与 {@code summary} <b>都不出现</b>（用户裁定 15 ①「肯定是笼统的，除非要求 full 查看」）； {@code plaintext == true}
+   * ⇒ <b>明文档</b>——{@code args}（明文）与 {@code summary}（人读一行，它就是参数值渲染出来的）一并给出。 {@code escalatedFilter}
+   * 非 null ⇒ 只列该集合里的条目（P2b 的列表过滤）。
+   *
+   * <p><b>★ 为什么 {@code summary} 在概览档也要收起</b>：{@link PackageItem#summary()} 是<b>由参数值渲染</b>的 （{@code
+   * DecisionItemDigest#itemSummary} 产出形如 {@code "doc_edit path=x.md …"} 的一行），它<b>就是</b>一份截断后的参数。
+   * 用户裁定 15 ① 把"默认不给明文"收窄成硬口径，而摘要里那截参数恰恰最容易把令牌/路径带出去——概览因此只回答 "这一条是哪个工具、第几条、有几个参数"（{@link
+   * #overviewOf}），要看内容就显式要 {@code full}。
    *
    * <p>{@code escalated} 标记：{@code true} = 这条还需要人裁（逐级预裁定之后剩下的），{@code false} = 已由某一级预裁定批掉。
    */
-  private static List<Map<String, Object>> itemRows(
+  private List<Map<String, Object>> itemRows(
       DecisionPackage pkg, boolean plaintext, Set<Integer> escalatedFilter) {
     List<Map<String, Object>> items = new ArrayList<>(pkg.items().size());
     for (PackageItem item : pkg.items()) {
@@ -333,17 +755,131 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       if (escalatedFilter != null && !escalated) {
         continue;
       }
-      Map<String, Object> row = new LinkedHashMap<>();
-      row.put("index", item.index());
-      row.put("toolName", item.toolName());
-      row.put("summary", item.summary());
-      row.put("escalated", escalated);
-      if (plaintext) {
-        row.put("args", item.args());
-      }
-      items.add(row);
+      items.add(itemRow(pkg, item, plaintext, escalated));
     }
     return items;
+  }
+
+  /** 单条条目行（包详情与条目详情共用一处渲染：两处各写一份必然漂移）。 */
+  private Map<String, Object> itemRow(
+      DecisionPackage pkg, PackageItem item, boolean plaintext, boolean escalated) {
+    Map<String, Object> row = new LinkedHashMap<>();
+    row.put("index", item.index());
+    row.put("toolName", item.toolName());
+    if (plaintext) {
+      // 明文档：人读一行 + 参数明文（明文只经这条回环 HTTP 出面）
+      row.put("summary", item.summary());
+      row.put("args", item.args());
+    } else {
+      // 概览档：只有"哪个工具、第几条"这类不含参数值的说明（见 itemRows 的注释）
+      row.put("overview", overviewOf(item));
+    }
+    row.put("escalated", escalated);
+    row.put("digest", item.argsDigest());
+    // 条目级表态快照（裁定 15 ②）："这一条定了没有、谁定的"——未表态 ⇒ null（不编一个"驳回"）
+    Map<Integer, DecisionPackages.ItemVerdict> verdicts = verdictsOf(pkg);
+    DecisionPackages.ItemVerdict verdict = verdicts.get(item.index());
+    row.put("verdict", verdict == null ? null : verdict.approved() ? APPROVE : REJECT);
+    row.put("decidedBy", verdict == null ? null : verdict.by());
+    row.put("decisionNote", verdict == null || verdict.note().isBlank() ? null : verdict.note());
+    return row;
+  }
+
+  /** 该包已表态的条目（按 index；{@code DECIDED} 之后由裁决反推，见 {@code DecisionPackages#itemVerdicts}）。 */
+  private Map<Integer, DecisionPackages.ItemVerdict> verdictsOf(DecisionPackage pkg) {
+    Map<Integer, DecisionPackages.ItemVerdict> verdicts = new LinkedHashMap<>();
+    for (DecisionPackages.ItemVerdict verdict : packages.itemVerdicts(pkg.id())) {
+      verdicts.put(verdict.index(), verdict);
+    }
+    return verdicts;
+  }
+
+  /** 逐条表态行（列表/详情共用）：{@code [{index, verdict, by, note}]}，按 index 升序。 */
+  private List<Map<String, Object>> verdictRows(DecisionPackage pkg) {
+    List<DecisionPackages.ItemVerdict> verdicts = new ArrayList<>(packages.itemVerdicts(pkg.id()));
+    verdicts.sort((left, right) -> Integer.compare(left.index(), right.index()));
+    List<Map<String, Object>> rows = new ArrayList<>(verdicts.size());
+    for (DecisionPackages.ItemVerdict verdict : verdicts) {
+      Map<String, Object> row = new LinkedHashMap<>();
+      row.put("index", verdict.index());
+      row.put("verdict", verdict.approved() ? APPROVE : REJECT);
+      row.put("by", verdict.by());
+      row.put("note", verdict.note());
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  /** 还没表态的条目 index（裁定 15 ④：未表态 <b>≠</b> 拒绝——它要单独看得出来）。 */
+  private List<Integer> undecidedIndexes(DecisionPackage pkg) {
+    Set<Integer> decided = verdictsOf(pkg).keySet();
+    List<Integer> rows = new ArrayList<>();
+    for (PackageItem item : pkg.items()) {
+      if (!decided.contains(item.index())) {
+        rows.add(item.index());
+      }
+    }
+    return rows;
+  }
+
+  /**
+   * 概览档的一行说明（<b>不含参数值</b>；用户裁定 15 ①）：能说的只有"哪个工具、第几条"以及参数<b>有几个</b>。
+   *
+   * <p>为什么连参数个数都给：它帮人判断"这条是不是比我以为的复杂"，而个数本身不是内容（{@code args} 的键名与值一个都不露）。
+   */
+  private static String overviewOf(PackageItem item) {
+    if (item.args().isEmpty()) {
+      return item.toolName() + "（无参数）";
+    }
+    return item.toolName() + "（含 " + item.args().size() + " 个参数；要看内容请用 full）";
+  }
+
+  /** 包内某条（不存在 ⇒ {@code null}）。 */
+  private static PackageItem itemOf(DecisionPackage pkg, int index) {
+    for (PackageItem item : pkg.items()) {
+      if (item.index() == index) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 明文读取的审计（用户裁定 15 ①）：只报"谁 / 哪个包 / 哪些 index"，<b>明文本身不进事件</b>。
+   *
+   * <p>没装配审计口 ⇒ 什么也不做（有意保留的降级，见 {@link DecisionReadAudit}）；审计口抛异常 ⇒ 只 WARN ——审计面故障不得把一次正常读取变成 500。
+   */
+  private void auditFullRead(String packageId, DecisionPackage pkg, boolean full) {
+    if (!full || readAudit == null) {
+      return;
+    }
+    List<Integer> indexes = new ArrayList<>(pkg.items().size());
+    for (PackageItem item : pkg.items()) {
+      indexes.add(item.index());
+    }
+    try {
+      readAudit.detailRead(packageId, List.copyOf(indexes), DEFAULT_BY);
+    } catch (RuntimeException failure) {
+      LOG.warn("决策面明文读取审计失败（不影响本次读取） packageId={}", packageId, failure);
+    }
+  }
+
+  /** {@code ?full=1} 的判据（只认 {@code 1}/{@code true}；其余值一律当"没要求"——不猜）。 */
+  private static boolean wantsFull(HttpExchange exchange) {
+    String query = exchange.getRequestURI().getQuery();
+    if (query == null || query.isBlank()) {
+      return false;
+    }
+    for (String pair : query.split("&")) {
+      int eq = pair.indexOf('=');
+      String key = eq < 0 ? pair : pair.substring(0, eq);
+      String value = eq < 0 ? "" : pair.substring(eq + 1);
+      if ("full".equals(key.strip())) {
+        String normalized = value.strip();
+        return "1".equals(normalized) || "true".equalsIgnoreCase(normalized);
+      }
+    }
+    return false;
   }
 
   /** index 集合的稳定排序副本（列表响应里给人看的 {@code escalated} 字段；JSON 数组顺序稳定，便于肉眼对账）。 */
@@ -367,48 +903,6 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     return row;
   }
 
-  /**
-   * 人的裁决：先查后决（未知 id 直接 404）⇒ 解析 body ⇒ 交桥回填 ⇒ 回执。
-   *
-   * <p><b>★ 只认包登记表</b>（P3e 的边界）：{@link #inFlight} 那条在途口<b>不</b>参与 {@code POST}——在途的跨进程临时包 （{@code
-   * xp-…}）是"父侧为一次提交现造的临时包"，它没有状态机、没有提交口、也不该被这条 HTTP 路裁决。 让它可裁决就等于给跨进程那条路开出第二条决策路径（不变量 1）。在途包 id
-   * 在这里与未知 id 同归 {@code 404}。
-   */
-  private void handleDecide(HttpExchange exchange, String id) throws IOException {
-    Optional<DecisionPackage> found = packages.find(id);
-    if (found.isEmpty()) {
-      send(exchange, 404, Map.of("error", "未知的决策包 id", "code", DecisionPackages.PACKAGE_NOT_FOUND));
-      return;
-    }
-    Decision decision;
-    try {
-      decision = readDecision(exchange, found.get());
-    } catch (BadBody badBody) {
-      send(exchange, 400, Map.of("error", badBody.getMessage()));
-      return;
-    }
-    DecisionSubmission submission;
-    try {
-      submission = submissions.submitDecision(id, decision);
-    } catch (DecisionPackages.RejectionException refusal) {
-      refuseByCode(exchange, refusal);
-      return;
-    } catch (RuntimeException failure) {
-      // 兜底：编排/桥的意外异常不得让连接悬着，也不得被说成"客户端写错了"
-      LOG.warn("决策面裁决提交异常（未落定） packageId={} 异常={}", id, failure.toString());
-      send(exchange, 500, Map.of("error", "裁决提交失败（服务器侧异常）"));
-      return;
-    }
-    LOG.info(
-        "决策面收到裁决 packageId={} state={} approved={} rejected={} by={}",
-        id,
-        submission.pkg().state(),
-        approvedIndexes(submission.pkg()).size(),
-        rejectedIndexes(submission.pkg()).size(),
-        decision.by());
-    send(exchange, 200, receiptRow(submission));
-  }
-
   /** 状态机具名拒 ⇒ HTTP 状态码（设计 §5.11 第 11 条）；认不出的码 ⇒ 500（缺陷不该伪装成客户端错误）。 */
   private void refuseByCode(HttpExchange exchange, DecisionPackages.RejectionException refusal)
       throws IOException {
@@ -416,8 +910,14 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     int status =
         switch (code) {
           case DecisionPackages.PACKAGE_NOT_FOUND, DecisionPackages.PACKAGE_EXPIRED -> 404;
-          case DecisionPackages.INVALID_DECISION -> 400;
-          case DecisionPackages.PACKAGE_NOT_PROPOSED -> 409;
+          case DecisionPackages.INVALID_DECISION,
+              DecisionPackages.INVALID_ITEM_INDEX,
+              DecisionPackages.NO_ITEM_DECIDED ->
+              400;
+          case DecisionPackages.PACKAGE_NOT_PROPOSED,
+              DecisionPackages.PARTIAL_DECISION,
+              DecisionPackages.ITEM_ALREADY_DECIDED ->
+              409;
           default -> 500;
         };
     if (status == 500) {
@@ -433,7 +933,7 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     send(exchange, status, Map.of("error", message, "code", code));
   }
 
-  /** 裁决回执：实际生效的裁决 + 逐条去向；没有回执时用 {@code warning} 说清为什么。 */
+  /** 回执：实际生效的裁决 + 逐条去向 +（执行命令那一步的）提交回执；没有回执时用 {@code warning} 说清为什么。 */
   private static Map<String, Object> receiptRow(DecisionSubmission submission) {
     DecisionPackage pkg = submission.pkg();
     Map<String, Object> body = new LinkedHashMap<>();
@@ -442,7 +942,7 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     body.put("decision", decisionRow(pkg));
     CommitReceipt receipt = submission.receipt();
     if (receipt == null) {
-      // 桥没落定（提交口未装配 / COMMIT_FAILED）：显式 null + 一句诚实说明，绝不静默
+      // 桥没落定（提交口未装配 / COMMIT_FAILED / 两段式的第一段还没执行）：显式 null + 一句诚实说明，绝不静默
       body.put("commit", null);
       body.put("warning", submission.commitNote());
       return body;
@@ -470,21 +970,9 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
     return body;
   }
 
-  /** 解析并校验请求体（非法 ⇒ {@link BadBody}，由调用方转 400）。 */
+  /** 解析并校验整包裁决请求体（非法 ⇒ {@link BadBody}，由调用方转 400）。 */
   private Decision readDecision(HttpExchange exchange, DecisionPackage pkg) throws IOException {
-    byte[] raw = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
-    if (raw.length > MAX_BODY_BYTES) {
-      throw new BadBody("请求体过大（上限 " + MAX_BODY_BYTES + " 字节）");
-    }
-    JsonNode node;
-    try {
-      node = raw.length == 0 ? null : JSON.readTree(raw);
-    } catch (JsonProcessingException e) {
-      throw new BadBody("请求体不是合法 JSON");
-    }
-    if (node == null || !node.isObject()) {
-      throw new BadBody("请求体必须是 JSON 对象");
-    }
+    JsonNode node = readBody(exchange);
     // 形态位读成 Optional：**缺席**（人没选这一形态）与**显式 false** 在判定上是同一件事，
     // 但类型上必须分得清——可空 Boolean 让 SpotBugs 判 NP_BOOLEAN_RETURN_NULL（真发现：可空布尔是易漏判的形状）
     boolean approveAllTrue = flag(node, "approveAll").orElse(false);
@@ -514,6 +1002,27 @@ public final class DecisionPackagesHttpHandler implements HttpHandler {
       approved = readItems(itemsNode);
     }
     return new Decision(approved, textField(node, "by", DEFAULT_BY), textField(node, "note", ""));
+  }
+
+  /** 读 + 解析请求体（空体 ⇒ 空对象；过大 / 非 JSON / 非对象 ⇒ {@link BadBody}）。 */
+  private static JsonNode readBody(HttpExchange exchange) throws IOException {
+    byte[] raw = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
+    if (raw.length > MAX_BODY_BYTES) {
+      throw new BadBody("请求体过大（上限 " + MAX_BODY_BYTES + " 字节）");
+    }
+    if (raw.length == 0) {
+      return JSON.createObjectNode();
+    }
+    JsonNode node;
+    try {
+      node = JSON.readTree(raw);
+    } catch (JsonProcessingException e) {
+      throw new BadBody("请求体不是合法 JSON");
+    }
+    if (node == null || !node.isObject()) {
+      throw new BadBody("请求体必须是 JSON 对象");
+    }
+    return node;
   }
 
   /**

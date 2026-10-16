@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.approval.ApprovalChannel;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
+import io.mosire.agentlib.approval.ApprovalGate;
 import io.mosire.agentlib.approval.ApprovalRequest;
 import io.mosire.agentlib.approval.AskKind;
 import io.mosire.agentlib.approval.PendingApprovals;
@@ -111,6 +112,24 @@ class DecisionApprovalBridgeTest {
       Optional<DecisionCommitPort> commitPort,
       boolean withJudgementDetails,
       Optional<DecisionCascade> cascade) {
+    startWithGates(List.of(), window, commitPort, withJudgementDetails, cascade);
+  }
+
+  /** 与 {@link #start} 同形，但可以给<b>闸链</b>塞快判闸（用来造"无人在环"那条路：闸链代批）。 */
+  private void startWithGates(
+      List<ApprovalGate> gates,
+      Duration window,
+      Optional<DecisionCommitPort> commitPort,
+      boolean withJudgementDetails) {
+    startWithGates(gates, window, commitPort, withJudgementDetails, Optional.empty());
+  }
+
+  private void startWithGates(
+      List<ApprovalGate> gates,
+      Duration window,
+      Optional<DecisionCommitPort> commitPort,
+      boolean withJudgementDetails,
+      Optional<DecisionCascade> cascade) {
     pending = new PendingApprovals();
     channel = new RecordingChannel();
     bus = new EventBus();
@@ -118,7 +137,7 @@ class DecisionApprovalBridgeTest {
     bus.subscribe(events::add);
     packages = new DecisionPackages();
     ApprovalCoordinator coordinator =
-        new ApprovalCoordinator(List.of(), List.of(channel), pending, window, bus, key -> true);
+        new ApprovalCoordinator(gates, List.of(channel), pending, window, bus, key -> true);
     bridge =
         new DecisionApprovalBridge(
             packages,
@@ -195,7 +214,13 @@ class DecisionApprovalBridgeTest {
 
     assertThat(settled).isPresent();
     assertThat(settled.orElseThrow().items()).as("一轮三条 ⇒ 包内三条").hasSize(3);
-    assertThat(settled.orElseThrow().state()).isEqualTo(PackageState.COMMITTED);
+    // ★★ 通道上的批准 = 人**自己的执行命令**（2026-10-17 控制方裁定 2，用户可推翻）：判据与跨进程网关的
+    //   {@code byHuman} 同源（审批面上登记项还在 ⇒ 这是人答的，不是闸链代批）⇒ flush 返回时裁决与执行
+    //   都已经发生。★ 判别力：去掉 {@code DecisionApprovalBridge#backfill} 的 {@code approved} 分支 ⇒
+    //   这里退回 DECIDED、下面 batches 为空 ⇒ 当场红。
+    assertThat(settled.orElseThrow().state())
+        .as("flush 返回时人已批 ⇒ 被批子集已执行（人批的那个键就是执行命令）")
+        .isEqualTo(PackageState.COMMITTED);
     assertThat(channel.published).as("一条包 = 一条包级请求（不是三条）").hasSize(1);
     assertThat(pending.pending()).as("审批面上同样只有一条（没有'不属于任何包的待裁决项'）").hasSize(1);
     ApprovalRequest request = channel.published.get(0);
@@ -327,12 +352,67 @@ class DecisionApprovalBridgeTest {
     Optional<DecisionPackage> settled = bridge.flush(queue);
     long elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000L;
 
+    // ★★ 同步投递的判据原样成立（裁定 4 + 控制方裁定 2）：人批的那个键就是执行命令 ⇒ flush 返回时
+    //   **裁决与执行都已经发生**。判别力：去掉 backfill 的 approved 分支 ⇒ 本条退回 DECIDED、batches 为空。
     assertThat(settled.orElseThrow().state())
         .as("flush 返回时裁决与执行都已经发生（同步投递：不是'提了就走'）")
         .isEqualTo(PackageState.COMMITTED);
     assertThat(batches).as("提交口在 flush 返回之前就被调过").hasSize(1);
     assertThat(channel.awaitCalls).as("确实问过通道（不是绕开人等）").hasValue(1);
     assertThat(elapsedMs).as("窗口 120s，但人立刻答了 ⇒ 远早于窗口返回").isLessThan(10_000L);
+  }
+
+  // ---------- C-5：闸链代批（无人在环）⇒ 表态即执行 ----------
+
+  /**
+   * ★★ <b>闸链代批 = 无人在环 ⇒ 表态即执行</b>（2026-10-17 控制方裁定 1，用户可推翻）：快判链在<b>登记之前</b>跑并给出终局批准 ⇒
+   * 审批面上从来没有过登记项（连 {@code approval.requested} 都没发）⇒ 没有人能看到这一包、也没有人能敲执行命令；若仍要求显式
+   * commit，这一包只会白等到窗口结束再按"已批未执行"作废——自动路径等于失效。
+   *
+   * <p><b>与上一条的分界</b>：上一条是人在通道上答的（判据 {@code registered(request)} 为真）；本条在审批面上一条登记项都没有
+   * （判据为假）——两条都当场执行，只是"谁拍的板"不同。
+   *
+   * <p><b>判别力</b>：去掉 {@code DecisionApprovalBridge#backfill} 的 {@code approved} 分支 ⇒ 本条 {@code
+   * state} 退回 {@code DECIDED} 且 {@code batches} 为空 ⇒ 当场红。
+   */
+  @Test
+  void gateChainApprovalWithoutAHumanAlsoCommitsImmediately() {
+    List<List<ResolvedCall>> batches = new ArrayList<>();
+    // 闸链代批（AutoApproveGate 形状的桩）：命中即终局，不登记、不碰通道
+    ApprovalGate autoApprove =
+        new ApprovalGate() {
+          @Override
+          public String name() {
+            return "case-auto-approve";
+          }
+
+          @Override
+          public Optional<ApprovalDecision> decide(ApprovalRequest request) {
+            return Optional.of(ApprovalDecision.APPROVE_ONCE);
+          }
+        };
+    startWithGates(
+        List.of(autoApprove),
+        Duration.ofSeconds(30),
+        Optional.of(
+            (id, calls) -> {
+              batches.add(List.copyOf(calls));
+              return committed(id, calls.size());
+            }),
+        true);
+    PendingDecisionQueue queue = queue("main");
+    queue.register(
+        "bash", Map.of("command", "sudo apt install x"), ask("bash:ask:apt", AskKind.MODE_LIMITED));
+
+    Optional<DecisionPackage> settled = bridge.flush(queue);
+
+    assertThat(settled.orElseThrow().state())
+        .as("闸链批准 ⇒ 无人在环 ⇒ 当场执行（自动路径不该白等一个不存在的人）")
+        .isEqualTo(PackageState.COMMITTED);
+    assertThat(batches).as("被批子集恰好提交一次").hasSize(1);
+    assertThat(channel.awaitCalls).as("闸链命中 ⇒ 人一次都没被问（人不在环里）").hasValue(0);
+    assertThat(channel.published).as("审批面上没有登记项 ⇒ 没有人能看到这一包、也没人能敲执行命令").isEmpty();
+    assertThat(pending.pending()).as("登记表里同样一条都没有").isEmpty();
   }
 
   // ---------- B-3：冲突整批退回 ----------
@@ -363,7 +443,9 @@ class DecisionApprovalBridgeTest {
 
     Optional<DecisionPackage> settled = bridge.flush(queue);
 
-    assertThat(settled.orElseThrow().state()).isEqualTo(PackageState.CONFLICTED);
+    assertThat(settled.orElseThrow().state())
+        .as("人批的键 = 执行命令 ⇒ flush 返回时整批一次提交已被退回（CONFLICTED）")
+        .isEqualTo(PackageState.CONFLICTED);
     assertThat(batches).as("整批一次提交后被退回（不是逐条重试）").hasSize(1);
     Event conflicted = awaitEvent(DecisionEventTypes.CONFLICTED, Duration.ofSeconds(5));
     JsonNode payload = JSON.readTree(conflicted.payload());

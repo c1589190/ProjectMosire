@@ -30,9 +30,12 @@ import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
 import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
+import io.mosire.brain.decision.DecisionHistoryTools;
+import io.mosire.brain.decision.DecisionWindows;
 import io.mosire.brain.decision.ReleaseMarkingCommitPort;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
+import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.EventTypes;
 import io.mosire.brain.runtime.TurnResult;
@@ -106,6 +109,9 @@ public final class SubagentProcessMain {
 
   private static final ObjectMapper JSON = new ObjectMapper();
 
+  /** 子体侧决策历史工具的供给源 id（与父侧同名工具分源：便于按源整组卸载与审计）。 */
+  private static final String DECISION_HISTORY_TOOL_SOURCE_ID = "decision-history-local";
+
   private SubagentProcessMain() {}
 
   /**
@@ -163,6 +169,25 @@ public final class SubagentProcessMain {
               SkillPermissions.decode(options.docVisible()),
               SkillPermissions.decode(options.docEditable()));
       ToolRegistry registry = new ToolRegistry();
+      // ★ 裁定 15 ④（2026-10-17 用户指令「这玩意他妈不是可配置项吗？」）：子体自己的"本轮包窗口"同样可配——
+      //   读**它自己的**配置根（父侧经 --config-dir 传下来的那一个；缺席 = 离线/测试形态 ⇒ 缺省 30 分钟不变）。
+      //   ★ 这一项不是"父侧替子体配"：跨进程结算的两个窗口在父侧（App 的 decisionWindows + 网关），子体这一份只决定
+      //     "它本地那个包自己的 deadline"（它拿到回执就落 decided/committed，正常路径根本走不到到点）。两边同名同义。
+      //   ★ 走 AgentPipeline 的进程级缺省而不是 toolConfig：子体这条装配路（AgentRuntime 的无 toolConfig 构造）
+      //     没有工具配置通道，而 AgentRuntime 不在本单改动面内——理由写在 AgentPipeline#defaultDecisionDeadlineMillis。
+      if (options.configDir() != null) {
+        DecisionWindows childWindows =
+            DecisionWindows.load(new FileConfigStore(options.configDir()));
+        AgentPipeline.useDecisionDeadlineMillis(childWindows.deadlineMillis());
+      }
+      // ★ 用户裁定 15 ⑤（补 P2b 缺口 #5）：子体进程**本地**注册 decision_history —— 读**它自己的** events.db
+      //   与**它自己的**实例 id。它因此能"下一轮看上一轮的整个包 + 按 index 看其中几项"（默认概览、full 才明文）。
+      //   ★ 与父侧那一份的关系：同名工具、各自读各自的库（父侧那份 noExport = true，外发即越权）。
+      //   ★ 注册在桥绑定**之前**：名字相同的工具在 registry 里只能有一个（重复注册会响亮抛错），
+      //     而这里要的就是"子体看到的是自己那一份"——父侧那份本来也不外发，两者不会互相覆盖。
+      registry.register(
+          DECISION_HISTORY_TOOL_SOURCE_ID,
+          DecisionHistoryTools.localTool(options.dataDir().resolve("events.db"), config.id()));
       if (options.parentLink()) {
         // 父侧建好的管道 → MCP client（握手/工具目录/调用全经此传输；父侧永远在同一对管道上服务）
         McpToolSource parentSource = new McpToolSource("parent");

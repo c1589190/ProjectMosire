@@ -60,15 +60,49 @@ public final class PendingDecisionQueue {
   private volatile boolean proposalMade;
 
   /**
+   * 本轮包的裁决窗口（毫秒）——包 deadline = {@code 收尾当刻 + 本值}。
+   *
+   * <p><b>为什么它是字段而不是直接用常量</b>（2026-10-17 用户指令「太变态了直接等30分钟，改！」）：这个值同时是 <b>包投递后等人答复的等待上限</b>（{@code
+   * DecisionApprovalBridge#deliver} → {@code coordinator.decide}， 见裁定 10：等待窗口 = 包自己的 {@code
+   * deadlineEpochMs}）。写死成常量之后，<b>用例与部署都没法把它缩短</b>—— 一条"没人答复"的用例会真的挂满 30 分钟。⇒ 改成可注入，**缺省值仍是 {@link
+   * DecisionPackages#DEFAULT_DEADLINE_MILLIS}（30 分钟，裁定 10 的原值）**，行为逐字不变；
+   * 需要短窗的地方（用例、演示、特殊部署）显式传一个小值即可。
+   */
+  private final long deadlineMillis;
+
+  /**
    * @param proposerKey 提议者实例键（{@code AgentIdentity#instanceId()}："一实例一未决包"的键，也是包与裁决历史的归属键）
    * @param caller 调用者等级桶（与 {@code proposerKey} 正交：桶答"什么等级"，键答"哪个实例"）
    */
   public PendingDecisionQueue(String proposerKey, AccessToken caller) {
+    this(proposerKey, caller, DecisionPackages.DEFAULT_DEADLINE_MILLIS);
+  }
+
+  /**
+   * 同上，但显式给定裁决窗口（裁定 10 的缺省值见 {@link DecisionPackages#DEFAULT_DEADLINE_MILLIS}）。
+   *
+   * <p><b>用例必须用这个构造</b>：涉及时钟/deadline 的用例一律注入<b>毫秒级窗口</b>，或者用 {@code DecisionPackages#expire(long)}
+   * 显式驱动到点——<b>禁止真实等待</b>（等 30 分钟既不是判据也不是耐心）。
+   *
+   * @param proposerKey 提议者实例键
+   * @param caller 调用者等级桶
+   * @param deadlineMillis 裁决窗口（毫秒，必须为正）
+   */
+  public PendingDecisionQueue(String proposerKey, AccessToken caller, long deadlineMillis) {
     this.proposerKey = Objects.requireNonNull(proposerKey, "proposerKey");
     if (proposerKey.isBlank()) {
       throw new IllegalArgumentException("proposerKey 不得为空白（它是「一个实例一个未决包」的键）");
     }
     this.caller = Objects.requireNonNull(caller, "caller");
+    if (deadlineMillis <= 0) {
+      throw new IllegalArgumentException("deadlineMillis 必须为正（毫秒）: " + deadlineMillis);
+    }
+    this.deadlineMillis = deadlineMillis;
+  }
+
+  /** 本轮包的裁决窗口（毫秒）；缺省 {@link DecisionPackages#DEFAULT_DEADLINE_MILLIS}。 */
+  public long deadlineMillis() {
+    return deadlineMillis;
   }
 
   /** 提议者实例键（进 {@link ProposeRequest#proposerKey()}；包与历史跟着它走，设计 §5 裁定 3）。 */
@@ -196,7 +230,8 @@ public final class PendingDecisionQueue {
   }
 
   /**
-   * 同上，但由调用方给定当刻墙钟（可测）；窗口长度仍是 {@link DecisionPackages#DEFAULT_DEADLINE_MILLIS}。
+   * 同上，但由调用方给定当刻墙钟（可测）；窗口长度取本队列注入的 {@link #deadlineMillis()}（缺省 {@link
+   * DecisionPackages#DEFAULT_DEADLINE_MILLIS}）。
    *
    * @param nowEpochMs 收尾当刻的墙钟毫秒
    */
@@ -218,8 +253,7 @@ public final class PendingDecisionQueue {
       lock.unlock();
     }
     ProposeRequest request =
-        new ProposeRequest(
-            proposerKey, caller, items, nowEpochMs + DecisionPackages.DEFAULT_DEADLINE_MILLIS);
+        new ProposeRequest(proposerKey, caller, items, nowEpochMs + deadlineMillis);
     LOG.debug(
         "本轮待裁决队列收成一个包：proposerKey={} caller={} items={} deadlineEpochMs={}",
         proposerKey,

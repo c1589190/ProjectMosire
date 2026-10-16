@@ -160,7 +160,7 @@ class DecisionHistoryToolsTest {
   void onlyOwnPackagesAreVisible() throws Exception {
     seed();
 
-    Map<String, Object> body = DecisionHistoryTools.read(db, SELF, null, 20);
+    Map<String, Object> body = DecisionHistoryTools.read(db, SELF, null, null, false, 20);
 
     assertThat(body.get("self")).isEqualTo(SELF);
     assertThat(rows(body))
@@ -174,7 +174,8 @@ class DecisionHistoryToolsTest {
   void perItemOutcomesAndReasonsComeFromTheCommittedEvent() throws Exception {
     seed();
 
-    Map<String, Object> row = rowOf(DecisionHistoryTools.read(db, SELF, null, 20), "dp-1");
+    Map<String, Object> row =
+        rowOf(DecisionHistoryTools.read(db, SELF, null, null, false, 20), "dp-1");
 
     assertThat(row.get("state")).isEqualTo("COMMITTED");
     assertThat(row.get("finalizedBy")).as("裁决者来自轨迹").isEqualTo(DecisionCascade.HUMAN_DECIDER);
@@ -194,7 +195,8 @@ class DecisionHistoryToolsTest {
   void rejectedPackageReportsThePackageLayerReason() throws Exception {
     seed();
 
-    Map<String, Object> row = rowOf(DecisionHistoryTools.read(db, SELF, null, 20), "dp-3");
+    Map<String, Object> row =
+        rowOf(DecisionHistoryTools.read(db, SELF, null, null, false, 20), "dp-3");
 
     assertThat(row.get("state")).as("一条都没批 ⇒ 零落盘终局").isEqualTo("REJECTED");
     assertThat(items(row).get(0).get("outcome")).isEqualTo("REJECTED");
@@ -207,7 +209,8 @@ class DecisionHistoryToolsTest {
   void expiredPackageIsReadableWithItsReason() throws Exception {
     seed();
 
-    Map<String, Object> row = rowOf(DecisionHistoryTools.read(db, SELF, null, 20), "dp-5");
+    Map<String, Object> row =
+        rowOf(DecisionHistoryTools.read(db, SELF, null, null, false, 20), "dp-5");
 
     assertThat(row.get("state")).as("作废也是结果，也必须可回读（裁定 8）").isEqualTo("EXPIRED");
     assertThat(items(row).get(0).get("outcome")).isEqualTo("NOT_COMMITTED");
@@ -218,8 +221,8 @@ class DecisionHistoryToolsTest {
   void otherPeoplesPackageLooksExactlyLikeAnUnknownOne() throws Exception {
     seed();
 
-    Map<String, Object> others = DecisionHistoryTools.read(db, SELF, "dp-2", 20);
-    Map<String, Object> unknown = DecisionHistoryTools.read(db, SELF, "dp-404", 20);
+    Map<String, Object> others = DecisionHistoryTools.read(db, SELF, "dp-2", null, false, 20);
+    Map<String, Object> unknown = DecisionHistoryTools.read(db, SELF, "dp-404", null, false, 20);
 
     assertThat(rows(others)).as("查别人 = 查不到（无存在性 oracle）").isEmpty();
     assertThat(JSON.writeValueAsString(others))
@@ -231,7 +234,7 @@ class DecisionHistoryToolsTest {
   void singlePackageQueryReturnsThatPackage() throws Exception {
     seed();
 
-    Map<String, Object> body = DecisionHistoryTools.read(db, SELF, "dp-1", 20);
+    Map<String, Object> body = DecisionHistoryTools.read(db, SELF, "dp-1", null, false, 20);
 
     assertThat(rows(body)).hasSize(1);
     assertThat(rows(body).get(0).get("packageId")).isEqualTo("dp-1");

@@ -82,6 +82,13 @@ class CrossProcessDecisionAcceptanceTest {
   private static final String PACKAGE = "dp-1";
   private static final ObjectMapper JSON = new ObjectMapper();
 
+  /**
+   * <b>第二段"等执行命令"的窗口</b>（毫秒，用例级）：按缺省 30 秒等的话，本类每一条"没人下执行命令"的用例都要白挂 30 秒 （实测 2026-10-17：c7/c8a/c8b 各
+   * 30.15s、c9 60.25s，整类 150.8s）。它只决定"多久按裁定 15 ④ 收尾"，与判据无关 ——见 AGENTS §四 第 11
+   * 条与用户指令「太变态了直接等30分钟，改！」。
+   */
+  private static final long COMMIT_WAIT_MILLIS = 200L;
+
   private final EventBus bus = new EventBus();
   private final PendingApprovals pending = new PendingApprovals();
   private final List<SqliteEventStore> stores = new CopyOnWriteArrayList<>();
@@ -458,6 +465,7 @@ class CrossProcessDecisionAcceptanceTest {
             channel,
             Duration.ofMillis(150));
     // 五参构造：没有父侧本轮队列 ⇒ 没有"父侧那一刻算出来的那份 kind"可采信
+    // ★ 同样注入毫秒级执行等待窗（按缺省 30s 等的话，本条"没人答"就要白挂 30 秒）
     CrossProcessDecisionGateway gateway =
         new CrossProcessDecisionGateway(
             instanceId ->
@@ -468,7 +476,8 @@ class CrossProcessDecisionAcceptanceTest {
             coordinator,
             pending,
             null,
-            Optional.of(details));
+            Optional.of(details),
+            COMMIT_WAIT_MILLIS);
 
     Map<String, Object> args = args("一");
     CrossProcessDecisionGateway.Verdict verdict =
@@ -737,7 +746,8 @@ class CrossProcessDecisionAcceptanceTest {
         coordinator,
         pending,
         ledger,
-        details);
+        details,
+        COMMIT_WAIT_MILLIS);
   }
 
   private ApprovalCoordinator coordinator(RecordingChannel channel) {

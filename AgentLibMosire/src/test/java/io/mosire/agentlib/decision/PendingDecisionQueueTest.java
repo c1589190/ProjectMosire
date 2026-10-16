@@ -167,4 +167,46 @@ class PendingDecisionQueueTest {
         .as("proposerKey 是「一实例一未决包」与历史归属的键，空白 = 拒")
         .isInstanceOf(IllegalArgumentException.class);
   }
+
+  /**
+   * <b>裁决窗口可注入</b>（2026-10-17 用户指令「太变态了直接等30分钟，改！」）：包 deadline 同时是"投递后等人答复"的 等待上限（裁定 10），写死成编译期常量 ⇒
+   * 一条"没人答复"的用例会真挂 30 分钟。本用例钉住"注多少就是多少"。
+   */
+  @Test
+  void injectedDeadlineWindowIsHonouredExactly() {
+    long now = 1_700_000_000_000L;
+    PendingDecisionQueue queue = new PendingDecisionQueue(PROPOSER, AccessToken.DEFAULT, 250L);
+    queue.register("bash", Map.of("command", "x"), ask("bash:ask:x", AskKind.SENSITIVE));
+
+    ProposeRequest request = queue.toProposeRequest(now).orElseThrow();
+
+    assertThat(queue.deadlineMillis()).as("窗口就是注入的那个值").isEqualTo(250L);
+    assertThat(request.deadlineEpochMs())
+        .as("包 deadline = 收尾当刻 + 注入窗口（毫秒级，用例不必真等）")
+        .isEqualTo(now + 250L);
+  }
+
+  /** 缺省窗口必须**逐字保持** 30 分钟（裁定 10 的原值）——注入能力不许改变既有行为。 */
+  @Test
+  void defaultDeadlineWindowStaysAtThirtyMinutes() {
+    PendingDecisionQueue queue = new PendingDecisionQueue(PROPOSER, AccessToken.DEFAULT);
+    queue.register("bash", Map.of("command", "x"), ask("bash:ask:x", AskKind.SENSITIVE));
+
+    long now = 1_700_000_000_000L;
+
+    assertThat(queue.deadlineMillis())
+        .as("缺省 = DecisionPackages.DEFAULT_DEADLINE_MILLIS（30 分钟），行为逐字不变")
+        .isEqualTo(DecisionPackages.DEFAULT_DEADLINE_MILLIS);
+    assertThat(queue.toProposeRequest(now).orElseThrow().deadlineEpochMs())
+        .isEqualTo(now + DecisionPackages.DEFAULT_DEADLINE_MILLIS);
+  }
+
+  /** 非法窗口（0/负）响亮拒——"窗口为零"会造出一建包即到点的假象，必须挡在构造期。 */
+  @Test
+  void nonPositiveDeadlineWindowIsRefused() {
+    assertThatThrownBy(() -> new PendingDecisionQueue(PROPOSER, AccessToken.DEFAULT, 0L))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> new PendingDecisionQueue(PROPOSER, AccessToken.DEFAULT, -1L))
+        .isInstanceOf(IllegalArgumentException.class);
+  }
 }

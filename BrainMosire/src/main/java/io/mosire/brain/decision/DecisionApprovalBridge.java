@@ -15,6 +15,7 @@ import io.mosire.agentlib.decision.DecisionEventTypes;
 import io.mosire.agentlib.decision.DecisionItemDigest;
 import io.mosire.agentlib.decision.DecisionPackage;
 import io.mosire.agentlib.decision.DecisionPackages;
+import io.mosire.agentlib.decision.DecisionReadAudit;
 import io.mosire.agentlib.decision.DecisionSubmission;
 import io.mosire.agentlib.decision.DecisionSubmissionPort;
 import io.mosire.agentlib.decision.PackageItem;
@@ -137,9 +138,9 @@ import org.slf4j.LoggerFactory;
  *       EXPIRED} 不算，它从来没有进入过决策面）；
  *   <li>{@code decision.package.decided}：{@link #backfill} 与 {@link #submitDecision} 里 {@code
  *       packages.decide(...)} 返回之后（<b>全驳也发</b>，{@code approvedCount=0}）；
- *   <li>{@code decision.package.committed} / {@code .conflicted}：{@link #commitAfterDecision} 拿到
- *       port 回执<b>之后</b>。 ★ <b>port 抛异常 ⇒ 一条 {@code committed} 都不发</b>（宁可少一条事件，也不写一条假成功）； "被批子集为空 ⇒
- *       REJECTED"那条路也不发（零落盘，没有提交这回事）。
+ *   <li>{@code decision.package.committed} / {@code .conflicted}：{@link #commitPackage} 拿到 port
+ *       回执<b>之后</b>（★ 用户裁定 15 ③：那是<b>执行命令</b>那一步的事，表态不产生这两条事件）。 ★ <b>port 抛异常 ⇒ 一条 {@code
+ *       committed} 都不发</b>（宁可少一条事件，也不写一条假成功）； "被批子集为空 ⇒ REJECTED"那条路也不发（零落盘，没有提交这回事）。
  * </ul>
  *
  * <p>载荷的骨架严格只此六项（顺序即组装顺序）：{@code packageId / itemCount / approvedCount / rejectedCount / toolNames
@@ -167,7 +168,7 @@ import org.slf4j.LoggerFactory;
  * <p>{@code summary}/{@code digest} 与全部日志只出现包 id、工具名、条目数、脱敏摘要——参数明文只活在包内 {@code args} 与提交口那条路上，
  * 本桥一行都不碰。
  */
-public final class DecisionApprovalBridge implements DecisionSubmissionPort {
+public final class DecisionApprovalBridge implements DecisionSubmissionPort, DecisionReadAudit {
 
   private static final Logger LOG = LoggerFactory.getLogger(DecisionApprovalBridge.class);
   private static final ObjectMapper JSON = new ObjectMapper();
@@ -186,6 +187,14 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
 
   /** 决策面 HTTP 结算审批面请求时的 {@code by}（审计：这条请求是被"决策面已经答过了"结算掉的）。 */
   public static final String DECISION_FACE_SOURCE = "decision-packages";
+
+  /**
+   * 「表态完成、还没执行」的诚实说明（用户裁定 15 ③，两段式）：表态接口的回执里必须带它，否则读回执的人会把 {@code DECIDED}
+   * 读成"已经执行了"——而那正是本裁定要拆开的两件事。
+   */
+  public static final String AWAITING_COMMIT_NOTE =
+      "已表态（DECIDED）：被批子集尚未执行——两段式的第二段要显式下执行命令"
+          + "（commit_decision_package / POST /api/decision-packages/{id}/commit）";
 
   /**
    * 回填进 {@link Decision#by()} 的裁决人标识。
@@ -380,6 +389,18 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
           proposed.id(),
           trail.finalizedBy(),
           proposed.items().size());
+      // ★★ 无人在环的自动裁决 ⇒ **表态即 commit**（2026-10-17 控制方裁定，用户可推翻；与跨进程网关那条
+      //   {@code CrossProcessDecisionGateway#isAutoApproval} **同一口径**）：这一包里**一条都没上报到人**
+      //   （{@code escalated.isEmpty()}）⇒ 不存在"能看到这一包、能敲一下执行命令"的人；若仍要求显式 commit，
+      //   被级联批准的这一包只会一直等到到点、按"已批未执行"作废（零落盘）——**自动路径等于失效**。
+      //   ★ 判据就是 escalated 空不空（= 有没有人参与），**不**看级联本身：有人参与的**决策面表态**那条路照旧
+      //     只表态、等显式执行命令（用户裁定 15 ③ 的原意）；**人按审批面那个键**那条路当场执行——
+      //     它是人自己的执行命令（裁定 2），落点在 {@link #backfill} 的 {@code approved} 分支。
+      //   ★ 判别力：把这三行去掉 ⇒ {@code
+      // AppApprovalWiringTest#cascadeApprovesModeLimitedItemWithoutAskingTheHuman}
+      //     的 runs 停在 0（"批了却没人执行"），而审批面上一条请求都没有——没有任何人能来执行它。
+      //   ★ 用 {@code commitAfterDecision}（不是 {@code commitPackage}）：后者在"零批准"时会先抛具名拒，
+      //     而这里要的是"零批准 ⇒ 包层短路成 REJECTED、根本不碰提交口"那条既有语义。
       commitAfterDecision(decided);
       return packages.find(proposed.id());
     }
@@ -416,8 +437,8 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
    * Optional.empty()}。这条不是"优化"，是"没命中敏感调用的回合，事件库里一条决策包的痕迹都不该有"。
    *
    * <p><b>为什么返回值是"重新 find 一次"而不是 propose/onProposed 的返回值</b>：{@code propose} 给的是裁决<b>之前</b>的快照，
-   * {@code onProposed} 内部还要经过投递、裁决、提交三段——只有 {@code find} 读得到提交之后那个真值（同 {@link #commitAfterDecision}
-   * 里"回执要报实际生效的终态"那条注释）。取不到（理论上到不了：终局包不淘汰）⇒ 退回投递前的快照。
+   * {@code onProposed} 内部还要经过投递、裁决两段（★ 裁定 15 ③：执行是之后**另一条命令**的事）——只有 {@code find}
+   * 读得到裁决之后那个真值。取不到（理论上到不了：终局包不淘汰）⇒ 退回投递前的快照。
    *
    * <p><b>失败语义</b>（调用方 {@code AgentPipeline} 的收尾怎么处理它）：{@code PACKAGE_ALREADY_OPEN}
    * 这类状态机具名拒<b>原样上抛</b> （{@link DecisionPackages.RejectionException}）——那是"这一轮没投出去"的响亮形态，由管线的收尾记
@@ -766,13 +787,29 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
     }
     emitDecided(decided);
     LOG.info(
-        "决策包裁决已回填 packageId={} approved={} rejected={} by={} 上报={}",
+        "决策包裁决已回填 packageId={} approved={} rejected={} by={} 上报={} 本步执行={}",
         decided.id(),
         decision.approvedIndexes().size(),
         itemCount - decision.approvedIndexes().size(),
         decision.by(),
-        escalated);
-    commitAfterDecision(decided);
+        escalated,
+        approved ? "当场（这条答复就是执行命令）" : "否（只表态：等显式执行命令）");
+    if (approved) {
+      // ★★ 谁的表态**就是**执行命令（2026-10-17 控制方裁定 1/2，用户可推翻）——只有**批准**才当场执行：
+      //   ① 人按审批面那个键 ⇒ 这个键本来就是人自己的执行命令（与跨进程网关的 {@code byHuman ⇒ commitApproved}
+      //      同一口径：放行了提出者线程却什么都不执行，是自相矛盾）；
+      //   ② 上级代批闸 / AutoApprove 批准（{@code registered(request)} 为假）⇒ 这一包**没有人在环**
+      //      （审批面上从来没登记项 ⇒ 没有人能来敲执行命令）⇒ 表态即执行（裁定 1）。
+      //   两条的判据都只是"这次答复是**批准**"：人按 DENY 不是执行命令 ⇒ 只表态，被批子集要显式 commit
+      //   （与用户裁定 15 ③ 的两段式不冲突——本方法管的从来不是"人经决策面表态"那条路：那条路下包已不是
+      //   PROPOSED，上面的 {@link #preCheckDecidable} 当场返回，走不到这里）。
+      //   ★ 判别力：去掉这一次执行 ⇒ {@code AppApprovalWiringTest#packageLevelApprovalIsNarrowedToOnce} 的
+      //     runs 停在 0（"人按了批准、工具没跑、而且没有任何提示"=最坏的一类假成功）。
+      //   ★ 为什么落在这里、而不在 {@code AgentPipeline#flushPendingDecisions}：管线拿到的只是**包快照**，
+      //     它区分不出"这一包是人按审批键批的"（该执行）与"人经决策面表态的"（只表态）——按快照一律
+      //     commit 会把裁定 15 ③ 的两段式一并推翻。
+      commitAfterDecision(decided);
+    }
   }
 
   /**
@@ -820,10 +857,9 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
   /**
    * 决策面 HTTP 的裁决回填口（设计 §5.13(e)；{@link DecisionSubmissionPort} 的实现）。
    *
-   * <p><b>为什么必须是这一条路</b>：HTTP 处理器直调 {@link DecisionPackages#decide(String, Decision)} 会漏掉两件事——
-   * {@code decision.package.decided} 事件不落、提交口不被调（{@code COMMITTED}/{@code CONFLICTED} 永远不产生）， 而
-   * HTTP 面还会回一个 200。本方法把"回填 → 发事件 → 提交 → 结算审批面请求 → 回执"串成一条，与审批链那条路共用 {@link
-   * #commitAfterDecision}（同一个提交口径，不写第二套）。
+   * <p><b>为什么必须是这一条路</b>：HTTP 处理器直调 {@link DecisionPackages#decide(String, Decision)} 会漏掉 {@code
+   * decision.package.decided} 事件（四个事件的唯一写者是本桥）与审批面那条请求的结算。本方法把"回填 → 发事件 → 结算审批面请求" 串成一条；★ 用户裁定 15 ③
+   * 之后它<b>不</b>再执行（执行走 {@link #commitPackage}，同一个提交口径，不写第二套）。
    *
    * <p><b>★ P2b：裁决面与级联合并</b>——人从决策面批的仍然只是<b>上报给他的那些条目</b>：{@code preApproved ∪ (人的批准 ∩ 上报集合)}
    * 才是终局。包外 index（body 里写了个不存在的条目）原样带进裁决，交给状态机具名拒（{@code INVALID_DECISION}）——本层不另造第二处校验。
@@ -849,17 +885,109 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
     DecisionPackage decided = packages.decide(packageId, effective);
     emitDecided(decided);
     LOG.info(
-        "决策包裁决已回填（决策面 HTTP） packageId={} approved={} rejected={} by={} 上报={}",
+        "决策包裁决已回填（决策面 HTTP；★ 两段式：本步只表态、不执行） packageId={} approved={} rejected={} by={} 上报={}",
         decided.id(),
         decided.decision().approvedIndexes().size(),
         decided.items().size() - decided.decision().approvedIndexes().size(),
         decided.decision().by(),
         escalated);
-    DecisionSubmission submission = commitAfterDecision(decided);
-    // ★ 结算审批面上那条包级请求（P2a 发现 B）：必须在 decide 成功之后——先结算会让提出者线程抢在决策面前面回填，
-    //   那样决策面的 POST 反而会拿到 409（人明明答对了）。放在提交之后：提出者醒来时读到的是已落定的终态。
+    // ★ 裁定 15 ③ 的两段式对"人经**决策面**逐条/整包表态"成立：表态只把包推到 DECIDED，执行要显式下
+    //   commit_decision_package / POST /{id}/commit（决策面那条 commit 走 {@link #commitPackage}）。
+    //   ★★ 本方法**只服务决策面**——审批面上那个批准键走的**不是**这条路（它经 ApprovalCoordinator 回到
+    //   {@link #deliver} → {@link #backfill}）：那个键是人**自己的执行命令**（2026-10-17 控制方裁定 2，用户可推翻；
+    //   与跨进程网关的 {@code byHuman ⇒ commitApproved} 同一口径），执行落点在 {@code backfill} 的
+    //   {@code approved} 分支。★ 判别力：去掉那里的执行 ⇒
+    //   {@code AppApprovalWiringTest#packageLevelApprovalIsNarrowedToOnce} 的 runs 停在 0——
+    //   "人都批了、工具却没跑、而且没有任何提示"是最坏的一类假成功。
+    //   ★ 两边形状差别的**判据**（不是"约定"）：本方法在包已是终态时不存在，而决策面这条路上包由本方法自己
+    //     先推成 DECIDED ⇒ 提出者线程随后被 {@link #settleApprovalRequest} 放行、{@link #backfill} 的
+    //     {@link #preCheckDecidable} 当场返回 ⇒ 那条路**结构上**执行不了（裁定 15 ③ 因此天然成立，
+    //     不靠"记得别执行"）。
     settleApprovalRequest(packageId, !merged.isEmpty());
-    return submission;
+    return new DecisionSubmission(decided, null, AWAITING_COMMIT_NOTE);
+  }
+
+  /**
+   * 条目级表态（用户裁定 15 ②：用户口中的"event 命令看一条、裁一条"）。
+   *
+   * <p><b>它仍然是一次裁决的分段表达</b>：不建第二个包、不投第二条请求、不执行——只把"这一条怎么定"记进包表。 每次表态都发一条 {@code
+   * decision.package.item_decided}（不含明文）；全部条目都表态完 ⇒ 包自动进 {@code DECIDED}，
+   * 那时<b>同样只结算审批面上的请求、不执行</b>（执行要显式下执行命令）。
+   *
+   * <p>理由位（{@code note}）是<b>选填</b>的（裁定 14 第 4 条）：它只进事件载荷与记录面，不参与任何判定。
+   */
+  @Override
+  public DecisionSubmission itemDecided(
+      String packageId, int index, boolean approve, String by, String note) {
+    Objects.requireNonNull(packageId, "packageId");
+    Objects.requireNonNull(by, "by");
+    DecisionPackages.ItemDecisionResult result =
+        packages.itemDecided(packageId, index, approve, by, note);
+    emitItemDecided(result.pkg().id(), index, approve, by, note);
+    LOG.info(
+        "决策包条目级表态 packageId={} index={} approve={} 已表态={} 未表态={} state={} by={}",
+        packageId,
+        index,
+        approve,
+        result.verdicts().size(),
+        result.undecidedCount(),
+        result.pkg().state(),
+        by);
+    if (result.decidedNow()) {
+      // 全部条目都表了态 ⇒ 包自动终结为 DECIDED（裁定 15 ③）。decided 事件照发（与整包裁决那条路同一形状）
+      emitDecided(result.pkg());
+      settleApprovalRequest(packageId, !result.pkg().decision().approvedIndexes().isEmpty());
+    }
+    return new DecisionSubmission(result.pkg(), null, AWAITING_COMMIT_NOTE);
+  }
+
+  /**
+   * 执行命令（用户裁定 15 ③：用户口中的"裁决包执行命令"）。
+   *
+   * <p>只有这一步会让被批子集落盘：{@code DECIDED} 直接执行；{@code DECIDING} 由包层先把没表态的条目按裁定 14 归成被驳
+   * （零落盘，理由如实记"未表态"）再执行；一条都没批 ⇒ 包层具名拒（{@code NO_ITEM_DECIDED}），这里原样上抛。 重复下命令 ⇒ 包层幂等（拿到同一份回执，不重复执行）。
+   */
+  @Override
+  public DecisionSubmission commitPackage(String packageId, String by) {
+    Objects.requireNonNull(packageId, "packageId");
+    DecisionPackage current = packages.find(packageId).orElseThrow(() -> unknownPackage(packageId));
+    if (commitPort.isEmpty()) {
+      String note = "提交口未装配（DecisionCommitPort 未注入）：执行命令无处落地、包保持 " + current.state() + "——这不是「已执行」";
+      LOG.warn(note + " packageId={} by={}", packageId, by);
+      return new DecisionSubmission(current, null, note);
+    }
+    CommitReceipt receipt = packages.commit(packageId, commitPort.orElseThrow());
+    DecisionPackage settled = packages.find(packageId).orElse(current);
+    LOG.info(
+        "决策包执行命令完成 packageId={} state={} status={} outcomes={} by={}",
+        packageId,
+        settled.state(),
+        receipt.status(),
+        receipt.outcomes().size(),
+        by);
+    emitReceipt(settled, receipt);
+    return new DecisionSubmission(settled, receipt, "");
+  }
+
+  /**
+   * 明文读取审计口（用户裁定 15 ①）：{@code GET ...?full=1} 每读一次明文就落一条 {@code
+   * decision.package.detail_read}——载荷只有"谁 / 哪个包 / 哪些 index"，<b>不记明文</b>。
+   *
+   * <p>它是 {@link DecisionReadAudit} 的实现（装配层把它交给决策面）。事件投递失败只 WARN（审计面故障不该把一次读取变成失败， 同 {@link
+   * #emit}）。
+   */
+  @Override
+  public void detailRead(String packageId, List<Integer> indexes, String by) {
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("packageId", packageId == null ? "" : packageId);
+    payload.put("indexes", indexes == null ? List.of() : List.copyOf(indexes));
+    payload.put("by", by == null || by.isBlank() ? DECISION_FACE_SOURCE : by);
+    emit(DecisionEventTypes.DETAIL_READ, payload, packageId);
+    LOG.info(
+        "决策包明文读取已审计 packageId={} indexes={} by={}",
+        packageId,
+        payload.get("indexes"),
+        payload.get("by"));
   }
 
   /** 未知包 id 的具名拒（与状态机同码：HTTP 面据此回 404）。 */
@@ -970,15 +1098,18 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
   }
 
   /**
-   * 裁决之后的提交段（审批链与 HTTP 面<b>共用</b>）：没装配提交口 ⇒ 只落 WARN、包保持 {@code DECIDED}； 装了 ⇒ 恰好一次 {@link
-   * DecisionPackages#commit}，拿到回执之后才发 {@code committed}/{@code conflicted}。
+   * 裁决之后的提交段（<b>只服务"这条答复就是执行命令"的那两条路</b>——无人在环的自动裁决，与人按下审批面批准键）： 没装配提交口 ⇒ 只落 WARN、包保持 {@code
+   * DECIDED}；装了 ⇒ 恰好一次 {@link DecisionPackages#commit}，拿到回执之后才发 {@code committed}/{@code
+   * conflicted}。
    *
-   * <p>★ <b>port 抛异常 ⇒ 一条 {@code committed} 都不发</b>（设计 §5.10①）：{@code packages.commit} 把 port 的异常包成
-   * {@code COMMIT_FAILED}，这里只记 ERROR 并把"没落定"如实写进 {@code commitNote}——绝不补发一条"已提交"的事件来配平叙事。 回执是
-   * {@code REJECTED}（被批子集为空 ⇒ 零落盘）时也不发：表里没有"被驳的提交"这一类事件。
+   * <p><b>★ 它为什么不挂在"人经决策面表态"那条路上</b>（用户裁定 15 ③）：那条路上人批完还要显式下执行命令，执行是 {@link #commitPackage}
+   * 那一步的事——而且它<b>结构上</b>走不到这里（包已被 {@code submitDecision} 推成终态， {@link #backfill} 的 {@link
+   * #preCheckDecidable} 当场返回）。两条会走到这里的路各自成立： ① 一条都没上报到人的自动裁决（{@code onProposed} 的级联分支 / 闸链代批）；②
+   * 人按了审批面那个批准键 （{@code backfill} 的 {@code approved} 分支）——那个键本来就是人自己的执行命令。
    *
-   * <p><b>返回值的两处读者</b>：HTTP 面拿它拼回执（{@link DecisionSubmission}）；审批链那条路只要副作用（事件与提交），
-   * 所以忽略返回值——两条路的状态机后果完全一样。
+   * <p><b>★ port 抛异常 ⇒ 一条 {@code committed} 都不发</b>：{@code packages.commit} 把 port 的异常包成 {@code
+   * COMMIT_FAILED}，这里只记 ERROR 并把"没落定"如实写进 {@code commitNote}——**绝不**补发一条"已提交"的事件来配平叙事。 回执是 {@code
+   * REJECTED}（被批子集为空 ⇒ 零落盘）时也不发：表里没有"被驳的提交"这一类事件。
    */
   private DecisionSubmission commitAfterDecision(DecisionPackage decided) {
     int itemCount = decided.items().size();
@@ -991,33 +1122,48 @@ public final class DecisionApprovalBridge implements DecisionSubmissionPort {
     try {
       receipt = packages.commit(decided.id(), commitPort.orElseThrow());
     } catch (DecisionPackages.RejectionException refusal) {
-      // COMMIT_FAILED（提交口抛异常/回执违约）⇒ 包保持 DECIDED、不记回执：绝不把"没落定"说成落定；
-      // ★ 也绝不发 committed/conflicted（这里到不了 emitReceipt，结构上就发不出去）
       String note = "提交未落定（包保持 DECIDED）：code=" + refusal.code() + " 理由=" + refusal.getMessage();
       LOG.error(
-          "决策包提交未落定（包保持 DECIDED；一条 committed/conflicted 都不发）：packageId={} code={} 理由={}",
+          "决策包自动裁决的提交未落定（包保持 DECIDED；一条 committed/conflicted 都不发）：packageId={} code={} 理由={}",
           decided.id(),
           refusal.code(),
           refusal.getMessage());
       return new DecisionSubmission(decided, null, note);
     }
     LOG.info(
-        "决策包提交完成 packageId={} status={} outcomes={} revisionRef={}",
+        "决策包自动裁决提交完成（无人在环：表态即执行） packageId={} status={} outcomes={} revisionRef={}",
         decided.id(),
         receipt.status(),
         receipt.outcomes().size(),
         receipt.revisionRef());
     emitReceipt(decided, receipt);
-    // ★ 回执要报"实际生效"的终态：decided 是提交<b>之前</b>的快照（DECIDED），提交之后包已变成
-    //   COMMITTED/REJECTED/CONFLICTED。拿旧快照回执，HTTP 面就会在"已经落定"的包上写着 state=DECIDED
-    //   （临时探针当场抓到过这一条）。刷新取一次真值；取不到（理论上到不了）就退回旧快照，不编状态。
-    DecisionPackage settled = packages.find(decided.id()).orElse(decided);
-    return new DecisionSubmission(settled, receipt, "");
+    return new DecisionSubmission(packages.find(decided.id()).orElse(decided), receipt, "");
   }
 
   /** {@code decided} 事件（裁决回填之后，含全驳）。 */
   private void emitDecided(DecisionPackage decided) {
     emit(DecisionEventTypes.DECIDED, payload(decided, null), decided.id());
+  }
+
+  /**
+   * {@code item_decided} 事件（用户裁定 15 ②）：{@code {packageId, index, approve|reject, by}}，<b>不含明文</b>。
+   *
+   * <p>理由位（{@code note}）也随载荷出去：它是<b>人的话</b>（可选），不是参数——与 {@code outcomes} 里逐条理由同一档。
+   * 参数明文一个字节都不进来（{@link PackageItem#args()} 在本方法里根本不被读）。
+   */
+  private void emitItemDecided(
+      String packageId, int index, boolean approve, String by, String note) {
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("packageId", packageId);
+    payload.put(
+        "proposerKey", packages.find(packageId).map(DecisionPackage::proposerKey).orElse(""));
+    payload.put("index", index);
+    payload.put("verdict", approve ? "approve" : "reject");
+    payload.put("by", by);
+    if (note != null && !note.isBlank()) {
+      payload.put("note", note);
+    }
+    emit(DecisionEventTypes.ITEM_DECIDED, payload, packageId);
   }
 
   /** 提交回执 → {@code committed}/{@code conflicted}（{@code REJECTED} = 零落盘，没有这一类事件）。 */

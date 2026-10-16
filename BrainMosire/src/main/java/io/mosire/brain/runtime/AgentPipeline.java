@@ -2,8 +2,8 @@ package io.mosire.brain.runtime;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.decision.DecisionTurnScope;
 import io.mosire.agentlib.decision.PendingDecisionQueue;
 import io.mosire.agentlib.event.Event;
@@ -81,6 +81,21 @@ public final class AgentPipeline {
 
   private static final Logger LOG = LoggerFactory.getLogger(AgentPipeline.class);
   private static final ObjectMapper JSON = new ObjectMapper();
+
+  /**
+   * <b>{@code decision.package.deadlineMs} 在 {@code toolConfig} 里的键</b>（用户 2026-10-17 指令
+   * 「这玩意他妈不是可配置项吗？」）：等人答复的窗口（= 本轮包的 {@code deadlineEpochMs}，裁定 10），由<b>装配层</b>从配置读出来
+   * 放进工具配置表，本类在绑定本轮队列时取它（见 {@link #bindPendingDecisions}）。
+   *
+   * <p><b>为什么走 {@code toolConfig} 而不是给构造加参数</b>：{@code toolConfig} 正是本仓既有的"装配层 → 管线工具面" 配置通道（先例
+   * {@code SandboxMask.CONFIG_KEY}），而且它已经是<b>所有</b>管线构造（含子体进程那条最朴素的）都收的参数——
+   * 加一个构造参数要同时改十几条构造与全部调用点，且子体进程那几条<b>本来就没有</b>配置来源。缺省（键不在表里）= {@link PendingDecisionQueue}
+   * 自己的缺省（30 分钟），行为逐字不变。
+   *
+   * <p>值非法（非整数 / ≤ 0）不在这里兜底：装配层读配置时已经<b>响亮失败</b>（{@code DecisionWindows.load}）。本类只认 {@link
+   * Number}，其余类型按"没配"办并留一条 WARN——管线不该在回合中间抛出一个启动期就该报的错。
+   */
+  public static final String CONFIG_DECISION_DEADLINE_MS = "decision.package.deadlineMs";
 
   private final AgentConfig config;
   private final LlmClient llm;
@@ -509,13 +524,13 @@ public final class AgentPipeline {
    * <p><b>为什么与桥并存而不是二选一</b>：装配层可能同时给两者（子体进程里挂一条本进程的桥做兜底，或反过来）； 谁走哪条路由 {@link
    * #flushPendingDecisions} 现判（缝优先），不由构造顺序暗示。
    *
-   * <p><b>{@code EI_EXPOSE_REP2} 抑制（写明理由）</b>：{@code decisionBridge} 与 {@code
-   * crossProcessSubmitter} 都是<b>注入的协作者</b>——管线在回合收尾必须调它们（收成包、投递/提交、等裁决、执行被批子集）。它们与本类既有的 {@code
-   * events}/{@code bus}/{@code llm}/{@code guard} 完全同类：<b>故意的共享引用（依赖注入）</b>，不是"把内部状态漏出去"；
-   * 为它们做防御性拷贝既无意义（两者都不可拷贝）也会拆掉唯一写者。抑制只为压掉"存外部可变对象"这条对注入场景的误报，
-   * <b>不改</b>注入形状；它落在<b>本条终态构造</b>上（只有它真正持有这两个引用）。
+   * <p><b>为什么不给 {@code decisionBridge}/{@code crossProcessSubmitter} 挂 {@code EI_EXPOSE_REP2}
+   * 抑制</b>： 它们是<b>注入的协作者</b>（管线在回合收尾必须调它们：收成包、投递/提交、等裁决、执行被批子集），与本类既有的 {@code events}/{@code
+   * bus}/{@code llm}/{@code guard} 完全同类——<b>故意的共享引用（依赖注入）</b>，不是"把内部状态漏出去"。 ★
+   * 这里此前挂过一条抑制，<b>2026-10-17 clean 重编（先 {@code rm -rf target/classes}）实测它是多余的</b>： 去掉抑制、只跑
+   * SpotBugs（跳开 checkstyle）⇒ {@code BugInstance size is 0}，没有任何 {@code EI_EXPOSE_REP2} 告警 ⇒ 按
+   * AGENTS §三"抑制多余也是要修的告警"删掉它。若将来真报了，再按当时的事实重新加回来并写明理由。
    */
-  @SuppressFBWarnings("EI_EXPOSE_REP2")
   public AgentPipeline(
       AgentConfig config,
       LlmClient llm,
@@ -849,7 +864,60 @@ public final class AgentPipeline {
         crossProcessSubmitter == null
             ? AgentIdentity.mainFrom(toolConfig).instanceId()
             : crossProcessSubmitter.proposerKey();
-    return DecisionTurnScope.bind(new PendingDecisionQueue(instanceId, caller));
+    return DecisionTurnScope.bind(
+        new PendingDecisionQueue(instanceId, caller, decisionDeadlineMillis()));
+  }
+
+  /**
+   * 本轮包的裁决窗口（毫秒），取自装配层放进 {@link #toolConfig} 的 {@link #CONFIG_DECISION_DEADLINE_MS}。
+   *
+   * <p><b>为什么让装配层读配置、而不是管线自己读配置库</b>：Brain 层不认识配置根（{@code ConfigStore} 由 {@code App} /
+   * 子体进程装配点持有），而"读一个键、值非法就响亮失败"这条口径归装配层（与 {@code SubagentLimitsLoader} 等同一条路）。 本类只做一次取值 + 形状判断。
+   *
+   * <p><b>缺省 = 队列自己的缺省</b>（30 分钟）：键不在表里、值为 null、或值不是正数 ⇒ 不传窗（走二参语义）。值非法时装配层
+   * 早已响亮失败，所以这里的分支实际只服务"离线夹具手搓 toolConfig""子体进程没配"这两档。
+   */
+  private long decisionDeadlineMillis() {
+    Object configured = toolConfig.get(CONFIG_DECISION_DEADLINE_MS);
+    if (configured instanceof Number number && number.longValue() > 0L) {
+      return number.longValue();
+    }
+    if (configured != null) {
+      LOG.warn(
+          "本轮决策窗口配置不可用（按缺省 {}ms 办，配置键 {}）值={}——装配层应当在启动期就为非法值响亮失败",
+          DecisionPackages.DEFAULT_DEADLINE_MILLIS,
+          CONFIG_DECISION_DEADLINE_MS,
+          configured);
+    }
+    return defaultDecisionDeadlineMillis;
+  }
+
+  /**
+   * <b>本进程的缺省决策窗口</b>（毫秒）：默认 {@link DecisionPackages#DEFAULT_DEADLINE_MILLIS}（30 分钟， 行为与接线前逐字相同）。
+   *
+   * <p><b>为什么存在这个进程级旋钮</b>：主 Agent 那条路把配置经 {@code toolConfig} 传进来就够了；<b>子体进程没有这条缝</b>
+   * ——它走的是"最朴素的装配"（{@code AgentRuntime} 的无 {@code toolConfig} 构造），而 {@code AgentRuntime} 不在本单的改动面
+   * 内。子体要的只是"它本地那个包自己的 deadline"（跨进程结算的窗口在父侧的网关上，不在它这里），所以给一个 <b>进程级</b>缺省：子体装配点在 {@code new
+   * AgentRuntime(...)} 之前设一次即可（一个子体进程只有一个 Agent， 这条缝不存在"两个实例用不同窗口"的场景）。
+   *
+   * <p>非法值（≤ 0）在这里被忽略并留 WARN：真正的"值非法 ⇒ 响亮失败"发生在装配层读配置时 （{@code
+   * DecisionWindows#load}），本字段只承载已经校验过的那一份。
+   */
+  private static volatile long defaultDecisionDeadlineMillis =
+      DecisionPackages.DEFAULT_DEADLINE_MILLIS;
+
+  /**
+   * 设置本进程的缺省决策窗口（毫秒；≤ 0 忽略并留 WARN）。见 {@link #defaultDecisionDeadlineMillis} 的理由。
+   *
+   * @return 是否生效
+   */
+  public static boolean useDecisionDeadlineMillis(long deadlineMillis) {
+    if (deadlineMillis <= 0L) {
+      LOG.warn("忽略非正的决策窗口（毫秒）: {}——保持 {}", deadlineMillis, defaultDecisionDeadlineMillis);
+      return false;
+    }
+    defaultDecisionDeadlineMillis = deadlineMillis;
+    return true;
   }
 
   /**

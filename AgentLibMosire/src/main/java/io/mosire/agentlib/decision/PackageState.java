@@ -15,6 +15,18 @@ package io.mosire.agentlib.decision;
 public enum PackageState {
   /** 已建包、等裁决：唯一「未决」态，{@link DecisionPackages#pending()} 只列它。 */
   PROPOSED,
+  /**
+   * <b>裁决累积中</b>（用户裁定 15，2026-10-17）：逐条表态（{@link DecisionPackages#itemDecided}）已经开始、但还有条目没表态。
+   *
+   * <p><b>为什么需要它</b>：用户的"event 命令看一条、裁一条"是<b>一次裁决的分段表达</b>——裁到一半的包既不是"还没人裁" （{@code
+   * PROPOSED}：那样会让人以为一条都没定，也会把已表态的条目重新问一遍），也不是"裁决已作出"（{@code DECIDED}： 那样 {@link
+   * DecisionPackages#commit} 就会把<b>没表态的条目</b>当成被驳执行掉）。两个态都不是，就必须有第三个。
+   *
+   * <p><b>与"未表态"的关系</b>：本态下没表态的条目<b>既不是批准、也不是驳回</b>——它保持"未决"。 到点（{@link
+   * DecisionPackages#expire(long)}）才按用户裁定 14「静默 = 拒绝」把它们归成被驳（零落盘）， 包于是终结为 {@code DECIDED}
+   * 并<b>再</b>走一次到点判定（已批未执行 ⇒ {@code EXPIRED}，见该方法的注释）。
+   */
+  DECIDING,
   /** 裁决已作出（整包一次裁 + 逐条例外）：等提交；被批子集<b>可能为空</b>（全部条目被驳）。 */
   DECIDED,
   /** 被批子集已一次提交、宿主回执已落定：恰好一条 revision。 */

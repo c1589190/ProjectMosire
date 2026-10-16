@@ -41,6 +41,9 @@ class DecisionPackagesHttpHandlerInFlightTest {
   private static final ObjectMapper JSON = new ObjectMapper();
   private static final String IN_FLIGHT_ID = "xp-11111111-2222-3333-4444-555555555555";
 
+  /** 明文读取审计桩（用户裁定 15 ①）：只记"哪一次读了什么"，用来断言审计真的落了、且不含明文。 */
+  private final RecordingReadAudit audit = new RecordingReadAudit();
+
   /** 真包（在主表里）与在途包（只在取数口里）各一个：判据要能分辨"这两级"。 */
   @Test
   void theDetailFaceResolvesInFlightPackagesAsPlaintextButStaysReadOnly() throws Exception {
@@ -49,9 +52,25 @@ class DecisionPackagesHttpHandlerInFlightTest {
     DecisionPackages packages = new DecisionPackages();
     AtomicInteger submissions = new AtomicInteger();
     DecisionSubmissionPort submissionsPort =
-        (packageId, decision) -> {
-          submissions.incrementAndGet();
-          throw new AssertionError("在途包不得走到提交口");
+        new DecisionSubmissionPort() {
+          @Override
+          public DecisionSubmission submitDecision(String packageId, Decision decision) {
+            submissions.incrementAndGet();
+            throw new AssertionError("在途包不得走到提交口");
+          }
+
+          @Override
+          public DecisionSubmission itemDecided(
+              String packageId, int index, boolean approve, String by, String note) {
+            submissions.incrementAndGet();
+            throw new AssertionError("在途包不得走到提交口");
+          }
+
+          @Override
+          public DecisionSubmission commitPackage(String packageId, String by) {
+            submissions.incrementAndGet();
+            throw new AssertionError("在途包不得走到提交口");
+          }
         };
     CountingInFlight inFlight = new CountingInFlight();
     try (bus;
@@ -66,10 +85,12 @@ class DecisionPackagesHttpHandlerInFlightTest {
           packages,
           submissionsPort,
           packageId -> packageId.equals(IN_FLIGHT_ID) ? Set.of(0) : null,
-          inFlight);
+          inFlight,
+          null,
+          audit);
       int port = endpoint.boundPort();
 
-      // ---- ① 在途包：GET 详情读得到逐条明文（与真包同一形状）----
+      // ---- ① 在途包：GET 详情读得到逐条（★ 用户裁定 15 ①：默认概览，full=1 才给明文）----
       inFlight.put(inFlightPackage());
       HttpResponse<String> detail =
           get(port, DecisionPackagesHttpHandler.PATH + "/" + IN_FLIGHT_ID);
@@ -83,9 +104,36 @@ class DecisionPackagesHttpHandlerInFlightTest {
       JsonNode item = row.get("items").get(0);
       assertThat(item.get("index").asInt()).isZero();
       assertThat(item.get("toolName").asText()).isEqualTo("sensitive_probe");
-      assertThat(item.get("summary").asText()).isNotBlank();
-      assertThat(item.get("args").get("text").asText()).as("★ args 是明文").isEqualTo("一");
+      assertThat(item.get("overview").asText())
+          .as("★ 概览档给的是「哪个工具、几个参数」，不是参数值")
+          .contains("sensitive_probe");
+      assertThat(item.has("summary")).as("★ 概览档连人读摘要都不给（它就是截断后的参数）").isFalse();
       assertThat(item.get("escalated").asBoolean()).as("上报视图对这个 id 说了 {0}").isTrue();
+      // ★ 裁定 15 ①：**默认概览**——明文（args）一个字都不出现，摘要照旧给
+      assertThat(item.has("args")).as("★ 默认概览不含明文（用户裁定 15 ①）").isFalse();
+      assertThat(item.get("digest").asText()).isNotBlank();
+      // ★ 明文"不出现"的判据要看**解析后的字段**：脱敏摘要（argsDigest 的十六进制）里可以合法地含有明文的
+      //   某个字符，拿整段 body 做子串匹配会得到一条假红（本用例第一版就是这么红的）
+      assertThat(detail.body()).as("★ 默认响应体里不得出现明文本身").doesNotContain("TOPSECRET-INFLIGHT");
+      assertThat(row.get("items").get(0).has("args")).isFalse();
+      assertThat(audit.reads).as("★ 没要明文就不落审计（读了没看 ≠ 看了）").isEmpty();
+
+      // ★ 裁定 15 ①：**显式 full=1 才给明文**，并且每一次都落审计事件（只记谁/哪个包/哪些 index）
+      HttpResponse<String> full =
+          get(port, DecisionPackagesHttpHandler.PATH + "/" + IN_FLIGHT_ID + "?full=1");
+      assertThat(full.statusCode()).isEqualTo(200);
+      JsonNode fullRow = JSON.readTree(full.body());
+      assertThat(fullRow.get("items").get(0).get("args").get("text").asText())
+          .as("★ full=1 ⇒ args 是明文")
+          .isEqualTo("TOPSECRET-INFLIGHT");
+      assertThat(fullRow.get("items").get(0).get("summary").asText())
+          .as("★ 明文档才给人读摘要（它含参数值）")
+          .contains("TOPSECRET-INFLIGHT");
+      assertThat(audit.reads).as("★ 每一次 full 读取都落一条审计").hasSize(1);
+      assertThat(audit.reads.get(0)).contains(IN_FLIGHT_ID).contains("[0]");
+      assertThat(audit.reads.get(0))
+          .as("★ 审计只记谁/哪个包/哪些 index，绝不记明文")
+          .doesNotContain("TOPSECRET-INFLIGHT");
 
       // ---- ② 只读：不进 pending() 列表、POST 不认它 ----
       JsonNode list = JSON.readTree(get(port, DecisionPackagesHttpHandler.PATH).body());
@@ -112,10 +160,17 @@ class DecisionPackagesHttpHandlerInFlightTest {
       HttpResponse<String> realDetail =
           get(port, DecisionPackagesHttpHandler.PATH + "/" + real.id());
       assertThat(realDetail.statusCode()).isEqualTo(200);
-      assertThat(
-              JSON.readTree(realDetail.body()).get("items").get(0).get("args").get("text").asText())
-          .isEqualTo("真包明文");
+      assertThat(JSON.readTree(realDetail.body()).get("items").get(0).has("args"))
+          .as("★ 真包的默认详情同样是概览（口径不分在途/在表）")
+          .isFalse();
       assertThat(inFlight.findCount()).as("★ 主表命中 ⇒ 不问在途口").isEqualTo(callsBefore);
+      HttpResponse<String> realFull =
+          get(port, DecisionPackagesHttpHandler.PATH + "/" + real.id() + "?full=1");
+      assertThat(realFull.statusCode()).isEqualTo(200);
+      assertThat(
+              JSON.readTree(realFull.body()).get("items").get(0).get("args").get("text").asText())
+          .isEqualTo("真包明文");
+      assertThat(audit.reads).as("★ 真包的 full 读取同样落审计").hasSize(2);
 
       inFlight.failWith(new IllegalStateException("取数口炸了（用例桩）"));
       assertThat(get(port, DecisionPackagesHttpHandler.PATH + "/" + IN_FLIGHT_ID).statusCode())
@@ -131,7 +186,7 @@ class DecisionPackagesHttpHandlerInFlightTest {
         IN_FLIGHT_ID,
         "prober-1",
         AccessToken.DEFAULT,
-        List.of(packageItem(0, "sensitive_probe", Map.of("text", "一"))),
+        List.of(packageItem(0, "sensitive_probe", Map.of("text", "TOPSECRET-INFLIGHT"))),
         System.currentTimeMillis(),
         System.currentTimeMillis() + DecisionPackages.DEFAULT_DEADLINE_MILLIS,
         PackageState.PROPOSED,
@@ -170,6 +225,17 @@ class DecisionPackagesHttpHandlerInFlightTest {
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build(),
             HttpResponse.BodyHandlers.ofString());
+  }
+
+  /** 明文读取审计口的最简实现：把每次读取的原样记下来（判据自己再断言内容）。 */
+  private static final class RecordingReadAudit implements DecisionReadAudit {
+
+    private final List<String> reads = new CopyOnWriteArrayList<>();
+
+    @Override
+    public void detailRead(String packageId, List<Integer> indexes, String by) {
+      reads.add(packageId + " " + indexes + " by=" + by);
+    }
   }
 
   /** 在途取数口的桩：一张可增删的表 + 调用计数 + 可注入的异常（判据要能分辨"命中主表"与"问在途口"）。 */

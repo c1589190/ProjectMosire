@@ -37,6 +37,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.AfterEach;
@@ -52,7 +53,8 @@ import org.junit.jupiter.api.Test;
  *   <li>★ <b>{@code SENSITIVE} 不被代批</b>：上报条目里有敏感区条目 ⇒ 请求取 {@code SENSITIVE} ⇒ 上级判定闸<b>一次都没被问</b>
  *       （零批准）。判别力：把 {@code requestKind} 的"任一条不是 MODE_LIMITED ⇒ SENSITIVE"那一句去掉 ⇒ 假模型会点头 ⇒ 本条红；
  *   <li>★ <b>{@code MODE_LIMITED} 在装配了明细缝时可被代批，且判定提示里带逐条明文</b>：用真 {@link LlmSuperiorJudgement} + 假
- *       {@link LlmClient}（不联网、不花钱）把提示抓下来，断言里面逐条写着参数原文；
+ *       {@link LlmClient}（不联网、不花钱）把提示抓下来，断言里面逐条写着参数原文；并断言<b>自动裁决的终局 = 被批</b> （2026-10-17
+ *       控制方裁定「无人在环的自动裁决 ⇒ 表态即 commit」，用户可推翻——见 {@code awaitAnswer} 里那一段）；
  *   <li>★ <b>明细缝缺席 ⇒ 退回 {@code SENSITIVE}</b>（fail-closed）：同一个 {@code MODE_LIMITED} 条目在没有明细缝的装配里，
  *       上级判定闸一次都没被问、零批准。判别力：把那条回退去掉 ⇒ 上级<b>盲批</b> ⇒ 本条红；
  *   <li><b>在途明文面</b>：判定当刻（= 正等人裁的窗口里）决策面按 {@code xp-…} 取得到父侧自己那份逐条明文；投递返回即消失。
@@ -66,12 +68,98 @@ class CrossProcessDecisionKindAndPlaintextTest {
 
   private static final Pattern TRANSIENT_ID = Pattern.compile("xp-[0-9a-fA-F-]{36}");
 
+  /**
+   * <b>第二段"等执行命令"的窗口</b>（毫秒，用例级）：按缺省 30 秒等的话本类四条就是 120 秒（实测）。 它只决定"没人下执行命令时多久按裁定 15 ④ 收尾"，与判据无关——见
+   * AGENTS §四 第 11 条。
+   */
+  private static final long COMMIT_WAIT_MILLIS = 200L;
+
   private final EventBus bus = new EventBus();
   private final PendingApprovals pending = new PendingApprovals();
 
   @AfterEach
   void tearDown() {
     bus.close();
+  }
+
+  /**
+   * ★ <b>人在审批面批准 = 人自己的执行命令</b>（用户裁定 15 ③ 在跨进程这条路上的落点）。
+   *
+   * <p>为什么它不是"绕过两段式"：人按下审批面那个批准键，本来就是<b>第二段</b>的动作——它会结算审批面上那条请求、
+   * 放行正阻塞在提交口上的提出者线程；若这里只把它当"表态"，这一包会按"已批未执行"作废（零落盘）， 而线程恰恰是被它放行的："放行了却什么都不执行"。⇒ 记成 committed，终局交给
+   * {@code committedVerdict} （与决策面 commit 同一条算法），裁决者如实记 {@code HUMAN}。
+   *
+   * <p><b>判别力</b>：去掉 {@code settle} 里那段 {@code byHuman ⇒ waiting.commit()} ⇒ 本条的 {@code
+   * approvedIndexes} 变空、{@code deciderLevel} 变 {@code NONE}（这正是 2026-10-17 收口前实测的形态）。
+   */
+  @Test
+  void aHumanApprovalOnTheApprovalFaceIsTheCommitCommand() {
+    ParentSubagentDecisionLedger ledger = canSubmitLedger();
+    RecordingChannel channel = new RecordingChannel();
+    channel.answer(ApprovalDecision.APPROVE_ONCE);
+    ApprovalCoordinator coordinator = coordinator(List.of(), channel, Duration.ofSeconds(5));
+    CrossProcessDecisionGateway gateway = gateway(ledger, coordinator, Optional.empty());
+
+    Map<String, Object> args = Map.of("text", "一");
+    ledger.defer(
+        probe(AskKind.SENSITIVE),
+        childContext(args),
+        new ToolGate.Ask("probe:ask", "探针要向人确认一次", AskKind.SENSITIVE));
+
+    CrossProcessDecisionGateway.Verdict verdict = gateway.submit(request(args));
+
+    assertThat(verdict.approvedIndexes())
+        .as("★ 人批了 ⇒ 这一条被批、交回提出者执行（人都点头了，不该再作废）")
+        .containsExactly(0);
+    assertThat(verdict.deciderLevel())
+        .as("★ 记录说真话：人拍的板记 HUMAN")
+        .isEqualTo(CrossProcessDecisionGateway.DECIDER_HUMAN);
+    assertThat(verdict.finalizedBy()).isEqualTo(DecisionCascade.HUMAN_DECIDER);
+  }
+
+  /**
+   * ★ <b>人在窗口内表态 + 下执行命令 ⇒ 交回提出者执行</b>（用户裁定 15 ②③ 的操作序列："看一条、裁一条、再下执行命令"）。
+   *
+   * <p>本条的判别力落在"执行命令真的要有人下"这件事上：与上一条唯一的差别就是多了一次 {@link
+   * CrossProcessDecisionGateway#commitPackage}（在同一个窗口内），结果从零批准变成"这一条被批"。
+   */
+  @Test
+  void aCommitCommandInsideTheWindowCommitsTheVotedItems() throws Exception {
+    ParentSubagentDecisionLedger ledger = canSubmitLedger();
+    RecordingChannel channel = new RecordingChannel();
+    // ★ 协调器窗口也压到毫秒级（本条要的正是"没人答 ⇒ 进第二段等执行命令"）：按 5s 等就白等 5 秒。
+    ApprovalCoordinator coordinator = coordinator(List.of(), channel, Duration.ofMillis(200));
+    CrossProcessDecisionGateway gateway = gateway(ledger, coordinator, Optional.empty());
+
+    Map<String, Object> args = Map.of("text", "一");
+    ledger.defer(
+        probe(AskKind.SENSITIVE),
+        childContext(args),
+        new ToolGate.Ask("probe:ask", "探针要向人确认一次", AskKind.SENSITIVE));
+
+    AtomicReference<CrossProcessDecisionGateway.Verdict> verdict = new AtomicReference<>();
+    Thread submitter =
+        new Thread(() -> verdict.set(gateway.submit(request(args))), "case-submitter");
+    submitter.start();
+    // 等人这一包出现在在途面上，再"看一条、裁一条、下执行命令"（正是用户裁定 15 的操作序列）
+    String packageId = null;
+    for (int i = 0; i < 2000 && packageId == null; i++) {
+      packageId = gateway.list().stream().map(DecisionPackage::id).findFirst().orElse(null);
+      if (packageId == null) {
+        Thread.sleep(5L);
+      }
+    }
+    assertThat(packageId).as("在途面出现这一包").isNotNull();
+    gateway.itemDecided(packageId, 0, true, "用例：人", "");
+    gateway.commitPackage(packageId, "用例：人");
+    submitter.join();
+
+    assertThat(verdict.get().approvedIndexes())
+        .as("★ 人在窗口内表态 + 下执行命令 ⇒ 这一条被批、交回提出者执行")
+        .containsExactly(0);
+    assertThat(verdict.get().deciderLevel())
+        .as("★ 记录说真话：人下的执行命令记成 HUMAN")
+        .isEqualTo(CrossProcessDecisionGateway.DECIDER_HUMAN);
   }
 
   // ---------- ③ MODE_LIMITED + 明细缝在 ⇒ 可被代批，提示里带逐条明文 ----------
@@ -108,7 +196,12 @@ class CrossProcessDecisionKindAndPlaintextTest {
     assertThat(judgedKinds)
         .as("★ kind 取父侧那份（MODE_LIMITED）⇒ 请求真的上了上级判定台")
         .containsExactly(AskKind.MODE_LIMITED);
-    assertThat(verdict.approvedIndexes()).as("上级代批闸批准 ⇒ 这一条被批").containsExactly(0);
+    // ★★ 控制方裁定（2026-10-17，用户可推翻）：**无人在环的自动裁决 ⇒ 表态即 commit**。
+    //   上级代批这条路上审批面从来没有过登记项（approval.requested 都没发）⇒ 没有"人"能来敲执行命令；
+    //   若仍要求显式 commit，这一包只会白等到窗口结束再按"已批未执行"作废，自动路径等于失效。
+    //   ⇒ 闸链批准 = 终局：被批条目交回提出者执行（本类不执行）。判别力：去掉 awaitAnswer 里那段 isAutoApproval
+    //     分支 ⇒ 本条 verdict.approvedIndexes() 变空（**这正是 2026-10-17 实测的那条红**）、且白等满窗口。
+    assertThat(verdict.approvedIndexes()).as("上级代批 ⇒ 这一条被批（自动路径：表态即 commit）").containsExactly(0);
     assertThat(verdict.deciderLevel())
         .as("★ 记录说真话：代批记成 SUPERIOR，不记成 HUMAN")
         .isEqualTo(CrossProcessDecisionGateway.DECIDER_SUPERIOR);
@@ -215,6 +308,7 @@ class CrossProcessDecisionKindAndPlaintextTest {
             channel,
             Duration.ofMillis(120));
     // 五参构造：接线明细缝但**没有**父侧本轮队列 ⇒ 没有"父侧那一刻算出来的那份 kind"可采信
+    // ★ 同样注入毫秒级执行等待窗（按缺省 30s 等的话，本条"没人答"就要白挂 30 秒——实测 30.122s）。
     CrossProcessDecisionGateway gateway =
         new CrossProcessDecisionGateway(
             instanceId ->
@@ -225,7 +319,8 @@ class CrossProcessDecisionKindAndPlaintextTest {
             coordinator,
             pending,
             null,
-            Optional.of(details));
+            Optional.of(details),
+            COMMIT_WAIT_MILLIS);
 
     Map<String, Object> args = Map.of("text", "一");
     CrossProcessDecisionGateway.Verdict verdict =
@@ -263,6 +358,8 @@ class CrossProcessDecisionKindAndPlaintextTest {
       ParentSubagentDecisionLedger ledger,
       ApprovalCoordinator coordinator,
       Optional<SuperiorJudgeDetailRegistry> details) {
+    // ★ 裁定 15 ④（2026-10-17 用户指令「太变态了直接等30分钟，改！」+ AGENTS §四 第 11 条）：用例**一律**注入毫秒级
+    //   执行等待窗——按缺省（30s）等的话，本类四条用例就是 4×30s（实测 120.6s）。窗口只决定"没人下执行命令时多久收尾"。
     return new CrossProcessDecisionGateway(
         instanceId ->
             Optional.of(
@@ -272,7 +369,8 @@ class CrossProcessDecisionKindAndPlaintextTest {
         coordinator,
         pending,
         ledger,
-        details);
+        details,
+        COMMIT_WAIT_MILLIS);
   }
 
   /** 没有可上溯层级的级联（每一级都解析不出来 ⇒ 上报集合 = 全部条目，与真装配的"没人有能力"同形）。 */

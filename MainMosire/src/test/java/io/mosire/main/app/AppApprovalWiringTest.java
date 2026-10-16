@@ -140,8 +140,22 @@ class AppApprovalWiringTest {
         JsonNode item = pending.get("items").get(0);
         assertThat(item.get("index").asInt()).isZero();
         assertThat(item.get("toolName").asText()).isEqualTo("danger_probe");
-        assertThat(item.get("summary").asText())
-            .as("条目摘要由包层从 args 派生（裁定 6：不再是工具自报的 Ask.summary，也不再是『工具名 + 摘要』）")
+        // ★ 裁定 15 ①（两档查看）：默认 = **概览** ⇒ 明文与"人读摘要"（它就是截断后的参数）都不在列表里；
+        //   要摘要/明文得显式 full=1（下面那条 detail 请求就是那一档，且会落一条 detail_read 审计）。
+        assertThat(item.has("summary")).as("★ 默认概览不给摘要（它含参数值）").isFalse();
+        assertThat(item.has("args")).as("★ 默认概览不给明文").isFalse();
+        assertThat(item.get("overview").asText())
+            .as("概览给的是「哪个工具、几个参数」")
+            .contains("danger_probe")
+            .doesNotContain(SECRET);
+        HttpResponse<String> itemDetail =
+            get(
+                app.approvalPort(),
+                DecisionPackagesHttpHandler.PATH + "/" + packageId + "/items/0?full=1");
+        assertThat(itemDetail.statusCode()).isEqualTo(200);
+        JsonNode fullItem = JSON.readTree(itemDetail.body());
+        assertThat(fullItem.get("summary").asText())
+            .as("★ full 档的条目摘要由包层从 args 派生（裁定 6：不再是工具自报的 Ask.summary）")
             .isEqualTo("danger_probe token=" + SECRET)
             .isNotEqualTo(SUMMARY);
 
@@ -163,9 +177,18 @@ class AppApprovalWiringTest {
 
         assertThat(runs).as("人还没答，工具体绝不能先跑").hasValue(0);
 
-        HttpResponse<String> receipt =
+        // ★ 两段式（用户裁定 15 ③）：第一段表态（只到 DECIDED、零执行），第二段执行命令 ⇒ COMMITTED
+        HttpResponse<String> voted =
             postPackageDecision(
                 app.approvalPort(), packageId, "{\"approveAll\":true,\"by\":\"case-human\"}");
+        assertThat(voted.statusCode()).isEqualTo(200);
+        assertThat(JSON.readTree(voted.body()).get("state").asText())
+            .as("★ 表态 ≠ 执行：决策面批完只到 DECIDED")
+            .isEqualTo("DECIDED");
+        assertThat(runs).as("★ 还没下执行命令 ⇒ 工具体绝不能跑").hasValue(0);
+        HttpResponse<String> receipt =
+            postPackageDecision(
+                app.approvalPort(), packageId + "/commit", "{\"by\":\"case-human\"}");
         assertThat(receipt.statusCode()).isEqualTo(200);
         JsonNode receiptBody = JSON.readTree(receipt.body());
         assertThat(receiptBody.get("state").asText()).isEqualTo("COMMITTED");
@@ -240,28 +263,25 @@ class AppApprovalWiringTest {
                 app.approvalPort(), packageId, "{\"rejectAll\":true,\"by\":\"case-human\"}");
         assertThat(receipt.statusCode()).isEqualTo(200);
         JsonNode receiptBody = JSON.readTree(receipt.body());
+        // ★ 两段式：驳 = 一次表态（approvedCount=0）⇒ 包进 DECIDED、**没有提交段**；"被驳"由 decision 的
+        //   approved/rejected 两个列表如实表达（包状态机里没有"REJECTED 态"；零落盘由"进不了提交段"保证）。
         assertThat(receiptBody.get("state").asText())
-            .as("整包驳 ⇒ 零落盘终局（不是 EXPIRED 那一档『没人答复』）")
-            .isEqualTo("REJECTED");
+            .as("整包驳 ⇒ 零批准（不是 EXPIRED 那一档『没人答复』）")
+            .isEqualTo("DECIDED");
         assertThat(receiptBody.get("decision").get("by").asText()).isEqualTo("case-human");
         assertThat(receiptBody.get("decision").get("approved").size()).isZero();
         assertThat(receiptBody.get("decision").get("rejected").size()).isEqualTo(1);
         assertThat(receiptBody.get("decision").get("rejected").get(0).asInt()).isZero();
-        JsonNode commit = receiptBody.get("commit");
-        assertThat(commit.get("status").asText()).isEqualTo("REJECTED");
-        assertThat(commit.get("outcomes").size()).isEqualTo(1);
-        assertThat(commit.get("outcomes").get(0).asText())
-            .as("逐条去向：被驳（由包层填，不是宿主）")
-            .isEqualTo("REJECTED");
-        assertThat(commit.get("reason").asText()).as("零落盘的理由要说得出来").contains("被批子集为空");
+        // ★ 表态那一步的回执没有 commit 段（执行是第二段的事）；"零批准 ⇒ 零落盘"由包层保证，
+        //   这里用**包终局**钉住它：到点收尾时它仍是"被驳"而不是"没人答复"。
         assertThat(runs).as("被拒的调用绝不执行工具体").hasValue(0);
 
         assertThat(turn.get(20, TimeUnit.SECONDS).stopReason())
             .as("驳回同样结算那条包级请求 ⇒ 立即放行（不是等满 60s 窗口）")
             .isEqualTo(StopReason.FINISHED);
         assertThat(packageState(app.approvalPort(), packageId))
-            .as("到点收尾不得把『被驳』改写成『没人答』（REJECTED 与 EXPIRED 必须分得开）")
-            .isEqualTo("REJECTED");
+            .as("到点收尾不得把『被驳』改写成『没人答』（零批准与 EXPIRED 必须分得开：驳回留在 DECIDED + 逐条 rejected）")
+            .isEqualTo("DECIDED");
         assertThat(toolContents(llm.requests.get(1)))
             .as("模型侧拿到的是受理形态（P1b）：既不是执行成功，也不是旧的审批拒绝形态")
             .singleElement()
@@ -305,6 +325,11 @@ class AppApprovalWiringTest {
         Future<TurnResult> turn = turns.submit(() -> app.runtime().chat("帮我装个包"));
 
         JsonNode request = awaitPendingItem(app.approvalPort(), Duration.ofSeconds(20));
+        String requestId = request.get("id").asText();
+        // 包 id 从决策面现取（审批列表不暴露 callerKey，而包 id 就藏在 pkg:<提出者>#<包 id> 里——那不是
+        // 测试该依赖的口径）；同一时刻决策面上恰好只有这一包（下面那条断言的判据）。
+        String packageId =
+            awaitPendingPackage(app.approvalPort(), Duration.ofSeconds(10)).get("id").asText();
         assertThat(request.get("classKey").asText())
             .as("人这次面对的是那条包级请求")
             .isEqualTo(DecisionApprovalBridge.CLASS_KEY);
@@ -315,15 +340,22 @@ class AppApprovalWiringTest {
 
         HttpResponse<String> receipt =
             postDecision(
-                app.approvalPort(),
-                request.get("id").asText(),
-                "{\"decision\":\"approve\",\"scope\":\"session\"}");
+                app.approvalPort(), requestId, "{\"decision\":\"approve\",\"scope\":\"session\"}");
         assertThat(receipt.statusCode()).isEqualTo(200);
         assertThat(JSON.readTree(receipt.body()).get("scope").asText())
             .as("包级请求的「本会话」降级为一次")
             .isEqualTo("once");
-        assertThat(runs).as("收窄的是会话语义，不是这一次的批准").hasValue(1);
+        // ★★ 审批面上那个批准键 = 人**自己的执行命令**（2026-10-17 控制方裁定 2，用户可推翻；与跨进程网关的
+        //   {@code byHuman ⇒ commitApproved} 同一口径）：人按下它，被批子集当场执行——"放行了提出者线程却什么
+        //   都不执行"是自相矛盾。★ 判别力：去掉 {@code DecisionApprovalBridge#backfill} 的 {@code approved}
+        //   分支 ⇒ 本条的 runs 停在 0（"人都批了、工具却没跑、而且没有任何提示"是最坏的一类假成功）。
+        //   ★ 断言的**时序**：执行发生在提出者线程的 {@code backfill} 里，而那个线程正是本回合的收尾
+        //     （{@code flushPendingDecisions} 同步投递）⇒ 先等回合收尾，再断言"跑了"（否则会与真实并发竞速）。
         assertThat(turn.get(20, TimeUnit.SECONDS).stopReason()).isEqualTo(StopReason.FINISHED);
+        assertThat(runs).as("★ 人按审批键 = 执行命令 ⇒ 工具体当场跑（收窄的是会话语义，不是这一次的批准）").hasValue(1);
+        assertThat(packageState(app.approvalPort(), packageId))
+            .as("★ 执行命令（审批面按键）之后包落 COMMITTED——不是停在 DECIDED 到点作废")
+            .isEqualTo("COMMITTED");
       } finally {
         turns.shutdownNow();
       }
@@ -357,7 +389,9 @@ class AppApprovalWiringTest {
       TurnResult result = app.runtime().chat("跑一条档位提升的命令");
 
       assertThat(result.stopReason()).isEqualTo(StopReason.FINISHED);
-      assertThat(runs).as("级联预裁定批准 ⇒ 被批子集在收尾时执行了（全程没有人参与）").hasValue(1);
+      // ★★ 无人在环的自动裁决 ⇒ 表态即 commit（2026-10-17 控制方裁定；与跨进程网关的 isAutoApproval 同一口径）：
+      //   这一包一条都没上报到人（escalated 为空）⇒ 没有人能来敲执行命令 ⇒ 级联批准当场就交回执行。
+      assertThat(runs).as("级联预裁定批准 ⇒ 被批子集在收尾时执行了（全程没有人参与；没有人的路径不该等一个不存在的人）").hasValue(1);
       assertThat(
               JSON.readTree(get(app.approvalPort(), "/api/approvals").body()).get("pending").size())
           .as("没有人被上报 ⇒ 审批面上一条请求都不该有")
@@ -430,8 +464,9 @@ class AppApprovalWiringTest {
         assertThat(limitedRuns).as("预裁定只是先记下，不是先执行（裁定 12）").hasValue(0);
         assertThat(sensitiveRuns).hasValue(0);
 
+        assertThat(limitedRuns).as("★ 还没下执行命令 ⇒ 预批准那条也不许跑（表态 ≠ 执行）").hasValue(0);
         HttpResponse<String> receipt =
-            postPackageDecision(
+            postPackageDecisionAndCommit(
                 app.approvalPort(), packageId, "{\"approveAll\":true,\"by\":\"case-human\"}");
         assertThat(receipt.statusCode()).isEqualTo(200);
         JsonNode receiptBody = JSON.readTree(receipt.body());
@@ -481,7 +516,7 @@ class AppApprovalWiringTest {
         String packageId = pending.get("id").asText();
 
         HttpResponse<String> receipt =
-            postPackageDecision(
+            postPackageDecisionAndCommit(
                 app.approvalPort(), packageId, "{\"rejectAll\":true,\"by\":\"case-human\"}");
         assertThat(receipt.statusCode()).isEqualTo(200);
         JsonNode commit = JSON.readTree(receipt.body()).get("commit");
@@ -745,6 +780,34 @@ class AppApprovalWiringTest {
     HttpResponse<String> detail = get(port, DecisionPackagesHttpHandler.PATH + "/" + packageId);
     assertThat(detail.statusCode()).as("包详情必须查得到（终局包不淘汰）").isEqualTo(200);
     return JSON.readTree(detail.body()).get("state").asText();
+  }
+
+  /**
+   * <b>走完两段式</b>（用户裁定 15 ③）：先在决策面表态（{@code approveAll}/{@code rejectAll}/{@code items}），
+   * 若这一包确实批出了东西（{@code approvedCount > 0}）就再下一条<b>执行命令</b>（{@code POST /{id}/commit}），
+   * 返回<b>执行命令那一步</b>的回执——它才有 {@code commit} 那一段（{@code outcomes}/{@code revisionRef}）。
+   *
+   * <p>★ 为什么合成一个助手：本类多数用例要的是"人批完 ⇒ 工具体跑了"这条端到端后果，而不是"表态那一步的回执长什么样"；
+   * 把第二段藏进助手，用例读起来仍是"人做了一个决定，事情发生了"，同时两段式的形状在代码里看得见。 一条都没批出（{@code rejectAll} / 全被驳）⇒
+   * <b>不下</b>执行命令（下了会被具名拒 {@code NO_ITEM_DECIDED}）， 直接返回表态那一步的回执，由用例断言"零落盘"。
+   */
+  private static HttpResponse<String> postPackageDecisionAndCommit(int port, String id, String body)
+      throws Exception {
+    HttpResponse<String> decided = postPackageDecision(port, id, body);
+    JsonNode parsed = JSON.readTree(decided.body());
+    int approvedCount = parsed.path("decision").path("approved").size();
+    if (approvedCount == 0) {
+      return decided;
+    }
+    return HttpClient.newHttpClient()
+        .send(
+            HttpRequest.newBuilder(
+                    URI.create(
+                        base(port) + DecisionPackagesHttpHandler.PATH + "/" + id + "/commit"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"by\":\"case-human\"}"))
+                .build(),
+            HttpResponse.BodyHandlers.ofString());
   }
 
   /** 从决策面裁决一个包（body 三形态见 {@code DecisionPackagesHttpHandler}：approveAll / rejectAll / items）。 */
