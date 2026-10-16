@@ -299,6 +299,13 @@ BashPluginMosire ────────────────────┘
    **不许把 Expected 改成实际值**（那会让用例退化成同义反复）。
 5. ★ **报“0 命中 / 零活动”之前，先自证工具在该写法下会命中**：用已知会命中的样本跑同一命令；
    禁止用 `2>/dev/null` 吞工具错误。搜全仓优先 `git grep`，含未入库文件用 `git grep --untracked`。
+   ★★ **实例（2026-10-17 “上下文窗口下沉”批，控制方在派单书里写错的）**：`git grep -n "…" -- '*/src/main'`
+   这种 pathspec **恒不命中**（`*/src/main` 匹配不到 `src/main/java/...`，要写 `*/src/main/**` 或直接给目录）——
+   命令 exit 1、零输出，看上去像“已核实为空”。控制方据此断言“生产侧只有 8 个文件引用 `AgentConfig`”，实测 **11 个**；
+   子 Agent 用正样本拆穿后重做，差额来自**同包隐式引用**（`AgentPipeline` / `AgentRuntime` / `AgentSpec` 与它同包，
+   压根不写 import）。⇒ 两条纪律：① **pathspec 与正则都要带正样本**（探针文件命中一次再报 0）；
+   ② **“改 import 的文件数” ≠ “受影响文件数”**——**同包隐式引用**、**通配 import**（`import io.mosire.x.*;`）、
+   **反射/字符串类名**、`META-INF/services` 都不在 import 扫描的覆盖范围内，**搬类/改包前必须逐类核查这四处**。
 6. ★ **拒收判据与接收判据都要有真样本**；红要红在被保护的那行上；没红也要问为什么没红
    （可能测试根本没跑到：类名、tag、profile、`--details=none` 都会让汇总缺失）。
 7. ★ **证据 = 真实命令 + 真实输出 + 退出码**，不是“应该能过”。报告至少写清：
@@ -381,6 +388,11 @@ BashPluginMosire ────────────────────┘
   判“重建成功与否”看类数/消费方测试，不看时间戳。
 - 仓库用 `.gitattributes` 钉死 LF；换设备后先 `git status` 看 `core.autocrlf` 是否把工作树 checkout 成 CRLF
   （会导致 `mvnw` shebang 失效）。
+  ★★ **本机现状是 CRLF，且它会咬行锚定的搜索**（2026-10-17 实测两次假阴性）：`core.autocrlf=true` + `.gitattributes` 只对
+  `mvnw`/`*.sh`/`*.cmd` 钉 eol ⇒ **工作树里全部 `.java` 都是 CRLF、索引里是 LF**（`git ls-files --eol` = `i/lf w/crlf`）。
+  后果：`grep -rl "^import X;$"` 这类**行尾锚定**一行都匹配不到（`;\r` 不匹配 `;$`）——当晚实测同一命令加 `$` 返回 **0 个文件**、
+  去掉 `$` 返回 **26 个**，差点把「26 个文件待改」误判成「无事可做」。⇒ 行锚定一律写 `\r?$`、或先 `tr -d '\r'`、或用
+  `git grep --cached`（索引是 LF）；**改文件时保持 CRLF**（别制造整文件重写的噪声），`spotless:apply` 不会转行尾。
 - 本机 `grep`/`find` 在当前 shell 是 GNU 工具；换 shell/外壳可能是 ugrep/bfs（默认尊重 `.gitignore`、
   跳过隐藏目录、`-newermt` 语义不同）。跨外壳搜索前先 `type -a grep find`；报 0 命中前先自证工具会命中。
 - 真进程/真模型脚本（`scripts/usage-test.sh`、`scripts/smoke-live.sh`）默认**不进**离线门禁，会真联网、真花钱；
