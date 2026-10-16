@@ -27,8 +27,9 @@ import org.slf4j.LoggerFactory;
  * <h2>八条红线落在哪（设计 §5.8）</h2>
  *
  * <ol>
- *   <li><b>提议即校验、任一条不过整包不建</b>：{@link #propose} 先逐条问 {@link ItemValidator}， 全过才发编号（具名拒 {@code
- *       ITEM_DENIED}）。
+ *   <li><b>提议即校验、任一条不过整包不建</b>：{@link #propose(ProposeRequest, ItemValidator)} 先逐条问 {@link
+ *       ItemValidator}， 全过才发编号（具名拒 {@code ITEM_DENIED}）。★ {@link #propose(ProposeRequest)}
+ *       是<b>无校验器</b>的重载（建包方已在校验，见该方法的注释），它逐字复用同一条路径。
  *   <li><b>一实例一个未决包</b>：{@link #propose} 见同一 {@code proposerKey} 已有 {@code PROPOSED} 包 ⇒ 具名拒 {@code
  *       PACKAGE_ALREADY_OPEN}（不覆盖、不排队）。
  *   <li><b>decide 一次终局</b>：只落在 {@code PROPOSED} 上；重复裁决 / 已终局 ⇒ {@code PACKAGE_NOT_PROPOSED}， 到点之后 ⇒
@@ -80,12 +81,46 @@ public final class DecisionPackages {
   /** 拒码：提交口抛异常或回执违反契约 ⇒ 包保持 {@code DECIDED}（没落定，也没被说成落定）。 */
   public static final String COMMIT_FAILED = "COMMIT_FAILED";
 
+  /**
+   * 被驳条目的逐条理由（<b>包层填</b>；设计 §5.3 + 裁定 8 补充 V14）。
+   *
+   * <p><b>为什么由包层填</b>：裁决只表达"哪几条被批"（{@link Decision#approvedIndexes()}），逐条"为什么被驳"的归属面在包层
+   * ——宿主（提交口）只报"落没落"，它根本不认识被驳的条目（被驳条目<b>永不</b>进 {@code calls}）。所以这条理由的文字是包层的一处常量， 不是宿主回执的一部分；{@code
+   * null}（未说明理由）留给"确实没有理由可说"的情形（V14 的可空语义），而被驳是一个<b>有原因</b>的去向。
+   */
+  public static final String REJECTED_ITEM_REASON = "该条未被裁决批准（被驳，零落盘）";
+
+  /**
+   * 包缺省的裁决窗口（毫秒）：{@code deadline = now + 这个值}。30 分钟——够人看一眼，也不让包挂到天荒地老。
+   *
+   * <p><b>为什么这个常量住在包层</b>：它描述的是<b>包</b>能等多久（设计 §5 裁定 10：「用包的」），不是某个工具的参数。 显式提议口 {@code
+   * decision_propose} 移除后，建包方（P1 的待裁决队列 / 回合收尾）与审批桥都以本常量为唯一出处， 不再从工具类借常量。
+   */
+  public static final long DEFAULT_DEADLINE_MILLIS = 30L * 60L * 1000L;
+
   private final ReentrantLock lock = new ReentrantLock();
   private final Map<String, Entry> entries = new LinkedHashMap<>();
   private final AtomicLong minted = new AtomicLong();
 
   /** 建一张空表（进程内单例由宿主装配决定；本类无静态状态）。 */
   public DecisionPackages() {}
+
+  /**
+   * 提议（<b>无校验器</b>）：把一批调用收成一个包并发编号——建包方已在校验，包层不再问第二个口。
+   *
+   * <p><b>为什么有这个重载</b>（设计 §5 裁定 1/6）：进包口径改成"工具符合条件就自动进包"之后，条目的结构与权限校验发生在 <b>命中那一刻的调用链上</b>（P1
+   * 的待裁决队列，那里本来就已经过了闸链判定）——校验责任不在包层，也没有第二个校验时机。
+   * 于是建包方不该被迫构造一个"永远放行"的校验器来表达"我这边已经判过了"（那会让"谁在校验"这件事看起来有两处）。
+   *
+   * <p><b>与带校验器的重载的关系</b>：本重载<b>逐字复用</b>同一条建包路径（{@link ItemValidator} 恒放行），所以 "一实例一个未决包"、index
+   * 唯一性、空包拒绝、到点即 {@code EXPIRED} 这些不变量两处完全一致——不是第二份实现。 带校验器的重载保留原签名不变（§5.8 冻结形状；仍有调用方），两者并存不是两条真相。
+   *
+   * @return 新建包的快照（通常 {@code PROPOSED}；deadline 已过 ⇒ {@code EXPIRED}）
+   * @throws RejectionException {@code PACKAGE_ALREADY_OPEN}（同 proposerKey 已有未决包）
+   */
+  public DecisionPackage propose(ProposeRequest request) {
+    return propose(request, (toolName, args) -> Optional.empty());
+  }
 
   /**
    * 提议：把一批调用收成一个包，逐条校验通过后发编号。
@@ -289,11 +324,13 @@ public final class DecisionPackages {
       List<ResolvedCall> calls = approvedCalls(current);
       if (calls.isEmpty()) {
         // 红线 5：被批子集为空 ⇒ 直接 REJECTED，根本不调 port
+        List<CommitReceipt.ItemOutcome> outcomes = allRejected(current);
         CommitReceipt receipt =
             new CommitReceipt(
                 CommitReceipt.Status.REJECTED,
                 null,
-                allRejected(current),
+                outcomes,
+                allReasons(outcomes.size(), REJECTED_ITEM_REASON),
                 "被批子集为空（全部条目被驳）：零落盘，未调用提交口");
         entry.receipt = receipt;
         entry.current = withState(current, PackageState.REJECTED, current.decision());
@@ -430,8 +467,8 @@ public final class DecisionPackages {
    *
    * <p><b>作废 ⇒ 释放该 {@code proposerKey} 的未决名额</b>：{@link #propose} 的「一实例一个未决包」只数 {@code PROPOSED}
    * （§5.11 第 4 条），所以包一进 {@code EXPIRED}，同一 {@code proposerKey} 立刻就能再提议。这正是本条要修的东西： 审批窗口（缺省
-   * 300s）短于包的裁决窗口（缺省 30min，{@code DecisionProposeTool#DEFAULT_DEADLINE_MILLIS}），
-   * 不作废的话那个"早已无人可批"的包会白占名额约 25 分钟（§5.12 裁定 B 的问题陈述）。
+   * 300s）短于包的裁决窗口（缺省 30min，{@link #DEFAULT_DEADLINE_MILLIS}）， 不作废的话那个"早已无人可批"的包会白占名额约 25 分钟（§5.12
+   * 裁定 B 的问题陈述）。
    *
    * <p><b>不顺带扫别的包</b>（那是 {@link #expire(long)} 的事）：具名口只回答"这个包作废了没有"。
    * <b>零落盘是结构性的</b>：本方法没有提交口参数，<b>不可能</b>触发任何落盘。
@@ -562,33 +599,49 @@ public final class DecisionPackages {
     return List.copyOf(outcomes);
   }
 
+  /** 等长的理由表（同一条文字重复 {@code count} 次；{@code reason} 为 null 时得到全 null = 未说明理由）。 */
+  private static List<java.util.Optional<String>> allReasons(int count, String reason) {
+    List<java.util.Optional<String>> reasons = new ArrayList<>(count);
+    for (int i = 0; i < count; i++) {
+      reasons.add(java.util.Optional.of(reason));
+    }
+    return List.copyOf(reasons);
+  }
+
   /**
    * 把宿主回执（按 {@code calls} 顺序）与"被驳条目"合成<b>一份对整包</b>的回执： 逐条一一对应、与 {@code items()} 同序、长度 = 包内条目数。
    *
    * <p>宿主少报的条目按整批 {@code status} 推导（被批子集是原子的：{@code COMMITTED} ⇒ 整批落定， 其余 ⇒ 整批未落）——这是 B-2
    * 的读法，不是猜测；但少报会让"逐条去向"退化，所以告警。 多报/自相矛盾（{@code status=COMMITTED} 却报某条
    * NOT_COMMITTED）都告警但以宿主的逐条结论为准： 世界侧才是权威，包层不替它改口。
+   *
+   * <p><b>逐条理由（P2b，裁定 8 补充）</b>：宿主报的那几条带<b>它自己给的理由</b>（{@code null} = 未说明理由，包层<b>不</b>替它编）， 被驳的那几条带
+   * {@link #REJECTED_ITEM_REASON}（包层填——被驳条目根本没进 {@code calls}，宿主无从表态）。
    */
   private static CommitReceipt merge(
       DecisionPackage current, List<ResolvedCall> calls, CommitReceipt host) {
-    List<CommitReceipt.ItemOutcome> hostOutcomes = host.outcomes();
-    if (hostOutcomes.size() > calls.size()) {
+    List<CommitReceipt.ItemResult> hostResults = host.itemResults();
+    if (hostResults.size() > calls.size()) {
       LOG.warn(
           "提交口回执 outcomes 多于 calls：id={} calls={} outcomes={}（多出的被忽略——包层只认包内条目）",
           current.id(),
           calls.size(),
-          hostOutcomes.size());
+          hostResults.size());
     }
-    Map<Integer, CommitReceipt.ItemOutcome> byIndex = new LinkedHashMap<>();
+    Map<Integer, CommitReceipt.ItemResult> byIndex = new LinkedHashMap<>();
     for (int i = 0; i < calls.size(); i++) {
       CommitReceipt.ItemOutcome outcome;
-      if (i < hostOutcomes.size()) {
-        outcome = hostOutcomes.get(i);
+      String itemReason;
+      if (i < hostResults.size()) {
+        outcome = hostResults.get(i).outcome();
+        itemReason = hostResults.get(i).reason();
       } else {
         outcome =
             host.status() == CommitReceipt.Status.COMMITTED
                 ? CommitReceipt.ItemOutcome.COMMITTED
                 : CommitReceipt.ItemOutcome.NOT_COMMITTED;
+        // 宿主没逐条给 ⇒ 理由保持"未说明"（不替它编一句话）
+        itemReason = null;
         LOG.warn(
             "提交口回执缺第 {} 条的 outcome：id={} status={} ⇒ 按 status 推导为 {}（宿主应逐条给全）",
             i,
@@ -603,14 +656,23 @@ public final class DecisionPackages {
             current.id(),
             calls.get(i).index());
       }
-      byIndex.put(calls.get(i).index(), outcome);
+      byIndex.put(calls.get(i).index(), new CommitReceipt.ItemResult(outcome, itemReason));
     }
     List<CommitReceipt.ItemOutcome> outcomes = new ArrayList<>(current.items().size());
+    List<java.util.Optional<String>> reasons = new ArrayList<>(current.items().size());
     for (PackageItem item : current.items()) {
-      CommitReceipt.ItemOutcome outcome = byIndex.get(item.index());
-      outcomes.add(outcome == null ? CommitReceipt.ItemOutcome.REJECTED : outcome);
+      CommitReceipt.ItemResult result = byIndex.get(item.index());
+      if (result == null) {
+        // 不在被批子集里 ⇒ 被驳（包层判的，零落盘），理由由包层填
+        outcomes.add(CommitReceipt.ItemOutcome.REJECTED);
+        reasons.add(java.util.Optional.of(REJECTED_ITEM_REASON));
+      } else {
+        outcomes.add(result.outcome());
+        reasons.add(java.util.Optional.ofNullable(result.reason()));
+      }
     }
-    return new CommitReceipt(host.status(), host.revisionRef(), outcomes, host.reason());
+    return new CommitReceipt(
+        host.status(), host.revisionRef(), outcomes, List.copyOf(reasons), host.reason());
   }
 
   /** 回执三结局 ⇒ 包状态（穷尽 switch：新增结局时编译器会提醒）。 */

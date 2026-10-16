@@ -2,7 +2,10 @@ package io.mosire.brain.runtime;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.decision.DecisionTurnScope;
+import io.mosire.agentlib.decision.PendingDecisionQueue;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
@@ -28,6 +31,7 @@ import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.Compactor;
 import io.mosire.brain.context.ContextAssembler;
 import io.mosire.brain.context.ContextLayer;
+import io.mosire.brain.decision.DecisionApprovalBridge;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -87,6 +91,18 @@ public final class AgentPipeline {
    * guard} 字段保留：它是本类既有装配契约的一部分，{@link ToolCallAuthorizer} 由它装配）。
    */
   private final ToolCallAuthorizer authorizer;
+
+  /**
+   * 本轮待裁决队列的出口（P1b，设计 §5 裁定 1+2+4）：回合收尾时把队列收成一个包、<b>同步</b>投递并等裁决。
+   *
+   * <p><b>{@code null} = 未接线</b>（本类既有构造、离线夹具、本单未接线的子 Agent 路径）：此时管线<b>不绑定</b>队列 （{@code
+   * DecisionTurnScope} 里没有当前轮），{@code ToolGate.Ask} 因此走 {@link ToolCallAuthorizer} 的既有那一跳 （问人 /
+   * 未装配编排器则 fail-closed 拒）——"不接线"不会静默变成"敏感调用不进包、也不执行"。
+   *
+   * <p><b>为什么是"有桥才绑"而不是"总是绑"</b>：绑了队列却没有桥 ⇒ {@code Ask} 调用既没执行、也没人去裁（队列无人收尾），
+   * 表现为"敏感调用悄悄消失了"。故队列的绑定与桥的接线绑成一个开关：要么整条链路都在，要么整条链路保持旧行为。
+   */
+  private final DecisionApprovalBridge decisionBridge;
 
   private final ContextAssembler assembler;
   private final EventStore events;
@@ -355,6 +371,61 @@ public final class AgentPipeline {
       CompactSummarySlot compactSummary,
       Map<String, Object> toolConfig,
       ApprovalCoordinator coordinator) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        coordinator,
+        null);
+  }
+
+  /**
+   * 全参装配 + 审批编排器 + <b>决策包桥</b>（P1b，设计 §5 裁定 1+2+4）：除最后一个参数外与上一条构造逐字相同。
+   *
+   * <p><b>{@code decisionBridge} 决定"本轮待裁决队列绑不绑"</b>：非 null ⇒ {@link #run(String)} 在回合开始时 {@link
+   * DecisionTurnScope#bind} 一个新队列，{@code ToolGate.Ask} 的调用改为"登记 + 当场回『已加入决策包』"
+   * （不执行、不阻塞、不走审批闸），回合收尾由桥收成一个包、<b>同步</b>投递并等裁决；{@code null} ⇒ 不绑队列， {@code Ask}
+   * 走既有那一跳（问人）。两者同进同退的理由写在 {@link #decisionBridge} 字段的注释里。
+   *
+   * <p><b>为什么必须是显式参数而不是装配层回头 set</b>：管线要在<b>回合边界</b>拿到它（绑/收尾都在那里），
+   * 而"装配完成后才塞进去"会让第一次回合有窗口期用不到它——那种间歇态最难查。装配层（{@code App}）在构造时就给全。
+   */
+  /**
+   * ★ <b>{@code EI_EXPOSE_REP2} 抑制（写明理由）</b>：{@code decisionBridge} 是<b>注入的协作者</b>——管线在回合收尾必须调它
+   * （本轮待裁决调用收成包、同步投递、等裁决）。它与本类既有的 {@code events}/{@code bus}/{@code llm}/{@code guard}
+   * 完全同类：**故意的共享引用（依赖注入）**，不是"把内部状态漏出去"；为它做防御性拷贝既无意义（桥不可拷贝）也会拆掉
+   * 唯一写者。抑制只为压掉"存外部可变对象"这条对注入场景的误报，<b>不改</b>注入形状。
+   */
+  @SuppressFBWarnings("EI_EXPOSE_REP2")
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge) {
+    this.decisionBridge = decisionBridge;
     this.toolConfig = Map.copyOf(Objects.requireNonNull(toolConfig, "toolConfig"));
     this.compactor = compactor;
     this.compactSummary = Objects.requireNonNull(compactSummary, "compactSummary");
@@ -472,9 +543,16 @@ public final class AgentPipeline {
    * 跑一回合：用户输入 →（LLM 循环 + 工具调用）→ 终止。
    *
    * <p>约定：方法是同步的（网络/子进程调用在工具内自行发生）；回合间共享 {@code history} （一个 Agent 实例的连续对话）。
+   *
+   * <p><b>P1b 追加的回合作用域</b>（设计 §5 裁定 1+2）：回合开始时把本轮的待裁决队列绑到当前线程，收尾时（{@code finally}，
+   * 含取消/超限/异常各条出口）把队列收成一个决策包、<b>同步</b>投递并等裁决——所以"回合返回"意味着裁决与执行都已经发生 （代价：慢裁决会占住这条线程，见 {@link
+   * #decisionBridge}）。
    */
   public TurnResult run(String userMessage) {
     Objects.requireNonNull(userMessage, "userMessage");
+    // ★ P1b（设计 §5 裁定 1+2）：本轮的待裁决队列——回合开始时绑到当前线程，回合收尾（含异常/取消路径）解绑。
+    //   "绑了队列"和"有桥收尾"是同一个开关（见 decisionBridge 的注释）：没有桥就不绑，Ask 保持既有行为。
+    PendingDecisionQueue pendingDecisions = decisionBridge == null ? null : bindPendingDecisions();
     // 上一次回合的取消请求到此为止：cancel() 只对当时正在跑的回合负责
     cancelled = false;
     // 压缩触发点：回合边界（组请求之前）。此处既没有在途的落库（上一回合早已 return），也没有并发的第二个 store
@@ -494,6 +572,36 @@ public final class AgentPipeline {
         new ArrayList<>(
             assembler.buildRequest(config, userMessage, replayedHistory, tools).messages());
 
+    try {
+      return runTurn(userMessage, deadline, quota, tools, messages, replayedSize);
+    } finally {
+      // ★ 先解绑取数口，再收包——顺序不能反（2026-10-18 实测踩到）：
+      //   收包那条路会**同步执行被批子集**（提交口在同一个线程上跑各条目自己的工具）。若此刻队列还绑着，
+      //   被批条目里任何一条自报 Ask 的工具都会**再登记进这个已经产出过提议的队列** ⇒ 命中"已提议不得再登记"
+      //   的守卫、该条被判成执行失败（实测：包被审批放行，提交结局却是 REJECTED）。
+      //   解绑之后，执行段看到的是"没有本轮队列" ⇒ 它走 authorizer 的既有行为（`Ask` 无队列 ⇒ 审批闸），
+      //   而"裁决即授权"这条口径由提交口自己保证（它用的是纯判定链 + 资源前置闸，见 LocalDecisionCommitPort；
+      //   P2b 前的注释写的是 `ToolCallAuthorizer.of(guard)`——那个形状早就不是现状，改准）。
+      clearPendingDecisions(pendingDecisions);
+      flushPendingDecisions(pendingDecisions);
+    }
+  }
+
+  /**
+   * 本回合的主循环（P1b 从 {@link #run(String)} 原样搬出来）：用户输入 →（LLM 循环 + 工具调用）→ 终止。
+   *
+   * <p>搬出来只为一件事：让回合级的作用域（本轮待裁决队列）由 {@link #run(String)} 的 {@code try/finally} 统一收尾—— 主循环里那<b>七个</b>
+   * {@code return} 出口（{@code CANCELLED} ×2 / {@code TURN_LIMIT} / {@code TIME_BUDGET} / {@code
+   * LLM_ERROR} / {@code QUOTA} / {@code TOOL_CALL_LIMIT} / 正常 {@code FINISHED}）一个都不用改，
+   * 也不可能漏掉某个新增出口（新增出口自动落进同一个 finally）。
+   */
+  private TurnResult runTurn(
+      String userMessage,
+      Instant deadline,
+      LlmQuota quota,
+      List<AgentTool> tools,
+      List<LlmMessage> messages,
+      int replayedSize) {
     int turns = 0;
     int totalToolCalls = 0;
     String finalText = "";
@@ -606,6 +714,65 @@ public final class AgentPipeline {
         totalToolCalls++;
         executeToolCall(messages, call);
       }
+    }
+  }
+
+  /**
+   * 绑上本轮的待裁决队列（设计 §5 裁定 1+2）：队列的身份取自<b>宿主已知</b>的调用者与实例 （{@link AgentIdentity#instanceId()}
+   * 是"一个实例一个未决包"的键、也是包与历史的归属键，裁定 3），模型给不出也改不了。
+   *
+   * @return 刚绑上的队列（收尾要用它按身份解绑，见 {@link #clearPendingDecisions}）
+   */
+  private PendingDecisionQueue bindPendingDecisions() {
+    // 实例身份与每次工具调用上下文里的那份<b>同源</b>（AgentIdentity.mainFrom(toolConfig)）：两者若各算一份，
+    // "包是谁提的"（proposerKey）就会与"那次调用是谁发的"（ApprovalRequest.requesterId）对不上。
+    return DecisionTurnScope.bind(
+        new PendingDecisionQueue(AgentIdentity.mainFrom(toolConfig).instanceId(), caller));
+  }
+
+  /**
+   * 回合收尾的汇总口（设计 §5 裁定 2 的落点）：本轮攒下的待裁决调用收成<b>一个包</b>，<b>同步</b>投递并等裁决（裁定 4）， 被批子集由提交口执行（装配层已接的那个执行者）。
+   *
+   * <p><b>调用时机 = 队列已解绑之后</b>（见 {@link #run(String)} 的 {@code finally}）：本方法会同步执行被批子集， 那一步不能再看见本轮的队列。
+   *
+   * <p><b>五个出口共用这一处</b>：主循环的七个 {@code return}（{@code CANCELLED} ×2 / {@code TURN_LIMIT} / {@code
+   * TIME_BUDGET} / {@code LLM_ERROR} / {@code QUOTA} / {@code TOOL_CALL_LIMIT} / 正常 {@code
+   * FINISHED}）全部经过 {@link #run(String)} 的 {@code finally}——所以"回合被打断"也收包（裁定
+   * 8：打断不是"包不算数"，被打断的包照常走它的投递与作废语义）。
+   *
+   * <p><b>空队列 ⇒ 什么都不做</b>（验收判据 ④：零副作用）：不建包、不发事件、不投递、不落任何记录。 判空在桥里（{@code
+   * DecisionApprovalBridge#flush}）也做了一次：那条路是"队列→提议请求"的唯一出口， 由它守"空队列不建包"比让每个调用方自己记得更可靠（桥的 flush 空队列
+   * ⇒ 返回 {@code Optional.empty()}）。
+   *
+   * <p><b>失败不改写出口</b>（见 {@link #run(String)} 的 finally 注释）：建包被拒（{@code PACKAGE_ALREADY_OPEN}
+   * 等）或投递异常 只落 ERROR 日志——本回合的 {@link TurnResult} 已经定了，收尾失败不该把 {@code TURN_LIMIT} 变成崩溃。 {@code
+   * Error} 不吞（OOM 这类系统级故障照常上抛）。
+   */
+  private void flushPendingDecisions(PendingDecisionQueue queue) {
+    if (queue == null) {
+      // 未接线（没有桥）：本回合本来就没绑队列，Ask 走的是既有审批闸——这里什么都不该做
+      return;
+    }
+    try {
+      decisionBridge
+          .flush(queue)
+          .ifPresent(
+              pkg ->
+                  LOG.info(
+                      "回合收尾：本轮待裁决调用已收成决策包 id={} state={} items={} caller={}（同步投递已结束）",
+                      pkg.id(),
+                      pkg.state(),
+                      pkg.items().size(),
+                      caller));
+    } catch (RuntimeException failure) {
+      LOG.error("回合收尾的决策包投递失败（本回合的出口不变；本轮待裁决调用零落盘——既不执行也不静默放行） caller={}", caller, failure);
+    }
+  }
+
+  /** 解绑本轮的取数口（{@code finally} 里必到）：只清自己绑的那一个，绝不动别人的绑定（见 {@link DecisionTurnScope}）。 */
+  private static void clearPendingDecisions(PendingDecisionQueue queue) {
+    if (queue != null) {
+      DecisionTurnScope.clear(queue);
     }
   }
 

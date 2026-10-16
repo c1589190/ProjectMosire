@@ -78,6 +78,19 @@ public final class EventTypes {
    */
   public static final String PLUGIN_LIFECYCLE = "plugin.lifecycle";
 
+  /**
+   * 装订期角色审计（RA4 的产物；2026-10-16 用户裁定「补上吧」⇒ 从"只有日志"改成"日志 + 一条事件"）。payload: {@code
+   * {"toolCount","roleDeclaringToolCount","knownRoleCount","catalogChecked","unknownRoles",
+   * "unknownCount","uncoveredCount","catalogDiffCount"}}——{@code unknownRoles} 去空白、去重、排序（角色名不是密钥；
+   * 逐条 findings 全文只进日志，不进事件）。
+   *
+   * <p><b>为什么它在装配期就发、且必须同步落库</b>：本事件存在的唯一目的就是留痕——「启动没通过」这件事本身也要留下痕迹， 所以发射点在「审计失败 ⇒
+   * 抛异常阻止启动」<b>之前</b>；又因为 {@code App.close()} 的顺序是 {@code events.close()} 先于 {@code bus.close()}、而
+   * {@code EventBus.publish} 是异步分派，走总线会在这个窗口里丢事件 ⇒ 由订阅者<b>同步</b> {@code append}（落库口径照 {@link
+   * #PLUGIN_LIFECYCLE}：{@code MAIN_CONVERSATION_ID} + 失败只告警不回滚）。
+   */
+  public static final String ROLE_AUDIT = "role.audit";
+
   private EventTypes() {
     throw new AssertionError("No instances");
   }

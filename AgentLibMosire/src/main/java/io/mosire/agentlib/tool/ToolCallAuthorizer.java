@@ -4,6 +4,8 @@ import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
 import io.mosire.agentlib.approval.ApprovalRequest;
 import io.mosire.agentlib.approval.ToolGate;
+import io.mosire.agentlib.decision.DecisionTurnScope;
+import io.mosire.agentlib.decision.PendingDecisionQueue;
 import io.mosire.agentlib.permission.ResourceAuthorizer;
 import io.mosire.agentlib.permission.ResourceDeniedException;
 import java.util.Objects;
@@ -162,6 +164,16 @@ public final class ToolCallAuthorizer {
         return ToolResult.error(COMMAND_BLOCKED, "命令被硬拒（不可审批）: class=" + blocked.classKey());
       }
       case ToolGate.Ask ask -> {
+        // ★ 设计 §5 裁定 1+2（2026-10-16）：进包口径 = 全部 Ask。本轮的待裁决队列若已绑定（管线在回合开始时绑），
+        //   这次调用<b>不执行、不阻塞、不走审批闸</b>——登记进队列，收尾时与其它命中一起收成一个包投递；
+        //   模型当场只拿到"已加入决策包"。
+        // ★ 回归安全网（没绑定队列时<b>逐字</b>保持今天的行为）：离线夹具、未接线的装配、以及本单未接线的子 Agent 路径
+        //   （见 Brain 的 AgentPipeline：没有审批桥就不绑队列）都走下面这条老路——Ask ⇒ 问人，未放行 ⇒ APPROVAL_DENIED。
+        //   没有这条网，"忘了接线"会表现为"敏感调用悄悄不执行了"，那是最贵的假绿。
+        Optional<PendingDecisionQueue> queue = DecisionTurnScope.current();
+        if (queue.isPresent()) {
+          return queuedForDecision(queue.get(), tool, scoped, ask);
+        }
         // 审批面看的是同一个上下文（resources 已注入）——同一份判定者贯穿五段，不在半路换掉
         Optional<ToolResult> approvalDenied = askForApproval(tool, scoped, ask);
         if (approvalDenied.isPresent()) {
@@ -176,6 +188,32 @@ public final class ToolCallAuthorizer {
       LOG.warn("工具内资源断言判否: tool={} 拒因={}", tool.name(), resourceDenied.getMessage());
       return ToolResult.error(RESOURCE_DENIED, resourceDenied.getMessage());
     }
+  }
+
+  /**
+   * 把这次 {@code Ask} 调用登记进<b>本轮待裁决队列</b>并返回给模型的人读结果（设计 §5 裁定 1+2）。
+   *
+   * <p><b>这一步只做一件事：记账</b>——不执行工具（{@link AgentTool#execute} 根本不在这里）、不阻塞（没有等人、没有通道）、 不登记 {@code
+   * PendingApprovals}（那条投递留到回合收尾，一个包一条请求）。参数明文只进队列（→ 包内 {@link
+   * io.mosire.agentlib.decision.PackageItem#args()}）；本方法<b>不</b>打日志、<b>不</b>发事件（事件面只带脱敏摘要，密钥纪律）。
+   *
+   * <p><b>返回值为什么是成功侧</b>：调用<b>被受理了</b>（受理 = 收进包），不是被拒。写成失败会让模型以为这条路走不通而改路重试
+   * ——重试只会排出第二个包。文案明确说"尚未裁决、本轮不会执行"（设计 §5 裁定 2 的原话口径）：它答的是"这条现在不会发生"。
+   *
+   * <p><b>为什么不带错误码</b>：{@link ToolResult} 的契约是 {@code code != null} ⇒ 失败（见该类注释），而这里不是失败—— 硬塞一个码就得改
+   * {@code ToolResult} 的契约或加新字段，两者都超出本单的"只做新增、不改冻结形状"。
+   */
+  private static ToolResult queuedForDecision(
+      PendingDecisionQueue queue, AgentTool tool, ToolContext context, ToolGate.Ask ask) {
+    queue.register(tool.name(), context.arguments(), ask);
+    return ToolResult.ok(
+        "已加入决策包（尚未裁决，结果下一轮自行查看）: tool="
+            + tool.name()
+            + " class="
+            + ask.classKey()
+            + "。★ 本次调用不会在现在执行，也没有去问审批人——它已随本轮的其它待裁决调用收进同一个决策包，"
+            + "由确认者整包裁决（可整包批 / 整包驳 / 逐条例外）；被批准的部分在回合结束时执行。"
+            + "不要因为这条结果重试同一个调用（那会排出第二个包），也不要假定它已经生效。");
   }
 
   /**

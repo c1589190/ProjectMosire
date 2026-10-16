@@ -4,7 +4,11 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * 提议时的逐条校验（设计 §5.8 冻结形状；红线 1）：宿主注入，{@link DecisionPackages#propose} 逐条问它。
+ * 提议时的逐条校验（设计 §5.8 冻结形状；红线 1）：宿主注入，{@link DecisionPackages#propose(ProposeRequest, ItemValidator)}
+ * 逐条问它。
+ *
+ * <p><b>它是可选的</b>：{@link DecisionPackages#propose(ProposeRequest)}（无校验器重载）用在"建包方自己已经判过"的路径上
+ * ——校验发生在那次调用的闸链上，包层不再问第二个口（设计 §5 裁定 1/6）。两条路建出来的包完全相同。
  *
  * <p><b>为什么必须在提议时就校验</b>：不校验，人批的就是一个"注定失败"的东西——批完才发现解析不了、 过不了权限、够不着资源面，白烧一次人的注意力；而这正是隔壁 #1/#2
  * 出血的共同前提（设计 §5.1）。 所以 propose 逐条问本口：<b>任一条不过 ⇒ 整包不建</b>（连包 id 都不发——"不给注定失败的东西发编号"）。

@@ -182,6 +182,35 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
+   * 启动（<b>暴露过滤器 + 自定义调用入口</b>的组合形态）：语义 = {@link #start(ToolRegistry, String, String, ToolContext,
+   * Predicate)} 的收窄面 × {@link #start(ToolRegistry, String, String, ToolContext,
+   * ToolCallAuthorizer)} 的判定入口。
+   *
+   * <p><b>为什么需要这个组合</b>：既有重载里"收窄外发面"与"换判定入口"<b>只能二选一</b>（要两个一起，过去只能落到 {@code startWith(...)}
+   * 并让调用方自己造 SDK transport——那会把 MCP SDK 的类型泄进宿主模块）。生产形态的两处需求同时成立： ① 外发面必须 = 该调用者的判定面（设计 §4.8 不变量
+   * A-6：可见面 ⊆ 判定面，否则模型会看见"一调就吃 {@code PERMISSION_DENIED}"的工具）；② 经 MCP 到达的调用必须过与管线同一条判定链（含审批闸）。
+   *
+   * @param include 工具名过滤器（命中才暴露；谓词在 server 生命周期内应保持纯函数）
+   * @param authorizer 工具调用唯一入口（审批闸等横切判定都在其中）
+   */
+  public static AgentToMcpServer start(
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      Predicate<String> include,
+      ToolCallAuthorizer authorizer) {
+    return startWith(
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        new StdioServerTransportProvider(McpJsonDefaults.getMapper()),
+        include,
+        authorizer);
+  }
+
+  /**
    * 以给定的流对启动（W3b 父子 stdio 链接的父侧：子进程的 stdIn/stdout 已被父进程接管，本 server 直接 在注入的流上服务，不复用 3 参重载的独立 spawn
    * 流程）。语义与 {@link #start(ToolRegistry, String, String, ToolContext)} 相同。
    *

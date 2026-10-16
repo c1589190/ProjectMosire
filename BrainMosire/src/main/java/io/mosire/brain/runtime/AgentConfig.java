@@ -25,12 +25,17 @@ public record AgentConfig(
     long quotaMaxTokens) {
 
   /**
-   * 默认轮次硬顶（计划 D10；2026-09-08 用户修订 20→2000）。
+   * 默认轮次硬顶（计划 D10；2026-09-08 用户修订 20→2000；<b>2026-10-16 用户裁定再修订 2000→114514</b>）。
    *
-   * <p>为什么放大：20 轮对长任务（多文件改造、深链调查）明显不够用；防跑飞的实际兜底由 {@link #DEFAULT_TIME_BUDGET}（墙钟）承担——
-   * 轮次硬顶只防御"每轮极快的空转循环"，预算硬顶防御"真实耗时失控"。
+   * <p><b>用户原话</b>：「把所有限制单个Agent执行轮数的限制改成114514！！！！」——即：<b>实际取消轮次上限</b>（这个数在任何真实 任务里都到不了）。
+   *
+   * <p>为什么这会成立：防跑飞的实际兜底本来就是 {@link #DEFAULT_TIME_BUDGET}（墙钟）——轮次硬顶只防御"每轮极快的空转循环"， 而那种循环也会很快撞上墙钟预算或
+   * token 配额。留一个大数而不是 0/负数：{@code maxTurns} 的契约是"必须为正" （见模板与 Builder 的守卫），"不限"用"大到到不了"表达，比引入一个"0 =
+   * 不限"的哨兵值少一条分支。
+   *
+   * <p>★ 时间预算与配额<b>没有被这次裁定改动</b>（10min / 30 次工具调用每轮仍在）：用户只裁了"轮数"。
    */
-  public static final int DEFAULT_MAX_TURNS = 2000;
+  public static final int DEFAULT_MAX_TURNS = 114514;
 
   public static final int DEFAULT_MAX_TOOL_CALLS_PER_TURN = 30;
   public static final Duration DEFAULT_TIME_BUDGET = Duration.ofMinutes(10);

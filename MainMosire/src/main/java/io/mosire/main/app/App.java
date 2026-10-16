@@ -1,5 +1,6 @@
 package io.mosire.main.app;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
@@ -12,11 +13,13 @@ import io.mosire.agentlib.approval.ConfirmGate;
 import io.mosire.agentlib.approval.HttpApprovalChannel;
 import io.mosire.agentlib.approval.LlmSuperiorJudgement;
 import io.mosire.agentlib.approval.PendingApprovals;
+import io.mosire.agentlib.approval.SuperiorJudgeDetailRegistry;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
 import io.mosire.agentlib.config.ConfigStore;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.decision.DecisionCommitPort;
 import io.mosire.agentlib.decision.DecisionPackages;
+import io.mosire.agentlib.decision.DecisionPackagesHttpHandler;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -57,7 +60,8 @@ import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
 import io.mosire.brain.decision.DecisionApprovalBridge;
-import io.mosire.brain.decision.DecisionProposeTool;
+import io.mosire.brain.decision.DecisionCascade;
+import io.mosire.brain.decision.DecisionHistoryTools;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentConfig;
 import io.mosire.brain.runtime.AgentRuntime;
@@ -87,6 +91,7 @@ import io.mosire.docs.DocsTools;
 import io.mosire.main.Version;
 import io.mosire.main.approval.CommandModeHttpHandler;
 import io.mosire.main.approval.TtyApprovalChannel;
+import io.mosire.main.decision.LocalDecisionCommitPort;
 import io.mosire.main.gateway.AdminHttpServer;
 import io.mosire.main.gateway.StatusSnapshot;
 import io.mosire.main.gateway.a2a.A2aAgentRunner;
@@ -121,6 +126,7 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -200,6 +206,13 @@ public final class App implements AutoCloseable {
    * <p>提成常量只为"同一个源名不在两处各写一遍"——值恒为 {@code "builtin"}，注册与"按源整组卸载"的口径逐字不变。
    */
   private static final String BUILTIN_TOOL_SOURCE_ID = "builtin";
+
+  /**
+   * 决策历史工具的供给源 id（P2b，{@code decision_history}）：与内置工具分开，便于按源整组卸载与审计。
+   *
+   * <p>它是<b>读类</b>工具（只读提出者自己的 {@code events.db}），却属于"决策包这一族"——源名按族切，不按读写切。
+   */
+  private static final String DECISION_HISTORY_TOOL_SOURCE_ID = "decision-history";
 
   /**
    * 技能根的能力 id（R2→R3b 交接项 2）：<b>只含 {@code skills: READ}</b>。
@@ -367,8 +380,11 @@ public final class App implements AutoCloseable {
     // （实测数据目录 events.db：distinct type 只有
     // agent.lifecycle/llm.call/conversation.turn/tool.call/tool.result，
     // 无 approval.*）。V3 判据要求 "approval.decided{scope=once} 落账" ⇒ 在这里把审批事件镜像进事件库。
-    // 只认 approval.* 前缀（管线自己的 emit 已落库，不会双写）；落库失败只告警，不改判定（同 B1 的审计口径）。
-    bus.subscribe(event -> mirrorApprovalEvent(events, event));
+    // 只认<b>前缀白名单</b>（管线自己的 emit 已落库，不会双写）；落库失败只告警，不改判定（同 B1 的审计口径）。
+    // ★ RB3（设计 §5.13(c)）：白名单必须含 decision.package.*——决策包的四个事件由桥投到 bus，
+    //   而这里过去只收 approval.* ⇒ 事件会<b>静默消失</b>（不报错、没有用例会红），这是 RB3 的真缺陷之一。
+    // ★ role.audit：装配期角色审计的留痕（同 §5.13(c)：它在装配失败抛异常<b>之前</b>经本订阅者同步落库）。
+    bus.subscribe(event -> mirrorInfrastructureEvent(events, event));
     ToolRegistry tools = new ToolRegistry();
     McpLinks links;
     try {
@@ -458,6 +474,9 @@ public final class App implements AutoCloseable {
       // 挂在这一层而不是 AgentPermissionSet.system() 里：system() 表达"运行时自身、本维不表态"（语义不动），
       // 从配置读出的身份是**装配层**的事实。角色名不进日志（明文面纪律），这里只报项数。
       RoleSet agentRoles = AgentRoles.load(configStore);
+      // ★ 外部 MCP 面的调用者令牌级别（2026-10-16 用户裁定「我想了一下还是GUEST吧，然后搞个配置文件，用户想配置System
+      //   就配置System，System等级留着有用」）：缺省 GUEST = 既有行为逐字不变；配了就按配置（值非法 ⇒ 启动响亮失败）。
+      AccessToken externalMcpToken = AgentExternalMcpToken.load(configStore);
       AgentPermissionSet permissionSet =
           AgentPermissionSet.system()
               .withResourceScopes(ResourceScopeMap.of(ResourceScopeMap.FS, workingDirs))
@@ -605,16 +624,27 @@ public final class App implements AutoCloseable {
       // S6 追加 SuperiorJudgeGate：AutoApproveGate <b>在前</b>是刻意的——会话级放行是人批的口子（用户裁决
       // "LIMITED 档下只认人批的会话"），人批过的类别不该再让上级 Agent 判一遍；代批闸只覆盖剩下的档位提升请求，
       // 敏感区与外部面它自己会让开（落到 ConfirmGate，即到人）。
+      // ★ RB3（设计 §5.13(d)(e)）：上级判定的<b>逐条明细缝</b>——它让上级判定看得见包内条目的明文参数（不是只看"几条、
+      //   哪些工具"就批）。★ 同一个实例必须也交给 DecisionApprovalBridge（见下方 6 参构造）：桥按"明细缝在不在"
+      //   决定要不要把包交给上级代批（只给判定面、不给桥 ⇒ 桥登记不了明细，包退回"只到人"；给了桥、没给判定面 ⇒ 上级盲判）。
+      SuperiorJudgeDetailRegistry decisionJudgeDetails = new SuperiorJudgeDetailRegistry();
       ApprovalCoordinator approvalCoordinator =
           new ApprovalCoordinator(
               List.of(
                   new AutoApproveGate(pendingApprovals),
-                  new SuperiorJudgeGate(new LlmSuperiorJudgement(llm), commandMode::get),
+                  new SuperiorJudgeGate(
+                      new LlmSuperiorJudgement(
+                          llm, LlmSuperiorJudgement.DEFAULT_TIMEOUT, decisionJudgeDetails),
+                      commandMode::get),
                   new ConfirmGate()),
               List.of(approvalTtyChannel, approvalHttpChannel),
               pendingApprovals,
               approvalConfig.timeout(),
-              bus);
+              bus,
+              // ★ P2b（设计 §5ter 裁定 13 的口径面）：会话放行的<b>收窄缝</b>——包级请求（callerKey = pkg:…）一律
+              //   不接受会话放行："一个包一次的裁决"不许变成"以后每个包都免问"（见 {@link #sessionGrantable}）。
+              //   这是 ApprovalCoordinator 既有构造器的既有参数（那个类一个字都不用改）。
+              App::sessionGrantable);
       ToolCallAuthorizer approvalAuthorizer =
           ToolCallAuthorizer.of(new ToolExecutionGuard(), approvalCoordinator);
       if (approvalConfig.http()) {
@@ -634,41 +664,108 @@ public final class App implements AutoCloseable {
               : "http://127.0.0.1:" + approvalServer.boundPort(),
           approvalTtyChannel.available() ? "可用" : "不可用（无控制终端）",
           approvalConfig.timeout().toSeconds());
-      // ★ RB2a/RB2b（设计 §5.9 ① ② ③）：决策包<b>提议面</b>（包登记表 + 模型面提议工具 decision_propose）
-      //   与<b>审批面投递桥</b>（一个包 = 一条 ApprovalRequest，答复回填统一裁决）。
+      // ★ RB2a/RB2b（设计 §5.9 ① ② ③）：决策包<b>包层</b>（包登记表）与<b>审批面投递桥</b>
+      //   （一个包 = 一条 ApprovalRequest，答复回填统一裁决）。
+      //   ★ 模型面的提议工具 decision_propose 已随裁定 6 移除（2026-10-16）：本段只装配"包层 + 桥 + 决策面"。
+      //   ★ P1b（裁定 1+2）：建包入口就是本段的桥 —— 下面把它交给 AgentRuntime（→ AgentPipeline），管线在回合收尾
+      //     把本轮的待裁决队列收成一个包（decisionApprovalBridge#flush：propose 无校验器重载 → 同步投递 → 等裁决）。
       //   装配顺序刻意排在审批面<b>之后</b>：桥要拿的正是上面刚建好的那两个实例——同一份 PendingApprovals、
       //   同一个 ApprovalCoordinator（不新建第二张表 / 不新建通道 / 不另起 HTTP 端点族，设计 §5.4 的验收判据）。
-      //   供给源口径与其它 builtin 工具同法（BuiltinToolSource + sourceId 归属）；
       //   DecisionPackages 随 App 字段持有（见 App#decisionPackages），RB2b/RB3 取同一个实例——不造静态单例。
       DecisionPackages decisionPackages = new DecisionPackages();
-      // 世界提交口（RB1 的 DecisionCommitPort，实现方是隔壁 RC1）：今天尚未落地 ⇒ empty = 未装配。
-      // 桥不会因此假装已落定：裁决后包保持 DECIDED 并落一行 WARN（见 DecisionApprovalBridge 的 backfill）。
-      // RC1 接上时只需把下面的 empty() 换成 Optional.of(它的实例)——桥与提议工具都不必改。
-      // ★ 用 Optional 而不是可空局部：装配层今天只可能传 null，可空写法被 SpotBugs 判成「恒为 null + 冗余判空」而门禁红。
-      Optional<DecisionCommitPort> decisionCommitPort = Optional.empty();
+      // ★ D30（P2a 发现 C 的落点）：工具自身配置经 ToolContext.config 注入，这条缝的两条路（管线 / 提交口）必须
+      //   拿<b>同一份</b>——早先提交口传的是 Map.of()，于是它成了"技能遮蔽面 / 子库定位"的绕过点。挪到决策块之前建：
+      //   提交口（LocalDecisionCommitPort）在下面就要用它。键名归 Brain（AgentContextReader 常量）与 AgentLib。
+      Map<String, Object> toolConfig = new LinkedHashMap<>();
+      toolConfig.put(
+          AgentContextReader.CONFIG_SUBAGENTS_ROOT,
+          config.dataDir().resolve("subagents").toString());
+      toolConfig.put(
+          AgentContextReader.CONFIG_SELF_EVENTS_DB,
+          config.dataDir().resolve("events.db").toString());
+      toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
+      // S6：档位持有者经同一个运行时缝下发（AgentPipeline 建调用上下文时现读它定主 Agent 的身份/档位）
+      toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
+      // 遮蔽面（R3b 起由工作区注册表产出）：文件工具（bash 的 L3 沙箱）据此决定"这条路径遮蔽 / 只读暴露"——
+      // 这是资源边界在文件工具一侧的唯一数据入口（判定见 SandboxMask，逐条目求与）。
+      // ★ 这里不再写死 ("skills", <技能根>) 字面：技能根本身就是一个装配期 REFERENCE 挂载，它的条目由
+      //   WorkspaceRegistry.maskEntries() 连命名空间一起产出（M6：只返回装配期条目；运行期挂载不进遮蔽面）。
+      toolConfig.put(SandboxMask.CONFIG_KEY, maskConfigOf(workspaceRegistry));
+      toolConfig = Map.copyOf(toolConfig);
+      // ★ P2b（设计 §5ter 裁定 12 / §5quater）：逐级预裁定。本单只接<b>主进程内</b>那条链——提出者到主 Agent 这一级；
+      //   子 Agent 跨进程那条路（每个子体链接一个实例级队列、父侧在其回合末 flush）<b>未做</b>，缺口写在 P2b 报告里。
+      //   链上的每一级给的是"它的权限集 + 现读档位 + 父级 id"：能力判据（权限面 ∩ 资源面 ∩ FULL 档）全在这三者上。
+      AgentPermissionSet cascadePermissions = permissionSet;
+      DecisionCascade decisionCascade =
+          new DecisionCascade(
+              instanceId ->
+                  AgentIdentity.MAIN_ID.equals(instanceId)
+                      ? Optional.of(
+                          new DecisionCascade.Level(
+                              AgentIdentity.MAIN_ID, cascadePermissions, commandMode.get(), ""))
+                      : Optional.empty(),
+              tools::find);
+      // ★ 本机形态的裁决包执行者（用户裁定 U10，设计 §5.3.1）：裁决之后由它逐条执行被批子集（调各条目自己的工具、
+      //   走纯判定链 + 资源前置闸——裁决即授权，执行时不再过一次审批闸），把逐条执行结果收成一份统一回执。
+      //   世界形态（隔壁 RC1）是同一个 SPI 的另一个实现：一次提交进世界 + 返回不透明 revisionRef。
+      //   ★ 诚实边界：本机没有版本语义 ⇒ **无原子性保证**（逐条落、中途失败即部分落盘），逐条去向与原因写进回执。
+      // ★ 取一次快照给执行者用：permissionSet / commandMode 在本装配块里后面还会被重新赋值（lambda 捕获不到非
+      //   effectively-final 的局部变量）。"执行时以谁的身份跑"取的是装配完成后的那两份实例。
+      AgentPermissionSet executingPermissions = permissionSet;
+      CommandModeHolder executingMode = commandMode;
+      Optional<DecisionCommitPort> decisionCommitPort =
+          Optional.of(
+              new LocalDecisionCommitPort(
+                  tools,
+                  // ★ P2a（"执行这一跳"）：执行只过纯判定链——裁决即授权，不再过一次审批闸（判定规则仍只有
+                  //   ToolExecutionGuard 一处）。guard 由装配层注入、不在提交口里 new：那是本类看不见的隐藏依赖。
+                  new ToolExecutionGuard(),
+                  // ★ P2b（裁定 13 补）：判据链补齐资源面，并把<b>同一份</b> toolConfig 注入提交口（P2a 发现 A/C）
+                  toolConfig,
+                  // ★ P2b（裁定 11）：执行身份<b>按当次终局裁决者现取</b>，不是写死主 Agent。
+                  packageId ->
+                      executingIdentityOf(
+                          packageId, executingPermissions, executingMode, decisionCascade)));
+      // ★ RB3：6 参构造 = 上事件总线（不接 ⇒ decision.package.* 四类一条都不发）+ 上明细缝（不接 ⇒ 包退回"只到人"）。
+      // ★ P1b（裁定 1+2+4）：这个桥是"Ask 自动进包"这条链路的最后一环——本块下面把它交给 AgentRuntime
+      //   （→ AgentPipeline），管线在回合收尾调 bridge.flush(本轮队列)：propose（无校验器重载）→ 同步投递 → 等裁决
+      //   → 被批子集执行。**不交给运行时**就等于"建了桥没人用"，那正是"敏感调用悄悄不执行"的形状。
+      // ★ P2b：7 参构造 = 再上逐级预裁定（裁定 12 / §5quater）——桥按它决定"哪些条目还要问人"。
       DecisionApprovalBridge decisionApprovalBridge =
           new DecisionApprovalBridge(
-              decisionPackages, approvalCoordinator, pendingApprovals, decisionCommitPort);
-      BuiltinToolSource decisionToolSource =
-          new BuiltinToolSource(
-              BUILTIN_TOOL_SOURCE_ID,
-              List.of(
-                  new DecisionProposeTool(
-                      decisionPackages,
-                      tools,
-                      decisionValidators(tools),
-                      decisionApprovalBridge::onProposed)));
-      for (AgentTool decisionTool : decisionToolSource.listTools()) {
-        tools.register(decisionToolSource.id(), decisionTool);
+              decisionPackages,
+              approvalCoordinator,
+              pendingApprovals,
+              decisionCommitPort,
+              bus,
+              Optional.of(decisionJudgeDetails),
+              Optional.of(decisionCascade));
+      // ★ 裁定 6（2026-10-16，用户原话「一旦工具符合条件就是自动进包」）：显式提议口 decision_propose 已<b>移除</b>
+      //   ——工具面不再有它。进包口径 = 全部 ToolGate.Ask（裁定 1）：命中那一刻由 ToolCallAuthorizer 登记进本轮队列
+      //   （不执行、不阻塞），回合收尾由上面的桥收成一个包（裁定 2）+ 同步投递（裁定 4）。
+      // ★ RB3（设计 §5.13(f)）：决策面挂在<b>同一台</b>审批 server、同一端口上（不新起 server、不新造端点族）。
+      //   POST 走桥的回填路径（DecisionSubmissionPort）：事件照发、提交口照调——直调状态机会让这两件事都不发生。
+      //   ★ P2b：多传一个"上报视图"——列表只列上报给人的条目、逐条打 escalated 标记（§5quater ④）。
+      if (approvalServer != null) {
+        DecisionPackagesHttpHandler.register(
+            approvalServer,
+            decisionPackages,
+            decisionApprovalBridge,
+            packageId -> decisionApprovalBridge.escalatedItems(packageId).orElse(null));
       }
+      // ★ P2b（裁定 5 的底线「下一轮要看结果直接调工具看」）：查自己的决策历史——读提出者自己的 events.db，
+      //   按 proposerKey 只列自己的包（别人的与不存在的返回同一个空结果，无存在性 oracle）。
+      tools.register(DECISION_HISTORY_TOOL_SOURCE_ID, DecisionHistoryTools.tool());
       LOG.info(
-          "决策包面已装配：工具={} 条目上限={} 裁决窗口={}ms 审批桥=已接（一条包=一条审批请求 classKey={}）"
-              + " 提交口={}（事件/HTTP 面=RB3，本单未接）",
-          DecisionProposeTool.NAME,
-          DecisionProposeTool.MAX_ITEMS,
-          DecisionProposeTool.DEFAULT_DEADLINE_MILLIS,
+          "决策包面已装配：裁决窗口={}ms（包缺省 deadline，裁定 10） 审批桥=已接（一条包=一条审批请求 classKey={}）"
+              + " 提交口={} 事件面=已接（decision.package.* 四类） 决策面={} 上级代批={}",
+          DecisionPackages.DEFAULT_DEADLINE_MILLIS,
           DecisionApprovalBridge.CLASS_KEY,
-          decisionCommitPort.isPresent() ? "已装配" : "未装配（裁决后包保持 DECIDED）");
+          decisionCommitPort.isPresent() ? "已装配（本机形态=就地执行被批子集）" : "未装配（裁决后包保持 DECIDED）",
+          approvalServer == null
+              ? "未启用（approval.http=false）"
+              : "http://127.0.0.1:" + approvalServer.boundPort() + DecisionPackagesHttpHandler.PATH,
+          "已装配（明细缝在，包可交上级代批）");
       // W3b：子 Agent 编排装配（模板目录非空时才启用——计划 §4.4 + W3；编排工具先于暴露快照注册进工具面）
       // ★ RA4（设计 §4.6）：模板库在这里<b>只装载一次</b>——既供 SubagentManager 用，也供紧随其后的装订期角色审计取
       //   declaredRoles。上移只让审计看得见同一份快照；装载时机与失败语义（坏模板 / 缺目录 ⇒ 启动响亮失败）逐字不变。
@@ -721,6 +818,11 @@ public final class App implements AutoCloseable {
       Set<String> externalMcpRoles = Set.of();
       knownRoles.addAll(externalMcpRoles);
       RoleCatalogAudit.Report roleAudit = RoleCatalogAudit.of(tools, knownRoles).run();
+      // ★ RA4 补事件（2026-10-16 用户裁定「补上吧」；设计 §4.6 / §5.13(c)）：审计的结论要留痕，且必须在
+      //   「失败 ⇒ 抛异常阻止启动」之前发——否则"启动没通过"这件事本身反而没有痕迹。
+      //   ★ 走 events.append（同步）而不是 bus.publish：bus 是异步分派，而 App.close 的顺序是
+      //   events.close() 先于 bus.close()，走总线会在关停窗口里丢；这条事件存在的唯一目的就是留痕。
+      appendRoleAuditEvent(events, roleAudit);
       if (roleAudit.hasFailures()) {
         // 沿用本文件既有的装配失败口径：RuntimeException 原样上抛 → 主 catch 回收已装配资源 → CLI 非零退出（不新造一套）
         throw new IllegalStateException(
@@ -737,11 +839,23 @@ public final class App implements AutoCloseable {
       if (!roleAudit.uncoveredRoleFindings().isEmpty()) {
         LOG.warn("装订期角色审计（报告，不失败）: {}", roleAudit.uncoveredRoleFindings());
       }
-      // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露（R7 警示下的当前默认：GUEST 身份，收窄属 M3）。
-      // S4-B2：改用带 authorizer 的 5 参重载（V8 的结构前提——子体经 MCP 调父级工具时审批同样生效）；
-      // 调用者逐字保持 3 参重载的缺省（GUEST + unrestricted(GUEST)，红线 5：既有行为不变）。
+      // ★ 可被提议面报告已随标记位一并移除（裁定 6；2026-10-16）：进包口径变成"工具符合条件就自动进包"，
+      //   "哪些工具声明了 DecisionProposable"这一问不再存在（标记接口与 PROPOSABLE_NAMES 都已删）。
+      //   残留的"整套决策包机制不可达却毫无报错"这个风险由 P1b 的队列装配覆盖（那里是唯一建包入口）。
+      // W2 步骤 2：主 Agent 工具面经 stdio MCP server 暴露。
+      // S4-B2：带 authorizer 的重载（V8 的结构前提——子体经 MCP 调父级工具时审批同样生效）；
+      // ★ RB3/A-6（设计 §5.13(g)）：可见面与判定面**同源**——`include` 谓词只调 PermissionChecker.allows 这一个
+      //   oracle（与子体桥 SubProcessExecutor 同一个谓词，不抄第二份判定式），被裁掉的数量落日志（不静默消失）。
+      //   实测：缺省 GUEST 令牌下该面 19 个工具**全部**不通过——不是"收窄造成的损失"，而是它本来就一个都执行不了
+      //   （生产工具逐个把级别提到 ToolSpec.level(AccessToken.DEFAULT, …)，卡在"身份级别不足"那道闸）。
+      //   要让它能用，把 agent.externalMcp.token 配成 DEFAULT/SYSTEM；那**不改**本谓词的形状（可见面跟着判定面走）。
       // 注意 GUEST 桶 = 全体外部 MCP 客户端（桶粒度分不出实例）⇒ 人在 HTTP 上给 GUEST 批"本会话"会被收窄为一次，
       // "下次还问"是<b>设计</b>（S5 身份穿透前不许泛化），不是 bug——别为让 session 生效去动 callerKey。
+      AgentPermissionSet externalMcpPermissions =
+          AgentPermissionSet.unrestricted(externalMcpToken)
+              // 第 8 维（角色，设计 §4.5）：外部 MCP 面**显式表态为 ⊥**（一个角色都不是）⇒ 角色门工具对该面全拒。
+              // ★ 注意这不是该面"看不到工具"的死因：真实死因是**令牌级别**（角色维只是恰好也不相交）。
+              .withRoles(RoleSet.none());
       mcpServer =
           config.mcpExpose()
               ? AgentToMcpServer.start(
@@ -749,34 +863,23 @@ public final class App implements AutoCloseable {
                   "mosire-main",
                   Version.VERSION,
                   ToolContext.of(
-                      AccessToken.GUEST,
-                      // 第 8 维（角色，设计 §4.5）：外部 MCP 面**显式表态为 ⊥**（一个角色都不是）⇒ 角色门工具对该面全拒。
-                      // 桶（GUEST）与白名单（unrestricted）语义逐字不变——这一句只是把"恰好被桶挡住"变成"表态结果"。
-                      AgentPermissionSet.unrestricted(AccessToken.GUEST).withRoles(RoleSet.none()),
+                      externalMcpToken,
+                      externalMcpPermissions,
                       // S6：外部面显式自我介绍（external-mcp + FULL）。档位照旧不变，身份<b>必须</b>显式——
                       // 判定闸据此认出"这不是我派的下级"，从而不为外部客户端的命令背书（到人，见 SuperiorJudgeGate）
                       AgentIdentity.external()),
+                  // A-6 的可见面谓词（与判定面同一个 oracle；noExport 的求交在 AgentToMcpServer.exportable 里）
+                  name ->
+                      tools
+                          .find(name)
+                          .map(
+                              tool ->
+                                  PermissionChecker.allows(
+                                      externalMcpPermissions, name, tool.spec(), tool.roles()))
+                          .orElse(false),
                   approvalAuthorizer)
               : null;
-      // D30：工具自身配置经 ToolContext.config 注入（运行时缝，不走构造器全局）——read_agent_context 据此定位
-      // 子库根（与 subagentCommand 的 --data-dir 同源）与自身事件库；键名归 Brain（AgentContextReader 常量）
-      // bash 的 tools.bash.* 不再走这条缝：插件在 init 里经 HostServices 装载期读定（设计 D5），宿主零 bash schema
-      Map<String, Object> toolConfig = new LinkedHashMap<>();
-      toolConfig.put(
-          AgentContextReader.CONFIG_SUBAGENTS_ROOT,
-          config.dataDir().resolve("subagents").toString());
-      toolConfig.put(
-          AgentContextReader.CONFIG_SELF_EVENTS_DB,
-          config.dataDir().resolve("events.db").toString());
-      toolConfig.put(AgentContextReader.CONFIG_SELF_AGENT_ID, agentConfig.id());
-      // S6：档位持有者经同一个运行时缝下发（AgentPipeline 建调用上下文时现读它定主 Agent 的身份/档位）
-      toolConfig.put(CommandModeHolder.CONFIG_KEY, commandMode);
-      // 遮蔽面（R3b 起由工作区注册表产出）：文件工具（bash 的 L3 沙箱）据此决定"这条路径遮蔽 / 只读暴露"——
-      // 这是资源边界在文件工具一侧的唯一数据入口（判定见 SandboxMask，逐条目求与）。
-      // ★ 这里不再写死 ("skills", <技能根>) 字面：技能根本身就是一个装配期 REFERENCE 挂载，它的条目由
-      //   WorkspaceRegistry.maskEntries() 连命名空间一起产出（M6：只返回装配期条目；运行期挂载不进遮蔽面）。
-      toolConfig.put(SandboxMask.CONFIG_KEY, maskConfigOf(workspaceRegistry));
-      toolConfig = Map.copyOf(toolConfig);
+      // D30：工具自身配置（toolConfig）在本方法<b>前面</b>已建好（P2b 把它挪到决策块之前：提交口与管线必须拿同一份）
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
       // （--demo 恒"零行为变化"是本仓既有约定：它只跑一条脚本回合，没有工具调用面可审批）
@@ -808,7 +911,9 @@ public final class App implements AutoCloseable {
                   conversations,
                   MAIN_CONVERSATION_ID,
                   toolConfig,
-                  approvalCoordinator);
+                  approvalCoordinator,
+                  // P1b：桥交给管线 = "Ask 自动进包"这条链路的最后一环（没有它，管线不绑队列，Ask 走既有审批闸）
+                  decisionApprovalBridge);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;
@@ -1002,41 +1107,6 @@ public final class App implements AutoCloseable {
       tools.register(builtin.id(), tool);
     }
     return new SubagentRig(manager, processes);
-  }
-
-  /**
-   * RB2a：决策包条目的<b>装配注入校验器</b>（设计 §5.9 ② 的逐条校验、RB1 的 {@code ItemValidator} 注入点）。
-   *
-   * <p>三件事，按序：① 工具在不在目录里；② 它有没有声明 {@code DecisionProposable}；③ 调用者过不过 {@code
-   * PermissionChecker.allows}（<b>既有 oracle，不另写判定式</b>——可见面/判定面/提议面共用的那一个，设计 §4.8 的 A-6）。①② 的唯一实现点在
-   * {@link DecisionProposeTool#structuralDenial}，这里只调用、不抄规则。
-   *
-   * <p><b>★ 资源面准入是缺口（如实记，不许假称已判）</b>：{@code allows} 覆盖工具名级的七维（白名单/黑名单/桶/敏感/破坏/
-   * 只读/角色），<b>不</b>覆盖资源可达面——资源判定要"调用者权限集 × 工具声明的资源面"当场建出 {@code ResourceAuthorizer}（{@code
-   * ToolCallAuthorizer} 在执行前做的事），而提议发生在执行之前，今天没有对应输入能在
-   * 这里把它建出来。故本版<b>不判</b>资源面；B-5（包不绕单条闸链）不受影响：被批子集执行时照走完整判定链。
-   *
-   * <p><b>为什么按权限集产出、而不是固定一个校验器</b>：见 {@link DecisionProposeTool.ValidatorSource}——子 Agent 经父侧桥调用时
-   * {@code ToolContext.permissions()} 是<b>它自己</b>的权限集（父侧外发面已按它收窄）， 固定成主 Agent 的权限集就是权限放大。
-   */
-  private static DecisionProposeTool.ValidatorSource decisionValidators(ToolRegistry tools) {
-    return permissions ->
-        (toolName, args) -> {
-          Optional<String> structural = DecisionProposeTool.structuralDenial(tools, toolName);
-          if (structural.isPresent()) {
-            return structural;
-          }
-          // 结构面已确认工具在目录里；再查一次是刻意的重复查（同 AgentPipeline.executeToolCall 的口径：
-          // 判定式不搬到这里来，只调它）。真查不到只可能是注册表在两次查之间被改（插件装卸）⇒ 按拒处理（fail-closed）。
-          AgentTool tool = tools.find(toolName).orElse(null);
-          if (tool == null) {
-            return Optional.of("工具在两次校验之间从目录里消失: " + toolName);
-          }
-          if (!PermissionChecker.allows(permissions, toolName, tool.spec(), tool.roles())) {
-            return Optional.of("调用者权限不足（PermissionChecker.allows 拒绝）: " + toolName);
-          }
-          return Optional.empty();
-        };
   }
 
   /**
@@ -1538,14 +1608,19 @@ public final class App implements AutoCloseable {
   }
 
   /**
-   * 审批事件落库镜像：只收 {@code approval.*}（其余类型由管线自己的 emit 落库，这里再落就是双写），失败只告警。
+   * 基础设施事件落库镜像：按<b>前缀白名单</b>收 {@code approval.} ∪ {@code decision.package.} ∪ {@code role.audit.}
+   * （其余类型由管线自己的 emit 落库，这里再落就是双写），失败只告警。
    *
-   * <p><b>agent 字段为什么是 {@code main}</b>：审批事件在 B1 里以"基础设施事件"形态投出，不带调用者身份（bus 事件的 agent
-   * 为空串），而审批请求本身也不经过 AgentPipeline。本接线里能触发审批的唯一调用者是主 Agent（子体白名单拿不到 bash， 见 {@code ShellTool}
-   * 注册注释）⇒ 落 {@code main}。若日后子体能触发审批，这里必须换成真身份，否则审计会张冠李戴。
+   * <p><b>为什么是白名单而不是全量</b>：管线的 {@code agent.lifecycle/llm.call/tool.call/...} 由管线自己 {@code emit}
+   * 落库，全量订阅会双写。★ 白名单漏一族 ⇒ 那一族事件<b>静默消失</b>（不报错、没有用例会红）——RB3 的 {@code decision.package.*}
+   * 差点就是这样丢的（设计 §5.13(c)）。
+   *
+   * <p><b>agent 字段为什么是 {@code main}</b>：这些事件以"基础设施事件"形态投出，不带调用者身份（bus 事件的 agent 为空串），而审批请求本身也不经过
+   * AgentPipeline。本接线里能触发审批的唯一调用者是主 Agent（子体白名单拿不到 bash， 见 {@code ShellTool} 注册注释）⇒ 落 {@code
+   * main}。若日后子体能触发审批，这里必须换成真身份，否则审计会张冠李戴。
    */
-  private static void mirrorApprovalEvent(EventStore events, Event event) {
-    if (event.type() == null || !event.type().startsWith(APPROVAL_EVENT_PREFIX)) {
+  private static void mirrorInfrastructureEvent(EventStore events, Event event) {
+    if (event.type() == null || !isMirroredEventType(event.type())) {
       return;
     }
     try {
@@ -1553,12 +1628,65 @@ public final class App implements AutoCloseable {
           EventWrite.of(
               event.type(), MAIN_CONVERSATION_ID, event.payload(), event.correlationId()));
     } catch (RuntimeException failure) {
-      LOG.warn("审批事件落库失败（不影响判定） type={} seq={}", event.type(), event.seq(), failure);
+      LOG.warn("基础设施事件落库失败（不影响判定） type={} seq={}", event.type(), event.seq(), failure);
+    }
+  }
+
+  /** 镜像前缀白名单（设计 §5.13(c)）：审批 / 决策包 / 角色审计。 */
+  private static boolean isMirroredEventType(String type) {
+    return type.startsWith(APPROVAL_EVENT_PREFIX)
+        || type.startsWith(DECISION_PACKAGE_EVENT_PREFIX)
+        || type.startsWith(ROLE_AUDIT_EVENT_PREFIX);
+  }
+
+  /**
+   * 装订期角色审计的留痕事件（RA4 补；设计 §4.6 / §5.13(c)）：成功与失败都发，且必须发在"失败 ⇒ 抛异常阻止启动"之前。
+   *
+   * <p><b>为什么用 {@code events.append} 而不是 {@code bus.publish}</b>：总线是异步分派，而 {@code App#close()} 的顺序是
+   * {@code events.close()} 先于 {@code bus.close()} ⇒ 走总线会在关停窗口里丢事件。本事件存在的唯一目的就是留痕，
+   * 所以走同步落库；落库失败只告警（不能因为审计写不进去就改变"启动是否通过"这个结论）。
+   *
+   * <p><b>payload 只放计数与结论，不放逐条 findings 全文</b>：全文可能很长（且随工具面增长），逐条明细留给同一轮的两行日志 （INFO 摘要 / WARN
+   * 报告项）。{@code unknownRoles} 是角色名——它不是密钥（§4.3.1 的面的分工），所以可以落。
+   */
+  private static void appendRoleAuditEvent(EventStore events, RoleCatalogAudit.Report report) {
+    Map<String, Object> payload = new LinkedHashMap<>();
+    payload.put("toolCount", report.toolCount());
+    payload.put("roleDeclaringToolCount", report.roleDeclaringToolCount());
+    payload.put("knownRoleCount", report.knownRoleCount());
+    payload.put("catalogChecked", report.catalogChecked());
+    List<String> unknownRoles = new ArrayList<>(report.unknownRoleFindings());
+    Collections.sort(unknownRoles);
+    payload.put("unknownRoles", unknownRoles);
+    payload.put("unknownCount", report.unknownRoleFindings().size());
+    payload.put("uncoveredCount", report.uncoveredRoleFindings().size());
+    payload.put("catalogDiffCount", report.catalogDiffFindings().size());
+    try {
+      events.append(
+          EventWrite.of(
+              EventTypes.ROLE_AUDIT,
+              MAIN_CONVERSATION_ID,
+              PLUGIN_PAYLOAD.writeValueAsString(payload),
+              ""));
+    } catch (RuntimeException | JsonProcessingException failure) {
+      LOG.warn("role.audit 落库失败（不影响装配结论）", failure);
     }
   }
 
   /** 审批事件的类型前缀（B1 的 {@code ApprovalEventTypes} 只有两个常量，这里按前缀收口，不复制一份类型表）。 */
   private static final String APPROVAL_EVENT_PREFIX = "approval.";
+
+  /** 决策包事件前缀（RB3；常量在 AgentLib {@code DecisionEventTypes}，这里只做落库收口）。 */
+  private static final String DECISION_PACKAGE_EVENT_PREFIX = "decision.package.";
+
+  /**
+   * 角色审计<b>子类型</b>前缀（RA4 补事件；完整类型常量在 {@link EventTypes#ROLE_AUDIT} = {@code "role.audit"}）。
+   *
+   * <p>★ 带点是有意的区别：完整类型 {@code role.audit} 本身<b>不</b>走镜像白名单——审计由装配层直接 {@code events.append} 同步落库（见
+   * {@code appendRoleAuditEvent}），因为总线是异步的、关停窗口里会丢。 本前缀只认将来可能出现的 {@code role.audit.*}
+   * 子类型（当前没有），留它是为了别让"新增子类型"变成静默丢失。RT 的核查（报告 §5-4）确认当前无影响。
+   */
+  private static final String ROLE_AUDIT_EVENT_PREFIX = "role.audit.";
 
   /** 配置段名与键名（设计 D4 的解析顺序输入；值非法一律响亮失败，同 {@code commands.mode} 那套口径）。 */
   private static final String PLUGINS_SECTION = "plugins";
@@ -1571,6 +1699,58 @@ public final class App implements AutoCloseable {
 
   /** {@code plugin.lifecycle} 事件的 payload 组装（Jackson 仅用于这一处序列化；字段顺序 pluginId→version→state）。 */
   private static final ObjectMapper PLUGIN_PAYLOAD = new ObjectMapper();
+
+  /**
+   * <b>会话级放行的资格判据</b>（{@code ApprovalCoordinator} 的 {@code sessionGrantable} 注入缝；P2b，设计 §5ter 裁定
+   * 13）。
+   *
+   * <p><b>包级请求一律不放行会话</b>：包级 classKey 是冻结字面量（{@value DecisionApprovalBridge#CLASS_KEY}）， 若
+   * callerKey 取令牌桶，人对<b>某一个包</b>批的"本会话"就会被 {@code AutoApproveGate} 命中、把以后<b>每一个</b>包都放行。 桥因此把包级请求的
+   * callerKey 取成包级唯一桶（{@link DecisionApprovalBridge#packageCallerKey}），这里认出它、收成"一次"并落一行 WARN
+   * ——"包级不放行会话"这条口径必须看得见（否则下次有人放开 {@code sessionGrantable} 时它会静默消失）。
+   *
+   * <p>其余调用者照抄 {@code ApprovalCoordinator} 的缺省口径（只认 {@code SYSTEM}）：身份唯一性那条 fail-closed 收窄
+   * 与本单无关，一个字不改。
+   */
+  private static boolean sessionGrantable(String callerKey) {
+    if (DecisionApprovalBridge.isPackageCallerKey(callerKey)) {
+      LOG.warn("包级请求不接受会话放行（一个包一次的裁决不得复用为会话放行：不同范围的两次裁决不许互相放行） callerKey={}", callerKey);
+      return false;
+    }
+    return AccessToken.SYSTEM.name().equals(callerKey);
+  }
+
+  /**
+   * <b>该包以谁的身份执行</b>（设计 §5ter 裁定 11：执行者 = 裁决者）：按该包的<b>终局裁决者</b>现取身份，不是写死主 Agent。
+   *
+   * <p>三种取值各有出处：某一级 Agent 拍的板 ⇒ 用那一级的权限集与现读档位；<b>人</b>拍的板 ⇒ 用提出者/主 Agent 那一级
+   * （人不是进程内的权限主体，而提出者那一级本来就是把这条调用送进包的那一级）；认不出的裁决者 ⇒ <b>fail-closed</b> 给一个无白名单的只读身份（逐条 {@code
+   * PERMISSION_DENIED} → {@code NOT_COMMITTED}），绝不借用主 Agent 的权限兜底。
+   *
+   * <p>本单只接了主进程内那条链（链上只有主 Agent 一级），所以前两条今天取到的是同一份身份；区别在于取值是<b>每次现问</b>的 ——这正是"父 Agent 把窄权限包给子
+   * Agent"在执行侧成立的前提（否则子体提的包会以主 Agent 的 SYSTEM 权限执行）。
+   */
+  private static LocalDecisionCommitPort.ExecutingIdentity executingIdentityOf(
+      String packageId,
+      AgentPermissionSet permissions,
+      CommandModeHolder mode,
+      DecisionCascade cascade) {
+    String decider = cascade.finalizedBy(packageId).orElse(AgentIdentity.MAIN_ID);
+    if (AgentIdentity.MAIN_ID.equals(decider)
+        || DecisionCascade.HUMAN_DECIDER.equals(decider)
+        || DecisionCascade.SUPERIOR_DECIDER.equals(decider)) {
+      return new LocalDecisionCommitPort.ExecutingIdentity(
+          permissions.grantedToken(), permissions, AgentIdentity.main(mode.get()));
+    }
+    LOG.warn(
+        "终局裁决者不是本进程内已知的一级（按 fail-closed 用无权限身份执行，不借用主 Agent 的权限兜底）" + " decider={} packageId={}",
+        decider,
+        packageId);
+    return new LocalDecisionCommitPort.ExecutingIdentity(
+        AccessToken.GUEST,
+        new AgentPermissionSet(AccessToken.GUEST, Set.of(), Set.of(), false, false, true),
+        AgentIdentity.UNKNOWN);
+  }
 
   /** 单项资源关闭：异常只记日志（继续执行后续关闭——close 链不因单项失败中断）。 */
   private static void closeQuietly(String what, Runnable closer) {

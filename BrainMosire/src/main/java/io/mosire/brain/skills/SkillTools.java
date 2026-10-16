@@ -427,7 +427,13 @@ public final class SkillTools {
     }
   }
 
-  /** 共同骨架：把 {@link SkillException} 转成错误码（权限拒绝仍走 {@code ResourceDeniedException}，由唯一入口转码）。 */
+  /**
+   * 共同骨架：把 {@link SkillException} 转成错误码（权限拒绝仍走 {@code ResourceDeniedException}，由唯一入口转码）。
+   *
+   * <p><b>为什么是 {@code final}</b>：本类曾为"可被提议"的子类（{@code ProposableSkillTool}）而开放继承——本类由 6 个技能工具
+   * <b>共用</b>（读写都有），而那个标记只属于写入类那 2 个，所以标记必须落在<b>具体工具</b>上。2026-10-16 随标记位（{@code
+   * DecisionProposable}）一并回退：进包口径改成"工具符合条件就自动进包"（设计 §5 裁定 1/6），不再需要声明位，也就不再需要子类。
+   */
   private static final class SkillTool implements AgentTool {
 
     private final String name;

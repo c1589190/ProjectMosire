@@ -575,6 +575,10 @@ public final class DocsTools {
    *
    * <p><b>权限拒绝不经这里转</b>：{@code require} 抛的 {@code ResourceDeniedException} 由唯一入口 {@code
    * ToolCallAuthorizer} 接住并转码（工具不得自裁）——本类只处理文档语义自己的失败。
+   *
+   * <p><b>为什么是 {@code final}</b>：本类曾为"可被提议"的子类（{@code ProposableDocTool}）而开放继承——本类由 8 个 doc 工具
+   * <b>共用</b>（读写都有），而那个标记只属于写入类那 4 个，所以标记必须落在<b>具体工具</b>上。2026-10-16 随标记位（{@code
+   * DecisionProposable}）一并回退：进包口径改成"工具符合条件就自动进包"（设计 §5 裁定 1/6），不再需要声明位，也就不再需要子类。
    */
   private static final class DocTool implements AgentTool {
 

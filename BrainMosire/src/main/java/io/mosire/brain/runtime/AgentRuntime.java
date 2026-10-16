@@ -16,6 +16,7 @@ import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.ContextAssembler;
+import io.mosire.brain.decision.DecisionApprovalBridge;
 import java.util.Map;
 import java.util.Objects;
 
@@ -43,6 +44,10 @@ public final class AgentRuntime implements AutoCloseable {
   private final EventStore events;
   private final EventBus bus;
   private final AgentPipeline pipeline;
+
+  // ★ 决策包审批桥（P1b）**不是本类的字段**：它只在构造时透传给管线（管线才是唯一读者）。
+  //   早先存成字段被 SpotBugs 判 URF_UNREAD_FIELD（真发现：存了从不读），故删字段、留这条说明防"顺手加回来"。
+
   private boolean closed;
 
   /** 便捷装配（AgentSpec 形态——D17：一个 runtime 类 + 不同 Spec，见 {@link AgentSpec}）；默认守卫/上下文组装。 */
@@ -247,6 +252,9 @@ public final class AgentRuntime implements AutoCloseable {
    *
    * <p>{@code coordinator} 为 {@code null} = 无审批面（{@code ToolGate.Ask} fail-closed 拒）——除 S4-B2
    * 的终态装配路径外， 所有既有重载都传 {@code null}，行为逐字不变。
+   *
+   * <p><b>P1b 追加的 {@code decisionBridge}（决策包桥）</b>：本构造不带它（{@code null} = 不绑本轮待裁决队列、 {@code Ask}
+   * 走既有审批闸）。要接"Ask 自动进包"的装配请用下面带桥的那条构造——只有装配层拿得到桥实例 （{@code Main} 的 {@code App}），Brain 不造它。
    */
   public AgentRuntime(
       AgentSpec spec,
@@ -261,6 +269,49 @@ public final class AgentRuntime implements AutoCloseable {
       String conversationId,
       Map<String, Object> toolConfig,
       ApprovalCoordinator coordinator) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        store,
+        conversationId,
+        toolConfig,
+        coordinator,
+        null);
+  }
+
+  /**
+   * 全参装配 + <b>决策包桥</b>（P1b，设计 §5 裁定 1+2）：除最后一个参数外与上一条构造逐字相同。
+   *
+   * <p><b>{@code decisionBridge} 是什么</b>：Pipeline 在回合收尾把本轮攒下的待裁决调用收成一个决策包、<b>同步</b>投递并等裁决 （裁定
+   * 4），出口就是这个桥（{@link io.mosire.brain.decision.DecisionApprovalBridge#flush}）。<b>{@code null} =
+   * 不接线</b>： 管线不绑定本轮队列，{@code ToolGate.Ask} 保持既有行为（问人）。两者必须同进同退——只绑队列不给桥，等于让敏感调用 既没执行、也没人去裁（见
+   * {@code AgentPipeline#decisionBridge} 的注释）。
+   *
+   * <p><b>为什么由装配层注入而不是 Brain 自建</b>：桥要的实例（{@code DecisionPackages} / {@code ApprovalCoordinator} /
+   * {@code PendingApprovals} / 提交口 / 事件总线）全是装配层那<b>唯一</b>一份（设计 §5.4：不新建第二张表、不新建通道）。
+   *
+   * @param decisionBridge 决策包审批桥（{@code null} = 未接线：不绑队列、{@code Ask} 走既有审批闸）
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge) {
     this.spec = Objects.requireNonNull(spec, "spec");
     AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
@@ -268,6 +319,7 @@ public final class AgentRuntime implements AutoCloseable {
     this.events = Objects.requireNonNull(events, "events");
     this.bus = Objects.requireNonNull(bus, "bus");
     this.permissionSet = Objects.requireNonNull(permissionSet, "permissionSet");
+    // P1b：桥只转发给管线（决定"本轮队列绑不绑"），本类不读它的状态；null = 未接线（见字段注释）
     LlmClient client = Objects.requireNonNull(llm, "llm");
     this.pipeline =
         store == null
@@ -298,7 +350,8 @@ public final class AgentRuntime implements AutoCloseable {
                 null,
                 CompactSummarySlot.empty(),
                 toolConfig,
-                coordinator);
+                coordinator,
+                decisionBridge);
 
     // 起步即记录生命周期（事件词汇表 agent.lifecycle）
     // model 报的是【客户端实际在用的模型】（client.model()），不是装配层标签 config.model()：后者由
