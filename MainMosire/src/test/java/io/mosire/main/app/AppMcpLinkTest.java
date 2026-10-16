@@ -13,7 +13,7 @@ import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
-import io.mosire.brain.decision.DecisionProposeTool;
+import io.mosire.brain.decision.DecisionHistoryTools;
 import io.mosire.brain.skills.SkillTools;
 import io.mosire.docs.DocsTools;
 import io.mosire.workspace.WorkspaceTools;
@@ -59,14 +59,15 @@ class AppMcpLinkTest {
     // close 顺序：bridge 先整组下架工具（registry 恢复到"桥接前"的原状），再关源子进程。
     // 注意"原状"不是空表：主 Agent 的工具面 = 插件供给（本测试无插件目录 ⇒ 空）+ 内置技能工具 + R3b 起的
     // docs 工具（7+1=8：含 R8 的 doc_guide）与工作区工具（3+1=4：含 R8 的 workspace_info），
-    // 再加决策包提议面 1（RB2a 的 decision_propose）⇒ 合计 6+8+4+1 = 19。
+    // 决策包提议面 0（2026-10-16 裁定 6：decision_propose 已移除），P2b 起另有决策历史 1（decision_history，
+    // 只有主 Agent 自己的工具面注册它）⇒ 合计 6+8+4+1 = 19。
     // ★ 数字不再只写在注释里：下面那条 hasSize 把它钉住（家族增删而不回来看注释 ⇒ 当场红）。名字集合本身
     //   由 builtinToolNames() 从生产常量现取，全等断言自动跟随。
     // 断言写全等而非"包含"——桥若没把 echo 摘干净，这里会多出 echo ⇒ 转红。
     assertThat(app.runtime().registry().list())
         .extracting(AgentTool::name)
         .containsExactlyInAnyOrderElementsOf(builtinToolNames());
-    assertThat(builtinToolNames()).as("技能 6 + Docs 8 + 工作区 4 + 决策包提议面 1").hasSize(19);
+    assertThat(builtinToolNames()).as("技能 6 + Docs 8 + 工作区 4 + 决策历史 1").hasSize(19);
     waitForExit(pidFile);
   }
 
@@ -98,16 +99,15 @@ class AppMcpLinkTest {
             Duration.ofSeconds(30));
     try (McpToolSource client = new McpToolSource(appProcess)) {
       client.connect();
-      // 验收：SDK client listTools 可见主 Agent 工具面 = 桥同步进的 echo + 内置技能工具 + docs/workspace 工具
-      // （本能力新增；未表态的外部调用者一律 RESOURCE_DENIED，见 SkillToolsTest / DocsToolsTest）。工作束四起
-      // bash 来自插件，本子进程无插件目录 ⇒ 工具面无 bash。仍是全等断言：少一个（桥没同步过来）或多一个
-      // （不该外发的漏出去了）都转红。
-      assertThat(client.listTools())
-          .extracting(AgentTool::name)
-          .containsExactlyInAnyOrderElementsOf(
-              java.util.stream.Stream.concat(
-                      java.util.stream.Stream.of("echo"), builtinToolNames().stream())
-                  .toList());
+      // 验收（★ 2026-10-16 随 A-6「可见面 = 判定面」改口径；旧断言已被推翻，理由如下）：
+      //   外部 MCP 面的调用者令牌缺省 = AccessToken.GUEST（agent.externalMcp.token 可配），而生产内置工具
+      //   逐个把级别提到 ToolSpec.level(AccessToken.DEFAULT, …) ⇒ 它们在该面上**一个都调不动**。旧断言要求
+      //   "19 个内置工具都列得出来"= 断言"看得见却调不动"，正是 A-6 禁止的形状（模型会看见一调就吃
+      //   PERMISSION_DENIED 的工具）。现在可见面由一个谓词收窄（PermissionChecker.allows，与判定面同一个 oracle），
+      //   于是该面只列得出**判定面也放行**的工具：本 fixture 里只有桥同步进来的 echo（ToolSpec.DEFAULT 要求 GUEST）。
+      //   ★ 判别力仍在：bridge 没把 echo 摘干净/同步过来 ⇒ 少一个即红；把内置工具又漏出去 ⇒ 多一个即红。
+      //   要恢复 18 个（那是部署方的选择）：把 agent.externalMcp.token 配成 DEFAULT/SYSTEM。
+      assertThat(client.listTools()).extracting(AgentTool::name).containsExactlyInAnyOrder("echo");
       // 穿透调用：客户端 → App 的 AgentToMcpServer → registry → 桥 → 外部 MCP server
       AgentTool echo =
           client.listTools().stream()
@@ -252,10 +252,10 @@ class AppMcpLinkTest {
   }
 
   /**
-   * 主 Agent 的<b>内置</b>工具名（不含插件与 MCP 桥）：技能 6 + Docs 8 + 工作区 4 + 决策包提议面 1 = 19（R8 起 Docs 7→8、 工作区
-   * 3→4；RB2a 起加 decision_propose）。
+   * 主 Agent 的<b>内置</b>工具名（不含插件与 MCP 桥）：技能 6 + Docs 8 + 工作区 4 + 决策历史 1 = 19（R8 起 Docs 7→8、工作区 3→4；
+   * RB2a 起曾加 decision_propose，2026-10-16 裁定 6 已移除；P2b 加 {@code decision_history}）。
    *
-   * <p>四处名字集合都从生产常量现取（不重抄字面量）：哪一族少注册一个工具，全等断言当场转红； 上面的总数由调用点的 {@code hasSize(19)} 钉住，不再只活在注释里（★
+   * <p>名字集合都从生产常量现取（不重抄字面量）：哪一族少注册一个工具，全等断言当场转红； 上面的总数由调用点的 {@code hasSize(19)} 钉住，不再只活在注释里（★
    * 旧注释写"技能 11 … 合计 21"， 而 {@code SkillTools.NAMES} 实际只有 6 条——数字漂了没人发现，正是"注释里的数字"这类 drift 的典型）。
    */
   private static java.util.Set<String> builtinToolNames() {
@@ -263,8 +263,8 @@ class AppMcpLinkTest {
             SkillTools.NAMES,
             DocsTools.NAMES,
             WorkspaceTools.NAMES,
-            java.util.Set.of(DecisionProposeTool.NAME))
-        .flatMap(java.util.Set::stream)
+            java.util.List.of(DecisionHistoryTools.NAME))
+        .flatMap(java.util.Collection::stream)
         .collect(java.util.stream.Collectors.toUnmodifiableSet());
   }
 
