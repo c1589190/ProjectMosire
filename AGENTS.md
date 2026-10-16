@@ -239,6 +239,16 @@ BashPluginMosire ────────────────────┘
   **1132 tests, 0 failures, 0 errors, 6 skipped**；4 个模块 SpotBugs 均 `BugInstance size is 0`。
   ★ 后续以新一轮 `verify` 为准，旧数字自动降为历史。
 - **改完代码先 `./mvnw spotless:apply` 再 `./mvnw verify`**，避免格式门禁来回。
+- ★★ **判定 SpotBugs 结论前，先确证编译产物是新的**（2026-10-16 实测，吃掉四轮返工）：
+  增量编译留下的旧 class 会让 SpotBugs 反复报**同一个已经不存在的**告警（当晚 `CommitReceipt` 连报三次幽灵
+  `EI_EXPOSE_REP`，中途还反过来报"抑制多余"，差点把真正需要的那条抑制删掉）。
+  正确姿势：`rm -rf <模块>/target/classes` → `./mvnw -o -q -pl <模块> -am -DskipTests compile` →
+  `./mvnw -o -pl <模块> -am spotbugs:check`。**只跑 `spotbugs:check` 不重编 = 在读旧快照**。
+- ★★ **变异自证必须在"不与他人并发"的窗口里做**（同日晚实测）：测试 Agent 做变异（改坏生产文件→跑→还原）时，
+  控制方若同时跑全量 `verify`，编译会把**未还原的变异体**编进去 ⇒ 得到一条**假红**（当晚 `PendingDecisionQueueTest`
+  的 `[本轮只建了一个包] Expected size: 1 but was: 0` 就是变异体，不是回归）。
+  规矩：变异期要么独占 checkout（别人的 Maven 一律让路），要么在**副本**里做；看到"莫名其妙的红"先查
+  `git diff` 与文件 mtime，**先怀疑在自己脚下的变异体**，别急着改代码。
 - **勿加 `-N`**：`-N` 只构建根聚合器，对模块源码是空操作，`spotless:check` 会假绿；
   实测：模块里放明显违规文件，`./mvnw -N spotless:check` 退出 0，`./mvnw spotless:check` 正确报违规。
 - **全仓 verify 才是完整门禁**；用 `-pl <模块>` 时必须带 `-am`（否则可能用 `~/.m2` 的旧 SNAPSHOT，
@@ -328,7 +338,12 @@ BashPluginMosire ────────────────────┘
 7. 不要把本机工具目录（`.omo/`、`.work/`、`target/`、含密钥的配置）提交进库；提交前确认 `.gitignore` 仍覆盖它们。
    ★ **唯一例外（2026-10-16 核实）**：`AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar` 是**刻意 force-track**
    的（`git add -f`；先例 `246f326` / `ca604f3` / `3ba02c4` / `52b58c0`）——给消费方一个仓内可取用的产物。
-   刷新它的时机 = AgentLib 的**类集合或字节码**变化时；**只改 javadoc 不必刷**。除这一个文件外，`target/` 仍不入库。
+   ★ **刷新它的时机（2026-10-16 用户裁定更正）**：**不要逐批刷**。分两种情况——
+   ① **同一台机器上的消费方**（本机 `~/SimulatorMosire`）：走 §0.5 的 `./mvnw -pl AgentLibMosire -am install`
+   即可，**根本不需要这个 jar**，也就不必为它单独提交；
+   ② **要刷新时**：留到**阶段边界 / 关账**（一批改动做完、`verify` 绿之后），或确有跨机器取用需求时。
+   ⇒ 目的：不让"刷产物"变成每次改 AgentLib 都要多一笔提交与一次全量构建（用户 2026-10-16：
+   「先把手头上的代码修改和开发计划做完再刷新包」）。**只改 javadoc 永不刷**（字节码不变）。除这一个文件外，`target/` 仍不入库。
 
 ---
 
