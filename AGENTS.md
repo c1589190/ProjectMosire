@@ -34,7 +34,8 @@ BashPluginMosire ────────────────────┘
 | 模块 | artifactId | 包前缀 | 允许依赖 / 要点 |
 |---|---|---|---|
 | `AgentLibMosire` | `agentlib-mosire` | `io.mosire.agentlib.*` | 通用 LLM 工具包/接口/协议（llm client、AgentTool、MCP 适配、权限模型、事件存储、配置、进程管理）。★ **2026-10-17 边界改写（用户裁定）**：原口径「**无 Agent 假设**」已**不再成立**——按用户裁定「AgentConfig 整个下沉」与「窗口的结构编排和基础运行本身作为完全可复用的项目下沉到 AgentLib」，本库现含 **Agent 描述符**（`io.mosire.agentlib.agent.AgentConfig`，10 组件含 maxTurns/timeBudget/quotaMaxTokens/工具白黑名单）与**上下文窗口的结构与基础操作**（`io.mosire.agentlib.context.{ContextWindow,ContextComposer,LlmRoundTrip}`；📄 `设计-上下文窗口下沉.md`）。
-新口径：**无运行流假设**——库**不含循环、编排、终止结算、压缩/技能/记忆的具体实现**（这些留在宿主 Brain）；可被其他程序单独依赖；**不得 import** `io.mosire.brain.*` / `io.mosire.main.*` |
+★ **2026-10-17 第二次边界改写（用户裁定 B 方案：「先提交并推送一下，然后按照B进行开发」）**：**通用循环骨架**也下沉——`io.mosire.agentlib.runtime.{AgentLoop,StopPolicy,TurnListener,ToolCallDispatcher,LoopState,StopSignal,StopReason,TurnResult}`（📄 `设计-通用循环骨架.md`）。
+新口径（取代原「无运行流假设」）：**库含循环骨架与策略 SPI，不含任何具体策略**——循环的**结构**（组请求 → 一轮往返 → 工具分发 → 终止判定）在库；何时停、怎么记账/发事件、工具怎么执行/写回、怎么落库全由宿主注入。压缩/决策包/审批/事件形状/持久化/技能/记忆/子 Agent/重试/沙箱/权限判定仍留 Brain；`AgentPipeline` 是骨架的**第一个宿主实现**，不得再出现第二套循环。可被其他程序单独依赖；**不得 import** `io.mosire.brain.*` / `io.mosire.main.*` |
 | `BrainMosire` | `brain-mosire` | `io.mosire.brain.*` | 具体对话、工具载入、上下文构造/压缩、子 Agent 编排、skills、记忆。只依赖 `agentlib-mosire`（+ Jackson/SLF4J）；不得依赖 `MainMosire` |
 | `MainMosire` | `main-mosire` | `io.mosire.main.*` | 进程组装、CLI、网关（AdminREST/A2A/AG-UI/MCP）、健康检查、发行。**不含 Agent 行为逻辑**；主代码不得 import `io.mosire.bash.*` |
 | `BashPluginMosire` | `bash-plugin-mosire` | `io.mosire.bash.*` | PF4J 插件。**main 只依赖 `AgentLibMosire`**（PF4J 为 provided）；测试面可再依赖 Brain（test scope）。宿主 main 代码不得 import/使用它（Main 的 provided 依赖只服务构建顺序，见下） |
@@ -99,7 +100,7 @@ BashPluginMosire ────────────────────┘
 | 文档 | 内容 / 现状 |
 |---|---|
 | `开发计划.md` | **现行计划**（2026-09-14 重写版）；§五“纪律”逐条有效 |
-| `设计-*.md`（仓库根） | **现行设计文档**：身份与血缘 / 子 Agent 终局 / 子 Agent 上下文 / Bash 围栏 / 审批与工具内权限 / 多 provider 路由 / 插件系统 / 配置引导 / MCP HTTP 传输 / Skill 运行时 / **决策包作为唯一决策单元** / **上下文窗口下沉**（`设计-上下文窗口下沉.md`：AgentLib 收 `ContextWindow`/`ContextComposer`/`LlmRoundTrip`/`AgentConfig`，分层机制与压缩线留 Brain） |
+| `设计-*.md`（仓库根） | **现行设计文档**：身份与血缘 / 子 Agent 终局 / 子 Agent 上下文 / Bash 围栏 / 审批与工具内权限 / 多 provider 路由 / 插件系统 / 配置引导 / MCP HTTP 传输 / Skill 运行时 / **决策包作为唯一决策单元** / **上下文窗口下沉**（`设计-上下文窗口下沉.md`：AgentLib 收 `ContextWindow`/`ContextComposer`/`LlmRoundTrip`/`AgentConfig`，分层机制与压缩线留 Brain） / **通用循环骨架**（`设计-通用循环骨架.md`：AgentLib 收 `AgentLoop` + 三个策略 SPI `StopPolicy`/`TurnListener`/`ToolCallDispatcher` + `StopReason`/`TurnResult`；压缩/决策包/事件/持久化/技能/记忆留 Brain，`AgentPipeline` 是第一个宿主实现） |
 | `Research/调查报告.md` | 2026-09-08 调查结论（协议选型、架构参考、技术栈、风险）；**不是**开发计划 |
 | `README.md` | 项目介绍；其“里程碑状态”是历史快照，数字可能陈旧，**不作实时状态依据** |
 | `docs/archive/2026-09-14-旧计划/` | 已归档、**不再修改**的旧计划；Java 注释里对它们的文字引用不逐处改写（引的是历史决定出处） |
@@ -390,6 +391,10 @@ BashPluginMosire ────────────────────┘
    ② **要刷新时**：留到**阶段边界 / 关账**（一批改动做完、`verify` 绿之后），或确有跨机器取用需求时。
    ⇒ 目的：不让"刷产物"变成每次改 AgentLib 都要多一笔提交与一次全量构建（用户 2026-10-16：
    「先把手头上的代码修改和开发计划做完再刷新包」）。**只改 javadoc 永不刷**（字节码不变）。除这一个文件外，`target/` 仍不入库。
+   ★★ **`clean` 会删掉这个 force-tracked jar**（2026-10-17 实测：`./mvnw -o clean verify` 后 `git status` 出现
+   `D AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar`——它就在 `target/` 下）。规矩：**clean 之后、提交之前
+   必须 `git checkout HEAD -- AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar` 恢复**，别把"删除"当成本批改动提交；
+   真正刷新它的时机仍按上面两条（发布/版本管理重做时再统一处理，仓内 0.1.0 旧名与该工作流绑定）。
 
 ---
 
