@@ -22,10 +22,10 @@
 | 事实 | 证据/来源 |
 |---|---|
 | 源码基线为 `c46e777472bfc48c79d9dad0663c8a1c6c54574c`，对应 tag `v0.2.2`。 | `git rev-parse HEAD`、`git tag --points-at HEAD`。 |
-| 根 `pom.xml` 的 `project.version` 是 `0.2.2`，模块顺序为 AgentLib / Workspace / Docs / Brain / Main / BashPlugin。 | `pom.xml:9`、`pom.xml:42-47`。 |
+| 根 `pom.xml` 的 `project.version` 是 `0.2.3-SNAPSHOT`（2026-10-17 决策包读取端口批次），模块顺序为 AgentLib / Workspace / Docs / Brain / Main / BashPlugin；已发布版本仍是 `0.2.2`。 | `pom.xml:9`、`pom.xml:42-47`；实时状态以 `docs/agents/STATUS.md` 为准。 |
 | v0.2.2 发布验证证据为 1618 tests / 0 failures / 0 errors / 6 skipped；分模块为 AgentLib 674、Workspace 62、Docs 81、Brain 472、Bash 104（6 skipped）、Main 225；各模块 SpotBugs `BugInstance size is 0`。 | `.work/release-0.2.2-verify.log:275,373,485,765,873,2521,2585,2599`；这是**发布提交的历史证据**，不是当前实时测试数。 |
-| Pages 仓库当前已发布 0.2.2：父 pom + `agentlib-mosire` / `workspace-mosire` / `docs-mosire` 三库各含 jar、sources、pom 及校验文件；页面当前版本为 0.2.2。 | `gh-pages` 最新提交 `ca9d83b4b10bcd9e7f11db8a40c39ce7a21b2289`（消息 `deploy: c46e777...`）；`git ls-tree` 与 `FETCH_HEAD:index.html` 已核对。 |
-| 当前工作树只有 5 个未跟踪文件：4 个 `.factorypath` 与 `configs/agents/bash-agent.json`。 | 本批开工时 `git status --porcelain=v1 --untracked-files=all`。 |
+| Pages 仓库历史发布 0.2.2：父 pom + `agentlib-mosire` / `workspace-mosire` / `docs-mosire` 三库各含 jar、sources、pom 及校验文件；落地页历史版本为 0.2.2。 | `gh-pages` 最新提交 `ca9d83b4b10bcd9e7f11db8a40c39ce7a21b2289`（消息 `deploy: c46e777...`）；`git ls-tree` 与 `FETCH_HEAD:index.html` 已核对。 |
+| 本文编写时工作树只有 5 个未跟踪文件：4 个 `.factorypath` 与 `configs/agents/bash-agent.json`；后续读取端口批次另有未提交改动，实时 dirty 以 `docs/agents/STATUS.md` 为准。 | 本方案编写时的 `git status --porcelain=v1 --untracked-files=all`。 |
 
 ### 0.3 本方案的非目标
 
@@ -414,7 +414,7 @@ policy:
 - **发布前门禁证据**：`.work/release-0.2.2-verify.log`，结束于 2026-10-17T19:50:16+08:00，`BUILD SUCCESS`。
 - **测试**：1618 tests，0 failures，0 errors，6 skipped；分模块数字见 §0.2。**这是 0.2.2 发布提交的证据，不是当前工作树的实时测试数。**
 - **SpotBugs**：每个模块 `BugInstance size is 0`。
-- **Pages**：`gh-pages` 当前提交 `ca9d83b4b10bcd9e7f11db8a40c39ce7a21b2289`，提交消息 `deploy: c46e777...`；包含 0.1.0/0.2.0/0.2.1/0.2.2；0.2.2 路径含父 pom 与三库的 jar/sources/pom 及校验文件；落地页当前版本 0.2.2。
+- **Pages**：`gh-pages` 当前提交 `ca9d83b4b10bcd9e7f11db8a40c39ce7a21b2289`，提交消息 `deploy: c46e777...`；包含 0.1.0/0.2.0/0.2.1/0.2.2；0.2.2 路径含父 pom 与三库的 jar/sources/pom 及校验文件；落地页历史版本 0.2.2（历史快照）。
 - **发布范围**：发布工作流只发布父 pom + AgentLib/Workspace/Docs 三库；Brain/Main/Bash 不发 Pages（与 workflow 注释一致）。
 - **发布工作流行为**：现有顺序是先完整 `verify`，再 `deploy`；且 `deploy` 生命周期继续真实执行 Surefire，
   不跳过测试。用户 2026-10-17 裁定不修改这两点。
