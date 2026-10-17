@@ -263,7 +263,7 @@ def checked_files(root: Path) -> list[Path]:
     files = [root / "README.md", root / "AGENTS.md"]
     agents_dir = root / "docs" / "agents"
     if agents_dir.is_dir():
-        files.extend(sorted(agents_dir.glob("*.md")))
+        files.extend(sorted(agents_dir.rglob("*.md")))
     return files
 
 
