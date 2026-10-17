@@ -55,7 +55,7 @@ import org.slf4j.LoggerFactory;
  * <p><b>不淘汰（已知取舍）</b>：终局包留在表里不清理——{@link #find} 要能回答"那个包后来怎么了"，
  * 重放要能拿回同一份回执（B-4）；淘汰会把"重放"变成"未知包"，把幂等保证推回给调用方。 代价是长驻进程的内存随包数线性增长，需要保留策略时由宿主/RB3 收口（本版不提供隐性上限）。
  */
-public final class DecisionPackages {
+public final class DecisionPackages implements DecisionPackageReadPort {
 
   private static final Logger LOG = LoggerFactory.getLogger(DecisionPackages.class);
 
@@ -834,6 +834,31 @@ public final class DecisionPackages {
     } finally {
       lock.unlock();
     }
+  }
+
+  /**
+   * 读取端口形状的逐条表态（{@link DecisionPackageReadPort#verdicts(String)}）。
+   *
+   * <p>旧 {@link #itemVerdicts(String)} 是 Brain 内存适配器的冻结签名，本方法只做同形转换，不改变任何状态机行为。为了与旧读口保持逐字一致，
+   * 这里仍复用旧方法的惰性过期兼容口径；{@code DECIDING} 包的旧投影也会按旧适配器的既有规则摊开累积裁决。需要纯累计语义的新宿主应直接使用 {@link
+   * DecisionPackageSnapshot#verdicts()}，不要照搬本适配器。
+   *
+   * @param packageId 包 id（非 null）
+   * @return 顶层协议形状的已表态条目；未知 id ⇒ 空表
+   */
+  @Override
+  public List<DecisionItemVerdict> verdicts(String packageId) {
+    List<ItemVerdict> legacy = itemVerdicts(packageId);
+    if (legacy.isEmpty()) {
+      return List.of();
+    }
+    List<DecisionItemVerdict> converted = new ArrayList<>(legacy.size());
+    for (ItemVerdict verdict : legacy) {
+      converted.add(
+          new DecisionItemVerdict(
+              verdict.index(), verdict.approved(), verdict.by(), verdict.note()));
+    }
+    return List.copyOf(converted);
   }
 
   /** 单条表态的内存态展开（按包内条目顺序；未表态的条目不出现在结果里）。 */

@@ -23,7 +23,7 @@ import org.slf4j.LoggerFactory;
  * 决策包的 MCP 工具面（U4，上游契约 {@code docs/upstream/agentlib-decision-contract.md} §7.1）。
  *
  * <p><b>它是谁</b>：把「列包、看包、整包表态、逐条表态、执行已批子集」做成五个通用 {@link AgentTool}。工具只依赖 AgentLib 的决策协议与工具 SPI，不拥有
- * HTTP server、不 import 宿主的 Brain/Main 类型；装配层把同一个 {@link DecisionPackages}、写路径口 {@link
+ * HTTP server、不 import 宿主的 Brain/Main 类型；装配层把 {@link DecisionPackageReadPort}、写路径口 {@link
  * DecisionSubmissionPort} 与可选的在途包口传进来，即可注册到任意 MCP 工具面。
  *
  * <p><b>★ 调用者身份不从参数取</b>：模型可以伪造 {@code by} 字段，但工具只看 {@link ToolContext#identity()} 的实例 id。模型给的
@@ -73,7 +73,7 @@ public final class DecisionPackageTools {
   private static final String REJECT = "reject";
   private static final String UNKNOWN_BY = "unknown";
 
-  private final DecisionPackages packages;
+  private final DecisionPackageReadPort packages;
   private final DecisionSubmissionPort submissions;
   private final InFlightDecisionPackages inFlight;
   private final InFlightDecisionActions inFlightActions;
@@ -82,19 +82,33 @@ public final class DecisionPackageTools {
   private final List<AgentTool> tools;
 
   /**
-   * 最小装配：只有包表、写路径口与审批角色。
+   * 旧的最小装配重载：保留给已有 Brain/宿主调用方。
    *
-   * @param packages 决策包登记表（必须与真正的待决面是同一个实例）
+   * @param packages 决策包登记表（{@link DecisionPackages} 实现读取端口）
    * @param submissions 决策写路径口（实现方通常是宿主的决策包桥）
    * @param approverRoles 允许调用决策工具的宿主角色（不得为空；空集无法表达“谁能审批”）
    */
   public DecisionPackageTools(
       DecisionPackages packages, DecisionSubmissionPort submissions, Set<String> approverRoles) {
+    this((DecisionPackageReadPort) packages, submissions, approverRoles);
+  }
+
+  /**
+   * 最小装配：只有读取端口、写路径口与审批角色。
+   *
+   * @param packages 决策包读取端口（必须是宿主真正的待决面，不要求是 {@link DecisionPackages}）
+   * @param submissions 决策写路径口（实现方通常是宿主的决策包桥）
+   * @param approverRoles 允许调用决策工具的宿主角色（不得为空；空集无法表达“谁能审批”）
+   */
+  public DecisionPackageTools(
+      DecisionPackageReadPort packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles) {
     this(packages, submissions, approverRoles, null, null, null);
   }
 
   /**
-   * 全参装配：在主口之外接上在途包只读口、在途包写口与明文读取审计口。
+   * 旧的全参装配重载：保留给已有 Brain/宿主调用方。
    *
    * @param packages 决策包登记表
    * @param submissions 主包表的写路径口
@@ -105,6 +119,32 @@ public final class DecisionPackageTools {
    */
   public DecisionPackageTools(
       DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles,
+      InFlightDecisionPackages inFlight,
+      InFlightDecisionActions inFlightActions,
+      DecisionReadAudit readAudit) {
+    this(
+        (DecisionPackageReadPort) packages,
+        submissions,
+        approverRoles,
+        inFlight,
+        inFlightActions,
+        readAudit);
+  }
+
+  /**
+   * 全参装配：在主读取口之外接上在途包只读口、在途包写口与明文读取审计口。
+   *
+   * @param packages 决策包读取端口
+   * @param submissions 主包表的写路径口
+   * @param approverRoles 允许调用决策工具的宿主角色（不得为空）
+   * @param inFlight 在途包只读口（{@code null} = 没有这个口）
+   * @param inFlightActions 在途包写口（{@code null} = 在途包不可写）
+   * @param readAudit 明文读取审计口（{@code null} = 不落审计；接口允许的降级）
+   */
+  public DecisionPackageTools(
+      DecisionPackageReadPort packages,
       DecisionSubmissionPort submissions,
       Set<String> approverRoles,
       InFlightDecisionPackages inFlight,
@@ -200,21 +240,104 @@ public final class DecisionPackageTools {
     this.tools = List.copyOf(built);
   }
 
-  /** 便捷工厂：等价于三参构造。 */
+  /**
+   * 旧的便捷工厂：等价于旧的 {@link DecisionPackages} 三参构造。
+   *
+   * @param packages 决策包登记表
+   * @param submissions 决策写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @return 工具门面
+   */
   public static DecisionPackageTools of(
       DecisionPackages packages, DecisionSubmissionPort submissions, Set<String> approverRoles) {
+    return new DecisionPackageTools((DecisionPackageReadPort) packages, submissions, approverRoles);
+  }
+
+  /**
+   * 便捷工厂：等价于端口三参构造。
+   *
+   * @param packages 决策包读取端口
+   * @param submissions 决策写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @return 工具门面
+   */
+  public static DecisionPackageTools of(
+      DecisionPackageReadPort packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles) {
     return new DecisionPackageTools(packages, submissions, approverRoles);
   }
 
-  /** 静态工厂：直接返回五个工具的不可变列表（三参装配）。 */
+  /**
+   * 旧的静态工厂：直接返回五个工具的不可变列表（{@link DecisionPackages} 三参装配）。
+   *
+   * @param packages 决策包登记表
+   * @param submissions 决策写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @return 五个工具
+   */
   public static List<AgentTool> all(
       DecisionPackages packages, DecisionSubmissionPort submissions, Set<String> approverRoles) {
+    return new DecisionPackageTools((DecisionPackageReadPort) packages, submissions, approverRoles)
+        .tools();
+  }
+
+  /**
+   * 静态工厂：直接返回五个工具的不可变列表（端口三参装配）。
+   *
+   * @param packages 决策包读取端口
+   * @param submissions 决策写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @return 五个工具
+   */
+  public static List<AgentTool> all(
+      DecisionPackageReadPort packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles) {
     return new DecisionPackageTools(packages, submissions, approverRoles).tools();
   }
 
-  /** 静态工厂：直接返回五个工具的不可变列表（全参装配）。 */
+  /**
+   * 旧的静态工厂：直接返回五个工具的不可变列表（{@link DecisionPackages} 全参装配）。
+   *
+   * @param packages 决策包登记表
+   * @param submissions 主包表的写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @param inFlight 在途包只读口
+   * @param inFlightActions 在途包写口
+   * @param readAudit 明文读取审计口
+   * @return 五个工具
+   */
   public static List<AgentTool> all(
       DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles,
+      InFlightDecisionPackages inFlight,
+      InFlightDecisionActions inFlightActions,
+      DecisionReadAudit readAudit) {
+    return new DecisionPackageTools(
+            (DecisionPackageReadPort) packages,
+            submissions,
+            approverRoles,
+            inFlight,
+            inFlightActions,
+            readAudit)
+        .tools();
+  }
+
+  /**
+   * 静态工厂：直接返回五个工具的不可变列表（端口全参装配）。
+   *
+   * @param packages 决策包读取端口
+   * @param submissions 主包表的写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @param inFlight 在途包只读口
+   * @param inFlightActions 在途包写口
+   * @param readAudit 明文读取审计口
+   * @return 五个工具
+   */
+  public static List<AgentTool> all(
+      DecisionPackageReadPort packages,
       DecisionSubmissionPort submissions,
       Set<String> approverRoles,
       InFlightDecisionPackages inFlight,
@@ -225,9 +348,46 @@ public final class DecisionPackageTools {
         .tools();
   }
 
-  /** 便捷工厂：等价于全参构造。 */
+  /**
+   * 旧的便捷工厂：等价于旧的 {@link DecisionPackages} 全参构造。
+   *
+   * @param packages 决策包登记表
+   * @param submissions 主包表的写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @param inFlight 在途包只读口
+   * @param inFlightActions 在途包写口
+   * @param readAudit 明文读取审计口
+   * @return 工具门面
+   */
   public static DecisionPackageTools of(
       DecisionPackages packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles,
+      InFlightDecisionPackages inFlight,
+      InFlightDecisionActions inFlightActions,
+      DecisionReadAudit readAudit) {
+    return new DecisionPackageTools(
+        (DecisionPackageReadPort) packages,
+        submissions,
+        approverRoles,
+        inFlight,
+        inFlightActions,
+        readAudit);
+  }
+
+  /**
+   * 便捷工厂：等价于端口全参构造。
+   *
+   * @param packages 决策包读取端口
+   * @param submissions 主包表的写路径口
+   * @param approverRoles 审批角色（不得为空）
+   * @param inFlight 在途包只读口
+   * @param inFlightActions 在途包写口
+   * @param readAudit 明文读取审计口
+   * @return 工具门面
+   */
+  public static DecisionPackageTools of(
+      DecisionPackageReadPort packages,
       DecisionSubmissionPort submissions,
       Set<String> approverRoles,
       InFlightDecisionPackages inFlight,
@@ -245,6 +405,14 @@ public final class DecisionPackageTools {
   /** {@link #all()} 的静态别名：等价于 {@code new ... .tools()}。 */
   public static List<AgentTool> tools(
       DecisionPackages packages, DecisionSubmissionPort submissions, Set<String> approverRoles) {
+    return all((DecisionPackageReadPort) packages, submissions, approverRoles);
+  }
+
+  /** 静态别名：接受宿主读取端口的五工具装配。 */
+  public static List<AgentTool> tools(
+      DecisionPackageReadPort packages,
+      DecisionSubmissionPort submissions,
+      Set<String> approverRoles) {
     return all(packages, submissions, approverRoles);
   }
 
@@ -332,7 +500,7 @@ public final class DecisionPackageTools {
     if (full && readAudit != null) {
       auditDetailRead(packageId, located.pkg(), by);
     }
-    List<DecisionPackages.ItemVerdict> verdicts = verdictsOf(located);
+    List<DecisionItemVerdict> verdicts = verdictsOf(located);
     Map<String, Object> body = detailRow(located, verdicts, full);
     return ToolResult.ok(JSON.writeValueAsString(body));
   }
@@ -473,9 +641,9 @@ public final class DecisionPackageTools {
     }
   }
 
-  private List<DecisionPackages.ItemVerdict> verdictsOf(LocatedPackage located) {
+  private List<DecisionItemVerdict> verdictsOf(LocatedPackage located) {
     if (located.main()) {
-      return packages.itemVerdicts(located.pkg().id());
+      return packages.verdicts(located.pkg().id());
     }
     if (inFlightActions == null) {
       return List.of();
@@ -483,7 +651,16 @@ public final class DecisionPackageTools {
     try {
       List<DecisionPackages.ItemVerdict> verdicts =
           inFlightActions.itemVerdicts(located.pkg().id());
-      return verdicts == null ? List.of() : verdicts;
+      if (verdicts == null || verdicts.isEmpty()) {
+        return List.of();
+      }
+      List<DecisionItemVerdict> converted = new ArrayList<>(verdicts.size());
+      for (DecisionPackages.ItemVerdict verdict : verdicts) {
+        converted.add(
+            new DecisionItemVerdict(
+                verdict.index(), verdict.approved(), verdict.by(), verdict.note()));
+      }
+      return List.copyOf(converted);
     } catch (RuntimeException failure) {
       LOG.warn("读取在途包表态失败（按未表态处理） exceptionType={}", failure.getClass().getName());
       return List.of();
@@ -519,7 +696,7 @@ public final class DecisionPackageTools {
   }
 
   private Map<String, Object> detailRow(
-      LocatedPackage located, List<DecisionPackages.ItemVerdict> verdicts, boolean full) {
+      LocatedPackage located, List<DecisionItemVerdict> verdicts, boolean full) {
     DecisionPackage pkg = located.pkg();
     Map<String, Object> row = new LinkedHashMap<>();
     row.put("id", pkg.id());
@@ -553,8 +730,8 @@ public final class DecisionPackageTools {
   }
 
   private List<Map<String, Object>> itemRows(
-      DecisionPackage pkg, List<DecisionPackages.ItemVerdict> verdicts, boolean full) {
-    Map<Integer, DecisionPackages.ItemVerdict> byIndex = indexVerdicts(verdicts);
+      DecisionPackage pkg, List<DecisionItemVerdict> verdicts, boolean full) {
+    Map<Integer, DecisionItemVerdict> byIndex = indexVerdicts(verdicts);
     List<Map<String, Object>> rows = new ArrayList<>(pkg.items().size());
     for (PackageItem item : pkg.items()) {
       Map<String, Object> row = new LinkedHashMap<>();
@@ -566,7 +743,7 @@ public final class DecisionPackageTools {
         // 明文只走这一个显式分支；summary 是参数值派生文本，任何档位都不输出。
         row.put("args", item.args());
       }
-      DecisionPackages.ItemVerdict verdict = byIndex.get(item.index());
+      DecisionItemVerdict verdict = byIndex.get(item.index());
       row.put("verdict", verdict == null ? null : verdict.approved() ? APPROVE : REJECT);
       row.put("decidedBy", verdict == null ? null : verdict.by());
       row.put("decisionNote", verdict == null || verdict.note().isBlank() ? null : verdict.note());
@@ -586,12 +763,11 @@ public final class DecisionPackageTools {
     return row;
   }
 
-  private static List<Map<String, Object>> verdictRows(
-      List<DecisionPackages.ItemVerdict> verdicts) {
-    List<DecisionPackages.ItemVerdict> sorted = new ArrayList<>(verdicts);
+  private static List<Map<String, Object>> verdictRows(List<DecisionItemVerdict> verdicts) {
+    List<DecisionItemVerdict> sorted = new ArrayList<>(verdicts);
     sorted.sort((left, right) -> Integer.compare(left.index(), right.index()));
     List<Map<String, Object>> rows = new ArrayList<>(sorted.size());
-    for (DecisionPackages.ItemVerdict verdict : sorted) {
+    for (DecisionItemVerdict verdict : sorted) {
       Map<String, Object> row = new LinkedHashMap<>();
       row.put("index", verdict.index());
       row.put("verdict", verdict.approved() ? APPROVE : REJECT);
@@ -602,19 +778,19 @@ public final class DecisionPackageTools {
     return rows;
   }
 
-  private static Map<Integer, DecisionPackages.ItemVerdict> indexVerdicts(
-      List<DecisionPackages.ItemVerdict> verdicts) {
-    Map<Integer, DecisionPackages.ItemVerdict> byIndex = new LinkedHashMap<>();
-    for (DecisionPackages.ItemVerdict verdict : verdicts) {
+  private static Map<Integer, DecisionItemVerdict> indexVerdicts(
+      List<DecisionItemVerdict> verdicts) {
+    Map<Integer, DecisionItemVerdict> byIndex = new LinkedHashMap<>();
+    for (DecisionItemVerdict verdict : verdicts) {
       byIndex.put(verdict.index(), verdict);
     }
     return byIndex;
   }
 
   private static List<Integer> undecidedIndexes(
-      DecisionPackage pkg, List<DecisionPackages.ItemVerdict> verdicts) {
+      DecisionPackage pkg, List<DecisionItemVerdict> verdicts) {
     Set<Integer> decided = new LinkedHashSet<>();
-    for (DecisionPackages.ItemVerdict verdict : verdicts) {
+    for (DecisionItemVerdict verdict : verdicts) {
       decided.add(verdict.index());
     }
     List<Integer> undecided = new ArrayList<>();

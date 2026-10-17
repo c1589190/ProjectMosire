@@ -84,6 +84,33 @@ public record DecisionCommitPlan(
 
 `calls` 是被批子集，非空；`before` 是提交前快照。宿主可以用它把效果、outcome、最终包状态写入同一事务。
 
+### 3.5 新增 `DecisionPackageReadPort`
+
+```java
+public interface DecisionPackageReadPort {
+
+  Optional<DecisionPackage> find(String packageId);
+
+  List<DecisionPackage> pending();
+
+  List<DecisionPackage> all();
+
+  List<DecisionItemVerdict> verdicts(String packageId);
+
+  Optional<String> expiryReason(String packageId);
+}
+```
+
+这是五个 MCP 决策工具的**读路径端口**（2026-10-17 用户裁定 B/A/A）：
+
+- `find(id)` 是历史入口：旧 tick、已终局、已过期的包都必须能按 id 读到；未知 id ⇒ 空。
+- `pending()` / `all()` 是列表投影：宿主可按当前 tick/领域状态裁剪，也可排除 `MERGED`；不要求世界全历史。
+- `verdicts(id)` 返回顶层 `DecisionItemVerdict`，不新增对 `DecisionPackages.ItemVerdict` 的依赖。
+- 新宿主实现必须纯只读：读不得改状态、发事件或写审计；`full=true` 审计仍归 `DecisionReadAudit`。
+- `DecisionPackages` 是兼容例外：其既有五个读方法的惰性过期行为保留；`verdicts` 仍沿用旧 `itemVerdicts` 的 `DECIDING` 投影规则，新宿主应直接返回 `DecisionPackageSnapshot.verdicts()`。
+
+`DecisionPackages implements DecisionPackageReadPort`；`DecisionPackageTools` 保留 7 个旧构造器/工厂入口，并为 `of(...)`、`all(...)`、`tools(...)` 增加端口重载（含 3 参与 6 参 `of/all`）。
+
 ## 4. 纯状态转移
 
 新增 `DecisionPackageTransitions`。所有方法：
