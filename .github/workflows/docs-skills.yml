@@ -1,0 +1,55 @@
+name: docs-skills
+
+# 文档 / 脚本 / 工程 Skill 契约的最小检查闭环。
+# 本工作流不运行 Maven：Java 的门禁仍由 verify.yml / publish-maven.yml 负责。
+
+on:
+  push:
+    paths:
+      - "AGENTS.md"
+      - "README.md"
+      - "docs/**"
+      - "scripts/**"
+      - ".github/workflows/docs-skills.yml"
+  pull_request:
+    paths:
+      - "AGENTS.md"
+      - "README.md"
+      - "docs/**"
+      - "scripts/**"
+      - ".github/workflows/docs-skills.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-skills-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-skills:
+    name: docs / scripts / skills lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 语法检查（Python / Bash）
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/*.py
+          bash -n scripts/*.sh
+
+      - name: 文档一致性
+        run: python3 scripts/check-docs.py
+
+      - name: 工程 Skill 契约
+        run: python3 scripts/skills-lint.py
+
+      - name: 脚本自检（拒绝样本；不跑 Maven）
+        run: |
+          set -euo pipefail
+          python3 scripts/test-summary.py --selftest
+          python3 scripts/check-docs.py --selftest
+          python3 scripts/skills-lint.py --selftest
+          bash scripts/gate.sh selftest
