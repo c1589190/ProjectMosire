@@ -18,6 +18,8 @@ import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.RoleSet;
 import io.mosire.agentlib.permission.ToolSpec;
+import io.mosire.agentlib.runtime.StopReason;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;

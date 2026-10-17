@@ -1,8 +1,8 @@
 package io.mosire.main.gateway.debug;
 
+import io.mosire.agentlib.runtime.StopReason;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.brain.runtime.AgentRuntime;
-import io.mosire.brain.runtime.StopReason;
-import io.mosire.brain.runtime.TurnResult;
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;

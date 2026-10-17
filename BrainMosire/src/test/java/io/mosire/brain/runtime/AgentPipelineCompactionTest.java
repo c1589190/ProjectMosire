@@ -18,6 +18,7 @@ import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.runtime.StopReason;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.ToolExecutionGuard;

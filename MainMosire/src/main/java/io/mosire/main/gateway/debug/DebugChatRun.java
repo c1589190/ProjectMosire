@@ -1,6 +1,6 @@
 package io.mosire.main.gateway.debug;
 
-import io.mosire.brain.runtime.TurnResult;
+import io.mosire.agentlib.runtime.TurnResult;
 import java.time.Instant;
 
 /**

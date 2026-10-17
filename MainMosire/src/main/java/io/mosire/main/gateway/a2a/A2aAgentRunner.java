@@ -1,8 +1,8 @@
 package io.mosire.main.gateway.a2a;
 
+import io.mosire.agentlib.runtime.StopReason;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.brain.runtime.AgentRuntime;
-import io.mosire.brain.runtime.StopReason;
-import io.mosire.brain.runtime.TurnResult;
 import io.mosire.main.gateway.a2a.A2aTaskService.A2aMessageRunner;
 import io.mosire.main.gateway.a2a.A2aTaskService.TaskEditor;
 import java.util.List;

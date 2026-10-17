@@ -1,7 +1,7 @@
 package io.mosire.main.gateway.agui;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import io.mosire.brain.runtime.StopReason;
+import io.mosire.agentlib.runtime.StopReason;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;

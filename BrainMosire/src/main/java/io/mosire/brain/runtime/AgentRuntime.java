@@ -11,6 +11,8 @@ import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.runtime.StopReason;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;

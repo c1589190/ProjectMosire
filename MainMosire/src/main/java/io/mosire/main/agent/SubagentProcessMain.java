@@ -24,6 +24,7 @@ import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.PermissionChecker;
 import io.mosire.agentlib.plugin.ToolSource;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
@@ -38,7 +39,6 @@ import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.EventTypes;
-import io.mosire.brain.runtime.TurnResult;
 import io.mosire.brain.skills.SkillAccess;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillPermissions;
@@ -100,8 +100,8 @@ import java.util.function.Predicate;
  * <p><strong>退出码语义（如实二分，勿写成"失败一律非零"）</strong>：<b>引导期</b>装配失败 ⇒ stderr + <b>非零退出</b>，绝不把异常焐成零退出 ——缺
  * {@code llm.*}（{@code E_LLM_CONFIG_MISSING}）、缺密钥（{@code E_KEY_MISSING}）、密钥引用形态不支持（{@code
  * E_REF_FORM_UNSUPPORTED}），见 {@link #realLlm} 的取密钥预检。而 <b>chat 期</b>的 LLM 失败（端点不可达 / 401 / 超时）由
- * {@link io.mosire.brain.runtime.AgentPipeline}（{@code :289-293}）收敛成 {@link
- * io.mosire.brain.runtime.StopReason#LLM_ERROR} 的<b>正常回合</b>——本类照常打印"回合完成"并 <b>exit
+ * {@link io.mosire.brain.runtime.AgentPipeline}（本回合的 {@code onLlmError} 回调）收敛成 {@link
+ * io.mosire.agentlib.runtime.StopReason#LLM_ERROR} 的<b>正常回合</b>——本类照常打印"回合完成"并 <b>exit
  * 0</b>，退出码不区分"模型坏了"。 这是<b>既有语义</b>（与主 Agent 一致；脚本假 LLM 排空时同样走这条路），父侧只能从回合停因 {@code stop=LLM_ERROR}
  * 分辨；改退出码属另一件事。
  */

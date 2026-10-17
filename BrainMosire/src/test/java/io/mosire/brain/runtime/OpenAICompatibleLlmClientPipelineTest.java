@@ -13,6 +13,8 @@ import io.mosire.agentlib.llm.ModelRoute;
 import io.mosire.agentlib.llm.OpenAICompatibleLlmClient;
 import io.mosire.agentlib.llm.QuotaExceededException;
 import io.mosire.agentlib.permission.AgentPermissionSet;
+import io.mosire.agentlib.runtime.StopReason;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;

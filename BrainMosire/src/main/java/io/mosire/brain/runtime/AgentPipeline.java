@@ -17,15 +17,25 @@ import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmClient;
+import io.mosire.agentlib.llm.LlmException;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmQuota;
 import io.mosire.agentlib.llm.LlmRequest;
 import io.mosire.agentlib.llm.LlmResponse;
+import io.mosire.agentlib.llm.QuotaExceededException;
 import io.mosire.agentlib.llm.ToolDef;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.PermissionChecker;
+import io.mosire.agentlib.runtime.AgentLoop;
+import io.mosire.agentlib.runtime.LoopState;
+import io.mosire.agentlib.runtime.StopPolicy;
+import io.mosire.agentlib.runtime.StopReason;
+import io.mosire.agentlib.runtime.StopSignal;
+import io.mosire.agentlib.runtime.ToolCallDispatcher;
+import io.mosire.agentlib.runtime.TurnListener;
+import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.agentlib.store.ConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
@@ -45,6 +55,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,6 +80,11 @@ import org.slf4j.LoggerFactory;
  * <p><b>上下文窗口（窗口下沉）</b>：会话状态自本批起由库侧的 {@link ContextWindow} 承载（一类一真相：窗口就是"此刻看得见的那串消息"
  * 本身，本类不再另建一份列表）；每次 LLM 往返都经 {@link LlmRoundTrip} 从窗口现组请求——请求永远派生自窗口，不缓存第二份真相。 该往返方法把"本轮输入 +
  * 答复"的写回当作往返的一部分（见 {@link AssemblerComposer} 与 {@link #saveHistory}）。
+ *
+ * <p><b>通用循环骨架（循环下沉）</b>：反过来，本类不再自己写 {@code while}——回合主循环已下沉到库侧 {@link AgentLoop}，本类是<b>骨架的
+ * 使用者</b>：{@link StopPolicy} 表达七种终止原因里"何时停"的判定（顺序照旧），{@link TurnListener} 承载记账/事件/占位回填/落库， {@link
+ * ToolCallDispatcher} 接既有工具执行入口。事件与落库顺序逐字节不变（设计 {@code 设计-通用循环骨架.md} §4.5）；"两份循环真相" 是这条边界要防的事（同稿 §八
+ * 风险 1）。
  *
  * <p><b>会话重置（D26）</b>：{@link #resetConversation(String)} 换新会话 id +
  * 清空内存工作集，旧会话在库里原样留档。重置<b>不是</b>重建管线： 本实例持有的 store/装配器/摘要槽一律沿用，"换会话"只落在会话级状态上。与回合一样受串行调用约定约束（R11）。
@@ -740,21 +756,24 @@ public final class AgentPipeline {
   }
 
   /**
-   * 本回合的主循环（P1b 从 {@link #run(String)} 原样搬出来）：用户输入 →（LLM 循环 + 工具调用）→ 终止。
+   * 装配并运行库侧的通用循环骨架（「通用循环骨架下沉」批的 Brain 侧落点）：{@link AgentLoop} 负责结构（何时问停、组请求、
+   * 发信、写回、解析工具调用、逐条分派），本方法只注入三件宿主策略——{@link StopPolicy}（七种终止原因里"何时停"的判定， 顺序照旧）、{@link
+   * TurnListener}（记账/事件/占位回填/落库）、{@link ToolCallDispatcher}（既有工具执行入口）。
    *
-   * <p>搬出来只为一件事：让回合级的作用域（本轮待裁决队列）由 {@link #run(String)} 的 {@code try/finally} 统一收尾—— 主循环里那<b>七个</b>
-   * {@code return} 出口（{@code CANCELLED} ×2 / {@code TURN_LIMIT} / {@code TIME_BUDGET} / {@code
-   * LLM_ERROR} / {@code QUOTA} / {@code TOOL_CALL_LIMIT} / 正常 {@code FINISHED}）一个都不用改，
-   * 也不可能漏掉某个新增出口（新增出口自动落进同一个 finally）。
+   * <p><b>为什么循环体从这里消失</b>：同一个骨架要能被 Brain 以外的程序复用；两套循环语义就是两套真相（设计 §八 的风险 1）。 本方法因此只做装配，不再持有 {@code
+   * while}——七个终止出口全部变成 {@link AgentLoop} 的回调，事件与落库顺序逐字不变 （设计 §4.5）。
    *
-   * <p><b>写回与落库的分工（新形状）</b>：消息的写回是往返的一部分（{@link LlmRoundTrip#call} 成功后窗口已含本轮输入与答复）， 本循环不再自己 {@code
-   * add} 任何东西——工具结果与悬空 {@code tool_call} 的占位失败结果都走 {@code window.append(...)}； 每个出口照旧先 {@link
-   * #saveHistory()} 再 return（顺序与旧实现一致）。
+   * <p><b>装配粒度是"每回合一个 {@link AgentLoop}"</b>：{@code composer}/{@code turnInput}/{@code
+   * deadline}/{@code quota} 都是回合级对象（{@link AssemblerComposer} 的头部每回合只算一次、由本回合共享），骨架实例不该跨回合复用。
    *
    * @param composer 本回合的编排器（头部只在它的首次 {@code compose} 里算一次，回合内复用同一个实例——见 {@link AssemblerComposer}）
    * @param turnInput 本回合的输入：第 1 轮是这条 user，此后逐轮传空（窗口里已经有了它，见 {@link #run(String)}）
    * @param userMessage 本轮用户原文（<b>只为事件 payload</b>）：与旧实现一样原样透传，不从窗口或 turnInput 反推—— {@code
    *     CONVERSATION_TURN} 的 {@code input} 与迁移前逐字节相同
+   * @param deadline 本回合的时间预算截止时刻（由 {@link #run(String)} 在压缩之后计算；仍用 {@link Instant#now()} 判， 不用骨架的
+   *     {@code elapsedMillis}——避免把"回合外耗时"算进预算）
+   * @param quota 本回合的 token 配额账本；{@code null} = 未装配配额（{@code quotaMaxTokens=0}）
+   * @param tools 本回合的可见工具面（注册表 ∩ 权限判定面，见 {@link #visibleTools()}）
    */
   private TurnResult runTurn(
       ContextComposer composer,
@@ -763,51 +782,91 @@ public final class AgentPipeline {
       Instant deadline,
       LlmQuota quota,
       List<AgentTool> tools) {
-    int turns = 0;
-    int totalToolCalls = 0;
-    String finalText = "";
-    boolean firstRound = true;
+    // 判定顺序与改造前逐字一致：cancelled → maxTurns → deadline；工具批中间只查取消（设计 §4.2）
+    StopPolicy stopPolicy = new TurnStopPolicy(deadline);
+    // 工具执行唯一入口一字不改：判定/审批/事件/脱敏/结果写回全在 executeToolCall 里（设计 §4.4）
+    ToolCallDispatcher dispatcher = (call, state) -> executeToolCall(call);
+    // 每回合一个监听器：事件/落库顺序逐字照抄旧循环的七个出口（设计 §4.3 与 §4.5 对照表）
+    TurnListener listener = new TurnEvents(userMessage, quota);
+    return AgentLoop.builder()
+        .window(window)
+        .composer(composer)
+        .llm(llm)
+        .dispatcher(dispatcher)
+        .stopPolicy(stopPolicy)
+        .listener(listener)
+        .maxToolCallsPerResponse(config.maxToolCallsPerTurn())
+        .build()
+        .runTurn(turnInput, tools);
+  }
 
-    while (true) {
+  /**
+   * 本回合的 {@link StopPolicy}（设计 §4.2）：把旧循环的两处终止判定原样搬到骨架的两个判定点上。
+   *
+   * <p><b>两个判定点为什么不同</b>：往返前的 {@link #check} 保持旧实现的三判顺序（取消 → 轮数 → 墙钟）； 工具批中间的分发前检查（{@link
+   * #checkToolCallBoundary}）<b>只判取消</b>——迁出前的循环在工具批里本来就只查 {@code
+   * cancelled}。若批内也跑完整判定，墙钟恰在工具批中途到期就会提前终止、把本批剩余调用留成悬空 {@code tool_call}， 而旧实现会跑完这批、到下一个回合顶才以
+   * {@code TIME_BUDGET} 退出——那是本批"行为逐字不变"判据之外的新悬空来源 （部分供应商会拒收下一回合请求）。
+   *
+   * <p>{@code deadline} 是回合级对象（由 {@link AgentPipeline#run(String)} 在压缩之后计算），故策略实例也按回合创建， 不跨回合复用。
+   */
+  private final class TurnStopPolicy implements StopPolicy {
+
+    private final Instant deadline;
+
+    private TurnStopPolicy(Instant deadline) {
+      this.deadline = deadline;
+    }
+
+    @Override
+    public Optional<StopSignal> check(LoopState state) {
       if (cancelled) {
-        emitDecision("CANCELLED", Map.of());
-        saveHistory();
-        return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
+        return Optional.of(new StopSignal(StopReason.CANCELLED, ""));
       }
-      if (turns >= config.maxTurns()) {
-        emitDecision("TURN_LIMIT", Map.of("maxTurns", config.maxTurns()));
-        saveHistory();
-        return new TurnResult(StopReason.TURN_LIMIT, turns, totalToolCalls, finalText);
+      if (state.rounds() >= config.maxTurns()) {
+        return Optional.of(new StopSignal(StopReason.TURN_LIMIT, ""));
       }
       if (Instant.now().isAfter(deadline)) {
-        emitDecision("TIME_BUDGET", Map.of("timeBudget", config.timeBudget().toString()));
-        saveHistory();
-        return new TurnResult(StopReason.TIME_BUDGET, turns, totalToolCalls, finalText);
+        return Optional.of(new StopSignal(StopReason.TIME_BUDGET, ""));
       }
+      return Optional.empty();
+    }
 
-      // 本轮输入：只在第 1 轮带 user——此后窗口里已有它，重复带上会让模型看到两条同样的用户消息
-      List<LlmMessage> roundInput = firstRound ? turnInput : List.of();
-      firstRound = false;
+    @Override
+    public Optional<StopSignal> checkToolCallBoundary(LoopState state) {
+      // 旧实现工具批内只判 cancelled；不在此处引入预算类终止（见类注：会造成新的悬空 tool_call）
+      return cancelled ? Optional.of(new StopSignal(StopReason.CANCELLED, "")) : Optional.empty();
+    }
+  }
 
-      LlmResponse response;
-      long startedNanos = System.nanoTime();
-      try {
-        // 一次往返 = 组请求（从窗口现取）+ 发信 + 写回（本轮输入在前、答复在后）：窗口回来时已含这一问一答
-        response = LlmRoundTrip.call(llm, window, composer, roundInput, tools);
-      } catch (io.mosire.agentlib.llm.LlmException e) {
-        // LlmClient 契约只抛 LlmException。★ 失败路径的接线要求（设计 §5.2）：LlmRoundTrip 在 chat 抛出时
-        //   "窗口一个字节都没动"（写回是成功后才发生的），所以本轮 user 必须由宿主自己补写回再落库——
-        //   否则第 1 轮失败时"用户说过什么"就丢了（旧行为里本轮 user 在组请求时就已进列表，故落库的那份含它）。
-        //   第 ≥2 轮 roundInput 为空，appendAll 天然是空操作（旧行为同样不新增任何东西）。
-        window.appendAll(roundInput);
-        // 此刻 assistant 消息尚未入列，历史以工具结果干净收尾（与旧行为一致）
-        emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(e.getMessage())));
-        saveHistory();
-        return new TurnResult(StopReason.LLM_ERROR, turns, totalToolCalls, finalText);
-      }
-      long latencyMs = Math.max(0L, (System.nanoTime() - startedNanos) / 1_000_000L);
-      turns++;
-      // llm.call 记账（D18）在配额判定之前落库：超限终止也不能丢"这次调用确实发生了"的事实
+  /**
+   * 本回合的 {@link TurnListener}（设计 §4.3）：把旧循环七个出口的<b>事件与落库顺序逐字</b>搬到骨架的回调点上。
+   *
+   * <p><b>三条容易写错的顺序</b>（改这里之前先读设计 §4.5）：
+   *
+   * <ol>
+   *   <li>{@code LLM_CALL} 记账必须在配额判定<b>之前</b>落（D18：超限也不能丢"这次调用确实发生了"）；
+   *   <li>{@code quota.record} 居中——它抛 {@link QuotaExceededException} 时返回 {@link StopReason#QUOTA}
+   *       信号， 骨架随即走 {@link #onStop} 出口；
+   *   <li>{@code CONVERSATION_TURN} 必须在配额判定<b>之后</b>发（超限那轮不落会话事件，与旧实现逐字一致）。
+   * </ol>
+   *
+   * <p><b>为什么终止回调自己调 {@code saveHistory()}</b>：骨架的 exactly-once 契约保证一次回合只会有其中一个终止
+   * 回调被调用，把落库放进回调里之后，"结果已返回、历史没保存"的窗口不存在；各出口仍各调一次、顺序仍是"先事件后落库"。
+   */
+  private final class TurnEvents implements TurnListener {
+
+    private final String userMessage;
+    private final LlmQuota quota;
+
+    private TurnEvents(String userMessage, LlmQuota quota) {
+      this.userMessage = userMessage;
+      this.quota = quota;
+    }
+
+    @Override
+    public Optional<StopSignal> onRoundTrip(LlmResponse response, long latencyMs, LoopState state) {
+      // ① llm.call 记账（D18）在配额判定之前落库：超限终止也不能丢"这次调用确实发生了"的事实
       emit(
           EventTypes.LLM_CALL,
           Map.of(
@@ -824,11 +883,12 @@ public final class AgentPipeline {
               "latencyMs",
               latencyMs,
               "turns",
-              turns));
+              state.rounds()));
+      // ② 配额判定居中：超限 ⇒ 返回信号，骨架转 onStop 落 decision 事件并落库
       if (quota != null) {
         try {
           quota.record(response.inputTokens(), response.outputTokens());
-        } catch (io.mosire.agentlib.llm.QuotaExceededException e) {
+        } catch (QuotaExceededException e) {
           // ★ 已知行为变更（设计 §5.1，控制方裁定）：本出口<b>保留</b>模型答复。
           //   旧行为：配额判定发生在 messages.add(assistant) 之前 ⇒ 超限时答复既不进历史、也不落库，只留 llm.call 记账。
           //   新行为：写回是往返的一部分（LlmRoundTrip 在 chat 成功后立即 append）⇒ 终止时答复已在窗口内，
@@ -836,62 +896,70 @@ public final class AgentPipeline {
           //   把它从历史里丢掉并不对称——其余所有"已产生答复"的出口（FINISHED / TOOL_CALL_LIMIT / TURN_LIMIT /
           //   TIME_BUDGET / CANCELLED）本来都保留答复，QUOTA 曾是唯一的例外。
           //   ★ 禁止用"把刚 append 的答复再删掉"之类反向 hack 去凑旧行为（那会把窗口的只追加语义破掉）。
-          emitDecision("QUOTA", Map.of("reason", e.getMessage()));
-          saveHistory();
-          return new TurnResult(StopReason.QUOTA, turns, totalToolCalls, finalText);
+          return Optional.of(new StopSignal(StopReason.QUOTA, e.getMessage()));
         }
       }
-
-      // 追加 assistant 消息 + 回合事件（答复的写回已由 LlmRoundTrip 完成，这里只是落事件）
+      // ③ 会话事件（答复的写回已由 LlmRoundTrip 完成，这里只是落事件）
       emit(
           EventTypes.CONVERSATION_TURN,
           Map.of(
               "turns",
-              turns,
+              state.rounds(),
               "input",
               userMessage,
               "output",
               response.textPart().orElse(""),
               "model",
               response.model()));
+      return Optional.empty();
+    }
 
-      List<ContentPart.ToolCall> toolCalls =
-          response.assistantMessage().content().stream()
-              .filter(ContentPart.ToolCall.class::isInstance)
-              .map(ContentPart.ToolCall.class::cast)
-              .toList();
+    @Override
+    public void onFinished(String finalText, LoopState state) {
+      saveHistory();
+    }
 
-      if (toolCalls.isEmpty()) {
-        saveHistory();
-        return new TurnResult(
-            StopReason.FINISHED, turns, totalToolCalls, response.textPart().orElse(""));
+    @Override
+    public void onToolCallLimit(List<ContentPart.ToolCall> calls, LoopState state) {
+      emitDecision(
+          "TOOL_CALL_LIMIT",
+          Map.of("toolCalls", calls.size(), "max", config.maxToolCallsPerTurn()));
+      // 悬空 tool_call 修复：本回合一个都没执行，回灌前为每个调用补占位失败结果——
+      // 否则历史里存在无应答的 tool_call，下一回合部分供应商会拒收请求
+      for (ContentPart.ToolCall call : calls) {
+        window.append(
+            LlmMessage.tool(
+                new ContentPart.ToolResult(call.id(), call.name(), null, "回合因单次响应工具调用数超限中止")));
       }
+      saveHistory();
+    }
 
-      if (toolCalls.size() > config.maxToolCallsPerTurn()) {
-        emitDecision(
-            "TOOL_CALL_LIMIT",
-            Map.of("toolCalls", toolCalls.size(), "max", config.maxToolCallsPerTurn()));
-        // 悬空 tool_call 修复：本回合一个都没执行，回灌前为每个调用补占位失败结果——
-        // 否则历史里存在无应答的 tool_call，下一回合部分供应商会拒收请求
-        for (ContentPart.ToolCall call : toolCalls) {
-          window.append(
-              LlmMessage.tool(
-                  new ContentPart.ToolResult(call.id(), call.name(), null, "回合因单次响应工具调用数超限中止")));
-        }
-        saveHistory();
-        return new TurnResult(
-            StopReason.TOOL_CALL_LIMIT, turns, totalToolCalls, response.textPart().orElse(""));
-      }
+    @Override
+    public void onStop(StopSignal signal, LoopState state) {
+      emitDecision(signal.reason().name(), stopDetail(signal));
+      saveHistory();
+    }
 
-      for (ContentPart.ToolCall call : toolCalls) {
-        if (cancelled) {
-          emitDecision("CANCELLED", Map.of());
-          saveHistory();
-          return new TurnResult(StopReason.CANCELLED, turns, totalToolCalls, finalText);
-        }
-        totalToolCalls++;
-        executeToolCall(call);
-      }
+    @Override
+    public void onLlmError(LlmException error, List<LlmMessage> roundInput, LoopState state) {
+      // 失败路径的接线要求（设计 §5.2）：LlmRoundTrip 在 chat 抛出时"窗口一个字节都没动"（写回是成功后才发生的），
+      // 所以本轮 user 必须由宿主自己补写回再落库——否则第 1 轮失败时"用户说过什么"就丢了（旧行为里本轮 user 在组请求时就已进列表）。
+      // 第 ≥2 轮 roundInput 为空，appendAll 天然是空操作（旧行为同样不新增任何东西）。
+      window.appendAll(roundInput);
+      // 此刻 assistant 消息尚未入列，历史以工具结果干净收尾（与旧行为一致）
+      emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(error.getMessage())));
+      saveHistory();
+    }
+
+    /** onStop 的 payload 映射（设计 §4.3）：只覆盖旧实现的三种专属形状 + CANCELLED 空载荷，其余原因走通用 detail。 */
+    private Map<String, Object> stopDetail(StopSignal signal) {
+      return switch (signal.reason()) {
+        case TURN_LIMIT -> Map.of("maxTurns", config.maxTurns());
+        case TIME_BUDGET -> Map.of("timeBudget", config.timeBudget().toString());
+        case QUOTA -> Map.of("reason", signal.detail());
+        case CANCELLED -> Map.of();
+        default -> signal.detail().isEmpty() ? Map.of() : Map.of("reason", signal.detail());
+      };
     }
   }
 

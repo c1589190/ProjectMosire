@@ -3,8 +3,8 @@ package io.mosire.main.gateway.agui;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.mosire.agentlib.event.Event;
+import io.mosire.agentlib.runtime.StopReason;
 import io.mosire.brain.runtime.EventTypes;
-import io.mosire.brain.runtime.StopReason;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;

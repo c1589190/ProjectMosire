@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import io.mosire.brain.runtime.TurnResult;
+import io.mosire.agentlib.runtime.TurnResult;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
