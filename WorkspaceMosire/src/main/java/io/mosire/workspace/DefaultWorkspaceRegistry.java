@@ -2,6 +2,9 @@ package io.mosire.workspace;
 
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.ResourceScope;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -160,6 +163,13 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
           }
         }
       }
+      // M1 的真实路径补充：挂载根可能是软链；声明的词法落点在面内，不代表真实落点也在面内。
+      // 这一判只在挂载期做——resolveForIo 的读取者不需要 workspaces（创建挂载）面。
+      VirtualPath mountRoot = new VirtualPath(spec.name(), "");
+      Path realDir = realMountRoot(spec, caller, mountRoot);
+      admitMountFaceRealRoot(spec, caller, mountRoot, realDir);
+      admitRealRoot(spec, caller, mountRoot, realDir);
+
       // M9/W1/W2/M11/M12：落点在自己某个工作区目录之内时，只能更小、只能更窄
       Mount own = ownMountContaining(caller.holder(), spec.dir());
       if (own != null) {
@@ -317,6 +327,30 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
   }
 
   @Override
+  public ResolvedPath resolveForIo(
+      String virtualPath, WorkspaceCaller caller, IoMode mode, SymlinkPolicy policy) {
+    Objects.requireNonNull(caller, "caller");
+    Objects.requireNonNull(mode, "mode");
+    Objects.requireNonNull(policy, "policy");
+    if (mode != IoMode.READ && policy != SymlinkPolicy.REJECT) {
+      throw WorkspaceException.invalid("写路径不允许软链策略: " + policy);
+    }
+
+    VirtualPath parsed = VirtualPath.parse(virtualPath);
+    Mount mount = lookup(caller.holder(), parsed.mount());
+    if (mount == null) {
+      throw notFound(caller, parsed.mount(), "虚拟路径=" + parsed.label());
+    }
+    admit(mount, caller, parsed);
+
+    Path mapped = mappedPath(mount, parsed, caller);
+    Path realRoot = realMountRoot(mount, caller, parsed);
+    admitRealRoot(mount, caller, parsed, realRoot);
+    Path relative = mount.dir().relativize(mapped);
+    return secureTarget(mount, parsed, mapped, relative, realRoot, mode, policy, caller);
+  }
+
+  @Override
   public List<String> list(String virtualPrefix, WorkspaceCaller caller) {
     Objects.requireNonNull(caller, "caller");
     VirtualPath parsed = VirtualPath.parse(virtualPrefix);
@@ -325,6 +359,9 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
       throw notFound(caller, parsed.mount(), "虚拟前缀=" + parsed.label());
     }
     admit(mount, caller, parsed);
+    // 目录列举也是文件系统读取：先过同一条安全解析（默认 REJECT）。
+    // 否则“挂载内的软链目录”会把挂载外的条目投影出来——resolve 只承诺词法归属，不能当 IO 边界。
+    resolveForIo(virtualPrefix, caller, IoMode.READ, SymlinkPolicy.REJECT);
     List<String> entries = mount.resolver().list(mount.dir(), parsed.relative());
     if (entries == null) {
       throw deny(
@@ -342,6 +379,290 @@ public final class DefaultWorkspaceRegistry implements WorkspaceRegistry {
     }
     projected.sort(null);
     return List.copyOf(projected);
+  }
+
+  /** 映射策略的出口（与 {@link #resolve} 同一份 containment 口径）：只做词法映射与挂载范围检查，不承诺软链安全。 */
+  private Path mappedPath(Mount mount, VirtualPath parsed, WorkspaceCaller caller) {
+    Path resolved = mount.resolver().resolve(mount.dir(), parsed.relative());
+    if (resolved == null || !resolved.isAbsolute()) {
+      throw deny(
+          "G1",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "映射策略返回了非绝对路径（fail-closed，不替它猜）",
+          "resolved=" + resolved);
+    }
+    Path normalized = resolved.normalize();
+    if (!mount.contains(normalized)) {
+      throw deny(
+          "G1",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "映射策略把虚拟路径解析到了该挂载的授权范围之外",
+          "resolved=" + normalized + " mountDir=" + mount.dir());
+    }
+    return normalized;
+  }
+
+  /**
+   * 挂载根的真实路径换算：根存在取 realpath；根不存在取最近存在父目录的 realpath + 尾段。
+   *
+   * <p><b>只做 canonicalization，不做权限判定</b>：权限分成两种面，各自只在自己的动作上判——挂载期判 {@code workspaces}（“能在哪里建挂载”，见
+   * {@link #admitMountFaceRealRoot}），解析期判 capability 面（“能读哪里”，见 {@link #admitRealRoot}）。把 {@code
+   * workspaces} 面带到 {@link #resolveForIo} 会错误拒绝只有 capability 面、没有创建挂载面的读取者。
+   */
+  private Path realMountRoot(Mount mount, WorkspaceCaller caller, VirtualPath parsed) {
+    Path declared = mount.dir();
+    Path real;
+    try {
+      if (Files.exists(declared, LinkOption.NOFOLLOW_LINKS)) {
+        real = declared.toRealPath();
+        if (!Files.isDirectory(real)) {
+          throw deny(
+              "G1/real",
+              caller,
+              mount.user(),
+              mount.name().value(),
+              "挂载根的真实落点不是目录（fail-closed）",
+              "realRoot=" + real);
+        }
+      } else {
+        real = canonicalizeMissing(declared, caller, mount, parsed);
+      }
+    } catch (IOException e) {
+      throw new WorkspaceException(
+          WorkspaceException.RESOURCE_DENIED, "挂载根的真实路径解析失败（fail-closed）", e);
+    }
+    return real;
+  }
+
+  /**
+   * M1 的真实路径补充，<b>只在挂载期调用</b>：声明的词法落点在面内，不代表真实落点也在面内（根经软链落到 {@code workspaces}
+   * 面外时必须拒，软链不得放大创建挂载的权限）。
+   */
+  private void admitMountFaceRealRoot(
+      Mount mount, WorkspaceCaller caller, VirtualPath parsed, Path realRoot) {
+    if (!WorkspacePermissions.canMountWithin(caller.permissions(), realRoot)) {
+      throw deny(
+          "M1/real",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "挂载根的真实落点不在调用者的 workspaces 面内（软链不得放大权限）",
+          "path=" + parsed.label() + " realRoot=" + realRoot);
+    }
+  }
+
+  /**
+   * 真实挂载根也必须落在调用者的 capability 面内；否则“挂载根是软链”就会绕过 {@code admit} 的词法准入。
+   *
+   * <p><b>空能力集不做能力检查</b>：空能力挂载允许登记（此时真实根检查只剩挂载期的 M1 钩子 {@link
+   * #admitMountFaceRealRoot}），但它不落任何能力格、也不进遮蔽面；解析时由 {@link #admit} 以“没有声明任何能力”具名拒。因此这里没有能力命名空间
+   * 可查，直接跳过即可——fail-closed 由解析期的 {@code admit} 保持。
+   */
+  private void admitRealRoot(
+      Mount mount, WorkspaceCaller caller, VirtualPath parsed, Path realRoot) {
+    if (mount.capabilities().isEmpty()) {
+      return;
+    }
+    for (String id : mount.capabilities()) {
+      Capability capability = catalog.get(id).orElse(null);
+      if (capability == null) {
+        continue;
+      }
+      if (WorkspacePermissions.admits(caller.permissions(), capability, realRoot)) {
+        return;
+      }
+    }
+    throw deny(
+        "§4.5③/real",
+        caller,
+        mount.user(),
+        mount.name().value(),
+        "调用者的能力面覆盖不到挂载根的真实落点",
+        "path=" + parsed.label() + " realRoot=" + realRoot);
+  }
+
+  /** 按 mode/policy 做真实路径检查并返回结果。 */
+  private ResolvedPath secureTarget(
+      Mount mount,
+      VirtualPath parsed,
+      Path physical,
+      Path relative,
+      Path realRoot,
+      IoMode mode,
+      SymlinkPolicy policy,
+      WorkspaceCaller caller) {
+    if (policy == SymlinkPolicy.RESOLVE_WITHIN_ROOT) {
+      if (mode != IoMode.READ) {
+        throw WorkspaceException.invalid("RESOLVE_WITHIN_ROOT 只允许用于 READ");
+      }
+      if (!Files.exists(physical, LinkOption.NOFOLLOW_LINKS)) {
+        throw notFound(caller, parsed.mount(), "安全 IO 目标不存在: " + parsed.label());
+      }
+      Path real = realPath(physical, caller, mount, parsed);
+      requireWithinRoot(real, realRoot, caller, mount, parsed);
+      return new ResolvedPath(mount, relative.toString(), physical, real, true);
+    }
+
+    boolean exists = walkWithoutSymlinks(mount, physical, relative, mode, caller, parsed);
+    if (mode == IoMode.READ || mode == IoMode.WRITE_EXISTING) {
+      if (!exists) {
+        throw notFound(caller, parsed.mount(), "安全 IO 目标不存在: " + parsed.label());
+      }
+      Path real = realPath(physical, caller, mount, parsed);
+      requireWithinRoot(real, realRoot, caller, mount, parsed);
+      return new ResolvedPath(mount, relative.toString(), physical, real, true);
+    }
+
+    // CREATE
+    if (exists) {
+      Path real = realPath(physical, caller, mount, parsed);
+      requireWithinRoot(real, realRoot, caller, mount, parsed);
+      return new ResolvedPath(mount, relative.toString(), physical, real, true);
+    }
+    Path real = canonicalizeMissing(physical, caller, mount, parsed);
+    requireWithinRoot(real, realRoot, caller, mount, parsed);
+    return new ResolvedPath(mount, relative.toString(), physical, real, false);
+  }
+
+  /**
+   * 逐段检查软链。返回目标当前是否存在；一旦遇到不存在的段就停止（后续段不可能存在）。
+   *
+   * <p>写路径（WRITE_EXISTING / CREATE）与默认读路径都走这里；{@link SymlinkPolicy#RESOLVE_WITHIN_ROOT} 只在 READ
+   * 分支单独处理，不经过本方法。
+   */
+  private boolean walkWithoutSymlinks(
+      Mount mount,
+      Path physical,
+      Path relative,
+      IoMode mode,
+      WorkspaceCaller caller,
+      VirtualPath parsed) {
+    Path current = mount.dir();
+    if (relative.toString().isEmpty()) {
+      // 空相对路径 = 挂载根本身。Java 的 Path.of("") 也有 1 个空段，若不特判会把软链挂载根当成
+      // “路径中含软链”拒掉；而契约 §9.4 明确：挂载根可以是软链（挂载期已核真实根在权限面内）。
+      return Files.exists(current, LinkOption.NOFOLLOW_LINKS);
+    }
+    int segments = relative.getNameCount();
+    for (int i = 0; i < segments; i++) {
+      Path next = current.resolve(relative.getName(i));
+      if (Files.isSymbolicLink(next)) {
+        throw deny(
+            "G1/symlink",
+            caller,
+            mount.user(),
+            mount.name().value(),
+            "路径中包含软链（默认拒绝；读路径可显式使用 RESOLVE_WITHIN_ROOT）",
+            "path=" + parsed.label() + " segment=" + next.getFileName());
+      }
+      if (!Files.exists(next, LinkOption.NOFOLLOW_LINKS)) {
+        return false;
+      }
+      if (i < segments - 1 && !Files.isDirectory(next)) {
+        throw deny(
+            "G1/not-directory",
+            caller,
+            mount.user(),
+            mount.name().value(),
+            "路径中间段不是目录（fail-closed）",
+            "path=" + parsed.label());
+      }
+      current = next;
+    }
+    return Files.exists(current, LinkOption.NOFOLLOW_LINKS);
+  }
+
+  private Path realPath(Path physical, WorkspaceCaller caller, Mount mount, VirtualPath parsed) {
+    try {
+      return physical.toRealPath();
+    } catch (IOException e) {
+      throw notFound(caller, parsed.mount(), "安全 IO 目标无法解析真实路径: " + parsed.label());
+    }
+  }
+
+  private void requireWithinRoot(
+      Path real, Path realRoot, WorkspaceCaller caller, Mount mount, VirtualPath parsed) {
+    if (!real.startsWith(realRoot)) {
+      throw deny(
+          "G1/real",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "真实路径落在挂载根之外（软链逃逸，fail-closed）",
+          "path=" + parsed.label() + " real=" + real + " root=" + realRoot);
+    }
+  }
+
+  /** 目标不存在时，找最近存在父目录的 realpath，再拼上尚不存在的尾段；尾段里出现软链一律拒。 */
+  private Path canonicalizeMissing(
+      Path path, WorkspaceCaller caller, Mount mount, VirtualPath parsed) {
+    Path cursor = path;
+    List<Path> tail = new ArrayList<>();
+    while (cursor != null && !Files.exists(cursor, LinkOption.NOFOLLOW_LINKS)) {
+      Path name = cursor.getFileName();
+      if (name == null) {
+        break;
+      }
+      tail.add(0, name);
+      cursor = cursor.getParent();
+    }
+    if (cursor == null) {
+      throw deny(
+          "G1/missing-parent",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "目标没有可解析的已存在父目录（fail-closed）",
+          "path=" + parsed.label());
+    }
+    if (Files.isSymbolicLink(cursor)) {
+      throw deny(
+          "G1/symlink",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "最近存在父目录本身是软链（写路径拒绝）",
+          "path=" + parsed.label() + " parent=" + cursor.getFileName());
+    }
+    if (!Files.isDirectory(cursor)) {
+      throw deny(
+          "G1/not-directory",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "最近存在父目录不是目录（fail-closed）",
+          "path=" + parsed.label());
+    }
+    Path real;
+    try {
+      real = cursor.toRealPath();
+    } catch (IOException e) {
+      throw deny(
+          "G1/real-parent",
+          caller,
+          mount.user(),
+          mount.name().value(),
+          "父目录真实路径解析失败（fail-closed）",
+          "path=" + parsed.label());
+    }
+    for (Path segment : tail) {
+      Path next = real.resolve(segment);
+      if (Files.isSymbolicLink(next)) {
+        throw deny(
+            "G1/symlink",
+            caller,
+            mount.user(),
+            mount.name().value(),
+            "待创建路径尾段含软链（fail-closed）",
+            "path=" + parsed.label());
+      }
+      real = next;
+    }
+    return real.normalize();
   }
 
   // ---------------------------------------------------------------------------------------------

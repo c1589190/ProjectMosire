@@ -86,11 +86,32 @@ public interface WorkspaceRegistry {
   Path resolve(String virtualPath, WorkspaceCaller caller);
 
   /**
+   * <b>安全 IO 解析</b>：在词法映射 + 挂载鉴权之上，再做真实路径 containment 与软链策略。
+   *
+   * <p>所有文件读写（Docs、Bash、其他工具）都必须走本方法，不得直接拿 {@link #resolve} 的返回值去访问磁盘。旧 {@code resolve}
+   * 只承诺“命名上属于挂载”，不承诺“物理上不会经软链逃逸”，保留它只是为了兼容既有调用方与诊断用途。
+   *
+   * @param virtualPath 虚拟路径（{@code <挂载名>/<相对路径>}）
+   * @param caller 调用者身份 + 权限集
+   * @param mode 读 / 写已有 / 创建
+   * @param policy 软链策略；写路径只接受 {@link SymlinkPolicy#REJECT}
+   * @return 安全解析结果（物理路径只在本进程内部流转）
+   * @throws WorkspaceException 入参非法 / 挂载不存在 / 无权 / 软链或越界
+   */
+  default ResolvedPath resolveForIo(
+      String virtualPath, WorkspaceCaller caller, IoMode mode, SymlinkPolicy policy) {
+    throw WorkspaceException.denied("本工作区注册表未实现安全 IO 解析（fail-closed）: 请使用 resolveForIo 的实现");
+  }
+
+  /**
    * 投影：把物理树投影成<b>虚拟条目</b>（设计 §4.6）。本层只做"挂载 / 能力"级别的裁剪——条目级可见性归文档层的判据， 不在这里重复判（避免两处判同一件事）。
    *
    * <p>输出<b>只含虚拟路径</b>（G4）；列的是该前缀下的直接子项（不递归，见 {@link Resolver#list}）。
    *
-   * @throws WorkspaceException 同 {@link #resolve}
+   * <p><b>目录列举也是文件系统读取</b>：实现必须先经 {@link #resolveForIo}（默认 {@link SymlinkPolicy#REJECT}）确认真实路径安全，
+   * 不得让列举成为绕过软链策略的第二条读取链。
+   *
+   * @throws WorkspaceException 同 {@link #resolve}（列举时目标不可读同样是 {@code WORKSPACE_NOT_FOUND}）
    */
   List<String> list(String virtualPrefix, WorkspaceCaller caller);
 

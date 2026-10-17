@@ -2,15 +2,22 @@ package io.mosire.docs;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -36,6 +43,11 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>面向模型的输入输出只有相对路径与虚拟路径</b>（A7）：本类接收挂载内<b>相对路径</b>（映射由 {@link DocsEngine} 交给工作区解析点完成），
  * 对外渲染走注入的 {@link #labelOf}（相对路径 → 虚拟路径）。
+ *
+ * <p><b>软链与 TOCTOU 的诚实边界</b>：基目录是工作区 {@code resolveForIo} 给出的安全真实根；本类在每次读写前逐段 {@code
+ * isSymbolicLink} 检查，读/建/替换都用 {@code NOFOLLOW_LINKS} 或 {@code CREATE_NEW}，临时文件与目标同目录并走 {@code
+ * ATOMIC_MOVE}。未实现 {@code SecureDirectoryStream} 的目录 fd 相对操作，因此“逐段检查”与“真正 open/rename”
+ * 之间仍有一个竞争窗口；这里不静默退回“跟随软链的普通 IO”，窗口如实记录在这里。
  */
 final class DiskDocFiles implements DocFileStore {
 
@@ -48,21 +60,23 @@ final class DiskDocFiles implements DocFileStore {
   private final AtomicLong temporaryCounter = new AtomicLong();
 
   DiskDocFiles(Path baseDir, Function<String, String> labelOf) {
-    this.baseDir = baseDir;
-    this.labelOf = labelOf;
+    // 基目录必须是绝对、归一的安全真实根：相对根会把落点变成“进程 cwd 下的某个地方”。
+    this.baseDir =
+        java.util.Objects.requireNonNull(baseDir, "baseDir").toAbsolutePath().normalize();
+    this.labelOf = java.util.Objects.requireNonNull(labelOf, "labelOf");
   }
 
   @Override
   public DocReadResult read(String relativePath, String lines) {
     synchronized (lock) {
       String label = labelOf.apply(relativePath);
-      Path file = resolve(relativePath);
-      if (!Files.isRegularFile(file)) {
+      Path file = resolve(relativePath, label);
+      if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
         throw DocException.notFound("面内不存在这个文档（不存在与不可见在这里是同一个回答）: " + label);
       }
       byte[] bytes;
       try {
-        bytes = Files.readAllBytes(file);
+        bytes = readNoFollow(file, label);
       } catch (IOException e) {
         noteBroken(label, 0, "文件读不出来", file);
         throw DocException.readFailed("文档读不出来（没有把它当成空文件）: " + label, e);
@@ -100,27 +114,34 @@ final class DiskDocFiles implements DocFileStore {
   public DocFile create(String relativePath, String text) {
     synchronized (lock) {
       String label = labelOf.apply(relativePath);
-      Path file = resolve(relativePath);
+      Path file = resolve(relativePath, label);
+      if (file.equals(baseDir)) {
+        // 落点就是挂载根：它不是“一个文档文件”，且临时文件会落到挂载根之外（等于在范围外写）
+        throw DocException.invalid("文档落点不能是挂载根（要创建文件请给出挂载内的相对路径）: " + label);
+      }
       Path parent = file.getParent();
       if (parent == null) {
         // 落点没有父目录 = 挂载根解析成了"根/空路径"：装配/输入已坏，不能继续。
         // 此刻盘上还没有任何新东西（临时文件尚未落定），文案只出虚拟路径、不出物理落点
         throw DocException.writeFailed("文档落点没有父目录（挂载根解析异常）: " + label, null);
       }
-      ensureDirectory(parent);
+      ensureDirectory(parent, label);
       String content = normalize(text);
       byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
       Path temporary = temporaryPath(file);
       try {
-        Files.write(temporary, bytes);
-      } catch (IOException e) {
-        throw DocException.writeFailed("创建失败（临时文件都写不出来，盘上未新增任何东西）: " + label, e);
+        writeNewFile(temporary, bytes, label);
+      } catch (RuntimeException e) {
+        // 临时文件可能已经以 CREATE_NEW 落定：失败时删掉，别在盘上留半成品
+        deleteQuietly(temporary);
+        throw e;
       }
       try {
-        if (Files.exists(file)) {
+        if (Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
           // 撞名拒（B6）：先落定临时文件再判，窗口最小；判否只删临时文件，目标一个字节都不动
           throw DocException.exists("文档已存在（创建不覆盖；要改内容请用 doc_edit）: " + label);
         }
+        requireSafeTarget(file, label);
         atomicMove(temporary, file, label);
       } catch (RuntimeException e) {
         deleteQuietly(temporary);
@@ -150,13 +171,13 @@ final class DiskDocFiles implements DocFileStore {
     }
     synchronized (lock) {
       String label = labelOf.apply(relativePath);
-      Path file = resolve(relativePath);
-      if (!Files.isRegularFile(file)) {
+      Path file = resolve(relativePath, label);
+      if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
         throw DocException.notFound("面内不存在这个文档（不存在与不可见在这里是同一个回答）: " + label);
       }
       byte[] originalBytes;
       try {
-        originalBytes = Files.readAllBytes(file);
+        originalBytes = readNoFollow(file, label);
       } catch (IOException e) {
         throw DocException.readFailed("文档读不出来（编辑前必须先读到全文，否则无法保证全成或全不成）: " + label, e);
       }
@@ -173,11 +194,13 @@ final class DiskDocFiles implements DocFileStore {
       byte[] bytes = updated.getBytes(StandardCharsets.UTF_8);
       Path temporary = temporaryPath(file);
       try {
-        Files.write(temporary, bytes);
-      } catch (IOException e) {
-        throw DocException.writeFailed("编辑失败（临时文件写不出来，盘上未改动）: " + label, e);
+        writeNewFile(temporary, bytes, label);
+      } catch (RuntimeException e) {
+        deleteQuietly(temporary);
+        throw e;
       }
       try {
+        requireSafeTarget(file, label);
         atomicMove(temporary, file, label);
       } catch (RuntimeException e) {
         deleteQuietly(temporary);
@@ -270,10 +293,104 @@ final class DiskDocFiles implements DocFileStore {
 
   // ── 内部：IO ────────────────────────────────────────────────────────────────────────────────
 
-  /** 挂载内相对路径 → 物理落点（挂载根已由工作区解析点给出，本类不做任何映射）。 */
-  private Path resolve(String relativePath) {
+  /**
+   * 挂载内相对路径 → 物理落点（挂载根已是工作区解析点给出的安全真实根；本类不做虚拟路径映射）。
+   *
+   * <p><b>逐段软链拒绝</b>：{@code resolveForIo} 已经判过一次，但“检查”和“真正打开”之间有竞争窗口；这里在打开前按当前文件系统 状态再逐段查一遍，读/写都以
+   * {@code NOFOLLOW_LINKS} 打开。不跟随软链是本类的硬边界，不是调用方的可选策略。
+   */
+  private Path resolve(String relativePath, String label) {
+    requireSafeBaseDir(label);
     String relative = relativePath == null ? "" : relativePath.strip();
-    return relative.isEmpty() ? baseDir : baseDir.resolve(relative).normalize();
+    if (relative.isEmpty()) {
+      return baseDir;
+    }
+    Path current = baseDir;
+    for (String segment : relative.split("/", -1)) {
+      if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) {
+        // 引擎已经校验过拼法；这里再拒一次是纵深防御（绝不允许相对路径逃出挂载根）
+        throw DocException.denied("挂载内相对路径不是合法形态（fail-closed）: " + label);
+      }
+      Path next = current.resolve(segment);
+      if (Files.isSymbolicLink(next)) {
+        throw DocException.denied("路径中包含软链（默认拒绝，不跟随）: " + label);
+      }
+      current = next;
+    }
+    return current;
+  }
+
+  private void requireSafeBaseDir(String label) {
+    if (Files.isSymbolicLink(baseDir)) {
+      throw DocException.denied("挂载根是软链（默认拒绝，不跟随）: " + label);
+    }
+  }
+
+  /**
+   * 以 {@code CREATE_NEW + NOFOLLOW_LINKS} 写临时文件（绝不覆盖、绝不跟随软链）。
+   *
+   * <p>临时文件与目标同目录：同文件系统的 {@code rename} 才可能是原子的；跨设备会失败，而失败在这里等于文档不可用。
+   */
+  private static void writeNewFile(Path temporary, byte[] bytes, String label) {
+    try (FileChannel channel =
+        FileChannel.open(
+            temporary,
+            StandardOpenOption.CREATE_NEW,
+            StandardOpenOption.WRITE,
+            LinkOption.NOFOLLOW_LINKS)) {
+      ByteBuffer buffer = ByteBuffer.wrap(bytes);
+      while (buffer.hasRemaining()) {
+        channel.write(buffer);
+      }
+      channel.force(true);
+    } catch (UnsupportedOperationException e) {
+      throw DocException.writeFailed("文件系统不支持 NOFOLLOW_LINKS（拒绝退回跟随软链的普通写）: " + label, e);
+    } catch (IOException e) {
+      throw DocException.writeFailed("临时文件写不出来（盘上未新增任何东西）: " + label, e);
+    }
+  }
+
+  /** 读：{@code NOFOLLOW_LINKS} 打开（与逐段检查构成两层防线）。 */
+  private static byte[] readNoFollow(Path file, String label) throws IOException {
+    try (InputStream input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+      return input.readAllBytes();
+    } catch (UnsupportedOperationException e) {
+      throw DocException.readFailed("文件系统不支持 NOFOLLOW_LINKS（拒绝退回跟随软链的普通读）: " + label, e);
+    }
+  }
+
+  /**
+   * 原子替换前的复核：真实父目录与（若存在的）目标真实路径都必须仍在安全真实根内，且目标不是软链。
+   *
+   * <p>这是“检查—替换”之间竞争窗口的最小加固；真正无窗口的做法是 fd 相对操作（{@code SecureDirectoryStream}），本实现 未使用它，TOCTOU
+   * 残余窗口如实记录在类 javadoc。
+   */
+  private void requireSafeTarget(Path target, String label) {
+    Path parent = target.getParent();
+    if (parent == null) {
+      throw DocException.writeFailed("文档落点没有父目录（fail-closed）: " + label, null);
+    }
+    try {
+      if (Files.isSymbolicLink(baseDir)) {
+        throw DocException.denied("挂载根是软链（默认拒绝，不跟随）: " + label);
+      }
+      Path realBase = baseDir.toRealPath();
+      Path realParent = parent.toRealPath();
+      if (!realParent.startsWith(realBase)) {
+        throw DocException.denied("文档落点的真实父目录落在挂载根之外（软链逃逸，fail-closed）: " + label);
+      }
+      if (Files.isSymbolicLink(target)) {
+        throw DocException.denied("文档落点是软链（默认拒绝，不跟随）: " + label);
+      }
+      if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+        Path realTarget = target.toRealPath();
+        if (!realTarget.startsWith(realBase)) {
+          throw DocException.denied("文档落点的真实路径落在挂载根之外（软链逃逸，fail-closed）: " + label);
+        }
+      }
+    } catch (IOException e) {
+      throw DocException.writeFailed("原子替换前无法复核文档落点（fail-closed，盘上未改动）: " + label, e);
+    }
   }
 
   private static void atomicMove(Path temporary, Path target, String label) {
@@ -288,11 +405,47 @@ final class DiskDocFiles implements DocFileStore {
     }
   }
 
-  private static void ensureDirectory(Path dir) {
-    try {
-      Files.createDirectories(dir);
-    } catch (IOException e) {
-      throw DocException.writeFailed("目录建不出来: " + dir.getFileName(), e);
+  /**
+   * 安全地逐级建目录：从最近已存在的父目录开始，每一级先查软链再 {@code createDirectory}。
+   *
+   * <p>不用 {@link Files#createDirectories}：它会跟随“已存在的软链目录”，于是挂载内的软链父目录会把文件写到挂载外。
+   */
+  private static void ensureDirectory(Path dir, String label) {
+    Deque<Path> missing = new ArrayDeque<>();
+    Path cursor = dir;
+    while (cursor != null && !Files.exists(cursor, LinkOption.NOFOLLOW_LINKS)) {
+      missing.push(cursor);
+      cursor = cursor.getParent();
+    }
+    if (cursor == null) {
+      throw DocException.writeFailed("目录没有可用的已存在父目录（fail-closed）: " + label, null);
+    }
+    if (Files.isSymbolicLink(cursor)) {
+      throw DocException.denied("目录路径包含软链（默认拒绝，不跟随）: " + label);
+    }
+    if (!Files.isDirectory(cursor, LinkOption.NOFOLLOW_LINKS)) {
+      throw DocException.writeFailed("目录落点不是目录（fail-closed）: " + label, null);
+    }
+    Path current = cursor;
+    for (Path target : missing) {
+      Path name = target.getFileName();
+      if (name == null) {
+        throw DocException.writeFailed("目录项没有文件名（fail-closed）: " + label, null);
+      }
+      Path next = current.resolve(name);
+      if (Files.isSymbolicLink(next)) {
+        throw DocException.denied("目录路径包含软链（默认拒绝，不跟随）: " + label);
+      }
+      try {
+        Files.createDirectory(next);
+      } catch (FileAlreadyExistsException e) {
+        if (Files.isSymbolicLink(next) || !Files.isDirectory(next, LinkOption.NOFOLLOW_LINKS)) {
+          throw DocException.denied("目录在创建时被替换成软链或非目录（fail-closed）: " + label);
+        }
+      } catch (IOException e) {
+        throw DocException.writeFailed("目录建不出来: " + label, e);
+      }
+      current = next;
     }
   }
 

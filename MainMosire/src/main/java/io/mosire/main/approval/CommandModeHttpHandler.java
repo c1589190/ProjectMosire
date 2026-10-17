@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
-import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.CommandModeHolder;
 import java.io.IOException;

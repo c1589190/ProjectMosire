@@ -1,4 +1,4 @@
-package io.mosire.agentlib.approval;
+package io.mosire.main.approval;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.mosire.agentlib.config.ConfigException;

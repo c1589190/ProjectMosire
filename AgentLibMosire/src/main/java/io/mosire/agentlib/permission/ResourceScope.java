@@ -1,11 +1,13 @@
 package io.mosire.agentlib.permission;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -38,6 +40,9 @@ import java.util.Set;
  * <p><b>诚实分级</b>：本类型判的是"**命名**"（这个词法上属于允许区吗），不是"**可达性**"——软链、绑定挂载、{@code ..}
  * 之后的重解析都不在它的承诺范围内。真正的结构性围栏是 L3 沙箱（没 bind 的路径根本不存在）。
  */
+@SuppressFBWarnings(
+    value = "EI_EXPOSE_REP",
+    justification = "prefixes 在构造期已冻结为不可修改的 LinkedHashSet；record 访问器返回同一不可变实例，不存在可写内部表示")
 public record ResourceScope(boolean unrestricted, Set<String> prefixes) {
 
   /** 前缀里的段分隔符（命名空间内的资源路径一律用它切段，Windows 反斜杠不参与）。 */
@@ -56,10 +61,18 @@ public record ResourceScope(boolean unrestricted, Set<String> prefixes) {
       for (String prefix : prefixes) {
         normalized.add(normalizePrefix(prefix));
       }
-      prefixes = Set.copyOf(normalized);
+      // 保序：Set.copyOf 不承诺迭代顺序，而 dirList()/summary()/审计摘要都按迭代顺序输出；
+      // 用不可变 LinkedHashSet 保留输入顺序，同时保持去重与 Set 语义。
+      prefixes = Collections.unmodifiableSet(normalized);
     }
   }
 
+  /**
+   * 前缀集合（不可变、保序）。
+   *
+   * <p>构造期已用不可修改的 {@link LinkedHashSet} 冻结；SpotBugs 不认"构造期已冻结"这条推理，故按本仓既有手法在访问器上标注抑制。 返回的是同一个不可变
+   * Set，调用方无法通过它改写记录。
+   */
   /** "不限"（= 本功能引入前的行为）。与 {@link #none()} 是两种取值，不是"没写"。 */
   public static ResourceScope unlimited() {
     return new ResourceScope(true, Set.of());
@@ -75,7 +88,7 @@ public record ResourceScope(boolean unrestricted, Set<String> prefixes) {
     if (prefixes == null || prefixes.length == 0) {
       throw new IllegalArgumentException("必须给至少一个前缀；空集请用 ResourceScope.none()");
     }
-    return new ResourceScope(false, Set.of(prefixes));
+    return new ResourceScope(false, new LinkedHashSet<>(java.util.Arrays.asList(prefixes)));
   }
 
   /**

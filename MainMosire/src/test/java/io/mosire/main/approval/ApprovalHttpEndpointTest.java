@@ -7,9 +7,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.approval.ApprovalChannel;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
-import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
 import io.mosire.agentlib.approval.ApprovalRequest;
-import io.mosire.agentlib.approval.HttpApprovalChannel;
+import io.mosire.agentlib.approval.PendingApprovalChannel;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.permission.CommandMode;
 import io.mosire.agentlib.permission.CommandModeHolder;
@@ -36,7 +35,7 @@ import org.junit.jupiter.api.Test;
  * 审批 HTTP 面（S4-B2）迁移后的 Main 侧判别性用例：H1~H5 + H9（编号同派发包 §一.5 的表）。
  *
  * <p>迁移后（设计 §七 P1-C）面本体是 AgentLib 通用件 {@link ApprovalHttpEndpoint} + {@link
- * HttpApprovalChannel}，Main 只装配 + 挂 {@code /api/commands/mode}
+ * PendingApprovalChannel}，Main 只装配 + 挂 {@code /api/commands/mode}
  * 薄包装。本类因此同时是<b>契约对照</b>：端点路径、状态码、回执字段集与 {@code effectiveDecision} 口径必须与迁移前逐条等价。
  *
  * <p>用的是真 {@link PendingApprovals} + 真 AgentLib 通道 + 真 {@link ApprovalCoordinator} + 真 HTTP 面（端口
@@ -337,7 +336,7 @@ class ApprovalHttpEndpointTest {
   private static final class Rig implements AutoCloseable {
 
     private final PendingApprovals pending = new PendingApprovals();
-    private final HttpApprovalChannel channel = new HttpApprovalChannel(pending);
+    private final PendingApprovalChannel channel = new PendingApprovalChannel(pending);
     private final ApprovalCoordinator coordinator =
         new ApprovalCoordinator(
             List.of(), List.of((ApprovalChannel) channel), pending, Duration.ofSeconds(5), null);

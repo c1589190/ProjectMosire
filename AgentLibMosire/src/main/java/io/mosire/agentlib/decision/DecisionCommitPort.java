@@ -1,6 +1,7 @@
 package io.mosire.agentlib.decision;
 
 import java.util.List;
+import java.util.Objects;
 
 /**
  * 提交口 SPI（设计 §5.8 冻结形状；§5.3「一次提交 + 回执」）：把<b>一个包</b>的<b>被批子集</b>当一次提交落下去。
@@ -40,4 +41,22 @@ public interface DecisionCommitPort {
    * @return 回执：三结局之一 + 逐条去向；{@code COMMITTED} 时必须带回非空白的不透明 {@code revisionRef}
    */
   CommitReceipt commit(String packageId, List<ResolvedCall> calls);
+
+  /**
+   * 提交一个 {@link DecisionCommitPlan}（U1 新增的重载）：默认委托冻结的旧方法，旧实现一行都不用改。
+   *
+   * <p><b>为什么默认方法而不是抽象方法</b>：旧实现在 Brain / Main 里已经存在；加抽象方法会让它们全部编译失败。默认委托让 "一次提交 = 一个计划"的新口与"一次提交 =
+   * 一组 calls"的旧口保持<b>同一份提交语义</b>，而不是第二条提交路径。
+   *
+   * <p>实现若需要提交前快照（同一事务里写效果 + outcome + 最终包状态），应覆写本方法从 {@code plan.before()} 取数； 默认实现只把 {@code
+   * plan.calls()} 交给旧方法。
+   *
+   * @param packageId 包 id（幂等键与对账键）
+   * @param plan 提交计划（calls 非空；before 是提交前快照）
+   * @return 回执：三结局之一 + 逐条去向
+   */
+  default CommitReceipt commit(String packageId, DecisionCommitPlan plan) {
+    Objects.requireNonNull(plan, "plan");
+    return commit(packageId, plan.calls());
+  }
 }

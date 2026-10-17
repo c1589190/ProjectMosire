@@ -3,9 +3,12 @@ package io.mosire.docs;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.permission.Operation;
 import io.mosire.agentlib.permission.ResourceScope;
+import io.mosire.workspace.IoMode;
 import io.mosire.workspace.Kind;
 import io.mosire.workspace.Mount;
 import io.mosire.workspace.MountName;
+import io.mosire.workspace.ResolvedPath;
+import io.mosire.workspace.SymlinkPolicy;
 import io.mosire.workspace.WorkspaceCaller;
 import io.mosire.workspace.WorkspaceException;
 import io.mosire.workspace.WorkspacePermissions;
@@ -75,7 +78,7 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.LOG, "append");
     require(target, caller, RequestKind.APPEND);
-    return logStore(target).append(request);
+    return logStore(target, caller, IoMode.CREATE).append(request);
   }
 
   /**
@@ -87,7 +90,7 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.LOG, "void");
     require(target, caller, RequestKind.VOID);
-    return logStore(target).voidEntry(DocEntryId.parse(id));
+    return logStore(target, caller, IoMode.CREATE).voidEntry(DocEntryId.parse(id));
   }
 
   /**
@@ -100,7 +103,7 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.LOG, "find");
     require(target, caller, RequestKind.READ);
-    Optional<DocEntry> found = logStore(target).find(DocEntryId.parse(id));
+    Optional<DocEntry> found = logStore(target, caller, IoMode.READ).find(DocEntryId.parse(id));
     if (found.isEmpty()) {
       LOG.debug("docs.find 未命中（与不可见同回答）虚拟路径={} 调用者={}", virtualPath, caller.holder());
       return Optional.empty();
@@ -118,7 +121,7 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.LOG, "read");
     require(target, caller, RequestKind.READ);
-    List<DocEntry> entries = logStore(target).read(address);
+    List<DocEntry> entries = logStore(target, caller, IoMode.READ).read(address);
     List<DocEntry> visible = new ArrayList<>(entries.size());
     for (DocEntry entry : entries) {
       DocVisibility.visible(viewer, entry).ifPresent(visible::add);
@@ -132,7 +135,7 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.LOG, "query");
     require(target, caller, RequestKind.READ);
-    return logStore(target).query(spec, viewer);
+    return logStore(target, caller, IoMode.READ).query(spec, viewer);
   }
 
   /**
@@ -148,7 +151,7 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.LOG, "list");
     require(target, caller, RequestKind.READ);
-    DocStore store = logStore(target);
+    DocStore store = logStore(target, caller, IoMode.READ);
     List<DocAddressSummary> summaries = new ArrayList<>();
     for (String address : store.addresses()) {
       List<DocEntry> entries = store.read(address);
@@ -171,7 +174,8 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.FILE, "read");
     require(target, caller, RequestKind.READ);
-    return files(target).read(target.relativePath(), lines);
+    ResolvedPath resolved = secureTarget(target, caller, IoMode.READ);
+    return files(target, resolved).read(target.relativePath(), lines);
   }
 
   /**
@@ -184,7 +188,8 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.FILE, "create");
     require(target, caller, RequestKind.CREATE);
-    return files(target).create(target.relativePath(), text);
+    ResolvedPath resolved = secureTarget(target, caller, IoMode.CREATE);
+    return files(target, resolved).create(target.relativePath(), text);
   }
 
   /**
@@ -197,7 +202,8 @@ public final class DocsEngine {
     DocTarget target = mountOf(virtualPath, caller);
     target.requireKind(Kind.FILE, "edit");
     require(target, caller, RequestKind.EDIT);
-    return files(target).edit(target.relativePath(), ops);
+    ResolvedPath resolved = secureTarget(target, caller, IoMode.WRITE_EXISTING);
+    return files(target, resolved).edit(target.relativePath(), ops);
   }
 
   // ── 挂载与诊断 ──────────────────────────────────────────────────────────────────────────────
@@ -283,7 +289,7 @@ public final class DocsEngine {
    */
   private List<BrokenDoc> rescanLogs(
       Mount mount, WorkspaceCaller caller, Predicate<List<DocEntry>> addressVisible) {
-    DocStore store = DocLogs.onDisk(baseDirOf(mount, caller));
+    DocStore store = DocLogs.onDisk(logRootOf(mount, caller));
     List<BrokenDoc> disclosed = new ArrayList<>();
     for (String address : store.addresses()) {
       int discovered = store.broken().size();
@@ -355,13 +361,61 @@ public final class DocsEngine {
     return new DocTarget(mount, relative, physical);
   }
 
-  /** 解析挂载的物理根（一次解析，不创建任何东西；扫不动就抛，由调用点决定跳过还是失败）。 */
-  private Path baseDirOf(Mount mount, WorkspaceCaller caller) {
-    String name = mount.name().value();
+  /**
+   * 目标的安全 IO 解析：<b>唯一允许喂给磁盘 IO 的路径来源</b>。
+   *
+   * <p>{@link #mountOf} 只做词法归属与纪律/准入归位；真正的软链与真实路径 containment 在这一步（{@link
+   * WorkspaceRegistry#resolveForIo} + {@link SymlinkPolicy#REJECT}）。因此文件读/建/改与日志根都不能再用 {@code
+   * registry.resolve} 的返回值去碰磁盘。
+   *
+   * <p>失败转码见 {@link #translateIo}：写路径永远 {@link SymlinkPolicy#REJECT}，不存在“可写软链”的选项。
+   */
+  private ResolvedPath secureTarget(DocTarget target, WorkspaceCaller caller, IoMode mode) {
     try {
-      return registry.resolve(name, caller);
+      return registry.resolveForIo(target.virtualPath(), caller, mode, SymlinkPolicy.REJECT);
     } catch (WorkspaceException e) {
-      throw translate(e);
+      throw translateIo(e, mode);
+    }
+  }
+
+  /**
+   * {@code LOG} 挂载根的安全真实路径（交给 {@link DocLogs} 的 {@code baseDir}）。
+   *
+   * <p>日志文件本身再由 {@link DocLogs} 逐文件做 no-symlink 检查；这里先保证“根”不是一条绕过 {@code resolveForIo}
+   * 的旁路——软链根按挂载期核过的真实根工作，挂载外软链根被拒。
+   */
+  private Path logRootOf(DocTarget target, WorkspaceCaller caller, IoMode mode) {
+    return logRootOf(target.virtualRoot(), caller, mode);
+  }
+
+  /** 某 {@code LOG} 挂载（读写前）的安全真实根；扫坏数据时也走这一条。 */
+  private Path logRootOf(Mount mount, WorkspaceCaller caller) {
+    return logRootOf(mount.name().value(), caller, IoMode.READ);
+  }
+
+  private Path logRootOf(String virtualRoot, WorkspaceCaller caller, IoMode mode) {
+    return resolveLogRoot(virtualRoot, caller, mode).realPath();
+  }
+
+  /**
+   * 解析 {@code LOG} 挂载根。
+   *
+   * <p><b>读遇到“根还没落盘”</b>：挂载只登记、不建目录，所以一个还没写过日志的 {@code LOG} 挂载根可以不存在；既有语义是 “空结果不抛”。这里用 {@link
+   * IoMode#CREATE} 的语义安全地得到“最近存在父目录真实路径 + 尾段”，而不是把“空”变成 “读失败”。软链/越界仍然在 {@code CREATE}
+   * 分支被拒（fail-closed）。
+   */
+  private ResolvedPath resolveLogRoot(String virtualRoot, WorkspaceCaller caller, IoMode mode) {
+    try {
+      return registry.resolveForIo(virtualRoot, caller, mode, SymlinkPolicy.REJECT);
+    } catch (WorkspaceException e) {
+      if (mode == IoMode.READ && WorkspaceException.WORKSPACE_NOT_FOUND.equals(e.code())) {
+        try {
+          return registry.resolveForIo(virtualRoot, caller, IoMode.CREATE, SymlinkPolicy.REJECT);
+        } catch (WorkspaceException fallback) {
+          throw translateIo(fallback, IoMode.CREATE);
+        }
+      }
+      throw translateIo(e, mode);
     }
   }
 
@@ -481,14 +535,36 @@ public final class DocsEngine {
 
   // ── 内部：存储装配（每次操作现建，保证"写完立刻对后续读可见"） ───────────────────────────────
 
-  /** {@code LOG} 存储（读、查、列、追加、作废都经它）。 */
-  private DocStore logStore(DocTarget target) {
-    return DocLogs.onDisk(target.baseDir());
+  /** {@code LOG} 存储（读、查、列、追加、作废都经它；根先走 {@link #resolveLogRoot} 得到安全真实根）。 */
+  private DocStore logStore(DocTarget target, WorkspaceCaller caller, IoMode mode) {
+    return DocLogs.onDisk(logRootOf(target, caller, mode));
   }
 
   /** {@code FILE} 存储（注入相对路径 → 虚拟路径的渲染，保证面向模型的那一侧只出虚拟路径）。 */
-  private DocFileStore files(DocTarget target) {
-    return new DiskDocFiles(target.baseDir(), relative -> render(target.mount(), relative));
+  private DocFileStore files(DocTarget target, ResolvedPath resolved) {
+    return new DiskDocFiles(
+        realRootOf(resolved, target.virtualPath()), relative -> render(target.mount(), relative));
+  }
+
+  /**
+   * 从安全解析结果反推挂载的真实根。
+   *
+   * <p>{@link SymlinkPolicy#REJECT} 下路径里没有软链，因此 {@code realPath} 与 {@code relativePath} 的段数一一对应
+   * （挂载根本身是不是软链都不改变这个相对深度）。这样 {@code DiskDocFiles} 拿到的是同一棵“根 + 相对路径”树，不需要再解析一次 {@code
+   * resolveForIo}——少一次解析就少一个“根和目标来自两棵不同树”的窗口。
+   */
+  private static Path realRootOf(ResolvedPath resolved, String virtualPath) {
+    Path root = resolved.realPath();
+    int depth =
+        resolved.relativePath().isEmpty() ? 0 : resolved.relativePath().split("/", -1).length;
+    for (int i = 0; i < depth; i++) {
+      Path parent = root.getParent();
+      if (parent == null) {
+        throw DocException.denied("安全解析结果的相对深度与真实路径不匹配（fail-closed）: " + virtualPath);
+      }
+      root = parent;
+    }
+    return root;
   }
 
   /**
@@ -510,13 +586,30 @@ public final class DocsEngine {
     return DocException.invalid(e.getMessage());
   }
 
+  /**
+   * 安全 IO 解析失败的转码（与 {@link #translate} 的差别只在一处）。
+   *
+   * <p>{@code WORKSPACE_NOT_FOUND} 在 {@link #mountOf} 的解析口表示“挂载不存在/无权”，但在 {@code resolveForIo} 的
+   * {@link IoMode#READ}/{@link IoMode#WRITE_EXISTING} 口也表示“目标在面内不存在”。后者必须落回 {@link
+   * DocException#DOC_NOT_FOUND}（与既有“面内不存在”同码），否则 {@code doc_read} 的 miss 会从 {@code DOC_NOT_FOUND}
+   * 变成 {@code RESOURCE_DENIED}，把“面内没有”说成“范围外”。
+   */
+  static DocException translateIo(WorkspaceException e, IoMode mode) {
+    if (WorkspaceException.WORKSPACE_NOT_FOUND.equals(e.code())
+        && (mode == IoMode.READ || mode == IoMode.WRITE_EXISTING)) {
+      return DocException.notFound(e.getMessage());
+    }
+    return translate(e);
+  }
+
   /** 挂载内地址摘要（{@code doc_list} 的 {@code LOG} 输出元素）。 */
   public record DocAddressSummary(String address, long visibleEntries) {}
 
   /**
    * 解析归位的结果：<b>挂载 + 纪律 + 挂载内相对路径</b>。
    *
-   * <p>{@link #baseDir()} 是物理落点——它<b>只在本模块内部流转</b>（喂存储与准入判定），绝不进面向模型的文案（A7）。
+   * <p>{@link #baseDir()} 只服务<b>准入判定</b>（资源面按挂载根表态）；真正喂给磁盘 IO 的路径必须来自 {@link
+   * WorkspaceRegistry#resolveForIo}（见 {@link #secureTarget}），绝不再用这里的词法落点碰磁盘。两者都绝不进面向模型的文案（A7）。
    */
   record DocTarget(Mount mount, String relativePath, Path physical) {
 
@@ -524,7 +617,7 @@ public final class DocsEngine {
       return mount.kind();
     }
 
-    /** 挂载的物理根（准入判定与存储装配用它；<b>不进面向模型的文案</b>）。 */
+    /** 挂载的声明物理根（<b>只用于准入判定</b>；磁盘 IO 用 {@code resolveForIo} 的真实根，<b>不进面向模型的文案</b>）。 */
     Path baseDir() {
       return mount.dir();
     }

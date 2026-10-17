@@ -14,8 +14,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 决策包登记表（设计 §5.8 冻结形状 + RB2c 按 §5.12 裁定 B 追加的具名作废口）：内存态、线程安全，七个动作 {@code propose / decide / commit
- * / find / pending / expire / expireNow}。
+ * 决策包登记表（设计 §5.8 冻结形状 + RB2c 按 §5.12 裁定 B 追加的具名作废口 + U1 宿主 id/编辑/快照入口）：内存态、线程安全。旧动作 {@code propose
+ * / decide / commit / find / pending / expire / expireNow} 行为不变；U1 新增 {@code propose(packageId,
+ * ...) / append / replaceItem / removeItem / decide(expectedVersion) / itemDecided(expectedVersion)
+ * / snapshot}，它们走 {@link DecisionPackageTransitions} 纯转移核心（本类只负责注册表、锁与旧内存适配语义）。
  *
  * <p><b>为什么不落库</b>（与 {@link io.mosire.agentlib.approval.PendingApprovals} 同口径）：包是
  * "当下这批调用的一次决策"，提议者与确认者都活在<b>当前进程</b>里——进程退出即失效是<b>对的</b>； 跨重启继承一个"上次批过"的包是错的。事件的留痕（{@code
@@ -154,6 +156,27 @@ public final class DecisionPackages {
    */
   public static final long DEFAULT_DEADLINE_MILLIS = 30L * 60L * 1000L;
 
+  /**
+   * 拒码（U1）：包内容已冻结——append / replaceItem / removeItem 只允许在 {@code PROPOSED} 且<b>还没有任何逐条表态</b>时进行。
+   *
+   * <p>首次 {@code itemDecided} 之后包进入 {@code DECIDING}，此后内容不再可改：允许编辑就会让"这一条到底被裁的是什么"出现两处真相。
+   */
+  public static final String PACKAGE_CONTENT_FROZEN = "PACKAGE_CONTENT_FROZEN";
+
+  /**
+   * 拒码（U1）：内容版本不匹配（"看旧包、批新包"的防线）。
+   *
+   * <p>不带版本的旧签名（{@link #decide(String, Decision)} / {@link #itemDecided(String, int, boolean,
+   * String, String)}）按当前版本执行， 仍兼容 Brain；带版本的新入口在版本不匹配时零状态变更地拒绝。
+   */
+  public static final String PACKAGE_VERSION_STALE = "PACKAGE_VERSION_STALE";
+
+  /** 拒码（U1）：removeItem 不得把包删空（空包没有可裁决/可提交的东西）。 */
+  public static final String PACKAGE_EMPTY = "PACKAGE_EMPTY";
+
+  /** 拒码（U1）：宿主给的包 id 已被登记过（同一 id 不覆盖；id 是幂等键与对账键）。 */
+  public static final String PACKAGE_ALREADY_EXISTS = "PACKAGE_ALREADY_EXISTS";
+
   private final ReentrantLock lock = new ReentrantLock();
   private final Map<String, Entry> entries = new LinkedHashMap<>();
 
@@ -281,6 +304,166 @@ public final class DecisionPackages {
   }
 
   /**
+   * 用<b>宿主给的 id</b>提议（U1，契约 §6 新增重载）：登记进同一张包表，但不发 {@code dp-N}。
+   *
+   * <p><b>为什么保留旧 {@link #propose(ProposeRequest)}</b>：Brain 的默认内存适配器仍要 {@code dp-N} 与系统时钟；旧签名与旧行为
+   * 一字不改。本重载是"宿主想自己命名包"的入口——id 由宿主给（不含明文参数/密钥是宿主责任），其余形状校验与旧入口同口径。
+   *
+   * <p><b>同 id 已存在 ⇒ {@code PACKAGE_ALREADY_EXISTS}</b>，不覆盖：id 是幂等键与对账键，覆盖会让旧回执对上一个新包。
+   * <b>"一实例一个未决包"照旧生效</b>：本类仍是"一实例一未决包"的内存适配器，宿主若要别的粒度应自带持久化表。
+   *
+   * <p>到点时刻已过 ⇒ 返回 {@code EXPIRED}（与旧入口"出生即过期"一致），并记下到点原因供 {@link #snapshot(String)} 读出。
+   *
+   * @param packageId 宿主给的包 id（非空白）
+   * @param request 提议请求（条目至少一条、index 互不相同）
+   * @return 新建包快照（通常 {@code PROPOSED}；deadline 已过 ⇒ {@code EXPIRED}）
+   * @throws RejectionException {@code PACKAGE_ALREADY_EXISTS} / {@code PACKAGE_ALREADY_OPEN}
+   */
+  public DecisionPackage propose(String packageId, ProposeRequest request) {
+    Objects.requireNonNull(packageId, "packageId");
+    Objects.requireNonNull(request, "request");
+    lock.lock();
+    try {
+      long now = System.currentTimeMillis();
+      expireLocked(now);
+      // 先做形状校验（空包/重复 index 在发号之前拒），再判注册表冲突
+      DecisionPackageSnapshot candidate =
+          DecisionPackageTransitions.propose(packageId, request, now);
+      if (entries.containsKey(packageId)) {
+        throw new RejectionException(
+            PACKAGE_ALREADY_EXISTS, "包 id 已被登记：id=" + packageId + "——同一 id 不得覆盖（id 是幂等键与对账键）");
+      }
+      for (Entry candidateEntry : entries.values()) {
+        DecisionPackage open = candidateEntry.current;
+        if (open.state() == PackageState.PROPOSED
+            && open.proposerKey().equals(request.proposerKey())) {
+          throw new RejectionException(
+              PACKAGE_ALREADY_OPEN,
+              "proposerKey="
+                  + request.proposerKey()
+                  + " 已有未决包 "
+                  + open.id()
+                  + "（一个实例同一时刻最多一个未决包：先裁它，或等它超时）");
+        }
+      }
+      Entry entry = new Entry(candidate.pkg());
+      entry.contentVersion = candidate.contentVersion();
+      entry.snapshotVerdicts.addAll(candidate.verdicts());
+      entries.put(packageId, entry);
+      if (candidate.expiryReason() != null) {
+        expiredReasons.put(packageId, candidate.expiryReason());
+      }
+      LOG.debug(
+          "决策包登记（宿主 id） id={} proposerKey={} caller={} items={} deadlineEpochMs={} state={}",
+          entry.current.id(),
+          entry.current.proposerKey(),
+          entry.current.caller(),
+          entry.current.items().size(),
+          entry.current.deadlineEpochMs(),
+          entry.current.state());
+      return entry.current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 追加条目（U1，契约 §6 新增重载）：走纯转移核心，只允许 {@code PROPOSED} 且尚无逐条表态的包。
+   *
+   * <p>index 只增、允许不连续；remove 留下的洞不会被填上。首次 {@code itemDecided} 之后 ⇒ {@code PACKAGE_CONTENT_FROZEN}。
+   *
+   * @param packageId 包 id
+   * @param items 新条目（非空；index 严格递增且大于当前最大值）
+   * @return 追加后的包快照
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_CONTENT_FROZEN} / {@code
+   *     INVALID_ITEM_INDEX} / {@code PACKAGE_EXPIRED}
+   */
+  public DecisionPackage append(String packageId, List<PackageItem> items) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      long now = System.currentTimeMillis();
+      expireLocked(now);
+      Entry entry = require(packageId);
+      DecisionPackageSnapshot next =
+          DecisionPackageTransitions.append(snapshotOf(entry), items, entry.contentVersion, now);
+      applySnapshot(entry, next);
+      LOG.debug(
+          "决策包追加条目 id={} items={} contentVersion={}",
+          entry.current.id(),
+          entry.current.items().size(),
+          entry.contentVersion);
+      return entry.current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 原位替换条目的内容（U1，契约 §6 新增重载）：必须保持同一 index，且只能改尚未开始逐条表态的包。
+   *
+   * @param packageId 包 id
+   * @param index 目标条目的稳定身份
+   * @param replacement 新条目（{@code replacement.index() == index}）
+   * @return 替换后的包快照
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_CONTENT_FROZEN} / {@code
+   *     INVALID_ITEM_INDEX} / {@code PACKAGE_EXPIRED}
+   */
+  public DecisionPackage replaceItem(String packageId, int index, PackageItem replacement) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      long now = System.currentTimeMillis();
+      expireLocked(now);
+      Entry entry = require(packageId);
+      DecisionPackageSnapshot next =
+          DecisionPackageTransitions.replaceItem(
+              snapshotOf(entry), index, replacement, entry.contentVersion, now);
+      applySnapshot(entry, next);
+      LOG.debug(
+          "决策包替换条目 id={} index={} contentVersion={}",
+          entry.current.id(),
+          index,
+          entry.contentVersion);
+      return entry.current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 删除条目（U1，契约 §6 新增重载）：不重排剩余 index（留洞）；不得删空包。
+   *
+   * @param packageId 包 id
+   * @param index 目标条目的稳定身份
+   * @return 删除后的包快照
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_CONTENT_FROZEN} / {@code
+   *     INVALID_ITEM_INDEX} / {@code PACKAGE_EMPTY} / {@code PACKAGE_EXPIRED}
+   */
+  public DecisionPackage removeItem(String packageId, int index) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      long now = System.currentTimeMillis();
+      expireLocked(now);
+      Entry entry = require(packageId);
+      DecisionPackageSnapshot next =
+          DecisionPackageTransitions.removeItem(
+              snapshotOf(entry), index, entry.contentVersion, now);
+      applySnapshot(entry, next);
+      LOG.debug(
+          "决策包删除条目 id={} index={} items={} contentVersion={}",
+          entry.current.id(),
+          index,
+          entry.current.items().size(),
+          entry.contentVersion);
+      return entry.current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
    * 统一裁决：<b>整包一次裁、逐条例外</b>（不在 {@link Decision#approvedIndexes()} 里 = 被驳）。
    *
    * <p><b>一次终局</b>（红线 3）：只落在 {@code PROPOSED} 上，首次裁决<b>永不被覆盖</b>—— 重复 decide
@@ -326,6 +509,7 @@ public final class DecisionPackages {
                 + " 条）");
       }
       entry.current = withState(current, PackageState.DECIDED, decision);
+      entry.contentVersion++;
       LOG.debug(
           "决策包裁决 id={} by={} approved={} rejected={}",
           current.id(),
@@ -333,6 +517,46 @@ public final class DecisionPackages {
           decision.approvedIndexes().size(),
           current.items().size() - decision.approvedIndexes().size());
       return entry.current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 带<b>预期内容版本</b>的整包裁决（U1，契约 §6 新增重载）：走纯转移核心，版本不匹配 ⇒ {@code PACKAGE_VERSION_STALE}、零状态变更。
+   *
+   * <p>旧 {@link #decide(String, Decision)} 保留并按当前版本执行（Brain 兼容）；本重载给宿主提供"看旧包、批新包"的防线。
+   *
+   * @param packageId 包 id
+   * @param expectedContentVersion 调用方看到的 {@link DecisionPackageSnapshot#contentVersion()}
+   * @param decision 统一裁决
+   * @return 裁决后的包快照（{@code DECIDED}；被批子集为空 ⇒ {@code REJECTED}）
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_VERSION_STALE} / {@code
+   *     PACKAGE_EXPIRED} / {@code PACKAGE_NOT_PROPOSED} / {@code PARTIAL_DECISION} / {@code
+   *     INVALID_DECISION}
+   */
+  public DecisionPackage decide(String packageId, long expectedContentVersion, Decision decision) {
+    Objects.requireNonNull(packageId, "packageId");
+    Objects.requireNonNull(decision, "decision");
+    lock.lock();
+    try {
+      long now = System.currentTimeMillis();
+      expireLocked(now);
+      Entry entry = require(packageId);
+      DecisionPackageSnapshot next =
+          DecisionPackageTransitions.decide(
+              snapshotOf(entry), expectedContentVersion, decision, now);
+      applySnapshot(entry, next);
+      // 整包裁决已经覆盖全部条目：旧的逐条累积 map 不再需要（快照累计在 applySnapshot 里已冻结）
+      entry.verdicts.clear();
+      LOG.debug(
+          "决策包裁决（带版本） id={} expected={} by={} approved={} state={}",
+          next.pkg().id(),
+          expectedContentVersion,
+          decision.by(),
+          decision.approvedIndexes().size(),
+          next.pkg().state());
+      return next.pkg();
     } finally {
       lock.unlock();
     }
@@ -397,7 +621,7 @@ public final class DecisionPackages {
             ITEM_ALREADY_DECIDED,
             "条目 index=" + index + " 已经表过态（裁决唯一：一条一次，重复表态不是改主意）包=" + current.id());
       }
-      entry.verdicts.put(index, verdict);
+      entry.recordVerdict(verdict);
       entry.current =
           withState(current, PackageState.DECIDING, accumulated(current, entry.verdicts));
       boolean finalized = false;
@@ -417,6 +641,58 @@ public final class DecisionPackages {
           entry.current.state());
       return new ItemDecisionResult(
           entry.current, verdictsOf(current, entry.verdicts), finalized, undecided);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 带<b>预期内容版本</b>的条目级表态（U1）：走纯转移核心，返回完整快照（含新 contentVersion）。
+   *
+   * <p>旧 {@link #itemDecided(String, int, boolean, String, String)} 保留并返回 {@link
+   * ItemDecisionResult}；本重载返回 {@link DecisionPackageSnapshot}，因为它额外的价值正是"表态同时拿到新版本"，宿主可据此继续做乐观并发。
+   *
+   * @param packageId 包 id
+   * @param expectedContentVersion 调用方看到的版本
+   * @param index 条目稳定身份
+   * @param approve {@code true} = 批准，{@code false} = 驳回
+   * @param by 表态人（空白 ⇒ {@link IllegalArgumentException}）
+   * @param note 可空理由
+   * @return 表态后的完整快照（{@code DECIDING} / {@code DECIDED}；全驳 ⇒ {@code REJECTED}）
+   * @throws RejectionException {@code PACKAGE_NOT_FOUND} / {@code PACKAGE_VERSION_STALE} / {@code
+   *     PACKAGE_EXPIRED} / {@code PACKAGE_NOT_PROPOSED} / {@code INVALID_ITEM_INDEX} / {@code
+   *     ITEM_ALREADY_DECIDED}
+   */
+  public DecisionPackageSnapshot itemDecided(
+      String packageId,
+      long expectedContentVersion,
+      int index,
+      boolean approve,
+      String by,
+      String note) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      long now = System.currentTimeMillis();
+      expireLocked(now);
+      Entry entry = require(packageId);
+      DecisionPackageSnapshot next =
+          DecisionPackageTransitions.itemDecided(
+              snapshotOf(entry), expectedContentVersion, index, approve, by, note, now);
+      applySnapshot(entry, next);
+      // 与新入口混用旧入口时，旧的逐条 map 必须看到同一条表态（否则旧入口会允许重复表态）
+      entry.verdicts.put(index, new ItemVerdict(index, approve, by, note));
+      if (next.pkg().state() != PackageState.DECIDING) {
+        entry.verdicts.clear();
+      }
+      LOG.debug(
+          "决策包条目级表态（带版本） id={} index={} approve={} state={} contentVersion={}",
+          next.pkg().id(),
+          index,
+          approve,
+          next.pkg().state(),
+          next.contentVersion());
+      return next;
     } finally {
       lock.unlock();
     }
@@ -691,6 +967,30 @@ public final class DecisionPackages {
       expireLocked(System.currentTimeMillis());
       Entry entry = entries.get(packageId);
       return entry == null ? Optional.empty() : Optional.of(entry.current);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  /**
+   * 完整运行态快照（U1，契约 §6 新增重载）：{@link DecisionPackage} + contentVersion + 逐条累计 + 回执 + 到点原因。
+   *
+   * <p>这是宿主持久化的入口；未知 id ⇒ {@code Optional.empty()}（与 {@link #find} 同口径）。读口照旧先做一次惰性到点扫描， 所以已到点的包返回的是
+   * {@code EXPIRED} 快照，而不是"消失"。
+   *
+   * <p>没有走宿主 id 新入口、仍由旧方法建的包也读得到：contentVersion 从 1 起、旧 {@code decide}/{@code itemDecided} 成功也会递增；旧
+   * {@code itemDecided} 的逐条表态会被累计进快照（终局后也不丢）。
+   *
+   * @param packageId 包 id
+   * @return 完整快照；未知 id ⇒ 空
+   */
+  public Optional<DecisionPackageSnapshot> snapshot(String packageId) {
+    Objects.requireNonNull(packageId, "packageId");
+    lock.lock();
+    try {
+      expireLocked(System.currentTimeMillis());
+      Entry entry = entries.get(packageId);
+      return entry == null ? Optional.empty() : Optional.of(snapshotOf(entry));
     } finally {
       lock.unlock();
     }
@@ -1094,6 +1394,54 @@ public final class DecisionPackages {
     return withState(current, PackageState.EXPIRED, null);
   }
 
+  /**
+   * 登记项 ⇒ 完整快照（调用方持锁）。
+   *
+   * <p>逐条累计优先用 {@link Entry#snapshotVerdicts}（旧 {@code itemDecided} 也会累计，且终局清 map 时不清它）；
+   * 若这个包是整包裁决出来的（没有逐条表态），则按 {@link Decision#approvedIndexes()} 摊成逐条口径——两个阶段对同一条给出同一结论。
+   */
+  private DecisionPackageSnapshot snapshotOf(Entry entry) {
+    List<DecisionItemVerdict> verdicts;
+    if (!entry.snapshotVerdicts.isEmpty()) {
+      verdicts = List.copyOf(entry.snapshotVerdicts);
+    } else {
+      verdicts = verdictsFromDecision(entry.current);
+    }
+    return new DecisionPackageSnapshot(
+        entry.current,
+        entry.contentVersion,
+        verdicts,
+        entry.receipt,
+        expiredReasons.get(entry.current.id()));
+  }
+
+  /** 把一份整包裁决摊成逐条累计（按包内条目顺序；整包裁决 = 每条都有明确去向）。 */
+  private static List<DecisionItemVerdict> verdictsFromDecision(DecisionPackage pkg) {
+    Decision decision = pkg.decision();
+    if (decision == null) {
+      return List.of();
+    }
+    List<DecisionItemVerdict> verdicts = new ArrayList<>(pkg.items().size());
+    for (PackageItem item : pkg.items()) {
+      verdicts.add(
+          new DecisionItemVerdict(
+              item.index(), decision.approves(item.index()), decision.by(), decision.note()));
+    }
+    return List.copyOf(verdicts);
+  }
+
+  /** 把纯转移核心返回的新快照写回登记项（调用方持锁；只在纯转移成功后调用）。 */
+  private void applySnapshot(Entry entry, DecisionPackageSnapshot next) {
+    entry.current = next.pkg();
+    entry.contentVersion = next.contentVersion();
+    entry.snapshotVerdicts.clear();
+    entry.snapshotVerdicts.addAll(next.verdicts());
+    entry.receipt = next.receipt();
+    if (next.expiryReason() != null) {
+      expiredReasons.put(next.pkg().id(), next.expiryReason());
+    }
+  }
+
   private String nextId() {
     // 包 id 会进事件/HTTP/回执：不得含明文参数或密钥（密钥纪律），序号足够
     return "dp-" + minted.incrementAndGet();
@@ -1105,6 +1453,16 @@ public final class DecisionPackages {
     private DecisionPackage current;
     private CommitReceipt receipt;
 
+    /** U1 内容版本（从 1 起；旧路径的 decide/itemDecided 成功也递增，旧入口不校验它）。 */
+    private long contentVersion = 1L;
+
+    /**
+     * U1 逐条表态的<b>只增</b>累计：进 {@link DecisionPackageSnapshot#verdicts()}，终局后也不丢（审计面要能回答"每一条是谁定的"）。
+     *
+     * <p>与 {@link #verdicts} 的分工：后者是旧适配器的分段裁决工作区（终局时会被清空），前者是快照的累计真相。
+     */
+    private final List<DecisionItemVerdict> snapshotVerdicts = new ArrayList<>();
+
     /**
      * 逐条表态的累积（用户裁定 15）：index ⇒ 表态。{@code PROPOSED} 态为空；表态一条就多一条； 包一进终局就清空（终局态读的是 {@link #current}
      * 里的 {@link Decision}）。
@@ -1113,6 +1471,15 @@ public final class DecisionPackages {
 
     Entry(DecisionPackage initial) {
       this.current = initial;
+    }
+
+    /** 旧路径记一条表态：同时维护旧工作区 map 与 U1 快照累计，并推进内容版本。 */
+    private void recordVerdict(ItemVerdict verdict) {
+      verdicts.put(verdict.index(), verdict);
+      snapshotVerdicts.add(
+          new DecisionItemVerdict(
+              verdict.index(), verdict.approved(), verdict.by(), verdict.note()));
+      contentVersion++;
     }
   }
 

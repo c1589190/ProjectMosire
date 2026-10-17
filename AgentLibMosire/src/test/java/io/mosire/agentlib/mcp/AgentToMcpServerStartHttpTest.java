@@ -15,9 +15,8 @@ import io.mosire.agentlib.approval.ApprovalChannel;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
 import io.mosire.agentlib.approval.ApprovalEventTypes;
-import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
 import io.mosire.agentlib.approval.ApprovalRequest;
-import io.mosire.agentlib.approval.HttpApprovalChannel;
+import io.mosire.agentlib.approval.PendingApprovalChannel;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.ToolGate;
 import io.mosire.agentlib.event.Event;
@@ -62,8 +61,8 @@ import org.junit.jupiter.api.Timeout;
  *
  * <p>证据线是<b>真线</b>：SDK 官方 client（{@code HttpClientStreamableHttpTransport} + {@code
  * McpClient.sync}）经真实 socket 完成 {@code initialize → tools/list → tools/call}；审批侧用真 {@link
- * PendingApprovals} + 真 {@link ApprovalCoordinator} + 真 {@link ApprovalHttpEndpoint} + 真 {@link
- * HttpApprovalChannel}，只有"人怎么点"这一步由用例 扮演（经真 HTTP 端点）。
+ * PendingApprovals} + 真 {@link ApprovalCoordinator} + 真 {@link
+ * PendingApprovalChannel}，只有"人怎么点"这一步由用例 直接写登记表（HTTP 适配器不在 AgentLib 核心）。
  *
  * <p>端口取 {@code 0}（系统分配）后从 {@link AgentToMcpServer#boundPort()} 读回，绝不硬编码，避免并行/本机端口冲突。
  */
@@ -74,8 +73,6 @@ class AgentToMcpServerStartHttpTest {
   private static final String SERVER_NAME = "start-http-test";
   private static final String VERSION = "0.1.0";
   private static final String CLASS_KEY = "bash:ask:apt";
-  private static final String APPROVALS_PATH = "/api/approvals";
-
   private static final ObjectMapper JSON = new ObjectMapper();
   private static final HttpClient RAW_HTTP =
       HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
@@ -181,7 +178,7 @@ class AgentToMcpServerStartHttpTest {
     ToolRegistry registry = new ToolRegistry();
     registry.register(askTool(bodyRan));
     PendingApprovals pending = new PendingApprovals();
-    HttpApprovalChannel channel = new HttpApprovalChannel(pending); // 不 markUp：面未就绪
+    PendingApprovalChannel channel = new PendingApprovalChannel(pending); // 不 markUp：面未就绪
     ApprovalCoordinator coordinator =
         new ApprovalCoordinator(
             List.of(), List.of((ApprovalChannel) channel), pending, Duration.ofSeconds(5), null);
@@ -209,7 +206,7 @@ class AgentToMcpServerStartHttpTest {
     ToolRegistry registry = new ToolRegistry();
     registry.register(askTool(bodyRan));
     PendingApprovals pending = new PendingApprovals();
-    HttpApprovalChannel channel = new HttpApprovalChannel(pending);
+    PendingApprovalChannel channel = new PendingApprovalChannel(pending);
     channel.markUp();
     ApprovalCoordinator coordinator =
         new ApprovalCoordinator(
@@ -245,11 +242,11 @@ class AgentToMcpServerStartHttpTest {
   // ---------------------------------------------------------------- ⑤ 端到端审批
 
   /**
-   * 端到端：client {@code tools/call} → 真 HTTP 审批面列出待裁决 → {@code POST} 决议 → 执行 + {@code
-   * approval.decided} 审计。
+   * 端到端：client {@code tools/call} → 真 {@link PendingApprovals} → 人批准 → 执行 + {@code
+   * approval.decided} 审计。传输层不在 AgentLib；这里直接对登记表作答，MCP 只是工具面。
    */
   @Test
-  void endToEndApprovalOverHttpApproveRunsToolAndEmitsAuditEvent() throws Exception {
+  void endToEndApprovalApproveRunsToolAndEmitsAuditEvent() throws Exception {
     AtomicBoolean bodyRan = new AtomicBoolean(false);
     ToolRegistry registry = new ToolRegistry();
     registry.register(askTool(bodyRan));
@@ -271,15 +268,9 @@ class AgentToMcpServerStartHttpTest {
                   client.callTool(
                       new McpSchema.CallToolRequest("apt_install", Map.of("pkg", "curl"))));
 
-      JsonNode listed = awaitApprovalListed(rig.base(), Duration.ofSeconds(10));
-      String id = listed.get("id").asText();
-      assertThat(listed.get("tool").asText()).isEqualTo("apt_install");
-
-      HttpResponse<String> decided =
-          rawPost(
-              rig.base() + APPROVALS_PATH + "/" + id,
-              "{\"decision\":\"approve\",\"scope\":\"once\",\"by\":\"值班人\"}");
-      assertThat(decided.statusCode()).isEqualTo(200);
+      ApprovalRequest served = awaitPending(rig.pending, Duration.ofSeconds(10));
+      assertThat(served.tool()).isEqualTo("apt_install");
+      assertThat(rig.pending.decide(served.id(), ApprovalDecision.APPROVE_ONCE, "test")).isTrue();
 
       McpSchema.CallToolResult result = call.get(10, TimeUnit.SECONDS);
       assertThat(result.isError()).isFalse();
@@ -289,7 +280,7 @@ class AgentToMcpServerStartHttpTest {
       Event audit =
           events.awaitType(ApprovalEventTypes.DECIDED, Duration.ofSeconds(5)).orElseThrow();
       JsonNode payload = JSON.readTree(audit.payload());
-      assertThat(payload.get("id").asText()).isEqualTo(id);
+      assertThat(payload.get("id").asText()).isEqualTo(served.id());
       assertThat(payload.get("decision").asText()).isEqualTo("APPROVE_ONCE");
       assertThat(payload.get("scope").asText()).isEqualTo("once");
     } finally {
@@ -301,7 +292,7 @@ class AgentToMcpServerStartHttpTest {
 
   /** 端到端（反向）：决议为 DENY ⇒ 调用失败且工具体不跑，审计事件照发。 */
   @Test
-  void endToEndApprovalOverHttpDenyKeepsTheToolBodyUnrun() throws Exception {
+  void endToEndApprovalDenyKeepsTheToolBodyUnrun() throws Exception {
     AtomicBoolean bodyRan = new AtomicBoolean(false);
     ToolRegistry registry = new ToolRegistry();
     registry.register(askTool(bodyRan));
@@ -323,12 +314,8 @@ class AgentToMcpServerStartHttpTest {
                   client.callTool(
                       new McpSchema.CallToolRequest("apt_install", Map.of("pkg", "curl"))));
 
-      JsonNode listed = awaitApprovalListed(rig.base(), Duration.ofSeconds(10));
-      String id = listed.get("id").asText();
-      assertThat(
-              rawPost(rig.base() + APPROVALS_PATH + "/" + id, "{\"decision\":\"deny\"}")
-                  .statusCode())
-          .isEqualTo(200);
+      ApprovalRequest served = awaitPending(rig.pending, Duration.ofSeconds(10));
+      assertThat(rig.pending.decide(served.id(), ApprovalDecision.DENY, "test")).isTrue();
 
       McpSchema.CallToolResult result = call.get(10, TimeUnit.SECONDS);
       assertThat(result.isError()).isTrue();
@@ -586,29 +573,22 @@ class AgentToMcpServerStartHttpTest {
     };
   }
 
-  /** 真 HTTP 审批面装配（端口 0，绑 127.0.0.1）：登记表 + HTTP 通道 + 编排器 + 端点。 */
+  /** 真审批登记表 + 通道 + 编排器；传输层不属于 AgentLib。 */
   private static final class ApprovalRig implements AutoCloseable {
 
     private final PendingApprovals pending = new PendingApprovals();
-    private final HttpApprovalChannel channel = new HttpApprovalChannel(pending);
+    private final PendingApprovalChannel channel = new PendingApprovalChannel(pending);
     private final ApprovalCoordinator coordinator;
-    private final ApprovalHttpEndpoint endpoint;
 
     ApprovalRig(EventBus bus) {
       this.coordinator =
           new ApprovalCoordinator(
               List.of(), List.of((ApprovalChannel) channel), pending, Duration.ofSeconds(10), bus);
-      this.endpoint = ApprovalHttpEndpoint.start(0, pending, coordinator);
       channel.markUp();
-    }
-
-    String base() {
-      return "http://127.0.0.1:" + endpoint.boundPort();
     }
 
     @Override
     public void close() {
-      endpoint.close();
       channel.close();
     }
   }
@@ -653,19 +633,6 @@ class AgentToMcpServerStartHttpTest {
     throw new AssertionError("审批请求未出现在登记表（等了 " + limit + "）");
   }
 
-  private static JsonNode awaitApprovalListed(String base, Duration limit) throws Exception {
-    long deadlineNanos = System.nanoTime() + limit.toNanos();
-    while (System.nanoTime() < deadlineNanos) {
-      HttpResponse<String> response = rawGet(base + APPROVALS_PATH);
-      JsonNode pending = JSON.readTree(response.body()).get("pending");
-      if (pending != null && pending.size() > 0) {
-        return pending.get(0);
-      }
-      sleep(10L);
-    }
-    throw new AssertionError("GET " + APPROVALS_PATH + " 未列出待裁决项（等了 " + limit + "）");
-  }
-
   private static HttpServer rebindEventually(int port) throws Exception {
     IOException last = null;
     long deadlineNanos = System.nanoTime() + Duration.ofSeconds(5).toNanos();
@@ -689,15 +656,6 @@ class AgentToMcpServerStartHttpTest {
   private static HttpResponse<String> rawGet(String url) throws Exception {
     return RAW_HTTP.send(
         HttpRequest.newBuilder(URI.create(url)).GET().build(),
-        HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-  }
-
-  private static HttpResponse<String> rawPost(String url, String body) throws Exception {
-    return RAW_HTTP.send(
-        HttpRequest.newBuilder(URI.create(url))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-            .build(),
         HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
   }
 

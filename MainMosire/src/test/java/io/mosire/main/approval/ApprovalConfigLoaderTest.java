@@ -1,4 +1,4 @@
-package io.mosire.agentlib.approval;
+package io.mosire.main.approval;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;

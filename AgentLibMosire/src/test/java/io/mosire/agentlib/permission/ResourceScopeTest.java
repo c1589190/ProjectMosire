@@ -66,6 +66,28 @@ class ResourceScopeTest {
   }
 
   @Test
+  void prefixOrderIsPreservedForDeterministicCwdAndAudit() {
+    ResourceScope scope = ResourceScope.of("/srv/zeta", "/srv/alpha", "/srv/middle");
+
+    assertThat(scope.prefixList()).containsExactly("/srv/zeta", "/srv/alpha", "/srv/middle");
+    assertThat(scope.dirList())
+        .containsExactly(Path.of("/srv/zeta"), Path.of("/srv/alpha"), Path.of("/srv/middle"));
+    assertThat(scope.summary()).isEqualTo("/srv/zeta,/srv/alpha,/srv/middle");
+  }
+
+  @Test
+  void ofDirsKeepsInputOrderForDeterministicDirList(@TempDir Path tempDir) throws Exception {
+    Path zeta = Files.createDirectories(tempDir.resolve("zeta"));
+    Path alpha = Files.createDirectories(tempDir.resolve("alpha"));
+    Path middle = Files.createDirectories(tempDir.resolve("middle"));
+
+    ResourceScope scope = ResourceScope.ofDirs(java.util.List.of(zeta, alpha, middle));
+
+    assertThat(scope.dirList())
+        .containsExactly(zeta.toRealPath(), alpha.toRealPath(), middle.toRealPath());
+  }
+
+  @Test
   void unrestrictedAndNoneAreTwoDifferentValues() {
     ResourceScope any = ResourceScope.unlimited();
     ResourceScope nothing = ResourceScope.none();

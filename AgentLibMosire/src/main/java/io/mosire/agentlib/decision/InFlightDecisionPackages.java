@@ -22,7 +22,7 @@ import java.util.Optional;
  *       <b>不</b>发事件，也<b>不</b>允许 {@code POST} 拿它当"可以裁决的包"——在途包不是决策单元， 它只是"人此刻有权看的全文"；
  *   <li><b>在途即消失</b>：登记只覆盖"这次投递正在等人/等闸"的那段窗口，结算（或到点、或投递异常返回）即<b>取不到</b>；
  *   <li><b>明文只在内存</b>：返回的包内条目带参数<b>明文</b>（与人看全文的要求同源），它只准出现在这条回环 HTTP 的响应里， 不进事件库、不进日志、不进任何 {@code
- *       ApprovalRequest} 载荷（与 {@link DecisionPackagesHttpHandler} 的明文纪律同一句话）。
+ *       ApprovalRequest} 载荷（与决策面适配器的明文纪律同一句话）。
  * </ol>
  *
  * <p>{@link Optional#empty()} = 不是这个口管的对象 / 已经结算 / 从来没登记过——三种情形<b>同一个回答</b>（不给存在性 oracle，
@@ -34,7 +34,7 @@ public interface InFlightDecisionPackages {
   /**
    * @param packageId 包 id（{@code xp-…} 这类临时包 id；{@code null} ⇒ 空值）
    * @return 该在途包的快照（含逐条明文条目）；不在途/不认识 ⇒ 空值。实现<b>不应抛异常</b>（抛了按"取不到"办，见 {@link
-   *     DecisionPackagesHttpHandler}）
+   *     决策面适配器）
    */
   Optional<DecisionPackage> find(String packageId);
 

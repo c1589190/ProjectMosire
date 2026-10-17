@@ -30,6 +30,14 @@
 ./mvnw verify              # 门禁：Spotless → Checkstyle → SpotBugs → 测试
 ```
 
+## 许可证
+
+本项目使用 **Apache License 2.0** 开源。完整文本见根目录 [`LICENSE`](LICENSE)；SPDX 标识为
+`Apache-2.0`。
+
+第三方依赖（MCP SDK、A2A SDK、Jackson、SQLite JDBC、PF4J、Log4j 等）各自保留其上游许可证，
+不因本项目采用 Apache-2.0 而改变。分发二进制或源码时请同时遵守各依赖的许可证与 NOTICE 要求。
+
 ## 里程碑状态
 
 > ⚠️ **本表是 P0 视角的历史快照（2026-09-11 前后），数字已陈旧**（如 M2 行的"188 测试""SpotBugs 告警 3+4+10"

@@ -407,4 +407,162 @@ class DecisionPackagesTest {
         .isInstanceOf(IllegalArgumentException.class);
     assertThat(packages.pending()).isEmpty();
   }
+
+  // ---------- U1：宿主 id / 完整快照 / 编辑窗口兼容入口 ----------
+
+  private static ProposeRequest hostRequest(String proposerKey, int count) {
+    List<PackageItem> items = new ArrayList<>(count);
+    for (int i = 0; i < count; i++) {
+      items.add(item(i));
+    }
+    return new ProposeRequest(proposerKey, AccessToken.SYSTEM, items, DEADLINE);
+  }
+
+  private static PackageItem item(int index) {
+    return new PackageItem(
+        index,
+        "tool_" + index,
+        Map.of("path", "f" + index + ".md"),
+        "digest-" + index,
+        "写第 " + index + " 个文件");
+  }
+
+  @Test
+  void hostIdProposalKeepsTheGivenIdWhileLegacyProposalStillMintsDpIds() {
+    DecisionPackages packages = new DecisionPackages();
+
+    DecisionPackage host = packages.propose("pkt-dm-1-360", hostRequest("host-sub", 1));
+    assertThat(host.id()).as("宿主 id 口逐字使用宿主给的 id").isEqualTo("pkt-dm-1-360");
+    assertThat(host.state()).isEqualTo(PackageState.PROPOSED);
+    assertThat(packages.snapshot(host.id()).orElseThrow().contentVersion())
+        .as("宿主 id 口也从 contentVersion=1 起")
+        .isEqualTo(1L);
+
+    DecisionPackage legacy = packages.propose(hostRequest("legacy-sub", 1));
+    assertThat(legacy.id()).as("旧 propose(request) 仍发 dp-N（旧测试不改）").startsWith("dp-");
+    assertThat(packages.snapshot(legacy.id()).orElseThrow().contentVersion()).isEqualTo(1L);
+  }
+
+  @Test
+  void duplicateHostIdIsRefusedWithoutOverwritingTheFirstPackage() {
+    DecisionPackages packages = new DecisionPackages();
+    DecisionPackage first = packages.propose("pkt-1", hostRequest("sub-a", 1));
+
+    assertThatThrownBy(() -> packages.propose("pkt-1", hostRequest("sub-b", 1)))
+        .as("同一 id 不覆盖（id 是幂等键与对账键）")
+        .isInstanceOf(DecisionPackages.RejectionException.class)
+        .hasFieldOrPropertyWithValue("code", DecisionPackages.PACKAGE_ALREADY_EXISTS);
+    assertThat(packages.find("pkt-1").orElseThrow().proposerKey())
+        .as("原包还在，没被后者覆盖")
+        .isEqualTo(first.proposerKey());
+    assertThat(packages.snapshot("not-a-package")).as("未知 id 的完整快照为空").isEmpty();
+    assertThatThrownBy(() -> packages.append("not-a-package", List.of(item(0))))
+        .as("未知 id 的编辑入口具名拒 PACKAGE_NOT_FOUND")
+        .isInstanceOf(DecisionPackages.RejectionException.class)
+        .hasFieldOrPropertyWithValue("code", DecisionPackages.PACKAGE_NOT_FOUND);
+  }
+
+  @Test
+  void appendReplaceRemoveTrackContentVersionInTheSnapshot() {
+    DecisionPackages packages = new DecisionPackages();
+    packages.propose("pkt-1", hostRequest("sub-a", 1));
+
+    packages.append("pkt-1", List.of(item(1), item(2)));
+    DecisionPackageSnapshot afterAppend = packages.snapshot("pkt-1").orElseThrow();
+    assertThat(afterAppend.pkg().items()).extracting(PackageItem::index).containsExactly(0, 1, 2);
+    assertThat(afterAppend.contentVersion()).isEqualTo(2L);
+
+    packages.replaceItem("pkt-1", 1, new PackageItem(1, "tool_new", Map.of(), "d", "s"));
+    assertThat(packages.snapshot("pkt-1").orElseThrow().contentVersion()).isEqualTo(3L);
+
+    packages.removeItem("pkt-1", 0);
+    DecisionPackageSnapshot afterRemove = packages.snapshot("pkt-1").orElseThrow();
+    assertThat(afterRemove.pkg().items())
+        .extracting(PackageItem::index)
+        .as("remove 留洞、不重排")
+        .containsExactly(1, 2);
+    assertThat(afterRemove.contentVersion()).isEqualTo(4L);
+  }
+
+  @Test
+  void versionedAdapterDecisionRejectsStaleReadsAndFreezesAfterFirstItemVerdict() {
+    DecisionPackages packages = new DecisionPackages();
+    DecisionPackage pkg = packages.propose("pkt-1", hostRequest("sub-a", 2));
+
+    assertThatThrownBy(() -> packages.decide(pkg.id(), 99L, new Decision(Set.of(0), "human", "")))
+        .isInstanceOf(DecisionPackages.RejectionException.class)
+        .hasFieldOrPropertyWithValue("code", DecisionPackages.PACKAGE_VERSION_STALE);
+
+    DecisionPackageSnapshot afterFirst = packages.itemDecided(pkg.id(), 1L, 0, true, "alice", "");
+    assertThat(afterFirst.pkg().state()).isEqualTo(PackageState.DECIDING);
+    assertThat(afterFirst.contentVersion()).isEqualTo(2L);
+    assertThat(afterFirst.verdicts()).extracting(DecisionItemVerdict::index).containsExactly(0);
+
+    assertThatThrownBy(() -> packages.append(pkg.id(), List.of(item(2))))
+        .as("首次表态后兼容入口也冻结内容")
+        .isInstanceOf(DecisionPackages.RejectionException.class)
+        .hasFieldOrPropertyWithValue("code", DecisionPackages.PACKAGE_CONTENT_FROZEN);
+  }
+
+  @Test
+  void legacyItemDecidedAlsoAdvancesTheSnapshotVersionAndFreezesContent() {
+    DecisionPackages packages = new DecisionPackages();
+    DecisionPackage pkg = packages.propose(hostRequest("sub-a", 2));
+
+    packages.itemDecided(pkg.id(), 0, true, "alice", "");
+
+    DecisionPackageSnapshot snapshot = packages.snapshot(pkg.id()).orElseThrow();
+    assertThat(snapshot.contentVersion()).as("旧入口成功表态也推进快照版本").isEqualTo(2L);
+    assertThat(snapshot.pkg().state()).isEqualTo(PackageState.DECIDING);
+    assertThat(snapshot.verdicts()).hasSize(1);
+    assertThatThrownBy(() -> packages.append(pkg.id(), List.of(item(2))))
+        .isInstanceOf(DecisionPackages.RejectionException.class)
+        .hasFieldOrPropertyWithValue("code", DecisionPackages.PACKAGE_CONTENT_FROZEN);
+  }
+
+  @Test
+  void snapshotDerivesPerItemVerdictsFromALegacyWholePackageDecision() {
+    DecisionPackages packages = new DecisionPackages();
+    DecisionPackage pkg = packages.propose(hostRequest("sub-a", 2));
+
+    packages.decide(pkg.id(), new Decision(Set.of(0), "human", "只批 0"));
+
+    DecisionPackageSnapshot snapshot = packages.snapshot(pkg.id()).orElseThrow();
+    assertThat(snapshot.contentVersion()).as("旧整包裁决也推进快照版本").isEqualTo(2L);
+    assertThat(snapshot.pkg().state()).isEqualTo(PackageState.DECIDED);
+    assertThat(snapshot.verdicts()).extracting(DecisionItemVerdict::index).containsExactly(0, 1);
+    assertThat(snapshot.verdicts())
+        .filteredOn(DecisionItemVerdict::approved)
+        .extracting(DecisionItemVerdict::index)
+        .containsExactly(0);
+    assertThat(snapshot.verdicts()).extracting(DecisionItemVerdict::by).containsOnly("human");
+  }
+
+  @Test
+  void commitPortPlanOverloadDelegatesToTheLegacyMethod() {
+    long now = System.currentTimeMillis();
+    DecisionPackageSnapshot proposed =
+        DecisionPackageTransitions.propose("pkt-1", hostRequest("sub-a", 2), now);
+    DecisionPackageSnapshot decided =
+        DecisionPackageTransitions.decide(
+            proposed, proposed.contentVersion(), new Decision(Set.of(1), "human", ""), now);
+    DecisionCommitPlan plan = DecisionPackageTransitions.prepareCommit(decided, now);
+
+    List<List<ResolvedCall>> seen = new ArrayList<>();
+    DecisionCommitPort port =
+        (packageId, calls) -> {
+          seen.add(List.copyOf(calls));
+          List<CommitReceipt.ItemOutcome> outcomes = new ArrayList<>();
+          for (int i = 0; i < calls.size(); i++) {
+            outcomes.add(CommitReceipt.ItemOutcome.COMMITTED);
+          }
+          return new CommitReceipt(CommitReceipt.Status.COMMITTED, "rev-port", outcomes, "");
+        };
+
+    CommitReceipt receipt = port.commit("pkt-1", plan);
+
+    assertThat(seen).as("默认重载把 plan.calls() 原样委托给旧方法").hasSize(1);
+    assertThat(seen.get(0)).extracting(ResolvedCall::index).containsExactly(1);
+    assertThat(receipt.revisionRef()).isEqualTo("rev-port");
+  }
 }

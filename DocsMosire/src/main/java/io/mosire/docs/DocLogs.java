@@ -1,6 +1,7 @@
 package io.mosire.docs;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -8,10 +9,14 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -40,9 +45,13 @@ import org.slf4j.LoggerFactory;
  * <p><b>坏行不静默</b>：解析不出来的行进 {@link #broken()} 披露并<b>继续</b>读；写侧永不产出坏行（{@link Json#encode} 是确定性的）。
  *
  * <p><b>诚实边界</b>：文件锁只在同主机、支持锁的文件系统上成立（设计 §9.3）；NFS/多机不在承诺内。若底层文件系统不支持锁，追加退化为"JVM 内互斥"
- * ——跨进程撕裂的风险由此<b>不被覆盖</b>，这一点写在代码里而不是含糊带过。读取路径（{@code read}/{@code query}/{@code addresses}）走
- * {@link Files#readAllBytes}：它不参与写者的互斥，理论上可能读到"另一个进程刚写了一半"的内容；那一条会作为坏行进 {@code broken}（不静默），
+ * ——跨进程撕裂的风险由此<b>不被覆盖</b>，这一点写在代码里而不是含糊带过。读取路径（{@code read}/{@code query}/{@code addresses}）用
+ * {@code NOFOLLOW_LINKS} 打开且不参与写者的互斥，理论上可能读到"另一个进程刚写了一半"的内容；那一条会作为坏行进 {@code broken}（不静默），
  * 下一次读即可自愈。
+ *
+ * <p><b>软链与 TOCTOU 的诚实边界</b>：本类只接受工作区 {@code resolveForIo} 给出的安全真实根；扫描遇到软链日志文件具名拒绝， 打开日志文件时用 {@code
+ * NOFOLLOW_LINKS}（写路径另加 {@code CREATE}），建目录逐级查软链后 {@code createDirectory}。 未实现 {@code
+ * SecureDirectoryStream} 的目录 fd 相对操作，因此检查与 open/rename 之间仍有一个竞争窗口；这里绝不静默退回 “跟随软链的普通 IO”，窗口如实记录在这里。
  */
 final class DocLogs implements DocStore {
 
@@ -71,7 +80,9 @@ final class DocLogs implements DocStore {
   private final List<BrokenDoc> broken = new ArrayList<>();
 
   private DocLogs(Path baseDir) {
-    this.baseDir = baseDir;
+    // 基目录必须是绝对、归一的安全真实根：相对根会把日志写到“进程 cwd 下的某个地方”。
+    this.baseDir =
+        java.util.Objects.requireNonNull(baseDir, "baseDir").toAbsolutePath().normalize();
   }
 
   /**
@@ -88,6 +99,7 @@ final class DocLogs implements DocStore {
   public DocEntry append(AppendRequest req) {
     synchronized (lock) {
       Path file = logFile(baseDir, req.address());
+      requireSafeBaseDir(fileNameOf(file));
       // ★ 排他锁必须包住"读行序 → 定序号 → 追加"这一整段，而且读也必须走**同一个被锁住的通道**。
       //   实测（本机 ext4，2026-10-13）：用 Files.readAllLines 在锁内另开描述符读，读到的是旧内容 ——
       //   两个进程于是在各自锁内都看到"0 行"、都算出序号 0，盘上出现重复序号。改成"锁内的读也走同一通道"后
@@ -149,10 +161,16 @@ final class DocLogs implements DocStore {
         // 继续下去只会是 createDirectories(null) 的 NPE（fail-closed，不猜落点；文案只出文件名，不出物理路径）
         throw DocException.writeFailed("日志落点没有父目录（挂载根解析异常，这一行没有落盘）: " + fileNameOf(file), null);
       }
-      ensureDirectory(parent);
+      ensureDirectory(parent, fileNameOf(file));
+      requireSafeBaseDir(fileNameOf(file));
+      requireSafeLogFile(file);
       try (FileChannel channel =
           FileChannel.open(
-              file, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+              file,
+              StandardOpenOption.CREATE,
+              StandardOpenOption.READ,
+              StandardOpenOption.WRITE,
+              LinkOption.NOFOLLOW_LINKS)) {
         FileLock fileLock = null;
         try {
           fileLock = channel.lock();
@@ -175,6 +193,9 @@ final class DocLogs implements DocStore {
             }
           }
         }
+      } catch (UnsupportedOperationException e) {
+        throw DocException.writeFailed(
+            "文件系统不支持 NOFOLLOW_LINKS（拒绝退回跟随软链的日志写入）: " + fileNameOf(file), e);
       } catch (IOException e) {
         throw DocException.writeFailed("日志打不开（这一行没有落盘）: " + fileNameOf(file), e);
       }
@@ -224,10 +245,12 @@ final class DocLogs implements DocStore {
     synchronized (lock) {
       String key = DocAddress.require(address);
       Path file = logFile(baseDir, key);
-      if (!Files.exists(file)) {
+      requireSafeBaseDir(fileNameOf(file));
+      if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
         // 这个地址还没有日志：是"空"，不是"坏"——返回空表（设计 §5.5 的"空结果不抛"）
         return List.of();
       }
+      requireSafeLogFile(file);
       // 读也走同一把 JVM 内锁：否则"读"可能落在"另一个进程刚 truncate/写到一半"的窗口里（跨进程的脏读）
       synchronized (jvmLock(file)) {
         return List.copyOf(readFile(file));
@@ -317,12 +340,12 @@ final class DocLogs implements DocStore {
 
   /** 读一个地址的日志文件（坏行进 {@code broken} 并继续；写路径上的读见 {@link #parseLines}）。 */
   private List<DocEntry> readFile(Path file) {
-    if (!Files.exists(file)) {
+    if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
       return List.of();
     }
     byte[] bytes;
     try {
-      bytes = Files.readAllBytes(file);
+      bytes = readNoFollow(file);
     } catch (IOException e) {
       noteBroken(fileNameOf(file), NOTHING, "日志读不出来（不把它当成空日志）", file);
       return List.of();
@@ -411,7 +434,8 @@ final class DocLogs implements DocStore {
   /** 扫描挂载目录下的全部日志文件（一层，不递归；{@code .log} 后缀是唯一识别口径）。 */
   private List<Path> scan(Path dir) {
     List<Path> files = new ArrayList<>();
-    if (!Files.isDirectory(dir)) {
+    requireSafeBaseDir(fileNameOf(dir));
+    if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
       return files;
     }
     try (Stream<Path> children = Files.list(dir)) {
@@ -422,7 +446,15 @@ final class DocLogs implements DocStore {
           // 与"坏行/坏文件名不静默"（设计 §5.3）相反 ⇒ 具名失败（fail-closed）
           throw DocException.reloadFailed("日志目录里有项没有文件名（无法判定它是不是日志）", null);
         }
-        if (Files.isRegularFile(child) && name.toString().endsWith(LOG_SUFFIX)) {
+        if (Files.isSymbolicLink(child)) {
+          // 不跟随软链。软链日志文件必须响亮拒绝（静默跳过会让“有个地址被藏起来”看起来像“没有这个地址”）
+          if (name.toString().endsWith(LOG_SUFFIX)) {
+            throw DocException.denied("日志目录里有软链日志文件（默认拒绝，不跟随）: " + name);
+          }
+          continue;
+        }
+        if (Files.isRegularFile(child, LinkOption.NOFOLLOW_LINKS)
+            && name.toString().endsWith(LOG_SUFFIX)) {
           files.add(child);
         }
       }
@@ -565,11 +597,71 @@ final class DocLogs implements DocStore {
     broken.add(new BrokenDoc(where, line, reason, Optional.of(physical.toString())));
   }
 
-  private static void ensureDirectory(Path dir) {
-    try {
-      Files.createDirectories(dir);
-    } catch (IOException e) {
-      throw DocException.writeFailed("日志目录建不出来: " + dir.getFileName(), e);
+  /**
+   * 安全地逐级建目录：从最近已存在的父目录开始，每一级先查软链再 {@code createDirectory}。
+   *
+   * <p>不用 {@link Files#createDirectories}：它会跟随“已存在的软链目录”，把日志写到挂载外。
+   */
+  private static void ensureDirectory(Path dir, String label) {
+    Deque<Path> missing = new ArrayDeque<>();
+    Path cursor = dir;
+    while (cursor != null && !Files.exists(cursor, LinkOption.NOFOLLOW_LINKS)) {
+      missing.push(cursor);
+      cursor = cursor.getParent();
+    }
+    if (cursor == null) {
+      throw DocException.writeFailed("日志目录没有可用的已存在父目录（fail-closed）: " + label, null);
+    }
+    if (Files.isSymbolicLink(cursor)) {
+      throw DocException.denied("日志目录包含软链（默认拒绝，不跟随）: " + label);
+    }
+    if (!Files.isDirectory(cursor, LinkOption.NOFOLLOW_LINKS)) {
+      throw DocException.writeFailed("日志目录落点不是目录（fail-closed）: " + label, null);
+    }
+    Path current = cursor;
+    for (Path target : missing) {
+      Path name = target.getFileName();
+      if (name == null) {
+        throw DocException.writeFailed("日志目录项没有文件名（fail-closed）: " + label, null);
+      }
+      Path next = current.resolve(name);
+      if (Files.isSymbolicLink(next)) {
+        throw DocException.denied("日志目录包含软链（默认拒绝，不跟随）: " + label);
+      }
+      try {
+        Files.createDirectory(next);
+      } catch (FileAlreadyExistsException e) {
+        if (Files.isSymbolicLink(next) || !Files.isDirectory(next, LinkOption.NOFOLLOW_LINKS)) {
+          throw DocException.denied("日志目录在创建时被替换成软链或非目录（fail-closed）: " + label);
+        }
+      } catch (IOException e) {
+        throw DocException.writeFailed("日志目录建不出来: " + label, e);
+      }
+      current = next;
+    }
+  }
+
+  /** 读：{@code NOFOLLOW_LINKS} 打开（与逐段检查构成两层防线）。 */
+  private static byte[] readNoFollow(Path file) throws IOException {
+    try (InputStream input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+      return input.readAllBytes();
+    } catch (UnsupportedOperationException e) {
+      throw DocException.readFailed(
+          "文件系统不支持 NOFOLLOW_LINKS（拒绝退回跟随软链的日志读取）: " + fileNameOf(file), e);
+    }
+  }
+
+  /** 挂载根不得是软链（{@link DocsEngine} 交给本类的是安全真实根；再查一次是纵深防御）。 */
+  private void requireSafeBaseDir(String label) {
+    if (Files.isSymbolicLink(baseDir)) {
+      throw DocException.denied("日志挂载根是软链（默认拒绝，不跟随）: " + label);
+    }
+  }
+
+  /** 日志文件本身不得是软链（final 组件由 {@code NOFOLLOW_LINKS} 再兜一层）。 */
+  private static void requireSafeLogFile(Path file) {
+    if (Files.isSymbolicLink(file)) {
+      throw DocException.denied("日志文件是软链（默认拒绝，不跟随）: " + fileNameOf(file));
     }
   }
 

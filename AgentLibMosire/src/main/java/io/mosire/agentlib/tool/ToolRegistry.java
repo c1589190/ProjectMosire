@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -12,6 +13,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,6 +28,10 @@ import org.slf4j.LoggerFactory;
  *
  * <p>来源归属：工具可带供给源 id 注册（二期 ToolSource 的 L2 层），内部维护 工具名 → sourceId 映射，支持按源整组卸载； 无源注册（内建路径）sourceId
  * 记为 null，永不参与按源匹配。注意：进入本表 = 全局可用，与某个 Agent 的白名单（L3）无关。
+ *
+ * <p><b>批量原子性</b>：{@link #registerAll(List)} 先全量校验（null / 空白名 / 批内重复 / 与现有冲突），全部通过后在
+ * 同一把写锁内一次写入；任何失败都不会留下半套工具。读接口（{@link #list()}、{@link #find(String)} 等）持读锁，
+ * 因此并发观察者也看不到"只写了一半"的中间态。单条 {@link #register(AgentTool)} / {@link #unregister(String)} 的语义不变。
  */
 public final class ToolRegistry {
 
@@ -34,13 +40,26 @@ public final class ToolRegistry {
   /** 无源工具的内部哨兵值（ConcurrentHashMap 不允许 null value）；真实 sourceId 非空白，永不与它相等。 */
   private static final String NO_SOURCE = "";
 
+  /**
+   * 写锁保护所有变更（单条注册/批量注册/移除）与来源归属表的一致性；读锁保证快照不会读到批量写入的中间态。
+   *
+   * <p>为什么不用"先校验再逐个 putIfAbsent"：那样并发批量注册会交错，出现"A 写一半、B 写另一半"的半套状态； 写锁把"校验 +
+   * 写入"合成一个临界区，批量注册要么整批可见、要么完全不可见。
+   */
+  private final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock();
+
   private final Map<String, AgentTool> tools = new ConcurrentHashMap<>();
   private final Map<String, String> toolToSource = new ConcurrentHashMap<>();
   private final CopyOnWriteArrayList<Runnable> changeListeners = new CopyOnWriteArrayList<>();
 
   /** 注册一个工具（内建路径，无来源归属）；名字重复抛 {@link IllegalArgumentException}；成功后广播变更。 */
   public AgentTool register(AgentTool tool) {
-    putChecked(null, tool);
+    readWriteLock.writeLock().lock();
+    try {
+      putChecked(null, tool);
+    } finally {
+      readWriteLock.writeLock().unlock();
+    }
     notifyChanged();
     return tool;
   }
@@ -51,15 +70,36 @@ public final class ToolRegistry {
    */
   public AgentTool register(String sourceId, AgentTool tool) {
     Objects.requireNonNull(sourceId, "sourceId");
-    putChecked(sourceId, tool);
+    readWriteLock.writeLock().lock();
+    try {
+      putChecked(sourceId, tool);
+    } finally {
+      readWriteLock.writeLock().unlock();
+    }
     notifyChanged();
     return tool;
   }
 
-  /** 批量注册；遇到重复立即抛错（不部分成功，调用方需保证先归并）；广播一次变更。 */
+  /**
+   * 批量注册（无来源归属）；全有或全无，成功后广播一次变更。
+   *
+   * <p>先对整批做全量校验——元素为 null、名字 null/空白、批内重名、与现有工具重名——任何一项不通过都抛 {@link IllegalArgumentException}
+   * 且<b>不写入任何一条</b>；全部通过后在同一把写锁内写入整批，并发调用方与 读接口都看不到半套。
+   *
+   * @param newTools 待注册工具；空列表是合法的空操作
+   * @throws IllegalArgumentException 校验失败（含 null 元素、空白名、重名）
+   */
   public void registerAll(List<AgentTool> newTools) {
-    for (AgentTool tool : newTools) {
-      putChecked(null, tool);
+    Objects.requireNonNull(newTools, "newTools");
+    readWriteLock.writeLock().lock();
+    try {
+      List<PendingTool> pending = validateBatch(newTools);
+      for (PendingTool entry : pending) {
+        tools.put(entry.name(), entry.tool());
+        toolToSource.put(entry.name(), NO_SOURCE);
+      }
+    } finally {
+      readWriteLock.writeLock().unlock();
     }
     if (!newTools.isEmpty()) {
       notifyChanged();
@@ -68,9 +108,17 @@ public final class ToolRegistry {
 
   /** 移除一个工具；不存在返回 null；移除成功广播变更。 */
   public AgentTool unregister(String name) {
-    AgentTool removed = tools.remove(name);
+    AgentTool removed;
+    readWriteLock.writeLock().lock();
+    try {
+      removed = tools.remove(name);
+      if (removed != null) {
+        toolToSource.remove(name);
+      }
+    } finally {
+      readWriteLock.writeLock().unlock();
+    }
     if (removed != null) {
-      toolToSource.remove(name);
       notifyChanged();
     }
     return removed;
@@ -79,11 +127,16 @@ public final class ToolRegistry {
   /** 批量移除（外部 MCP 工具源整组消失用）；返回实际移除数；广播一次变更。 */
   public int unregisterAll(Collection<String> names) {
     int count = 0;
-    for (String name : names) {
-      if (tools.remove(name) != null) {
-        toolToSource.remove(name);
-        count++;
+    readWriteLock.writeLock().lock();
+    try {
+      for (String name : names) {
+        if (tools.remove(name) != null) {
+          toolToSource.remove(name);
+          count++;
+        }
       }
+    } finally {
+      readWriteLock.writeLock().unlock();
     }
     if (count > 0) {
       notifyChanged();
@@ -100,18 +153,23 @@ public final class ToolRegistry {
       // 空白 id 会命中无源哨兵值，把内建工具整组误删——必须显式拒绝
       throw new IllegalArgumentException("sourceId 不能为空白");
     }
-    List<String> names = new ArrayList<>();
-    for (Map.Entry<String, String> entry : toolToSource.entrySet()) {
-      if (sourceId.equals(entry.getValue())) {
-        names.add(entry.getKey());
-      }
-    }
     int count = 0;
-    for (String name : names) {
-      if (tools.remove(name) != null) {
-        count++;
+    readWriteLock.writeLock().lock();
+    try {
+      List<String> names = new ArrayList<>();
+      for (Map.Entry<String, String> entry : toolToSource.entrySet()) {
+        if (sourceId.equals(entry.getValue())) {
+          names.add(entry.getKey());
+        }
       }
-      toolToSource.remove(name);
+      for (String name : names) {
+        if (tools.remove(name) != null) {
+          count++;
+        }
+        toolToSource.remove(name);
+      }
+    } finally {
+      readWriteLock.writeLock().unlock();
     }
     if (count > 0) {
       notifyChanged();
@@ -127,13 +185,18 @@ public final class ToolRegistry {
    * PluginToolSource#list()}），{@code source_list} 是两层的合并。
    */
   public Set<String> sourceIds() {
-    Set<String> ids = new TreeSet<>();
-    for (String sourceId : toolToSource.values()) {
-      if (!NO_SOURCE.equals(sourceId)) {
-        ids.add(sourceId);
+    readWriteLock.readLock().lock();
+    try {
+      Set<String> ids = new TreeSet<>();
+      for (String sourceId : toolToSource.values()) {
+        if (!NO_SOURCE.equals(sourceId)) {
+          ids.add(sourceId);
+        }
       }
+      return Collections.unmodifiableSet(ids);
+    } finally {
+      readWriteLock.readLock().unlock();
     }
-    return Collections.unmodifiableSet(ids);
   }
 
   /**
@@ -148,17 +211,22 @@ public final class ToolRegistry {
     if (sourceId == null || sourceId.isBlank()) {
       throw new IllegalArgumentException("sourceId 不能为空白");
     }
-    List<AgentTool> snapshot = new ArrayList<>();
-    for (Map.Entry<String, String> entry : toolToSource.entrySet()) {
-      if (sourceId.equals(entry.getValue())) {
-        AgentTool tool = tools.get(entry.getKey());
-        if (tool != null) {
-          snapshot.add(tool);
+    readWriteLock.readLock().lock();
+    try {
+      List<AgentTool> snapshot = new ArrayList<>();
+      for (Map.Entry<String, String> entry : toolToSource.entrySet()) {
+        if (sourceId.equals(entry.getValue())) {
+          AgentTool tool = tools.get(entry.getKey());
+          if (tool != null) {
+            snapshot.add(tool);
+          }
         }
       }
+      snapshot.sort(Comparator.comparing(AgentTool::name));
+      return List.copyOf(snapshot);
+    } finally {
+      readWriteLock.readLock().unlock();
     }
-    snapshot.sort(Comparator.comparing(AgentTool::name));
-    return List.copyOf(snapshot);
   }
 
   /** 注册变更监听（同步调用，勿阻塞）；close 句柄撤销监听。 首事件即"当时快照"之外的下一步变更——需要快照请自行调用 {@link #list()}。 */
@@ -169,27 +237,70 @@ public final class ToolRegistry {
   }
 
   public Optional<AgentTool> find(String name) {
-    return Optional.ofNullable(tools.get(name));
+    readWriteLock.readLock().lock();
+    try {
+      return Optional.ofNullable(tools.get(name));
+    } finally {
+      readWriteLock.readLock().unlock();
+    }
   }
 
   /** 按名称排序的快照副本。 */
   public List<AgentTool> list() {
-    List<AgentTool> snapshot = new ArrayList<>(tools.values());
-    snapshot.sort(Comparator.comparing(AgentTool::name));
-    return List.copyOf(snapshot);
+    readWriteLock.readLock().lock();
+    try {
+      List<AgentTool> snapshot = new ArrayList<>(tools.values());
+      snapshot.sort(Comparator.comparing(AgentTool::name));
+      return List.copyOf(snapshot);
+    } finally {
+      readWriteLock.readLock().unlock();
+    }
   }
 
   public int size() {
-    return tools.size();
+    readWriteLock.readLock().lock();
+    try {
+      return tools.size();
+    } finally {
+      readWriteLock.readLock().unlock();
+    }
   }
 
-  /** 实际写入（重复检查 + 来源归属登记），不广播——批量的广播统一在收尾处。 */
+  /** 实际写入（重复检查 + 来源归属登记），不广播——批量的广播统一在收尾处。调用方必须持有写锁。 */
   private void putChecked(String sourceId, AgentTool tool) {
     AgentTool existing = tools.putIfAbsent(tool.name(), tool);
     if (existing != null) {
       throw new IllegalArgumentException("工具名重复: " + tool.name());
     }
     toolToSource.put(tool.name(), sourceId == null ? NO_SOURCE : sourceId);
+  }
+
+  /**
+   * 批量注册的全量校验：只看不写，任何一项不合法即抛错（调用方据此保证零部分注册）。
+   *
+   * <p>名字在此时取一次并随校验结果返回，写入阶段不再调用 {@code tool.name()}——避免校验与写入之间名字变化 导致"校验的是 A、写进去的是
+   * B"。调用方必须持有写锁，否则校验与写入之间的现有集合可能被别人改动。
+   */
+  private List<PendingTool> validateBatch(List<AgentTool> newTools) {
+    List<PendingTool> pending = new ArrayList<>(newTools.size());
+    Set<String> batchNames = new HashSet<>();
+    for (AgentTool tool : newTools) {
+      if (tool == null) {
+        throw new IllegalArgumentException("批量注册的工具不能为 null");
+      }
+      String name = tool.name();
+      if (name == null || name.isBlank()) {
+        throw new IllegalArgumentException("工具名不能为空白: " + tool.getClass().getName());
+      }
+      if (!batchNames.add(name)) {
+        throw new IllegalArgumentException("批量注册内工具名重复: " + name);
+      }
+      if (tools.containsKey(name)) {
+        throw new IllegalArgumentException("工具名重复: " + name);
+      }
+      pending.add(new PendingTool(name, tool));
+    }
+    return pending;
   }
 
   /** 变更广播（同步）：监听方异常只记日志——变更本身已生效，不能回滚语义。 */
@@ -202,4 +313,7 @@ public final class ToolRegistry {
       }
     }
   }
+
+  /** 校验产物：名字只取一次，写入阶段按它落库。 */
+  private record PendingTool(String name, AgentTool tool) {}
 }

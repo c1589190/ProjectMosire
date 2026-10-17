@@ -1,14 +1,25 @@
-package io.mosire.agentlib.decision;
+package io.mosire.main.decision;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
-import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
 import io.mosire.agentlib.approval.PendingApprovals;
+import io.mosire.agentlib.decision.Decision;
+import io.mosire.agentlib.decision.DecisionItemDigest;
+import io.mosire.agentlib.decision.DecisionPackage;
+import io.mosire.agentlib.decision.DecisionPackages;
+import io.mosire.agentlib.decision.DecisionReadAudit;
+import io.mosire.agentlib.decision.DecisionSubmission;
+import io.mosire.agentlib.decision.DecisionSubmissionPort;
+import io.mosire.agentlib.decision.InFlightDecisionPackages;
+import io.mosire.agentlib.decision.PackageItem;
+import io.mosire.agentlib.decision.PackageState;
+import io.mosire.agentlib.decision.ProposeRequest;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.permission.AccessToken;
+import io.mosire.main.approval.ApprovalHttpEndpoint;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;

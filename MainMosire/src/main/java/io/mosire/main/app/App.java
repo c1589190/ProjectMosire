@@ -5,14 +5,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.agent.AgentConfig;
-import io.mosire.agentlib.approval.ApprovalConfig;
-import io.mosire.agentlib.approval.ApprovalConfigLoader;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
-import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
 import io.mosire.agentlib.approval.AutoApproveGate;
 import io.mosire.agentlib.approval.ConfirmGate;
-import io.mosire.agentlib.approval.HttpApprovalChannel;
 import io.mosire.agentlib.approval.LlmSuperiorJudgement;
+import io.mosire.agentlib.approval.PendingApprovalChannel;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeDetailRegistry;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
@@ -20,7 +17,6 @@ import io.mosire.agentlib.config.ConfigStore;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.decision.DecisionCommitPort;
 import io.mosire.agentlib.decision.DecisionPackages;
-import io.mosire.agentlib.decision.DecisionPackagesHttpHandler;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
@@ -95,8 +91,12 @@ import io.mosire.docs.DocNamespaces;
 import io.mosire.docs.DocsCapability;
 import io.mosire.docs.DocsTools;
 import io.mosire.main.Version;
+import io.mosire.main.approval.ApprovalConfig;
+import io.mosire.main.approval.ApprovalConfigLoader;
+import io.mosire.main.approval.ApprovalHttpEndpoint;
 import io.mosire.main.approval.CommandModeHttpHandler;
 import io.mosire.main.approval.TtyApprovalChannel;
+import io.mosire.main.decision.DecisionPackagesHttpHandler;
 import io.mosire.main.decision.LocalDecisionCommitPort;
 import io.mosire.main.gateway.AdminHttpServer;
 import io.mosire.main.gateway.StatusSnapshot;
@@ -345,7 +345,7 @@ public final class App implements AutoCloseable {
   private final TtyApprovalChannel approvalTtyChannel;
 
   /** HTTP 审批面在编排器侧的那条通道（S4-B2；{@code approval.http=false} 时恒不可用）。 */
-  private final HttpApprovalChannel approvalHttpChannel;
+  private final PendingApprovalChannel approvalHttpChannel;
 
   /**
    * 配置引导面（{@code --setup}；未开旗标时 {@code null}）：{@code GET /api/setup/status} + {@code POST
@@ -477,7 +477,7 @@ public final class App implements AutoCloseable {
     // S4-B2：审批面资源声明在 try 之外（同其余网关口径）——装配中途失败时 catch 里要回收已起的那部分
     ApprovalHttpEndpoint approvalServer = null;
     TtyApprovalChannel approvalTtyChannel = null;
-    HttpApprovalChannel approvalHttpChannel = null;
+    PendingApprovalChannel approvalHttpChannel = null;
     ExecutorService chatExecutor = null;
     SubagentManager subagentManager = null;
     SubprocessManager subagentProcesses = null;
@@ -517,7 +517,7 @@ public final class App implements AutoCloseable {
           CrossProcessDecisionGateway.DEFAULT_COMMIT_WAIT_MILLIS);
       PendingApprovals pendingApprovals = new PendingApprovals();
       approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
-      approvalHttpChannel = new HttpApprovalChannel(pendingApprovals);
+      approvalHttpChannel = new PendingApprovalChannel(pendingApprovals);
       // S6：LLM 的装配点<b>上移</b>到审批装配之前——上级判定闸（SuperiorJudgeGate）要用同一个客户端跑一次性判定。
       // 供应商客户端由 Main.selectLlm 经 llmOverride 注入（生产 = 真模型；App.start 直调无覆盖 = 离线骨架）。
       LlmClient llm = scriptedLlm(config, llmOverride);
@@ -1558,7 +1558,7 @@ public final class App implements AutoCloseable {
       SetupHttpServer setupServer,
       ApprovalHttpEndpoint approvalServer,
       TtyApprovalChannel approvalTtyChannel,
-      HttpApprovalChannel approvalHttpChannel,
+      PendingApprovalChannel approvalHttpChannel,
       DecisionPackages decisionPackages,
       MainAgent mainAgent) {
     this.events = events;
@@ -1649,6 +1649,9 @@ public final class App implements AutoCloseable {
    * <p>返回本体而不是快照：调用方（RB2b/RB3）要<b>写</b>它（decide/commit/expire），不是只读； 这与 {@link #runtime()} 返回
    * Runtime 本体同一口径——装配层持有的对象由装配层交给需要它的那一层， 而不是让每一层各自去造一个（造出来就是第二处真相）。
    */
+  @SuppressFBWarnings(
+      value = "EI_EXPOSE_REP",
+      justification = "装配层有意交出唯一实例：调用方要写它（decide/commit/expire），防御拷贝会造出第二套决策真相")
   public DecisionPackages decisionPackages() {
     return decisionPackages;
   }

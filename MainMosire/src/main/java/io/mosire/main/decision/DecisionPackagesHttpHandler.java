@@ -1,11 +1,22 @@
-package io.mosire.agentlib.decision;
+package io.mosire.main.decision;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
-import io.mosire.agentlib.approval.ApprovalHttpEndpoint;
+import io.mosire.agentlib.decision.CommitReceipt;
+import io.mosire.agentlib.decision.Decision;
+import io.mosire.agentlib.decision.DecisionPackage;
+import io.mosire.agentlib.decision.DecisionPackages;
+import io.mosire.agentlib.decision.DecisionReadAudit;
+import io.mosire.agentlib.decision.DecisionSubmission;
+import io.mosire.agentlib.decision.DecisionSubmissionPort;
+import io.mosire.agentlib.decision.InFlightDecisionActions;
+import io.mosire.agentlib.decision.InFlightDecisionPackages;
+import io.mosire.agentlib.decision.PackageItem;
+import io.mosire.agentlib.decision.PackageState;
+import io.mosire.main.approval.ApprovalHttpEndpoint;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;

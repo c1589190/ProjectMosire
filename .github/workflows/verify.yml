@@ -1,0 +1,27 @@
+name: verify
+
+# 每个 push / PR 都跑完整 Maven 门禁（Spotless → Checkstyle → SpotBugs → Surefire），
+# 发布工作流复用同一命令，避免“本地/发布/合并”三套判据。
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装配 JDK 21 + Maven 缓存
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: 完整门禁
+        run: ./mvnw -B verify

@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.mosire</groupId>
     <artifactId>mosire-parent</artifactId>
-    <version>0.2.1-SNAPSHOT</version>
+    <version>0.2.2</version>
   </parent>
 
   <artifactId>docs-mosire</artifactId>

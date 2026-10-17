@@ -1,4 +1,4 @@
-package io.mosire.agentlib.approval;
+package io.mosire.main.approval;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -6,6 +6,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.approval.ApprovalDecision;
+import io.mosire.agentlib.approval.ApprovalRequest;
+import io.mosire.agentlib.approval.PendingApprovals;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;

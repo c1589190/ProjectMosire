@@ -4,8 +4,9 @@ name: publish-maven
 #   https://c1589190.github.io/ProjectMosire/
 # 消费方只需在 pom 里加一个 <repository>，**不需要任何凭据**。
 #
-# 用法：打一个 tag（如 v0.1.0）即发布该版本；也可在 Actions 页手动 dispatch 指定版本。
-# 版本号必须固定（不能是 -SNAPSHOT）：Pages 上的文件被覆盖就没有可复现性了。
+# 用法：发布提交上的根 pom 已改成固定版本（如 0.2.1），再打 tag（v0.2.1）即发布该版本；
+# 也可在 Actions 页手动 dispatch 指定版本。tag/输入必须与根 pom 的 project.version 完全一致，
+# 且固定版本不能是 -SNAPSHOT：Pages 上的文件被覆盖就没有可复现性了。
 
 on:
   push:
@@ -13,12 +14,15 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "发布版本号（不含前导 v），例如 0.1.0"
+        description: "发布版本号（不含前导 v，必须与根 pom project.version 一致），例如 0.2.1"
         required: true
-        default: "0.1.0"
 
 permissions:
   contents: write # 推 gh-pages 分支
+
+concurrency:
+  group: publish-maven
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -33,21 +37,65 @@ jobs:
           java-version: "21"
           cache: maven
 
-      - name: 定版本（tag 名去掉前导 v；手动 dispatch 用输入）
+      - name: 校验发布版本与根 pom 一致
         run: |
           set -euo pipefail
           V="${{ github.event.inputs.version }}"
           if [ -z "${V}" ]; then V="${GITHUB_REF_NAME#v}"; fi
-          echo "发布版本：$V"
-          echo "PUBLISH_VERSION=$V" >> "$GITHUB_ENV"
-          ./mvnw -B -q versions:set -DnewVersion="$V" -DgenerateBackupPoms=false -DprocessAllModules=true
+          test -n "${V}" || { echo "::error::发布版本为空"; exit 1; }
+          case "${V}" in
+            *-SNAPSHOT)
+              echo "::error::拒绝发布 SNAPSHOT 版本：${V}"
+              exit 1
+              ;;
+          esac
 
-      - name: 构建 + 部署到本地暂存目录（标准 Maven 仓库布局）
-        # 只发父 pom + 三个库：Brain/Main/Bash 不发（Pages 仓库越小越好，消费方也用不到）
-        # SpotBugs 在本地门禁已跑；发布链路跳过它以缩短时间、减少抖动
+          POM_VERSION="$(python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("pom.xml").getroot()
+          ns = {"m": "http://maven.apache.org/POM/4.0.0"}
+          node = root.find("m:version", ns)
+          if node is None or not (node.text or "").strip():
+              raise SystemExit("根 pom 缺少 project/version")
+          print(node.text.strip())
+          PY
+          )"
+          if [ "${V}" != "${POM_VERSION}" ]; then
+            echo "::error::tag/输入版本 ${V} 与根 pom project.version ${POM_VERSION} 不一致；请先提交版本升号再打 tag"
+            exit 1
+          fi
+          echo "发布版本：${V}（与根 pom 一致）"
+          echo "PUBLISH_VERSION=${V}" >> "$GITHUB_ENV"
+
+      - name: 拒绝覆盖 gh-pages 上已存在的版本
         run: |
           set -euo pipefail
-          ./mvnw -B -DskipTests -Dspotbugs.skip=true \
+          V="${PUBLISH_VERSION}"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin gh-pages
+            for a in mosire-parent agentlib-mosire workspace-mosire docs-mosire; do
+              path="io/mosire/${a}/${V}"
+              if git cat-file -e "FETCH_HEAD:${path}" 2>/dev/null; then
+                echo "::error::gh-pages 已存在 ${path}，拒绝覆盖已发布版本"
+                exit 1
+              fi
+            done
+            echo "gh-pages 内没有版本 ${V}，可继续发布"
+          else
+            echo "gh-pages 尚不存在，按首次发布处理"
+          fi
+
+      - name: 发布前完整门禁
+        # 先跑全仓 verify（含测试与 SpotBugs）；失败则绝不进入 deploy。
+        run: ./mvnw -B verify
+
+      - name: 构建 + 部署到本地暂存目录（标准 Maven 仓库布局）
+        # 只发父 pom + 三个库：Brain/Main/Bash 不发（Pages 仓库越小越好，消费方也用不到）。
+        # SpotBugs 已由上一阶段全仓 verify 覆盖，这里只跳过重复分析以缩短发布链路；
+        # 不跳过测试：deploy 生命周期必须真实执行 Surefire。
+        run: |
+          set -euo pipefail
+          ./mvnw -B -Dspotbugs.skip=true \
             -pl .,AgentLibMosire,WorkspaceMosire,DocsMosire \
             deploy -DaltDeploymentRepository=pages::default::file://$PWD/target/pages
 

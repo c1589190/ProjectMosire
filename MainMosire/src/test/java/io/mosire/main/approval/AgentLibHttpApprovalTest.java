@@ -1,9 +1,16 @@
-package io.mosire.agentlib.approval;
+package io.mosire.main.approval;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.approval.ApprovalChannel;
+import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.approval.ApprovalDecision;
+import io.mosire.agentlib.approval.ApprovalEventTypes;
+import io.mosire.agentlib.approval.ApprovalRequest;
+import io.mosire.agentlib.approval.PendingApprovalChannel;
+import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import java.io.OutputStream;
@@ -22,8 +29,8 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
- * AgentLib 通用 HTTP 审批件（P1-C）的离线判别性用例：真 {@link PendingApprovals} + 真 {@link HttpApprovalChannel} + 真
- * {@link ApprovalCoordinator} + 真 {@link ApprovalHttpEndpoint}（端口 {@code 0}，走真
+ * AgentLib 通用 HTTP 审批件（P1-C）的离线判别性用例：真 {@link PendingApprovals} + 真 {@link PendingApprovalChannel}
+ * + 真 {@link ApprovalCoordinator} + 真 {@link ApprovalHttpEndpoint}（端口 {@code 0}，走真
  * socket），只有"人怎么答"这一步由用例扮演——所以断言的是<b>装配面</b>的行为，不是某个桩的。
  *
  * <p>四条语义各自命名、各自断言确切码/决定：① 超时 ⇒ DENY/`timeout`；② 重复决议 ⇒ 409 且不覆盖首决；③ 非唯一身份的 `APPROVE_SESSION` ⇒ 降级
@@ -155,8 +162,8 @@ class AgentLibHttpApprovalTest {
   }
 
   /**
-   * 闭环：{@code pending → decide → await} 走通——阻塞在 {@link HttpApprovalChannel#await} 的一侧被人经 HTTP 答复唤醒，
-   * 拿到同一个决议。
+   * 闭环：{@code pending → decide → await} 走通——阻塞在 {@link PendingApprovalChannel#await} 的一侧被人经 HTTP
+   * 答复唤醒， 拿到同一个决议。
    *
    * <p>判别性：把 handler 里的 {@code pending.decide(...)} 换成"只回 200"⇒ 等待侧拿到的仍是空 ⇒ 转红。
    */
@@ -188,7 +195,7 @@ class AgentLibHttpApprovalTest {
   }
 
   /**
-   * {@link HttpApprovalChannel#publish} 是 no-op 且不阻塞（HTTP 面不推送：待裁决列表直接读登记表快照）。
+   * {@link PendingApprovalChannel#publish} 是 no-op 且不阻塞（HTTP 面不推送：待裁决列表直接读登记表快照）。
    *
    * <p>判别性：把 publish 改成写登记表/等待 ⇒ 耗时断言或"登记表为空"断言转红。
    */
@@ -256,7 +263,7 @@ class AgentLibHttpApprovalTest {
   private static final class Rig implements AutoCloseable {
 
     private final PendingApprovals pending = new PendingApprovals();
-    private final HttpApprovalChannel channel = new HttpApprovalChannel(pending);
+    private final PendingApprovalChannel channel = new PendingApprovalChannel(pending);
     private final ApprovalCoordinator coordinator;
     private final ApprovalHttpEndpoint endpoint;
     private final HttpClient client = HttpClient.newHttpClient();

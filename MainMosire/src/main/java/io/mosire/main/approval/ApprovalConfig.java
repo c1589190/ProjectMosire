@@ -1,4 +1,4 @@
-package io.mosire.agentlib.approval;
+package io.mosire.main.approval;
 
 import java.time.Duration;
 import java.util.Objects;

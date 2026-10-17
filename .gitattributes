@@ -1,6 +1,23 @@
 # 行尾规范化：防止 mvnw 等 shell 脚本再被 CRLF 污染（shebang 损坏导致 Linux 上无法执行）
 * text=auto
-mvnw text eol=lf
+
+# 仓库内的文本源码/配置统一 LF，避免跨平台 checkout 产生行尾噪声；
+# Windows 脚本必须保留 CRLF（cmd.exe 对 LF 批处理的解析不可靠）。
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.java text eol=lf
+*.md text eol=lf
+*.xml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.properties text eol=lf
 *.sh text eol=lf
+mvnw text eol=lf
 *.cmd text eol=crlf
+mvnw.cmd -text
 *.bat text eol=crlf
+
+# Research/downloads 是上游规范的逐字节副本：不做行尾归一，避免把 vendored 文件
+# 变成整文件重写（要更新它们请按上游 release 重新下载并单独提交）。
+Research/downloads/** -text
