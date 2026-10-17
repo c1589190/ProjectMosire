@@ -12,6 +12,10 @@
 > 只吸收对本仓成立的部分，**不照抄 SimulatorMosire 的业务规则**（模块名、经济线、世界数据等一概不适用）。
 >
 > ★ 下文每条规矩尽量附**为什么**——它们来自真实的返工、事故或用户裁定，不是洁癖。
+>
+> ★ **当前状态入口**：`docs/agents/STATUS.md`（版本、源码基线、dirty、发布/Pages、未验证项）。
+> 本文只放常驻纪律，不重复实时测试数字；工程 Skill 方案见 `docs/agents/SKILLS.md`，
+> 规则迁移台账见 `docs/archive/2026-10-17-agents-rule-migration.md`。
 
 ---
 
@@ -27,18 +31,37 @@
 ```text
 MainMosire ──→ BrainMosire ──→ AgentLibMosire
 （入口/网关）   （Agent 运行时）   （通用工具包）
-                                     ▲
-BashPluginMosire ────────────────────┘   （PF4J 插件：main 只依赖 AgentLib；宿主不 import 它）
+   │               ├──→ WorkspaceMosire ──→ AgentLibMosire
+   │               └──→ DocsMosire ──→ WorkspaceMosire
+   ├──→ AgentLibMosire / WorkspaceMosire / DocsMosire（直接组装）
+   └── provided BashPluginMosire（仅构建顺序/插件拷贝；主代码不 import）
+
+BashPluginMosire ──→ AgentLibMosire（PF4J 为 provided；宿主不 import 它）
 ```
 
 | 模块 | artifactId | 包前缀 | 允许依赖 / 要点 |
 |---|---|---|---|
-| `AgentLibMosire` | `agentlib-mosire` | `io.mosire.agentlib.*` | 通用 LLM 工具包/接口/协议（llm client、AgentTool、MCP 适配、权限模型、事件存储、配置、进程管理）。★ **2026-10-17 边界改写（用户裁定）**：原口径「**无 Agent 假设**」已**不再成立**——按用户裁定「AgentConfig 整个下沉」与「窗口的结构编排和基础运行本身作为完全可复用的项目下沉到 AgentLib」，本库现含 **Agent 描述符**（`io.mosire.agentlib.agent.AgentConfig`，10 组件含 maxTurns/timeBudget/quotaMaxTokens/工具白黑名单）与**上下文窗口的结构与基础操作**（`io.mosire.agentlib.context.{ContextWindow,ContextComposer,LlmRoundTrip}`；📄 `设计-上下文窗口下沉.md`）。
-★ **2026-10-17 第二次边界改写（用户裁定 B 方案：「先提交并推送一下，然后按照B进行开发」）**：**通用循环骨架**也下沉——`io.mosire.agentlib.runtime.{AgentLoop,StopPolicy,TurnListener,ToolCallDispatcher,LoopState,StopSignal,StopReason,TurnResult}`（📄 `设计-通用循环骨架.md`）。
-新口径（取代原「无运行流假设」）：**库含循环骨架与策略 SPI，不含任何具体策略**——循环的**结构**（组请求 → 一轮往返 → 工具分发 → 终止判定）在库；何时停、怎么记账/发事件、工具怎么执行/写回、怎么落库全由宿主注入。压缩/决策包/审批/事件形状/持久化/技能/记忆/子 Agent/重试/沙箱/权限判定仍留 Brain；`AgentPipeline` 是骨架的**第一个宿主实现**，不得再出现第二套循环。可被其他程序单独依赖；**不得 import** `io.mosire.brain.*` / `io.mosire.main.*` |
-| `BrainMosire` | `brain-mosire` | `io.mosire.brain.*` | 具体对话、工具载入、上下文构造/压缩、子 Agent 编排、skills、记忆。只依赖 `agentlib-mosire`（+ Jackson/SLF4J）；不得依赖 `MainMosire` |
-| `MainMosire` | `main-mosire` | `io.mosire.main.*` | 进程组装、CLI、网关（AdminREST/A2A/AG-UI/MCP）、健康检查、发行。**不含 Agent 行为逻辑**；主代码不得 import `io.mosire.bash.*` |
-| `BashPluginMosire` | `bash-plugin-mosire` | `io.mosire.bash.*` | PF4J 插件。**main 只依赖 `AgentLibMosire`**（PF4J 为 provided）；测试面可再依赖 Brain（test scope）。宿主 main 代码不得 import/使用它（Main 的 provided 依赖只服务构建顺序，见下） |
+| `AgentLibMosire` | `agentlib-mosire` | `io.mosire.agentlib.*` | 通用 LLM 工具包/接口/协议 + Agent 描述符 + 上下文窗口结构 + 通用循环骨架；**含骨架/策略 SPI，不含具体策略**；不得 import `io.mosire.brain.*` / `io.mosire.main.*`。详细边界改写见下方。 |
+| `WorkspaceMosire` | `workspace-mosire` | `io.mosire.workspace.*` | 工作区虚拟路径、挂载、能力/权限与安全路径解析（`resolveForIo`）。只依赖 `agentlib-mosire`；不得反向依赖 Brain/Main。 |
+| `DocsMosire` | `docs-mosire` | `io.mosire.docs.*` | 文档/日志存储、编辑、查询与文档工具。依赖 `agentlib-mosire` + `workspace-mosire`；不得反向依赖 Brain/Main。 |
+| `BrainMosire` | `brain-mosire` | `io.mosire.brain.*` | 具体对话、工具载入、上下文构造/压缩、子 Agent 编排、skills、记忆。依赖 `agentlib-mosire`、`workspace-mosire`、`docs-mosire`（+ Jackson/SLF4J）；不得依赖 `MainMosire`。 |
+| `MainMosire` | `main-mosire` | `io.mosire.main.*` | 进程组装、CLI、网关（AdminREST/A2A/AG-UI/MCP）、健康检查、发行。依赖 `brain-mosire`、`agentlib-mosire`、`workspace-mosire`、`docs-mosire`；**不含 Agent 行为逻辑**；主代码不得 import `io.mosire.bash.*`。`bash-plugin-mosire` 仅 provided，只服务构建顺序/插件拷贝（见下）。 |
+| `BashPluginMosire` | `bash-plugin-mosire` | `io.mosire.bash.*` | PF4J 插件。**main 只依赖 `AgentLibMosire`**（PF4J 为 provided）；测试面可再依赖 Brain（test scope）。宿主 main 代码不得 import/使用它（Main 的 provided 依赖只服务构建顺序，见下）。 |
+
+**AgentLib 边界改写（用户裁定，原文保留）：**
+
+- **2026-10-17（第一次）**：原口径「**无 Agent 假设**」已**不再成立**——按用户裁定「AgentConfig 整个下沉」与
+  「窗口的结构编排和基础运行本身作为完全可复用的项目下沉到 AgentLib」，本库现含 **Agent 描述符**
+  （`io.mosire.agentlib.agent.AgentConfig`，10 组件含 maxTurns/timeBudget/quotaMaxTokens/工具白黑名单）与
+  **上下文窗口的结构与基础操作**（`io.mosire.agentlib.context.{ContextWindow,ContextComposer,LlmRoundTrip}`；
+  📄 `设计-上下文窗口下沉.md`）。
+- **2026-10-17（第二次，B 方案）**：用户原话「先提交并推送一下，然后按照B进行开发」；**通用循环骨架**也下沉——
+  `io.mosire.agentlib.runtime.{AgentLoop,StopPolicy,TurnListener,ToolCallDispatcher,LoopState,StopSignal,StopReason,TurnResult}`
+  （📄 `设计-通用循环骨架.md`）。
+- **新口径（取代原「无运行流假设」）**：**库含循环骨架与策略 SPI，不含任何具体策略**——循环的**结构**
+  （组请求 → 一轮往返 → 工具分发 → 终止判定）在库；何时停、怎么记账/发事件、工具怎么执行/写回、怎么落库全由宿主注入。
+  压缩/决策包/审批/事件形状/持久化/技能/记忆/子 Agent/重试/沙箱/权限判定仍留 Brain；`AgentPipeline` 是骨架的
+  **第一个宿主实现**，不得再出现第二套循环。可被其他程序单独依赖；**不得 import** `io.mosire.brain.*` / `io.mosire.main.*`。
 
 - **groupId**：`io.mosire`。
 - `MainMosire/pom.xml` 对 `bash-plugin-mosire` 有一条 **provided** 依赖，但它**不是宿主对插件的编译依赖**：
@@ -95,19 +118,32 @@ BashPluginMosire ────────────────────┘
 - **工程规矩**：技能范围变化、工具面变化、上下文预注入变化，都属于“改架构”——先改设计文档，再改代码；
   新测试要覆盖正向 + 负向（越权不可见、越界 spawn 被拒、无沙箱 fail-closed）。
 
+### 0.3.1 工程 Skill 与 Brain 运行时 Skill 的隔离（2026-10-17 用户裁定）
+
+- **两套 Skill 不是同一种东西**：工程 Skill 面向修改本仓库的编码代理；Brain 运行时 Skill 面向产品里的 Agent 运行时。
+- **工程 Skill** 根目录固定为仓库内 `.agents/skills/`；**当前不创建任何 active Skill**。发现/加载使用宿主技能发现机制，
+  **不硬编码 `skill_search`**，也不把运行时 `skill_*` 工具当作工程 Skill 的通用入口。
+- **Brain 运行时 Skill** 仍只经 `io.mosire.brain.skills.SkillAccess` 与其 6 个工具访问，根目录是运行时 `<dataDir>/skills/`；
+  **不得扫描/挂载 `.agents/skills/`**，也不得把工程 Skill 复制进发布 JAR 或运行时数据目录。
+- 两边不得是软链、挂载或父子目录；同名也仍是两套对象，不得互相回退。
+- 方案、状态机、宿主差异与 gate/report 细则见 `docs/agents/SKILLS.md`；首版只评估 `mosire-verify`，不直接上线。
+
 ### 0.4 文档地图（不要用 `@` 导入——会把文件展开进上下文，白载几千行）
 
 | 文档 | 内容 / 现状 |
 |---|---|
-| `开发计划.md` | **现行计划**（2026-09-14 重写版）；§五“纪律”逐条有效 |
+| `docs/agents/STATUS.md` | **当前实时状态入口**：版本、源码基线、dirty、发布/Pages、未验证项、下一步。 |
+| `docs/agents/SKILLS.md` | **工程 Skill v2 方案**：五层分流、状态机、契约、工程/运行时隔离、宿主差异、gate/report、维护预算；当前 0 个 active 工程 Skill。 |
+| `开发计划.md` | **范围/顺序与验收判据**（2026-09-14 重写）；不重复实时记账，实时状态见 STATUS；§五“纪律”逐条有效。 |
 | `设计-*.md`（仓库根） | **现行设计文档**：身份与血缘 / 子 Agent 终局 / 子 Agent 上下文 / Bash 围栏 / 审批与工具内权限 / 多 provider 路由 / 插件系统 / 配置引导 / MCP HTTP 传输 / Skill 运行时 / **决策包作为唯一决策单元** / **上下文窗口下沉**（`设计-上下文窗口下沉.md`：AgentLib 收 `ContextWindow`/`ContextComposer`/`LlmRoundTrip`/`AgentConfig`，分层机制与压缩线留 Brain） / **通用循环骨架**（`设计-通用循环骨架.md`：AgentLib 收 `AgentLoop` + 三个策略 SPI `StopPolicy`/`TurnListener`/`ToolCallDispatcher` + `StopReason`/`TurnResult`；压缩/决策包/事件/持久化/技能/记忆留 Brain，`AgentPipeline` 是第一个宿主实现） |
 | `Research/调查报告.md` | 2026-09-08 调查结论（协议选型、架构参考、技术栈、风险）；**不是**开发计划 |
 | `README.md` | 项目介绍；其“里程碑状态”是历史快照，数字可能陈旧，**不作实时状态依据** |
 | `docs/archive/2026-09-14-旧计划/` | 已归档、**不再修改**的旧计划；Java 注释里对它们的文字引用不逐处改写（引的是历史决定出处） |
+| `docs/archive/2026-10-17-agents-rule-migration.md` | 2026-10-17 规则迁移台账：逐条 keep / migrate / script / invalid / pending、理由与用户原话。 |
 | `.omo/plans/`、`.omo/drafts/`、`.omo/evidence/` | 本机 SDD/计划/证据目录（在 `.gitignore` 内，不入库）。跨会话/跨机器要复用的结论必须回写进仓库内文档或设计稿，不能只留在聊天或 `.omo/` |
-| `git log --oneline -20`、各模块 `target/surefire-reports/` | “当前真实状态”的最终依据；数字以本轮 `verify` 报告为准，不用旧表推 |
+| `git log --oneline -20`、各模块 `target/surefire-reports/` | “当前真实状态”的最终依据；数字以本轮 `verify` 报告为准，不用旧表推。实时摘要回写 STATUS。 |
 
-> 历史文档里的 `.superpowers/...` 路径若在本仓不存在，按历史留痕处理，不要据此判断当前状态。
+> 历史文档里的 `.superpowers/...` 路径若在本仓不存在，按历史留痕处理，**不是权威实时状态**，不要据此判断当前状态。
 
 ### 0.5 外部跟踪项（改代码前先查）
 
@@ -119,7 +155,9 @@ BashPluginMosire ────────────────────┘
   必须在本机重建并在消费方侧验证：
   `./mvnw -pl AgentLibMosire -am install`，再到 `~/SimulatorMosire` 跑
   `./mvnw -pl simos-core -am -Dtest=AgentLibAvailabilityTest -Dsurefire.failIfNoSpecifiedTests=false test`
-  （消费方钉住 13 个类和 JAR 类数下限；公开类集合只增不减，被钉住的类不得改名/挪包）。
+  （**自 2026-10-17 起公开 API 兼容基线以 0.2.2 为起点**；消费方钉住 13 个类和 JAR 类数下限；
+  公开类集合只增不减，被钉住的类不得改名/挪包）。**类数下限只是粗探针，不能证明方法签名/构造器/行为兼容；
+  兼容性以 japicmp/契约测试和下游实际验证为准。**
 
 ---
 
@@ -236,10 +274,12 @@ BashPluginMosire ────────────────────┘
   = Spotless（google-java-format）→ Checkstyle（`config/checkstyle.xml`）→
   SpotBugs（**实际配置 `effort=More` + `threshold=Low`**；计划曾写 Max，但 Max 与庞大 aux classpath
   组合会爆炸到 >25 分钟不终，More 保留深度数据流分析，见根 pom 注释）→ Surefire（JUnit 6）。
-- **本轮真数（2026-10-07，`./mvnw verify`，全仓）**：AgentLib **518** / Brain **334** /
-  Bash **104**（6 skipped，为需 root 的沙箱真跑）/ Main **176** ⇒
-  **1132 tests, 0 failures, 0 errors, 6 skipped**；4 个模块 SpotBugs 均 `BugInstance size is 0`。
-  ★ 后续以新一轮 `verify` 为准，旧数字自动降为历史。
+- **最近发布证据（0.2.2，2026-10-17）**：发布 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；
+  发布前 `./mvnw verify` 记录 AgentLib **674** / Workspace **62** / Docs **81** / Brain **472** /
+  Bash **104**（6 skipped）/ Main **225** ⇒ **1618 tests, 0 failures, 0 errors, 6 skipped**；
+  6 个模块 SpotBugs 均 `BugInstance size is 0`（来源 `.work/release-0.2.2-verify.log`）。
+  ★ 这是**发布提交的历史证据**，不是当前工作树实时测试数；当前版本、最新验证与 Pages 事实一律看
+  `docs/agents/STATUS.md`，旧数字不得冒充现状。
 - **改完代码先 `./mvnw spotless:apply` 再 `./mvnw verify`**，避免格式门禁来回。
 - ★★ **判定 SpotBugs 结论前，先确证编译产物是新的**（2026-10-16 实测，吃掉四轮返工）：
   增量编译留下的旧 class 会让 SpotBugs 反复报**同一个已经不存在的**告警（当晚 `CommitReceipt` 连报三次幽灵
@@ -274,11 +314,11 @@ BashPluginMosire ────────────────────┘
 - **聚焦单测**：
 
   ```bash
-  ./mvnw -q -Dtest='ClassA,ClassB' -Dsurefire.failIfNoSpecifiedTests=false test -pl BrainMosire -am
+  ./mvnw -B -ntp -Dtest='ClassA,ClassB' -Dsurefire.failIfNoSpecifiedTests=false test -pl BrainMosire -am
   ```
 
   ★ `-Dtest='A+B'` 是 JUnit 5 的 tag 表达式、**不是“或”**：不匹配任何类时 Surefire 一条不跑且退出 0。
-  要“或”用**逗号**。
+  要“或”用**逗号**。`-q` 会吞掉 `Tests run:` 汇总；报告必须看 Maven 汇总或本轮 Surefire 报告，不靠 `-q`。
 - **别动辄全量测试（D29）**：改动只跑相关单条用例；全量 `clean verify` 留给阶段边界/关账。
   存量离线用例是**回归钉**，默认保留；“老架构老测试，新架构新测试”；被改架构相关的旧测试可以迁移/删除，
   但必须说明原因，**不得为了变绿弱化断言、删除无关测试**。
@@ -295,8 +335,9 @@ BashPluginMosire ────────────────────┘
 ## 四、验证与证据：不许把“没跑”写成“通过”
 
 1. ★ **不信“rc=0 就是过了”。** `-q` 会吞掉 Surefire 汇总；类名写错、测试被跳过也会 rc=0。
-   要**看 Surefire 报告**（`*/target/surefire-reports/*.txt` 或 `[INFO] Tests run:` 汇总）并核对
-   **报告 mtime 落在本轮**。报“测试数”之前先清掉旧报告（或在 `clean verify` 里跑），否则会读到两轮并集。
+   要**看 Surefire 报告**（`*/target/surefire-reports/*.txt` 或 `[INFO] Tests run:` 汇总），并做 **run-bound 证据**：
+   写 run manifest（source SHA、开始时间、mode、命令），旧报告先移走或使用 run 专属报告后缀/目录，只解析本轮产生的报告；
+   **mtime 仅辅助，不能单独证明报告属于本轮**。否则会读到两轮并集。
 2. ★ **管道退出码陷阱**：`cmd | tail; echo "[exit=$?]"` 里 `$?` 是 `tail` 的退出码，不是 `cmd` 的。
    要么不接管道，要么显式取 `${PIPESTATUS[0]}`。
 3. ★ **新护栏/新判据要有判别力**：临时把被测逻辑改坏（变异体）⇒ 必须**当场红**，然后还原。
@@ -383,18 +424,10 @@ BashPluginMosire ────────────────────┘
    规矩：打印配置只按**白名单**出字段（`keys`/`credentials`/`secrets` 这类子树一律替换成 `<N chars>`），且**先**脱敏再 print；
    发现泄露当场报告并建议轮换，不许沉默。
 7. 不要把本机工具目录（`.omo/`、`.work/`、`target/`、含密钥的配置）提交进库；提交前确认 `.gitignore` 仍覆盖它们。
-   ★ **唯一例外（2026-10-16 核实）**：`AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar` 是**刻意 force-track**
-   的（`git add -f`；先例 `246f326` / `ca604f3` / `3ba02c4` / `52b58c0`）——给消费方一个仓内可取用的产物。
-   ★ **刷新它的时机（2026-10-16 用户裁定更正）**：**不要逐批刷**。分两种情况——
-   ① **同一台机器上的消费方**（本机 `~/SimulatorMosire`）：走 §0.5 的 `./mvnw -pl AgentLibMosire -am install`
-   即可，**根本不需要这个 jar**，也就不必为它单独提交；
-   ② **要刷新时**：留到**阶段边界 / 关账**（一批改动做完、`verify` 绿之后），或确有跨机器取用需求时。
-   ⇒ 目的：不让"刷产物"变成每次改 AgentLib 都要多一笔提交与一次全量构建（用户 2026-10-16：
-   「先把手头上的代码修改和开发计划做完再刷新包」）。**只改 javadoc 永不刷**（字节码不变）。除这一个文件外，`target/` 仍不入库。
-   ★★ **`clean` 会删掉这个 force-tracked jar**（2026-10-17 实测：`./mvnw -o clean verify` 后 `git status` 出现
-   `D AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar`——它就在 `target/` 下）。规矩：**clean 之后、提交之前
-   必须 `git checkout HEAD -- AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar` 恢复**，别把"删除"当成本批改动提交；
-   真正刷新它的时机仍按上面两条（发布/版本管理重做时再统一处理，仓内 0.1.0 旧名与该工作流绑定）。
+   ★ **旧 force-track 例外已失效（2026-10-17 用户裁定）**：删除
+   `AgentLibMosire/target/agentlib-mosire-0.1.0-SNAPSHOT.jar`；`target/` 默认不入库，**不得重建或 force-add 这个旧 jar**。
+   旧的“逐批刷新 / clean 后 checkout 恢复”规则不再适用（历史与理由见规则迁移台账）。
+   若未来确实需要仓内分发构建产物，先取得用户明确裁定，并在 `docs/agents/STATUS.md` / 计划中登记方案，不得默认恢复例外。
 
 ---
 
@@ -405,13 +438,12 @@ BashPluginMosire ────────────────────┘
   **`clean verify` 必须前台/受管跑**，“被内存守卫杀掉”既不是红也不是绿，不能算过。
 - `~/.m2` 是**每台机器各自的**：`agentlib-mosire` 要在本机重建一次才能被隔壁消费方用；
   判“重建成功与否”看类数/消费方测试，不看时间戳。
-- 仓库用 `.gitattributes` 钉死 LF；换设备后先 `git status` 看 `core.autocrlf` 是否把工作树 checkout 成 CRLF
-  （会导致 `mvnw` shebang 失效）。
-  ★★ **本机现状是 CRLF，且它会咬行锚定的搜索**（2026-10-17 实测两次假阴性）：`core.autocrlf=true` + `.gitattributes` 只对
-  `mvnw`/`*.sh`/`*.cmd` 钉 eol ⇒ **工作树里全部 `.java` 都是 CRLF、索引里是 LF**（`git ls-files --eol` = `i/lf w/crlf`）。
-  后果：`grep -rl "^import X;$"` 这类**行尾锚定**一行都匹配不到（`;\r` 不匹配 `;$`）——当晚实测同一命令加 `$` 返回 **0 个文件**、
-  去掉 `$` 返回 **26 个**，差点把「26 个文件待改」误判成「无事可做」。⇒ 行锚定一律写 `\r?$`、或先 `tr -d '\r'`、或用
-  `git grep --cached`（索引是 LF）；**改文件时保持 CRLF**（别制造整文件重写的噪声），`spotless:apply` 不会转行尾。
+- 仓库用 `.gitattributes` 钉死 LF；**不要假定某个 checkout 的当前 EOL**。换设备/开工前先
+  `git status`、`git ls-files --eol <path>` 和 `core.autocrlf` 一起看；CRLF 会让 `mvnw` shebang 或行锚定搜索失效。
+  ★★ **EOL 会咬行锚定搜索**（2026-10-17 实测两次假阴性）：若工作树是 CRLF，`grep -rl "^import X;$"` 可能一条都匹配不到
+  （`;\r` 不匹配 `;$`）。⇒ 行锚定写 `\r?$`、先 `tr -d '\r'`，或用 `git grep --cached`（索引是 LF）。
+  **改文件时保持该文件既有 EOL**，别制造整文件重写的噪声；2026-10-17 抽查 `AGENTS.md`、`README.md`、`开发计划.md`、`pom.xml`
+  为 `i/lf w/lf`，**旧的“本机现状是 CRLF”快照已过期**，不要据此判断当前工作树。
 - 本机 `grep`/`find` 在当前 shell 是 GNU 工具；换 shell/外壳可能是 ugrep/bfs（默认尊重 `.gitignore`、
   跳过隐藏目录、`-newermt` 语义不同）。跨外壳搜索前先 `type -a grep find`；报 0 命中前先自证工具会命中。
 - 真进程/真模型脚本（`scripts/usage-test.sh`、`scripts/smoke-live.sh`）默认**不进**离线门禁，会真联网、真花钱；
