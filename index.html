@@ -3,58 +3,33 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Mosire Maven 仓库（io.mosire：agentlib / workspace / docs）</title>
+    <meta name="description" content="Mosire 三个库（agentlib / workspace / docs）的只读 Maven 仓库" />
+    <title>Mosire Maven 仓库（io.mosire）</title>
     <style>
       :root { color-scheme: light dark; }
       body { font: 15px/1.75 -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
-             max-width: 52rem; margin: 3rem auto; padding: 0 1.2rem; }
-      h1 { font-size: 1.5rem; margin-bottom: .2rem; }
-      h2 { font-size: 1.1rem; margin-top: 2.2rem; border-bottom: 1px solid rgba(127,127,127,.3); padding-bottom: .3rem; }
-      h3 { font-size: 1rem; margin-top: 1.5rem; }
-      .sub { opacity: .7; margin-top: .4rem; }
-      pre { background: rgba(127,127,127,.13); padding: .9rem 1rem; border-radius: 6px; overflow-x: auto; }
+             max-width: 46rem; margin: 3rem auto; padding: 0 1.2rem; }
+      h1 { font-size: 1.45rem; margin-bottom: .2rem; }
+      h2 { font-size: 1.05rem; margin-top: 2rem; border-bottom: 1px solid rgba(127,127,127,.3); padding-bottom: .3rem; }
+      .sub { opacity: .75; margin-top: .3rem; }
+      pre { background: rgba(127,127,127,.13); padding: .8rem 1rem; border-radius: 6px; overflow-x: auto; }
       code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-      table { border-collapse: collapse; width: 100%; margin: .6rem 0; }
-      th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid rgba(127,127,127,.3); vertical-align: top; }
+      ul { padding-left: 1.2rem; }
+      li { margin: .25rem 0; }
       a { color: inherit; }
       .note { border-left: 3px solid rgba(127,127,127,.5); padding-left: .9rem; opacity: .9; }
-      .warn { border-left: 4px solid #c0392b; background: rgba(192,57,43,.08); padding: .7rem .9rem; border-radius: 4px; }
-      .ok { color: #1e8449; }
-      .toc { columns: 2; }
-      @media (max-width: 40rem) { .toc { columns: 1; } }
     </style>
   </head>
   <body>
     <h1>Mosire Maven 仓库</h1>
     <p class="sub">
-      这是一个<strong>只读 Maven 仓库</strong>（GitHub Pages），不是网站首页的替代品。<br />
-      当前发布版本：<code>0.2.0</code>（<code>io.mosire:agentlib-mosire</code> /
-      <code>workspace-mosire</code> / <code>docs-mosire</code> + 父 pom <code>mosire-parent</code>）。
-    </p>
-    <p class="note">
-      本页正文 = 仓库内《<code>对接须知-三个库-2026-10-17.md</code>》的<strong>主体内容抄录</strong>（面向消费方），
-      外加本仓做 Maven 仓库的门面信息。每条事实都附核实方式（命令 / <code>file:line</code>）；
-      <strong>没验过的一律写"未验"</strong>；原始报错文案照抄。
+      只读 Maven 仓库（GitHub Pages）。当前版本：<code>0.2.1</code>。<br />
+      发布 <code>io.mosire:agentlib-mosire</code> / <code>workspace-mosire</code> /
+      <code>docs-mosire</code> 三个库 + 父 pom <code>mosire-parent</code>；公开、消费方零认证。
     </p>
 
-    <h2 id="toc">本页目录</h2>
-    <ul class="toc">
-      <li><a href="#quick">0. 一页速览（照抄块）</a></li>
-      <li><a href="#artifacts">已发布的制品（0.2.0）</a></li>
-      <li><a href="#coords">1. 坐标 / 版本 / 依赖方向</a></li>
-      <li><a href="#changes">2. 相对 0.1.0 的变更点（0.2.0 窗口）</a></li>
-      <li><a href="#perms">3. 必填的权限面（未表态 = 什么都做不到）</a></li>
-      <li><a href="#tools">4. 工具面清单与准确数量（共 12 条）</a></li>
-      <li><a href="#pins">5. 可用性钉怎么跑</a></li>
-      <li><a href="#pitfalls">6. 常见坑（带原始报错文案）</a></li>
-      <li><a href="#corrections">7. 与《接入指南》的更正表</a></li>
-      <li><a href="#honest">8. 诚实边界（未验 / 未决）</a></li>
-      <li><a href="#maintain">维护方：怎么发新版</a></li>
-    </ul>
-
-    <h2 id="quick">0. 一页速览（照抄块）</h2>
-
-    <p>加一段 <code>repository</code> 就能用（公开、消费方零认证、跨机器可用）：</p>
+    <h2>接入</h2>
+    <p>在 <code>pom.xml</code> 里加仓库：</p>
     <pre><code>&lt;repositories&gt;
   &lt;repository&gt;
     &lt;id&gt;mosire-pages&lt;/id&gt;
@@ -64,366 +39,41 @@
   &lt;/repository&gt;
 &lt;/repositories&gt;</code></pre>
 
-    <pre><code>&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;docs-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.0&lt;/version&gt;&lt;/dependency&gt;
-&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;workspace-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.0&lt;/version&gt;&lt;/dependency&gt;
-&lt;!-- agentlib-mosire 由上面两个**传递**带过来（写了也行） --&gt;</code></pre>
+    <p>按需加依赖（<code>agentlib-mosire</code> 会被后两个传递带出）：</p>
+    <pre><code>&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;docs-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.1&lt;/version&gt;&lt;/dependency&gt;
+&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;workspace-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.1&lt;/version&gt;&lt;/dependency&gt;</code></pre>
 
-    <p><strong>三条必做</strong>（不做就全线 fail-closed）：</p>
-    <ol>
-      <li><strong>权限面显式表态</strong> <code>workspaces</code> / <code>docs</code> / <code>docs-edit</code> 三个命名空间
-        —— <strong>未表态 = 什么都做不到</strong>（不是"缺省放行"）；</li>
-      <li><strong><code>.destructiveAllowed(true)</code></strong> —— 否则 <code>doc_create</code> / <code>doc_edit</code>
-        等写工具返回"为破坏性操作，需显式放行"；</li>
-      <li>工具经 <code>ToolRegistry.registerAll(...)</code> 注册、<strong>经 <code>ToolCallAuthorizer</code> 执行</strong>；
-        且 <code>ToolContext.identity().instanceId()</code> <strong>必须等于挂载的 <code>user</code></strong>
-        （否则连挂载都解析不到）。</li>
-    </ol>
-
-    <p>工具面真数：<code>WorkspaceTools.all(registry)</code> = <strong>4</strong> 条、
-      <code>DocsTools.all(registry)</code> = <strong>8</strong> 条，<strong>合计 12</strong>（见 <a href="#tools">§4</a>）。</p>
-
-    <div class="warn">
-      <p><strong>★★ 升级前先读 <a href="#incompat">§5.4</a></strong>：<strong>0.2.0</strong> 与<strong>当时</strong>的
-        <code>~/SimulatorMosire</code> <strong>源级不兼容</strong>（2026-10-17 实测编译红，非猜）——
-        <code>AgentTool</code> 新增的 <code>default Set&lt;String&gt; roles()</code> 与消费方既有的
-        <code>SimosTool.roles()</code>（<code>Set&lt;ToolRole&gt;</code>）<strong>同名同擦除、返回类型不兼容</strong>。
-        升级到本页当前版本前，请先按 §5.4 核对这条撞名是否已经处置。</p>
-    </div>
-
-    <h2 id="artifacts">已发布的制品（0.2.0）</h2>
-    <table>
-      <tr><th>坐标</th><th>jar</th><th>sources</th><th>版本清单</th></tr>
-      <tr>
-        <td><code>io.mosire:agentlib-mosire</code></td>
-        <td><a href="io/mosire/agentlib-mosire/0.2.0/agentlib-mosire-0.2.0.jar">jar</a></td>
-        <td><a href="io/mosire/agentlib-mosire/0.2.0/agentlib-mosire-0.2.0-sources.jar">sources</a></td>
-        <td><a href="io/mosire/agentlib-mosire/maven-metadata.xml">metadata</a></td>
-      </tr>
-      <tr>
-        <td><code>io.mosire:workspace-mosire</code></td>
-        <td><a href="io/mosire/workspace-mosire/0.2.0/workspace-mosire-0.2.0.jar">jar</a></td>
-        <td><a href="io/mosire/workspace-mosire/0.2.0/workspace-mosire-0.2.0-sources.jar">sources</a></td>
-        <td><a href="io/mosire/workspace-mosire/maven-metadata.xml">metadata</a></td>
-      </tr>
-      <tr>
-        <td><code>io.mosire:docs-mosire</code></td>
-        <td><a href="io/mosire/docs-mosire/0.2.0/docs-mosire-0.2.0.jar">jar</a></td>
-        <td><a href="io/mosire/docs-mosire/0.2.0/docs-mosire-0.2.0-sources.jar">sources</a></td>
-        <td><a href="io/mosire/docs-mosire/maven-metadata.xml">metadata</a></td>
-      </tr>
-      <tr>
-        <td><code>io.mosire:mosire-parent</code>（父 pom，<strong>必须一起拿</strong>）</td>
-        <td colspan="2"><a href="io/mosire/mosire-parent/0.2.0/mosire-parent-0.2.0.pom">pom</a></td>
-        <td><a href="io/mosire/mosire-parent/maven-metadata.xml">metadata</a></td>
-      </tr>
-    </table>
+    <h2>当前版本制品（0.2.1）</h2>
     <ul>
-      <li>历史版本保留（发布用 <code>keep_files=true</code>），消费方可以钉旧版。</li>
-      <li>只发<strong>固定版本</strong>（不发 SNAPSHOT）：Pages 上的文件被覆盖就没有可复现性了。</li>
-      <li>需要 JDK 21。</li>
-      <li>★ 本页顶部的版本号来自发布时的 tag（见 <a href="#maintain">维护方</a>），页面文件本身不再硬编码版本。</li>
+      <li><code>io.mosire:agentlib-mosire</code>：
+        <a href="io/mosire/agentlib-mosire/0.2.1/agentlib-mosire-0.2.1.jar">jar</a> ·
+        <a href="io/mosire/agentlib-mosire/0.2.1/agentlib-mosire-0.2.1-sources.jar">sources</a></li>
+      <li><code>io.mosire:workspace-mosire</code>：
+        <a href="io/mosire/workspace-mosire/0.2.1/workspace-mosire-0.2.1.jar">jar</a> ·
+        <a href="io/mosire/workspace-mosire/0.2.1/workspace-mosire-0.2.1-sources.jar">sources</a></li>
+      <li><code>io.mosire:docs-mosire</code>：
+        <a href="io/mosire/docs-mosire/0.2.1/docs-mosire-0.2.1.jar">jar</a> ·
+        <a href="io/mosire/docs-mosire/0.2.1/docs-mosire-0.2.1-sources.jar">sources</a></li>
+      <li><code>io.mosire:mosire-parent</code>（父 pom，子模块靠它解析）：
+        <a href="io/mosire/mosire-parent/0.2.1/mosire-parent-0.2.1.pom">pom</a></li>
     </ul>
 
-    <h2 id="coords">1. 坐标 / 版本 / 依赖方向</h2>
-    <pre><code>docs-mosire ──→ workspace-mosire ──→ agentlib-mosire
-（文档引擎 + 工具面）  （工作区标准 + 工具面）  （通用工具包）</code></pre>
-
-    <table>
-      <tr><th>artifactId</th><th>本次发布版本</th><th>依赖方向</th><th>消费方</th></tr>
-      <tr><td><code>agentlib-mosire</code></td><td><strong>0.2.0</strong></td><td>最底（不依赖另两个）</td><td>已在用</td></tr>
-      <tr><td><code>workspace-mosire</code></td><td><strong>0.2.0</strong></td><td>→ <code>agentlib-mosire</code></td><td>需要"给 Agent 一块地"就用</td></tr>
-      <tr><td><code>docs-mosire</code></td><td><strong>0.2.0</strong></td><td>→ <code>workspace-mosire</code>（→ <code>agentlib-mosire</code>）</td><td>需要"Agent 读写文档"就用</td></tr>
-    </table>
-
+    <h2>须知</h2>
     <ul>
-      <li><strong>groupId</strong>：<code>io.mosire</code>；<strong>父 pom</strong>
-        <code>io.mosire:mosire-parent:0.2.0</code> 也在同一个仓里（子模块靠它解析）。</li>
-      <li><strong>两种取法</strong>（二者互不替代）：
-        <ol>
-          <li><strong>远程固定版</strong>（推荐，跨机器、零认证）：本 Pages 仓。
-            ★ 维护方本机 <code>~/.m2/settings.xml</code> 已把它登记成<strong>全局仓库</strong>（profile <code>mosire-repo</code>），
-            所以<strong>那台机器上不必再写 <code>&lt;repositories&gt;</code></strong>；换机器 / CI 要写上面 §0 那段。
-            看有哪些版本：<code>io/mosire/docs-mosire/maven-metadata.xml</code>
-            （<strong>仓根 URL 返回 404 是历史行为，本页就是仓根</strong>）。</li>
-          <li><strong>本机 <code>~/.m2</code> 的 <code>-SNAPSHOT</code></strong>（只服务本机开发迭代）：
-            <pre><code>cd /home/cna/ProjectMosire
-./mvnw -o -pl AgentLibMosire,WorkspaceMosire,DocsMosire -am -DskipTests install</code></pre>
-            ★ 但<strong>消费方当前并不用 SNAPSHOT</strong>（见 <a href="#pins">§5</a> 第 1 条），所以这条只影响本机开发。</li>
-        </ol>
-      </li>
-      <li><strong>版本号依据（为什么是 0.2.0 而不是 0.1.1）</strong>：相对 0.1.0 是<strong>新增一整条能力线</strong>
-        （决策包：22 个新类）+ 公开面新增，<code>agentlib-mosire</code> 的类数 143 → 185；
-        按 semver 的 <code>0.y.z</code> 读法（y = 特性/不兼容），y 位加一。</li>
+      <li>只发<strong>固定版本</strong>（不发 SNAPSHOT）；需要 JDK 21。</li>
+      <li>历史版本文件保留（可钉旧版），但 <code>maven-metadata.xml</code> 只反映最近一次发布。</li>
+      <li>详细接入文档（权限面、工具面、常见坑、已知不兼容）以仓库为准：
+        <a href="https://github.com/c1589190/ProjectMosire/blob/main/对接须知-三个库-2026-10-17.md">对接须知</a> ·
+        <a href="https://github.com/c1589190/ProjectMosire/blob/main/接入指南-三个库给消费方.md">接入指南</a> ·
+        <a href="https://github.com/c1589190/ProjectMosire">仓库主页</a></li>
     </ul>
 
-    <h2 id="changes">2. 相对 0.1.0 的变更点（★ 消费方先看这节）</h2>
-    <p><strong>这是 0.2.0 那一版的实测窗口</strong>（tag <code>v0.1.0</code> 2026-10-14 → 发布点 2026-10-17），属<strong>历史记录</strong>：
-      比 0.2.0 更新的版本，其变更点要看仓库里的发布说明，本页不代拟。
-      核实方式：<code>git log/diff v0.1.0..HEAD -- &lt;模块&gt;</code>。</p>
+    <h2>发版（维护方）</h2>
+    <p>打 tag 即发布：<code>git tag -a vX.Y.Z -m "…" &amp;&amp; git push origin vX.Y.Z</code>，
+      触发 <a href="https://github.com/c1589190/ProjectMosire/blob/main/.github/workflows/publish-maven.yml">publish-maven</a>
+      工作流（定版本 → 只发布父 pom + 三个库 → 校验布局 → 推 <code>gh-pages</code>）。
+      页面里的 <code>0.2.1</code> 由发布版本替换；版本变更说明见对应 tag 的注释。</p>
 
-    <table>
-      <tr><th>库</th><th>窗口内改动（实测）</th><th>对消费方意味着什么</th></tr>
-      <tr>
-        <td><code>agentlib-mosire</code></td>
-        <td>16 笔提交、<strong>46 文件 <code>+7817/−37</code></strong>；<code>src/main</code> <strong>新增 27 个类</strong>
-          （<code>decision</code> 包 22 个、<code>approval</code> 3 个、<code>permission</code> 2 个）、<strong>修改 7 个</strong>、
-          <strong>删除 0 个</strong>；jar 类数 <strong>143 → 185</strong></td>
-        <td><strong>类的增删只有增</strong>（0 删除，被钉住的类没挪/改名）；但 ★ <strong>有一个方法级源级不兼容</strong>，
-          见 <a href="#pins">§5.4</a>：<code>AgentTool.roles()</code> 与消费方 <code>SimosTool.roles()</code> 撞名。
-          其余新增：<code>ToolCallAuthorizer.of(...)</code> 重载与 3 个常量、
-          <code>AgentPermissionSet.withRoles(RoleSet)</code> + Builder 位</td>
-      </tr>
-      <tr>
-        <td><code>workspace-mosire</code></td>
-        <td><strong>窗口内零改动</strong>（<code>git log v0.1.0..HEAD -- WorkspaceMosire</code> 无输出）</td>
-        <td>0.1.0 与 0.2.0 的 <code>workspace-mosire</code> <strong>行为等价</strong>、工具面仍是 4 条</td>
-      </tr>
-      <tr>
-        <td><code>docs-mosire</code></td>
-        <td><strong>1 笔 javadoc-only</strong>（<code>DocsTools.java</code> <code>+4</code> 行注释）</td>
-        <td>字节码等价、工具面仍是 8 条</td>
-      </tr>
-    </table>
-
-    <p><strong>行为面要留意的三条</strong>：</p>
-    <ol>
-      <li><strong><code>Ask</code> 有了第二条路</strong>：<code>ToolCallAuthorizer</code> 新增"待裁决队列"入口
-        （<code>DECISION_QUEUED</code> 具名码）。★ <strong>用 <code>ToolCallAuthorizer.standard()</code> 的既有装配行为逐字不变</strong>
-        （该重载把队列位传 <code>null</code>）；只有显式接入待裁决队列的装配才走"登记进决策包、不执行"。</li>
-      <li><strong>新增三个公开常量</strong>：<code>ToolCallAuthorizer.DECISION_QUEUED</code> /
-        <code>DECISION_RELEASE_UNKNOWN</code> / <code>DECISION_RELEASE_USED</code> —— 子体侧靠<strong>码</strong>（不是文案）识别。</li>
-      <li><strong><code>/api/approvals</code> 本版仍在、未删</strong>；但它已被<strong>用户裁定 16 判为"彻底删除"</strong>
-        （<code>设计-决策包作为唯一决策单元.md</code> §5octies，含受影响清单）。⇒ 消费方<strong>不要新增</strong>对该面的依赖；
-        <code>~/SimulatorMosire</code> 现在依赖了它（<code>Shell.java:1287</code>、<code>GuiServer.java:2210</code> 透传、
-        <code>AgentLibAvailabilityTest.java:61</code> 钉 FQN），退役时要<strong>同一批</strong>改（跨项目破坏面）。</li>
-    </ol>
-
-    <h2 id="perms">3. 必填的权限面（未表态 = 什么都做不到）</h2>
-    <pre><code>AgentPermissionSet perms =
-    AgentPermissionSet.builder(AccessToken.SYSTEM)   // 或 DEFAULT
-        .allowAll()
-        .destructiveAllowed(true)                    // ★ 写文档必须
-        .resourceScopes(new ResourceScopeMap(Map.of(
-            "workspaces", ResourceScope.ofDir(root),  // ★ 建挂载必须
-            "docs",       ResourceScope.ofDir(root),  // ★ 读文档必须
-            "docs-edit",  ResourceScope.ofDir(root)))) // ★ 写文档必须
-        .build();</code></pre>
-
-    <ul>
-      <li>三个命名空间<strong>各自独立</strong>：只表态 <code>docs</code> 而没有 <code>docs-edit</code> ⇒ 读得到、写不了（反之亦然）；
-        一个都不表态 ⇒ 连挂载都建不了。</li>
-      <li><code>sensitiveAllowed(true)</code> 同理按需显式表态；<strong>放行不得多于父级</strong>（spawn 时的单调性规则）。</li>
-      <li>资源声明与判定在代码里的两处真值：<code>DocsCapability.Manifests.READ/WRITE</code>
-        （<code>docs</code> / <code>docs-edit</code>，缺省 <code>DENY</code>）、<code>WorkspaceTools</code> 的
-        <code>MANIFEST</code>（<code>workspaces</code>，缺省 <code>DENY</code>）。</li>
-      <li><code>workspace_info</code> 与 <code>doc_guide</code> <strong>刻意不声明任何资源面</strong>
-        （<code>ResourceManifest.NONE</code>）——面空/未表态的调用者照样能调它们，否则"自救渠道"对最需要它的人关门。</li>
-    </ul>
-
-    <h2 id="tools">4. 工具面清单与<strong>准确数量</strong>（以代码为准，已逐条核）</h2>
-    <table>
-      <tr><th>#</th><th>工具</th><th>库</th><th>声明的资源面</th><th>destructive</th><th>备注</th></tr>
-      <tr><td>1</td><td><code>mount_workspace</code></td><td>workspace</td><td><code>workspaces</code></td><td>否</td>
-        <td>只接受<strong>派生形态</strong>（<code>parent</code> + <code>subdir</code>），<strong>不接受物理路径</strong></td></tr>
-      <tr><td>2</td><td><code>unmount_workspace</code></td><td>workspace</td><td><code>workspaces</code></td><td>否</td>
-        <td>只注销挂载，物理目录保留</td></tr>
-      <tr><td>3</td><td><code>list_workspaces</code></td><td>workspace</td><td><code>workspaces</code></td><td>否</td>
-        <td>输出只含虚拟路径</td></tr>
-      <tr><td>4</td><td><code>workspace_info</code></td><td>workspace</td><td><strong>无</strong>（NONE）</td><td>否</td>
-        <td>零挂载也答得清楚（不是错误）</td></tr>
-      <tr><td>5</td><td><code>doc_list</code></td><td>docs</td><td><code>docs</code></td><td>否</td>
-        <td><code>LOG</code> 列地址摘要；<code>FILE</code> 列直接子项</td></tr>
-      <tr><td>6</td><td><code>doc_read</code></td><td>docs</td><td><code>docs</code></td><td>否</td>
-        <td>读不到<strong>不区分</strong>"不存在/不可见"</td></tr>
-      <tr><td>7</td><td><code>doc_query</code></td><td>docs</td><td><code>docs</code></td><td>否</td>
-        <td><code>LOG</code> 按时刻；<code>limit</code> 必填</td></tr>
-      <tr><td>8</td><td><code>doc_append</code></td><td>docs</td><td><code>docs-edit</code></td><td><strong>是</strong></td>
-        <td><code>LOG</code> 追加</td></tr>
-      <tr><td>9</td><td><code>doc_void</code></td><td>docs</td><td><code>docs-edit</code></td><td><strong>是</strong></td>
-        <td><code>LOG</code> 作废（原记录留在盘上）</td></tr>
-      <tr><td>10</td><td><code>doc_create</code></td><td>docs</td><td><code>docs-edit</code></td><td><strong>是</strong></td>
-        <td>无删除工具</td></tr>
-      <tr><td>11</td><td><code>doc_edit</code></td><td>docs</td><td><code>docs-edit</code></td><td><strong>是</strong></td><td></td></tr>
-      <tr><td>12</td><td><code>doc_guide</code></td><td>docs</td><td><strong>无</strong>（NONE）</td><td>否</td>
-        <td>能力自述；输出绝不出现物理落点</td></tr>
-    </table>
-
-    <ul>
-      <li><strong>数量真值 = workspace 4 + docs 8 = 12</strong>。机器可核的锚点：<code>WorkspaceTools.NAMES</code>
-        （<code>WorkspaceMosire/src/main/java/io/mosire/workspace/WorkspaceTools.java:80-81</code>，4 个名字）、
-        <code>DocsTools.NAMES</code>（<code>DocsMosire/src/main/java/io/mosire/docs/DocsTools.java:78-79</code>，8 个名字）、
-        两个 <code>all(...)</code> 方法（<code>WorkspaceTools.java:92-95</code>、<code>DocsTools.java:94-106</code>）。</li>
-      <li><strong>判别力用例</strong>（改坏会红）：<code>DocsMosire/src/test/java/io/mosire/docs/DocsToolsDisciplineTest.java:66</code>
-        （"工具面<strong>八个</strong>"）与 <code>:74-75</code>（工具对象名集合 == <code>DocsTools.NAMES</code>）；
-        <code>WorkspaceMosire/src/test/java/io/mosire/workspace/WorkspaceToolsTest.java:92</code>（同款，4 条）。</li>
-    </ul>
-
-    <p>注册与执行（照抄）：</p>
-    <pre><code>tools.registerAll(WorkspaceTools.all(registry));   // 4
-tools.registerAll(DocsTools.all(registry));        // 8
-ToolResult r = authorizer.execute(tools, "doc_create", ctx);   // 必须经唯一入口</code></pre>
-    <p>★ <code>ToolContext.resources</code> 缺省 <strong>denying</strong>：不经 <code>ToolCallAuthorizer</code> 的调用全部
-      fail-closed（这是有意的）。</p>
-
-    <h2 id="pins">5. 可用性钉：消费方侧那条测试怎么跑（★ 先说清"哪条钉钉住了什么"）</h2>
-
-    <h3>5.1 ★★ 现状事实（与仓库 <code>AGENTS.md</code> §0.5 的原文流程有出入，属 doc drift）</h3>
-    <ul>
-      <li>消费方 <code>~/SimulatorMosire</code> 现在钉的是<strong>固定版 0.1.0</strong>，不是 SNAPSHOT：
-        <code>pom.xml:108</code> <code>&lt;agentlib-mosire.version&gt;0.1.0&lt;/agentlib-mosire.version&gt;</code>
-        （三个库共用这一个拼写点；<code>simos-app/pom.xml:117-123</code> 用 <code>${agentlib-mosire.version}</code> 引 docs/workspace）。</li>
-      <li>实测解析结果（<code>./mvnw -o -q -pl simos-core dependency:tree -Dincludes=io.mosire:agentlib-mosire</code>）：
-        <code>\- io.mosire:agentlib-mosire:jar:0.1.0:compile</code>；
-        <code>~/.m2/.../agentlib-mosire/0.1.0/_remote.repositories</code> 写明来自 <strong><code>mosire-pages</code></strong>。</li>
-      <li>⇒ <strong><code>./mvnw -pl AgentLibMosire -am install</code> + <code>AgentLibAvailabilityTest</code> 这条既有流程，
-        在当前钉法下验不到本仓新代码</strong>：<code>install</code> 装的是 <code>0.1.0-SNAPSHOT</code>，而消费方解析的是 Pages 上的
-        <code>0.1.0</code>（实测该 jar 里 <code>io/mosire/agentlib/decision/</code> 类数 = <strong>0</strong>）。
-        它只证明"0.1.0 那个制品能加载"，不再证明"本仓今天的改动能加载"。改法待控制方裁定。</li>
-    </ul>
-
-    <h3>5.2 升级到本版后怎么验（一个 <code>-D</code> 就能整体改钉，不用改文件）</h3>
-    <pre><code>cd ~/SimulatorMosire
-./mvnw -pl simos-core -am -Dtest=AgentLibAvailabilityTest \
-       -Dsurefire.failIfNoSpecifiedTests=false -Dagentlib-mosire.version=0.2.0 test</code></pre>
-    <ul>
-      <li>该属性是<strong>唯一拼写点</strong> ⇒ 三库一起换版；<code>simos-core</code> 钉 16 个 FQN + JAR 类数下限 ≥118
-        （<code>AgentLibAvailabilityTest</code>）。</li>
-      <li>★ <strong>实测结果（2026-10-17）：这条命令现在红</strong>，红在<strong>消费方自己的</strong> <code>simos-ga-spi</code>
-        编译期 —— 见 §5.4，不是发布链路的问题。</li>
-      <li><strong>工具面/接线钉</strong>（消费方自带的真装配判据，编译期 import 了 <code>DocsTools</code>/<code>WorkspaceTools</code>）：
-        <pre><code>cd ~/SimulatorMosire
-./mvnw -pl simos-app -am -Dtest=AgentLibDocsWiringTest -Dsurefire.failIfNoSpecifiedTests=false test</code></pre></li>
-      <li>本仓侧（发布前的自检）：<code>./mvnw -pl AgentLibMosire -am install</code> ⇒
-        <strong>610 tests / 0 failures / 0 errors / SpotBugs <code>BugInstance size is 0</code></strong>（2026-10-17 03:37）。</li>
-    </ul>
-
-    <h3>5.3 "0 命中也是结论"的规矩（<code>AGENTS.md</code> §四.5）</h3>
-    <p>跑 <code>-Dtest=...</code> 时<strong>必须看 Surefire 报告 mtime 落在本轮</strong>；类名写错时 Surefire 一条不跑且退出 0
-      （<code>-Dsurefire.failIfNoSpecifiedTests=false</code> 就是为这种"只想跑一类"的调用准备的，代价是<strong>静默零跑</strong>）。</p>
-
-    <h3 id="incompat">5.4 ★★ 实测：0.2.0 与当时消费方<strong>源级不兼容</strong>（<code>roles()</code> 撞名）——升级前必须先处置</h3>
-    <p><strong>证据</strong>：<code>./mvnw -pl simos-core -am -Dtest=AgentLibAvailabilityTest -Dagentlib-mosire.version=0.2.0 -U test</code>
-      （先把 <code>~/.m2</code> 里的 <code>0.2.0</code> 目录清掉，强制从 Pages 真下载：日志里可见
-      <code>Downloaded from mosire-pages: …/agentlib-mosire-0.2.0.jar (389 kB)</code>）⇒
-      <strong>BUILD FAILURE，退出码 1</strong>，红在 <code>simos-ga-spi</code> 的 <code>compile</code>，<strong>不是</strong>测试断言：</p>
-    <pre><code>[ERROR] .../simos-ga-spi/src/main/java/io/mosire/simos/ga/spi/SimosTool.java:[35,17] roles() in io.mosire.simos.ga.spi.SimosTool clashes with roles() in io.mosire.agentlib.tool.AgentTool
-[ERROR]   return type java.util.Set&lt;io.mosire.simos.ga.spi.ToolRole&gt; is not compatible with java.util.Set&lt;java.lang.String&gt;
-[ERROR] .../simos-ga-spi/src/main/java/io/mosire/simos/ga/spi/SimosToolAdapter.java:[120,24] roles() in io.mosire.simos.ga.spi.SimosToolAdapter cannot implement roles() in io.mosire.agentlib.tool.AgentTool</code></pre>
-    <p><strong>根因</strong>（两侧都回代码核过）：</p>
-    <ul>
-      <li>本仓：<code>AgentTool</code> 在 0.1.0→0.2.0 窗口内<strong>新增</strong> <code>default Set&lt;String&gt; roles()</code>
-        （<code>AgentLibMosire/src/main/java/io/mosire/agentlib/tool/AgentTool.java</code>，角色维 RA4；
-        判定点 <code>PermissionChecker:87</code>、<code>RoleCatalogAudit:120/283</code>、<code>ToolExecutionGuard:49</code> 读它）。</li>
-      <li>消费方：<code>SimosTool extends AgentTool</code> <strong>早就</strong>声明了 <code>Set&lt;ToolRole&gt; roles()</code>
-        （<code>simos-ga-spi/.../SimosTool.java:35</code>，实现 <code>SimosToolAdapter.java:120</code>）——
-        <strong>同名、同擦除（<code>Set</code>）、返回类型不兼容</strong> ⇒ javac 直接拒。</li>
-      <li>语义也不同：AgentLib 侧角色名是<strong>不透明字符串</strong>（<code>Set&lt;String&gt;</code>），消费方侧是<strong>强类型枚举</strong> <code>ToolRole</code>。</li>
-    </ul>
-    <p><strong>候选处置（三条，均需控制方裁定；本条不代拟）</strong>：</p>
-    <ol>
-      <li><strong>本仓改名</strong>（如 <code>AgentTool#declaredRoles()</code> / <code>toolRoles()</code>）⇒ 消费方零改动；
-        代价是本仓公开面改名 + 新版本号，且 <code>AGENTS.md</code> §0.5 的"被钉类不得改名"只管类、不管方法；</li>
-      <li><strong>消费方改名</strong>（<code>SimosTool#roles()</code> → 另一个名字）⇒ 本仓不动；代价是消费方<strong>大面积</strong>改
-        （<code>roles()</code> 是它 44+ 工具的"唯一拼写点"）；</li>
-      <li><strong>消费方把返回类型对齐</strong> <code>Set&lt;String&gt;</code> ⇒ 丢掉强类型枚举，风险最大，不推荐。</li>
-    </ol>
-    <p>★ 无论选哪条，<strong>§5.1 那个缺口</strong>都是<strong>这次没能在发布前抓到它</strong>的直接原因：
-      按老流程跑 <code>install</code> + <code>AgentLibAvailabilityTest</code> 会<strong>全绿</strong>（因为解析的还是 0.1.0）。</p>
-
-    <h2 id="pitfalls">6. 常见坑（每条带原始报错文案）</h2>
-    <table>
-      <tr><th>#</th><th>现象（原始文案）</th><th>原因 / 解法</th></tr>
-      <tr><td>1</td><td><code>M1: 物理范围不在调用者的 workspaces 可达面内（缺省 DENY：未表态 = 一个挂载都建不了）</code></td>
-        <td>没表态 <code>workspaces</code></td></tr>
-      <tr><td>2</td><td><code>PERMISSION_DENIED: 工具 doc_create 为破坏性操作，需显式放行</code></td>
-        <td>没 <code>.destructiveAllowed(true)</code></td></tr>
-      <tr><td>3</td><td><code>RESOURCE_DENIED: 该调用者够不着这个工具声明的任何资源</code></td>
-        <td>没表态 <code>docs</code> / <code>docs-edit</code></td></tr>
-      <tr><td>4</td><td><code>WORKSPACE_NOT_FOUND: 工作区不存在或不可见: xxx</code></td>
-        <td><code>ToolContext.identity().instanceId()</code> 必须 == 挂载的 <code>user</code>（"不可见"与"不存在"刻意同码）</td></tr>
-      <tr><td>5</td><td><code>M2: 只能为自己或自己的后代创建工作区</code></td>
-        <td>替别人挂载要走正规血缘路径（<code>holder=父</code>、<code>user=子</code>、落点在父工作区内）</td></tr>
-      <tr><td>6</td><td><code>纪律不符（B9）：list 需要 LOG 纪律的挂载</code></td>
-        <td><code>DocsApi.list</code> 只服务 <code>LOG</code>；<code>FILE</code> 的<strong>直接子项</strong>列举走
-          <code>WorkspaceRegistry.list()</code>（投影）</td></tr>
-      <tr><td>7</td><td><code>DOC_NOT_FOUND</code> 但"文件明明在"</td>
-        <td>可见性判据（《接入指南》§5）：<code>owner</code>/<code>tags</code>/<code>affiliations</code> 三轴 + fail-closed 兜底</td></tr>
-      <tr><td>8</td><td><strong>物理路径不出现</strong>（不是报错，是<strong>约定</strong>）</td>
-        <td>面向模型的输出<strong>只含虚拟路径</strong>（<code>WorkspaceTools</code> 的 A7/G4、<code>DocsTools</code> 的 G4/A7）；
-          <code>mount_workspace</code> 只接受派生形态</td></tr>
-      <tr><td>9</td><td><strong><code>noExport</code> 与两个外发面都求交</strong></td>
-        <td><code>AgentToMcpServer.exportable(tool, include) = include.test(name) &amp;&amp; !spec.noExport()</code>
-          （<code>AgentToMcpServer.java:804-807</code>），且<strong>初始注册 / 列表 / 增量同步三处同源</strong>
-          （<code>:727</code>、<code>:777</code>、<code>:790</code>）⇒ 子体 MCP 桥与外部 MCP 面<strong>都</strong>受 <code>noExport</code> 约束。<br />
-          ★ 历史教训：曾有一版记录把"<code>noExport</code> 只挡子体桥"写成机制描述，随后被更正
-          （<code>MainMosire/.../app/AppMcpLinkTest.java:160-177</code> 的收口单）。
-          <strong>想彻底不外发 = 级别 + <code>noExport</code> 两道</strong>（级别挡判定面、<code>noExport</code> 挡结构面）</td></tr>
-      <tr><td>10</td><td>决策面 <code>POST</code> 回 <code>404 {"code":"PACKAGE_NOT_FOUND"}</code></td>
-        <td>决策面对<strong>在途包</strong>（跨进程临时包 <code>xp-…</code>）的写路由要求装配方接上"在途写口"；
-          没接（<code>null</code>）时详情面只认包登记表、写路由一律 404
-          （<code>DecisionPackagesHttpHandler.java:115</code>、<code>:439</code>、<code>:594</code>、<code>:643</code>）。
-          生产装配 <code>App</code> 已接（<code>App.java:866</code>、<code>:870</code>）</td></tr>
-    </table>
-
-    <h2 id="corrections">7. 与《接入指南》（2026-10-14）的更正表</h2>
-    <table>
-      <tr><th>位置</th><th>指南写的</th><th>真值（核实方式）</th></tr>
-      <tr><td>§1 表格 / §3.2</td><td>docs「7 个 <code>doc_*</code>」、workspace「3 个」，共 10</td>
-        <td><strong>docs 8（含 <code>doc_guide</code>）、workspace 4（含 <code>workspace_info</code>），共 12</strong>。
-          ★ 这不是"过期"：<code>git show v0.1.0:…/DocsTools.java</code> 与 <code>…/WorkspaceTools.java</code> 里
-          <code>all(...)</code> <strong>在 0.1.0 就已经是 8/4</strong> ⇒ 当时就数错了（<code>DocsTools</code> 自己的 javadoc 写的是
-          "七个文档工具 + 自述工具"）</td></tr>
-      <tr><td>§2.1</td><td>已发布版本 = <code>0.1.0</code></td>
-        <td>新增 <strong><code>0.2.0</code></strong>（本次发布；历史版本保留，<code>keep_files=true</code>）</td></tr>
-      <tr><td>§2</td><td>本机开发走 <code>~/.m2</code> 的 <code>0.1.0-SNAPSHOT</code></td>
-        <td>仍成立，但<strong>消费方已改走固定版</strong>（<code>~/SimulatorMosire/pom.xml:108</code> = <code>0.1.0</code>，
-          来源 <code>mosire-pages</code>）⇒ SNAPSHOT 路线只服务本机开发，不再影响消费方</td></tr>
-      <tr><td>§8</td><td>"三个库已装到本机 <code>~/.m2</code>（<code>…:0.1.0-SNAPSHOT</code>）"</td>
-        <td>仍成立，但<strong>它不等于"消费方在用它"</strong></td></tr>
-      <tr><td>§7</td><td>本仓回归 1257 tests / 消费契约 18/18</td>
-        <td>均为 2026-10-14 当轮真数；本轮 <code>install</code> 的真数是 AgentLib <strong>610 tests</strong>
-          （窗口内新增用例所致，两轮不可并排比）</td></tr>
-    </table>
-
-    <h2 id="honest">8. 诚实边界（未验 / 未决）</h2>
-    <ul>
-      <li><strong>已验</strong>（真跑）：Pages 上的制品<strong>能被 Maven 真下载</strong>
-        （<code>Downloaded from mosire-pages: …0.2.0.jar</code>）；发布制品与本机暂存件
-        <strong>类清单 + 每个 class 的 CRC 全等</strong>（185 / 24 / 43 个 class；jar 的 sha1 不同只因 zip 时间戳，非内容差异）。</li>
-      <li><strong>已验（红）</strong>：消费方在 <strong>0.2.0</strong> 下<strong>编译红</strong> —— 见 <a href="#incompat">§5.4</a>
-        （<strong>处置待控制方裁定</strong>）。</li>
-      <li><strong>未验</strong>：<code>~/SimulatorMosire</code> 侧 <code>simos-app</code> 的 <code>AgentLibDocsWiringTest</code>
-        <strong>本轮没跑</strong>（§5.2 给了命令，不给结论）；三库在消费方整体升到 <strong>0.2.0</strong> 后的构建<strong>跑不通</strong>
-        （§5.4 的编译红挡在前面），故"接线是否仍通"未验。</li>
-      <li><strong>未决</strong>：<code>AGENTS.md</code> §0.5 的消费方检查流程要不要跟着改钉（§5.1）；
-        <code>roles()</code> 撞名选哪条处置（§5.4）；<code>/api/approvals</code> 退役对消费方的破坏面怎么分批。</li>
-      <li>★ <strong><code>maven-metadata.xml</code> 只列最近一次发布的版本</strong>（实测 2026-10-17：<code>agentlib-mosire</code> 的
-        <code>&lt;versions&gt;</code> 里<strong>只有 0.2.0，0.1.0 不在列表里</strong>）——这是工作流的固有行为
-        （CI 在<strong>空暂存目录</strong>上 deploy，元数据是新的那份覆盖旧的；<code>keep_files=true</code> 保的是<strong>文件</strong>不是元数据）。
-        <strong>固定版本仍然解析得到</strong>（更早版本的 jar/pom 实测 HTTP 200）；但<strong>版本范围 / <code>LATEST</code> /
-        <code>RELEASE</code> 这类解析只会看到最近一次发布的版本</strong>。要用范围解析的消费方请知悉。</li>
-      <li>消费方 <code>simos-app/pom.xml:110</code> 的注释仍写"<code>doc_*</code> 7 条 + <code>workspace_*</code> 3 条"——
-        <strong>同一处数错的传播</strong>，属消费方文件，本仓不代改。</li>
-      <li>更早的《<code>接入指南-三个库给消费方.md</code>》（2026-10-14）与其更正表在仓库内 <code>main</code> 分支；
-        本页是它的主体抄录，装配配方与可见性判据的<strong>全文</strong>仍以该文件为准。</li>
-    </ul>
-
-    <h2 id="maintain">维护方：怎么发新版</h2>
-    <pre><code>git tag -a vX.Y.Z -m "…" &amp;&amp; git push origin vX.Y.Z   # tag 触发 .github/workflows/publish-maven.yml
-# 或在 Actions 页 / gh CLI 手动 dispatch publish-maven 并填版本号：
-#   gh workflow run publish-maven.yml -f version=X.Y.Z</code></pre>
-    <p>工作流做四件事：<code>versions:set</code> 定版本 → 只构建/部署「父 pom + 三个库」到暂存目录 →
-      <strong>校验布局</strong>（父 pom 与三库的 jar/pom/sources 必须齐，缺一个就红）→ 推 <code>gh-pages</code>
-      （<code>keep_files=true</code> ⇒ <strong>历史版本保留</strong>，消费方可钉旧版）。</p>
-    <p class="note">
-      ★ <strong>本页的版本参数化</strong>：页面源码（仓库内 <code>pages/index.html</code>）里凡是当前版本号的地方都写成占位符
-      <code>__MOSIRE_&#95;VERSION__</code>；工作流在"带上落地页"这一步用本次发布的版本号 <code>sed</code> 替换后再拷进暂存目录
-      （替换后若还残留占位符会直接失败）。⇒ 发新版<strong>不再需要</strong>手工改这张页面，也不会再出现"发了 0.2.0、门面仍写 0.1.0"的漂移。
-    </p>
-    <p class="note">
-      本页是<strong>单个静态 HTML 文件</strong>：无 JS、无外部样式/字体/脚本依赖，直读即可。
-      正文中的 <code>file:line</code> 与报错文案都来自仓库内的实测记录；发现与实际不符请以仓库代码与
-      <code>对接须知-三个库-2026-10-17.md</code> 为准。
-    </p>
+    <p class="note">单文件静态页：无 JS、无外部资源依赖。</p>
   </body>
 </html>
