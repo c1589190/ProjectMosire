@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.mosire</groupId>
+    <artifactId>mosire-parent</artifactId>
+    <version>0.2.2</version>
+  </parent>
+
+  <artifactId>workspace-mosire</artifactId>
+  <name>WorkspaceMosire</name>
+  <description>工作区标准：虚拟↔物理映射（Mount/Resolver）+ 唯一解析点鉴权 + 运行期挂载工具（mount_workspace/unmount_workspace/list_workspaces）+ 子工作区递归 + 生命周期与审计</description>
+
+  <dependencies>
+    <!-- 唯一生产依赖：权限模型（Operation/ResourceScope/AgentPermissionSet）、AgentTool 与工具骨架 -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>agentlib-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- 拒绝与装配留痕（物理路径只进日志与审计事件，见设计 §4.4 G4） -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- SpotBugs 抑制注解：注入的 Consumer/Function 与 resolver 是"有意持有外部对象"的标记（编译期仅为注解），
+         与 AgentLibMosire/BrainMosire 同款 -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

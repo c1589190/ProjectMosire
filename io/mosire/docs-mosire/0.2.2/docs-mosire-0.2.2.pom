@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.mosire</groupId>
+    <artifactId>mosire-parent</artifactId>
+    <version>0.2.2</version>
+  </parent>
+
+  <artifactId>docs-mosire</artifactId>
+  <name>DocsMosire</name>
+  <description>Docs 系统：LOG 追加型文档（NDJSON + 文件锁 + 可见性判据）+ FILE 文件型文档（自实现 IO：原子创建 / 行寻址编辑）+ doc_* 工具面</description>
+
+  <dependencies>
+    <!-- 权限模型（Operation/ResourceScope/AgentPermissionSet）、AgentTool 与工具骨架 -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>agentlib-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- 虚拟路径 → 物理落点的唯一解析点（含准入鉴权），Docs 不自造第二处映射 -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>workspace-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- 坏行/坏文件的披露只进日志（物理路径只进日志与审计事件，见设计 §5.3 与 A7） -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- SpotBugs 抑制注解：注入的 WorkspaceRegistry / Consumer 属于"有意持有外部对象"（编译期仅为注解），
+         与 AgentLibMosire/BrainMosire/WorkspaceMosire 同款 -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

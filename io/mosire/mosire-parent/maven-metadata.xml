@@ -3,10 +3,10 @@
   <groupId>io.mosire</groupId>
   <artifactId>mosire-parent</artifactId>
   <versioning>
-    <release>0.2.1</release>
+    <release>0.2.2</release>
     <versions>
-      <version>0.2.1</version>
+      <version>0.2.2</version>
     </versions>
-    <lastUpdated>20261017060121</lastUpdated>
+    <lastUpdated>20261017115543</lastUpdated>
   </versioning>
 </metadata>
