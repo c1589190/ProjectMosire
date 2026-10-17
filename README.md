@@ -15,19 +15,22 @@
 | `MainMosire` | 入口/网关：组装、CLI、AdminREST、A2A/AG-UI/MCP 入口、健康检查、发行 | `brain-mosire`、`agentlib-mosire`、`workspace-mosire`、`docs-mosire`；`bash-plugin-mosire` 仅 provided，用于构建顺序/插件拷贝，主代码不得 import/使用 |
 | `BashPluginMosire` | PF4J 插件：bash 工具与沙箱实现 | main 只依赖 `agentlib-mosire`（PF4J provided）；测试面可依赖 Brain；宿主 main 不 import 它 |
 
-依赖方向、模块红线与验证命令见 [`AGENTS.md`](AGENTS.md) §0.1；当前状态见 [`docs/agents/STATUS.md`](docs/agents/STATUS.md)。
+依赖方向与模块红线见 [`AGENTS.md`](AGENTS.md) §0.1；验证入口见 `scripts/gate.sh`（规则见 [`docs/agents/VERIFICATION.md`](docs/agents/VERIFICATION.md)）；当前状态见 [`docs/agents/STATUS.md`](docs/agents/STATUS.md)。
 
 ## 文档
 
 - [`docs/agents/STATUS.md`](docs/agents/STATUS.md) — **当前状态入口**：版本、源码基线、工作树、发布/Pages 事实、未验证项与下一步。
 - [`docs/agents/SKILLS.md`](docs/agents/SKILLS.md) — **工程 Skill v2 方案**：五层分流、状态机、契约、工程 Skill 与 Brain 运行时 Skill 隔离、宿主差异、gate/report、维护预算。当前 **0 个 active 工程 Skill**。
+- [`docs/agents/WORKFLOW.md`](docs/agents/WORKFLOW.md) — 控制方、派单粒度、任务书/测试 Agent、设计文档门槛、评审与等待、收工自查。
+- [`docs/agents/VERIFICATION.md`](docs/agents/VERIFICATION.md) — 并发、`scripts/gate.sh`、Surefire/SpotBugs、run-bound 证据、变异自证、时钟约束。
+- [`docs/agents/ENVIRONMENT.md`](docs/agents/ENVIRONMENT.md) — JDK/Maven、内存、`~/.m2`、LF/CRLF、grep/find、真模型脚本、临时目录。
 - [`开发计划.md`](开发计划.md) — **范围/顺序与验收判据**；不重复实时记账，实时状态以 STATUS 为准。
 - `设计-*.md`（仓库根）— 现行设计文档索引：身份与血缘 / 子 Agent 终局与等取口 / 子 Agent 上下文读取 / Bash 工具与工作目录围栏 / 审批与工具内权限 / 多 provider 路由 / 插件系统 / 配置引导 / MCP HTTP 传输 / Skill 运行时 / 决策包作为唯一决策单元 / 上下文窗口下沉 / 通用循环骨架等。数量随设计演进，不在此写死。
 - [`docs/upstream/`](docs/upstream/) — 上游三库契约：AgentLib 决策契约、Workspace 路径契约、Docs 存储契约。
 - [`docs/archive/2026-09-14-旧计划/`](docs/archive/2026-09-14-旧计划/) — **已归档弃用**的三代计划与 SDD 拆解；目录 README 列明历史与仍开着的接续项。历史文档不回头改。
 - [`docs/archive/2026-10-17-agents-rule-migration.md`](docs/archive/2026-10-17-agents-rule-migration.md) — 2026-10-17 的 AGENTS 规则迁移台账：keep / migrate / script / invalid / pending 及用户原话。
 - [`Research/调查报告.md`](Research/调查报告.md) — 2026-09-08 调查结论（协议选型、架构参考、技术栈、风险；**不是**开发计划）。
-- [`AGENTS.md`](AGENTS.md) — 常驻纪律、模块边界、门禁与事故规则。
+- [`AGENTS.md`](AGENTS.md) — **常驻内核与路由**：六模块边界、红线、并发/验证/文档/提交核心规则；长文在 `docs/agents/`。
 
 > `.superpowers/**` 是历史/本机工具路径，**不是权威实时状态**；本仓不再依赖它记账。
 

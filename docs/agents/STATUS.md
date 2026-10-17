@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-10-17 21:25（Asia/Shanghai）
+> **更新时间**：2026-10-17 21:35（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -77,6 +77,12 @@
 | 决定 | **不创建 active `mosire-verify`**；按“没有 RED 不建 Skill”原则，只把“验证优先用 `scripts/gate.sh` + run-bound summary”写入 `AGENTS.md`。 |
 | 候选位置 | `.work/skill-candidates/mosire-verify/`（本机、未入库、宿主不可发现）；评估记录见 `docs/agents/skills-eval/2026-10-17-mosire-verify.md`。 |
 
+### 2.6 AGENTS 压缩（2026-10-17）
+
+- `AGENTS.md` 从 **476 行 / 46.7KB 压到 174 行 / 14.1KB**；只保留常驻红线、六模块边界、并发/验证/文档/提交核心规则与路由。
+- 详细派单/评审/自查迁入 `docs/agents/WORKFLOW.md`；并发/门禁/证据/变异/时钟迁入 `docs/agents/VERIFICATION.md`；本机环境迁入 `docs/agents/ENVIRONMENT.md`。
+- 本批只改文档，未再跑 Maven；最近 full gate 仍是 `1ed2372` 的 1618/0/0/6，之后为 docs-only delta。
+
 ## 3. 工作树状态
 
 本任务更新 `STATUS.md` 前，工作树只有 5 个预存未跟踪文件（tracked clean）：
@@ -147,6 +153,9 @@
 | `AGENTS.md` | 常驻纪律、模块边界、红线；顶部指向本文。 |
 | `docs/agents/STATUS.md`（本文） | **实时状态入口**；最近验证源码基线、Phase 2 gate、dirty、发布/Pages、未验证、下一步。 |
 | `docs/agents/SKILLS.md` | 工程 Skill v2 方案；当前 **0 个 active 工程 Skill**。 |
+| `docs/agents/WORKFLOW.md` | 控制方、派单、责任区、评审与收工自查的操作手册。 |
+| `docs/agents/VERIFICATION.md` | 并发、gate、Surefire/SpotBugs、run-bound 证据与变异规则。 |
+| `docs/agents/ENVIRONMENT.md` | 本机环境、EOL、工具差异与临时数据约束。 |
 | `docs/agents/skills-eval/2026-10-17-mosire-verify.md` | `mosire-verify` pilot 的 baseline/skill 对照与“不激活”结论；不是 active Skill。 |
 | `开发计划.md` | 范围/顺序与验收判据；不重复实时记账。 |
 | 根 `设计-*.md` + `docs/upstream/**` | 机制与上游契约的权威设计。 |

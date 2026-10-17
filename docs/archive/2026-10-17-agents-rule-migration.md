@@ -2,6 +2,7 @@
 
 > **状态**：已落盘；本批只做文档与规则溯源，不删除历史、不改 Java/测试/scripts/.github/pom.xml，不 commit / push / 跑 Maven。
 > **对象**：2026-10-17 开工时的 `AGENTS.md`（441 行 / 43715 字节）。行号是当时快照，后续会漂移；以章节号 + 本台账 ID 定位。
+> **2026-10-17 后续压缩**：AGENTS 已压到 174 行 / 14127 字节；本台账中的旧行号/章节号只指压缩前快照。现行正文见 `AGENTS.md`、`docs/agents/WORKFLOW.md`、`VERIFICATION.md`、`ENVIRONMENT.md`。
 > **分类**：
 > - `keep`：规则继续留在 `AGENTS.md`，内容有效。
 > - `migrate`：规则迁到另一个权威层（`docs/agents/STATUS.md`、`docs/agents/SKILLS.md`、设计文档、归档），`AGENTS.md` 只留指针。
