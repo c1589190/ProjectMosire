@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-10-17 21:15（Asia/Shanghai）
+> **更新时间**：2026-10-17 21:25（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -67,6 +67,16 @@
 
 > 以上 focused 是判定样本，**不是当前 `1ed2372` 的 full gate 证据**；当前 full gate 见 §2.3。
 
+### 2.5 Phase 3：`mosire-verify` pilot 结论（不激活）
+
+| 项目 | 结果 |
+|---|---|
+| 场景 A：`VersionTest` | baseline 与 skill 均得到 `2/0/0/0`；skill 额外输出 gate run manifest/summary 与 `FOCUSED TEST PASSED (NOT a full gate)`。 |
+| 场景 B：`NoSuchPilotTestXYZ` | baseline 与 skill 均拒绝把 0 tests 说成通过；skill 通过 gate 得到 `EVIDENCE_INCOMPLETE` 与 run-bound 证据。 |
+| RED 基线 | **未出现**；baseline 两个场景都正确。 |
+| 决定 | **不创建 active `mosire-verify`**；按“没有 RED 不建 Skill”原则，只把“验证优先用 `scripts/gate.sh` + run-bound summary”写入 `AGENTS.md`。 |
+| 候选位置 | `.work/skill-candidates/mosire-verify/`（本机、未入库、宿主不可发现）；评估记录见 `docs/agents/skills-eval/2026-10-17-mosire-verify.md`。 |
+
 ## 3. 工作树状态
 
 本任务更新 `STATUS.md` 前，工作树只有 5 个预存未跟踪文件（tracked clean）：
@@ -79,7 +89,7 @@
 ?? configs/agents/bash-agent.json
 ```
 
-本任务只修改本文 `docs/agents/STATUS.md`；不修改其他文件，不 commit、不 push、不跑 Maven。full gate 的 Maven 运行由控制方通过 `./scripts/gate.sh full` 完成，本文只记录其 run-bound 证据。
+本批 Phase 3 只修改文档与 `.work` 候选/证据；不修改 Java、测试、脚本、工作流，不 commit、不 push、不跑 Maven。full gate 的 Maven 运行由控制方通过 `./scripts/gate.sh full` 完成，本文只记录其 run-bound 证据；候选未进入 active。
 
 ## 4. 0.2.2 发布历史与 Pages（保留）
 
@@ -115,7 +125,7 @@
 
 - **`.github/workflows/docs-skills.yml` 尚未在 GitHub Actions 实跑**；当前只有本地/脚本证据，不能宣称 CI 已绿。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
-- 本文件记录的是控制方在 `1ed2372` 上完成的 `./scripts/gate.sh full`；**本 STATUS 更新者没有亲自重跑 Maven**，也没有新的独立 full gate 结果。
+- 本文件记录的 full gate 是控制方在 `1ed2372` 上通过 `./scripts/gate.sh full` 实际执行的；当前 Phase 3 文档改动尚未再跑 full，若要把这些文档改动称为“已验证”，需要另行跑 gate。
 - 未在浏览器实际下载 Pages 上的 jar；Pages 事实只到 git 对象/路径级核对。
 - 未核对 GitHub Actions 的每一次 run 状态；0.2.2 发布事实以 `gh-pages` 提交对象和发布日志为准。
 - 未重新跑下游 `~/SimulatorMosire` 消费方测试；`japicmp/契约测试` 也未在本轮重跑。
@@ -124,9 +134,9 @@
 
 ## 6. 下一步
 
-1. **Phase 3**：在 `.work/skill-candidates/mosire-verify/` 建立候选，按 pilot 做 RED-GREEN；候选不得放进 `.agents/skills/`，不得直接创建 active Skill。
-2. 在 GitHub Actions 实跑 `docs-skills.yml`，并实测目标宿主对工程 Skill 的发现与显式/隐式触发。
-3. pilot 通过、宿主验证通过、owner/复核日/维护预算齐全后，才按 `docs/agents/SKILLS.md` 的 active 条件升级；active 以本文为实时摘要。
+1. 在 GitHub Actions 实跑 `docs-skills.yml`，并实测目标宿主对 `.agents/skills` 的发现与显式/隐式触发。
+2. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
+3. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 4. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
 5. 下次发布时更新版本、tag、Pages 提交与发布证据；历史 0.2.2 数字只保留为历史证据。
 
@@ -137,6 +147,7 @@
 | `AGENTS.md` | 常驻纪律、模块边界、红线；顶部指向本文。 |
 | `docs/agents/STATUS.md`（本文） | **实时状态入口**；最近验证源码基线、Phase 2 gate、dirty、发布/Pages、未验证、下一步。 |
 | `docs/agents/SKILLS.md` | 工程 Skill v2 方案；当前 **0 个 active 工程 Skill**。 |
+| `docs/agents/skills-eval/2026-10-17-mosire-verify.md` | `mosire-verify` pilot 的 baseline/skill 对照与“不激活”结论；不是 active Skill。 |
 | `开发计划.md` | 范围/顺序与验收判据；不重复实时记账。 |
 | 根 `设计-*.md` + `docs/upstream/**` | 机制与上游契约的权威设计。 |
 | `docs/archive/**` | 历史归档；不得当实时状态。 |

@@ -126,7 +126,7 @@ BashPluginMosire ──→ AgentLibMosire（PF4J 为 provided；宿主不 import
 - **Brain 运行时 Skill** 仍只经 `io.mosire.brain.skills.SkillAccess` 与其 6 个工具访问，根目录是运行时 `<dataDir>/skills/`；
   **不得扫描/挂载 `.agents/skills/`**，也不得把工程 Skill 复制进发布 JAR 或运行时数据目录。
 - 两边不得是软链、挂载或父子目录；同名也仍是两套对象，不得互相回退。
-- 方案、状态机、宿主差异与 gate/report 细则见 `docs/agents/SKILLS.md`；首版只评估 `mosire-verify`，不直接上线。
+- 方案、状态机、宿主差异与 gate/report 细则见 `docs/agents/SKILLS.md`；`mosire-verify` 已于 2026-10-17 完成 pilot 评估，结论为**不激活**（见 `docs/agents/skills-eval/2026-10-17-mosire-verify.md`）。
 
 ### 0.4 文档地图（不要用 `@` 导入——会把文件展开进上下文，白载几千行）
 
@@ -311,6 +311,9 @@ BashPluginMosire ──→ AgentLibMosire（PF4J 为 provided；宿主不 import
   报“找不到包”的**假红**；也可能只跑了部分模块的 Spotless/Checkstyle/SpotBugs）。
   `spotless:apply` 跑完后，用 `git diff --name-only` **列全**所有被改文件，不要只按一个模块路径 `git add`。
 - **`./mvnw test` 不跑 SpotBugs**：关账前必须跑 `verify`（或单独 `spotbugs:check`），并重新核对测试计数。
+- **验证优先入口**：需要验证时先用 `scripts/gate.sh pre|full|focused|selftest`，不要先手拼会吞汇总的 Maven 命令。
+  focused 的结论只能写 `FOCUSED TEST PASSED (NOT a full gate)`；必须引用 `.work/gate/<run_id>/summary.txt` 的 run-bound 计数。
+  没有 run-bound summary、或报告不能绑定本轮运行时，写 `EVIDENCE_INCOMPLETE`，不写 PASS。gate 不能表达的场景才退回手动 Maven，并说明原因。
 - **聚焦单测**：
 
   ```bash

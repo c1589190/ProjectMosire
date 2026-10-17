@@ -260,7 +260,7 @@ policy:
 
 > 表中的“发现方式/显式调用/隐式调用”都是待验证声明；具体发现与触发必须在目标宿主版本上实测，未实测的行保持 pending。
 
-## 7. 首版只评估 `mosire-verify`
+## 7. 首版评估记录：`mosire-verify`（结论：不激活）
 
 ### 7.1 定位
 
@@ -275,9 +275,9 @@ policy:
 | 任务类型 | 最小 gate | 不允许做的事 |
 |---|---|---|
 | 纯文档 | `git diff --check`；相对链接存在性检查；`git status --porcelain` 复核改动范围；模块表与 `pom.xml` 一致性检查（如触及模块表） | 声称跑过 Maven；用旧测试数字充当当前证据 |
-| 单模块代码小改 | 先确认本 checkout 无并发 Maven；`./mvnw -B -ntp -Dtest='<类名>' -Dsurefire.failIfNoSpecifiedTests=false test -pl <模块> -am`；报告 Maven `Tests run:` 汇总，不靠 `-q` | 在并发窗口跑全量；用 `-N` 假绿；只看 `rc=0` |
-| 阶段边界/关账 | `./mvnw verify`；核对各模块 `Tests run`、failures/errors/skipped、SpotBugs `BugInstance size`；必要时 `spotless:apply` 后再 verify | 把 `test` 当 `verify`；把旧 run 的报告当本轮 |
-| 发布/Pages 变更 | 版本与根 pom 一致；`./mvnw verify`；按发布工作流核对 gh-pages 版本路径与落地页 | 修改发布工作流顺序（用户已裁定不改）；无证据宣称已发布 |
+| 单模块代码小改 | 先确认本 checkout 无并发 Maven；`./scripts/gate.sh focused <模块> <测试模式>`；报告 gate 的 `summary.txt`、`Tests run` 汇总与 mode | 在并发窗口跑全量；用 `-N` 假绿；只看 `rc=0`；把 focused 写成 full |
+| 阶段边界/关账 | `./scripts/gate.sh full`；核对各模块 `Tests run`、failures/errors/skipped、SpotBugs `BugInstance size`；必要时 `spotless:apply` 后再 verify | 把 `test` 当 `verify`；把旧 run 的报告当本轮 |
+| 发布/Pages 变更 | 版本与根 pom 一致；`./scripts/gate.sh full`；按发布工作流核对 gh-pages 版本路径与落地页 | 修改发布工作流顺序（用户已裁定不改）；无证据宣称已发布 |
 
 ### 7.3 首版评估方法
 
@@ -290,7 +290,8 @@ policy:
    - 是否在错误的目录/模块执行；
    - 是否误碰任务未授权的文件；
    - 报告是否包含未做/未验证项。
-4. 只有全部通过且宿主发现机制实测成功，才允许在下一次变更中提议进入 active；本批不进入。
+4. 2026-10-17 已完成 pilot：baseline 与 skill 两组在上述正向/负向场景都正确；**没有出现 RED 基线**。
+   因此当前不进入 active，只保留评估记录与候选；完整对照见 `docs/agents/skills-eval/2026-10-17-mosire-verify.md`。
 
 ### 7.4 首版不评估的内容
 
@@ -460,15 +461,15 @@ policy:
 5. 删除已批准的旧 jar；只删除该文件，不碰 `target/` 其他内容。
 6. 做链接、diff、状态检查；**不跑 Maven**。
 
-### 阶段 1：候选 Skill 草案（未来批次，需用户另行授权）
+### 阶段 1：候选 Skill 草案（2026-10-17 已完成 pilot 评估）
 
-1. 创建 `.work/skill-candidates/mosire-verify/SKILL.md` 草案（不创建宿主适配文件，不放进 `.agents/skills/`）。
-2. 按 §4 契约自检；在本文候选表登记 `drafted`。
-3. 选一个纯文档任务做 pilot；显式调用，记录基线/对比。
-4. 若文档任务通过，再选一个小代码任务验证 Maven gate；全程遵守单 Maven 窗口。
-5. 只有 pilot gate/report 全过，才提议进入 active；进入 active 时把目录移到 `.agents/skills/mosire-verify/`，并补齐 owner、复核日、预算和回退路径。
+1. 已创建 `.work/skill-candidates/mosire-verify/SKILL.md` 草案（不创建宿主适配文件，不放进 `.agents/skills/`）。
+2. 按 §4 契约自检；在本文候选表登记 `evaluated-not-active`。
+3. 已完成 2 个真实场景的 baseline / skill 对照：正向 `VersionTest`、负向 `NoSuchPilotTestXYZ`。
+4. 结论：**baseline 两次都能正确拒绝假绿并通过正向验证**；skill 的主要收益是把流程收敛到 `scripts/gate.sh` 的 run-bound 证据，而不是修复一个 baseline 失败。按“没有 RED 不建 Skill”原则，**不激活**；把“验证优先用 `scripts/gate.sh`”写进 AGENTS，候选仅留在 `.work`。
+5. 详细记录见 `docs/agents/skills-eval/2026-10-17-mosire-verify.md`。
 
-### 阶段 2：宿主验证（未来批次）
+### 阶段 2：宿主验证（仅在未来重新提议 active 时执行）
 
 1. 对目标宿主实际执行发现 + 显式调用测试。
 2. 逐一验证宿主差异矩阵中的行；未验证行保持 pending。
@@ -485,6 +486,9 @@ policy:
 
 | 名称 | 状态 | 范围 | 评估入口 | 是否 active |
 |---|---|---|---|---|
-| `mosire-verify` | **proposed（仅评估）** | 文档/代码/发布三类验证任务的 gate + report | 本文 §7、§8 | 否 |
+| `mosire-verify` | **evaluated-not-active（2026-10-17）** | 文档/代码/发布三类验证任务的 gate + report | 本文 §7、§8；评估记录 `docs/agents/skills-eval/2026-10-17-mosire-verify.md` | 否 |
 
+> 2026-10-17 pilot 结论：baseline 与 skill 都能正确识别 focused/full、0 tests 和 EVIDENCE_INCOMPLETE；
+> skill 只带来“更一致地使用 `scripts/gate.sh` 与 run-bound 证据”的收益，没有真实 RED 基线。
+> 因此按“没有 RED 不建 Skill”原则不激活；验证入口写入 `AGENTS.md`，候选留在 `.work`，不进入 `.agents/skills/`。
 > 本批结束时仍为空 active 集合；这是有意为之，不是遗漏。
