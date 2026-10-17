@@ -259,6 +259,11 @@ BashPluginMosire ────────────────────┘
   ★ **同源陷阱：用 `cp`/`shutil.copy2` 还原会带回旧 mtime** ⇒ Maven 增量判"没变"不重编 ⇒
   你以为在测变异体，其实跑的还是上一轮的 class（P3c 实测：M19 红在了错的断言上）。还原后必须
   `touch`/`utime` 更新时间戳，并在每轮日志里确认出现 `Compiling`。
+- ★★ **版本升号后 `package` 不带 `clean` 会在 `MainMosire/target/plugins/` 留下两版插件 jar** ⇒ PF4J 以同一 `PluginId=bash`
+  拒绝加载第二个，**主进程启动即失败**（2026-10-17 真模型台架实测：`bash-plugin-mosire-0.1.0-SNAPSHOT.jar` 与
+  `0.2.0-SNAPSHOT.jar` 并存 ⇒ `There is an already loaded plugin … with the same id (bash)`，`App.wirePlugins` 抛
+  `PluginLoadException`）。⇒ 规则：**插件目录只许一个版本**；升版本号后先清 `MainMosire/target/plugins/`（或 `clean`），
+  真进程/真模型验证前先 `ls` 一眼这个目录。
 - **勿加 `-N`**：`-N` 只构建根聚合器，对模块源码是空操作，`spotless:check` 会假绿；
   实测：模块里放明显违规文件，`./mvnw -N spotless:check` 退出 0，`./mvnw spotless:check` 正确报违规。
 - **全仓 verify 才是完整门禁**；用 `-pl <模块>` 时必须带 `-am`（否则可能用 `~/.m2` 的旧 SNAPSHOT，
