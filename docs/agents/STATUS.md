@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-10-23 22:45（Asia/Shanghai）
+> **更新时间**：2026-10-23 22:55（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -11,7 +11,7 @@
 | 当前发布版本 | **0.2.3** | 2026-10-23 发布；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.3`；tag `v0.2.3`；发布证据见 §4.4。 |
 | 上一发布版本 | **0.2.2** | 发布基线 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；tag `v0.2.2`；发布历史见 §4.1–§4.3。 |
 | 最近 full gate 的源码 HEAD | **`790faa6590aaf06f0cd264a85a13161846112c40`** | 0.2.3 发布前门禁；manifest 记录 `worktree=dirty(tracked=12,untracked=5)`（工作树含本版代码与版本号）；run `20261023T143755Z-70901-26515`。 |
-| 0.2.3 发布提交 | **`fix(agentlib): DECIDING 分段表态可回填` + `release: 0.2.3`** | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。 |
+| 0.2.3 发布提交 | **`4287752`**（`fix(agentlib): DECIDING 分段表态可回填`）+ **`4ebbf6a`**（`release: 0.2.3`） | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。tag 指向 `4ebbf6a`。 |
 | 模块数 | **6** | 根 `pom.xml`：AgentLib、Workspace、Docs、Brain、Main、BashPlugin。 |
 | 公开 API 兼容基线 | **0.2.2 起** | 用户 2026-10-17 裁定；后续公开 API 只增不减，变更时走下游消费方验证。 |
 | 发布工作流 | **现有 `verify → deploy` 顺序与 `deploy` 继续跑测试的行为均不修改** | 用户 2026-10-17 裁定；本批未碰 `.github/workflows/**`。 |
@@ -163,31 +163,41 @@
 | 门禁源码基线 | `790faa6`，worktree `dirty(tracked=12,untracked=5)`；提交后的代码树与该工作树一致，仅追加 STATUS 文本。 |
 | 本版变更 | ① `DecisionPackageReadPort` + 五工具端口重载（`0481401`）；② DECIDING 分段表态可回填、`decide_item` 回执只报真实表态（`设计-决策包读取端口.md` §10）。 |
 | tag | `v0.2.3`（annotated，指向 release 提交）。 |
-| Pages | 发布工作流完成后回填 §4.5。 |
+| Pages | **已核验**：见 §4.5（gh-pages `3018c3c`，三库 0.2.3 可下载、校验和一致、消费方解析成功）。 |
 
-### 4.5 v0.2.3 Pages 核验
+### 4.5 v0.2.3 Pages 核验（2026-10-23 实测）
 
-> 发布工作流完成后回填：gh-pages 提交、三库 `0.2.3` 的 jar/pom/sources 下载与 sha1、落地页版本、独立消费方解析结果。
-
+| 项目 | 事实 |
+|---|---|
+| 发布工作流 | run `39972051690`（`publish-maven`，tag `v0.2.3`）全部步骤 success；`verify` run `39972052202`、`docs-skills` run `39972051502`、`pages build and deployment` run `39972893170` 均 success。 |
+| `gh-pages` 提交 | `3018c3cc9b7a79402bed67743c68d8b9a9c65452`，`2026-10-23T14:49:11Z`（22:49:11 +08），消息 `deploy: 4ebbf6a02178570744c2eaa7ee25b8211bd80189`。 |
+| 0.2.3 制品 | 父 pom + 三库的 `jar` / `sources.jar` / `pom` 及 `md5` / `sha1`，共 31 个文件。 |
+| HTTP | 父 pom 与三库 `jar`/`pom`/`sources.jar` 共 10 个 URL 全部 **200**。 |
+| 校验和 | 三库 jar/pom 下载后 sha1 与远端 `.sha1` **逐一相等**。 |
+| 内容 | 三库 `sources.jar` 与 tag `v0.2.3` 源码 `diff` 无差异（仅生成物 `META-INF`、`version.properties`）；类集合与源码一一对应（143 / 24 / 30，0 差额）。 |
+| 版本资源 | `agentlib-mosire-0.2.3.jar` 内 `version.properties` 为 `0.2.3`，且含 `DecisionPackageReadPort.class`。 |
+| 公开面 | `javap` 对比 0.2.2 → 0.2.3：只有新增（端口构造器与 `of/all/tools` 重载、`DecisionPackages.verdicts(String)`、`implements DecisionPackageReadPort`），无删除。 |
+| 独立消费方 | 独立本地仓库 + 仅 Pages 仓库，`dependency:resolve` 三库 0.2.3：**BUILD SUCCESS**（退出码 0）。 |
+| 落地页 | `index.html` 显示 **0.2.3**，链接指向三库与父 pom 的 0.2.3 制品。 |
+| 元数据 | 三库 + 父 pom 的 `maven-metadata.xml`：`release=0.2.3`；仍只列当前版本（历史目录保留，metadata 不累积，见 §4.3）。 |
 
 ## 5. 未验证 / 未做事项
 
-- 0.2.3 的 CI 与 Pages 证据在推送后回填 §4.5；推送前没有 0.2.3 的远端证据。
-- 0.2.2 已实际下载 jar/pom/sources 并核对 sha1；0.2.3 尚未从 Pages 下载核验（待发布）。
-- 已用 `javap` 对照 0.2.2 jar：`DecisionPackageTools` 旧公开成员无删除，新增 7 个端口重载；`DecisionPackages` 旧公开方法无删除（类声明新增 `implements`）。**未配置/未运行 japicmp**；0.2.3 相对 0.2.2 的公开面增量以源码/用例为准，未做字节码级兼容扫描。
+- 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
+- `maven-metadata.xml` 只列当前版本（0.2.3）；钉死版本的消费不受影响，`RELEASE`/`LATEST`/版本区间只能看到最新版。
+- **未配置/未运行 japicmp**；0.2.3 相对 0.2.2 的公开面用 `javap` 对照（§4.5）与用例覆盖，未做语义级兼容测试。
 - 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，需改为 `0.2.3` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
-- 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。
+- 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。CI 又在 tag `4ebbf6a` 上跑了一轮 `verify` 并通过（run `39972052202`）。
 - 迁移台账中的 pending 规则尚未裁定，见 `docs/archive/2026-10-17-agents-rule-migration.md`。
 
 ## 6. 下一步
 
-1. 等发布工作流完成，按 §4.5 核验 `0.2.3` 的三库制品与落地页，并把结果回填本文。
-2. Simos 把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.3`（走 Pages），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
-3. 下一开发版本从 `0.2.4-SNAPSHOT` 起（何时升号由用户决定）；公开 API 兼容基线从 0.2.2 起，0.2.3 只增不减。
-4. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
-5. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
-6. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
+1. Simos 把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.3`（走 Pages），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
+2. 下一开发版本从 `0.2.4-SNAPSHOT` 起（何时升号由用户决定）；公开 API 兼容基线从 0.2.2 起，0.2.3 只增不减。
+3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
+4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
+5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
 
 ## 7. 当前文档权威关系
 
