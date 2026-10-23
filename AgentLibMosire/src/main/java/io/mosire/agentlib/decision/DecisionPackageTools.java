@@ -559,7 +559,9 @@ public final class DecisionPackageTools {
         return ToolResult.error(DecisionPackages.INVALID_ITEM_INDEX, "该包里没有这个条目 index=" + index);
       }
       DecisionSubmission submission = submissions.itemDecided(packageId, index, approve, by, note);
-      return ToolResult.ok(JSON.writeValueAsString(receiptRow(submission, "itemDecided")));
+      return ToolResult.ok(
+          JSON.writeValueAsString(
+              receiptRow(submission, "itemDecided", verdictsOf(true, packageId))));
     }
     if (inFlightActions == null) {
       return packageNotFound();
@@ -569,7 +571,9 @@ public final class DecisionPackageTools {
     }
     DecisionSubmission submission =
         inFlightActions.itemDecided(packageId, index, approve, by, note);
-    return ToolResult.ok(JSON.writeValueAsString(receiptRow(submission, "itemDecided")));
+    return ToolResult.ok(
+        JSON.writeValueAsString(
+            receiptRow(submission, "itemDecided", verdictsOf(false, packageId))));
   }
 
   private ToolResult executeCommit(ToolContext context) throws JsonProcessingException {
@@ -642,29 +646,36 @@ public final class DecisionPackageTools {
   }
 
   private List<DecisionItemVerdict> verdictsOf(LocatedPackage located) {
-    if (located.main()) {
-      return packages.verdicts(located.pkg().id());
+    return verdictsOf(located.main(), located.pkg().id());
+  }
+
+  private List<DecisionItemVerdict> verdictsOf(boolean main, String packageId) {
+    if (main) {
+      return packages.verdicts(packageId);
     }
     if (inFlightActions == null) {
       return List.of();
     }
     try {
-      List<DecisionPackages.ItemVerdict> verdicts =
-          inFlightActions.itemVerdicts(located.pkg().id());
-      if (verdicts == null || verdicts.isEmpty()) {
-        return List.of();
-      }
-      List<DecisionItemVerdict> converted = new ArrayList<>(verdicts.size());
-      for (DecisionPackages.ItemVerdict verdict : verdicts) {
-        converted.add(
-            new DecisionItemVerdict(
-                verdict.index(), verdict.approved(), verdict.by(), verdict.note()));
-      }
-      return List.copyOf(converted);
+      return convertItemVerdicts(inFlightActions.itemVerdicts(packageId));
     } catch (RuntimeException failure) {
       LOG.warn("读取在途包表态失败（按未表态处理） exceptionType={}", failure.getClass().getName());
       return List.of();
     }
+  }
+
+  private static List<DecisionItemVerdict> convertItemVerdicts(
+      List<DecisionPackages.ItemVerdict> verdicts) {
+    if (verdicts == null || verdicts.isEmpty()) {
+      return List.of();
+    }
+    List<DecisionItemVerdict> converted = new ArrayList<>(verdicts.size());
+    for (DecisionPackages.ItemVerdict verdict : verdicts) {
+      converted.add(
+          new DecisionItemVerdict(
+              verdict.index(), verdict.approved(), verdict.by(), verdict.note()));
+    }
+    return List.copyOf(converted);
   }
 
   private void auditDetailRead(String packageId, DecisionPackage pkg, String by) {
@@ -803,14 +814,25 @@ public final class DecisionPackageTools {
   }
 
   private static Map<String, Object> receiptRow(DecisionSubmission submission, String step) {
+    return receiptRow(submission, step, List.of());
+  }
+
+  private static Map<String, Object> receiptRow(
+      DecisionSubmission submission, String step, List<DecisionItemVerdict> verdicts) {
     DecisionPackage pkg = submission.pkg();
     Map<String, Object> body = new LinkedHashMap<>();
     body.put("step", step);
     body.put("packageId", pkg.id());
     body.put("state", pkg.state().name());
     body.put("itemCount", pkg.items().size());
-    body.put("approved", approvedIndexes(pkg));
-    body.put("rejected", rejectedIndexes(pkg));
+    if (pkg.decision() == null) {
+      // DECIDING 的分段表态：未表态条目仍未决，不得像旧的 null 分支那样空报或按驳回摊开。
+      body.put("approved", verdictIndexes(pkg, verdicts, true));
+      body.put("rejected", verdictIndexes(pkg, verdicts, false));
+    } else {
+      body.put("approved", approvedIndexes(pkg));
+      body.put("rejected", rejectedIndexes(pkg));
+    }
     CommitReceipt receipt = submission.receipt();
     if (receipt == null) {
       body.put("commit", null);
@@ -831,6 +853,19 @@ public final class DecisionPackageTools {
     commit.put("itemResults", itemResults);
     body.put("commit", commit);
     return body;
+  }
+
+  private static List<Integer> verdictIndexes(
+      DecisionPackage pkg, List<DecisionItemVerdict> verdicts, boolean approved) {
+    Map<Integer, DecisionItemVerdict> byIndex = indexVerdicts(verdicts);
+    List<Integer> indexes = new ArrayList<>();
+    for (PackageItem item : pkg.items()) {
+      DecisionItemVerdict verdict = byIndex.get(item.index());
+      if (verdict != null && verdict.approved() == approved) {
+        indexes.add(item.index());
+      }
+    }
+    return indexes;
   }
 
   private static List<Integer> approvedIndexes(DecisionPackage pkg) {

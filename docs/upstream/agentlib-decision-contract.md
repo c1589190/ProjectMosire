@@ -205,6 +205,7 @@ public final class DecisionPackageTransitions {
 - 整包 `decide` 只允许 `PROPOSED`；首次裁决终局，不可覆盖。
 - 逐条 `itemDecided` 只允许 `PROPOSED` / `DECIDING`；同一条只允许一次表态。
 - 未表态条目不是“拒绝”，直到显式执行或到点。
+- `DECIDING` 快照的 `pkg.decision()` 可以为 `null`（统一裁决尚未产生）；`DecisionSubmission` 允许且仅允许 `DECIDING` 回填无裁决的包，`receipt == null` 时 `commitNote` 仍必须非空。
 - `Decision.approvedIndexes` 只引用当前存在的 index。
 
 ### 5.5 提交
@@ -255,6 +256,7 @@ MCP 可以审核决策包：MCP 的 `tools/list` / `tools/call` 能承载“列�
 - `decision_package_decide`：整包批准/拒绝/逐条例外；
 - `decision_package_decide_item`：逐条表态；
 - `decision_package_commit`：执行已批子集。
+- `decision_package_decide_item` 的回执：`DECIDING` 时 `approved` / `rejected` 来自真实逐条表态，未表态条目既不算批准也不算驳回。
 
 安全要求：
 

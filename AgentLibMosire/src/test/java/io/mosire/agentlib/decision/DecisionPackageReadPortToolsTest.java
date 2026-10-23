@@ -1,6 +1,7 @@
 package io.mosire.agentlib.decision;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -282,9 +283,108 @@ class DecisionPackageReadPortToolsTest {
         .isEqualTo(JSON.readTree(portGet.message()));
   }
 
+  @Test
+  void partialItemVerdictReturnsDecidingWithOnlyTheRealApprovedVerdict() throws Exception {
+    DecisionPackages packages = new DecisionPackages();
+    DecisionPackage pkg = proposeTwoItemPackage(packages, "pkt-partial");
+    SnapshotBackedSubmissionPort submissions = new SnapshotBackedSubmissionPort(packages);
+    DecisionPackageTools tools =
+        new DecisionPackageTools(packages, submissions, Set.of(APPROVER_ROLE));
+
+    ToolResult result =
+        tools
+            .decideItemTool()
+            .execute(
+                context(
+                    Map.of(
+                        "packageId",
+                        pkg.id(),
+                        "index",
+                        0,
+                        "verdict",
+                        "approve",
+                        "by",
+                        "forged-model")));
+
+    assertThat(result.success()).as("message=%s", result.message()).isTrue();
+    JsonNode body = JSON.readTree(result.message());
+    assertThat(body.get("state").asText()).isEqualTo("DECIDING");
+    assertThat(indexes(body.get("approved"))).as("只报已批准的真实表态").containsExactly(0);
+    assertThat(indexes(body.get("rejected"))).as("未表态的 index=1 不是驳回").isEmpty();
+    assertThat(submissions.last().pkg().state()).isEqualTo(PackageState.DECIDING);
+    assertThat(submissions.last().pkg().decision()).isNull();
+    assertThat(submissions.last().receipt()).isNull();
+
+    DecisionPackage deciding = submissions.last().pkg();
+    assertThat(new DecisionSubmission(deciding, null, "分段表态尚未执行").pkg()).isSameAs(deciding);
+    assertThatThrownBy(() -> new DecisionSubmission(deciding, null, " "))
+        .as("没有回执时 commitNote 仍必须非空")
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(
+            () ->
+                new DecisionSubmission(
+                    packageWithState("pkt-illegal-proposed", "dm", PackageState.PROPOSED, 1, null),
+                    null,
+                    "非法"))
+        .as("PROPOSED 仍不是可回填的包")
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(
+            () ->
+                new DecisionSubmission(
+                    packageWithState("pkt-illegal-decided", "dm", PackageState.DECIDED, 1, null),
+                    null,
+                    "非法"))
+        .as("只有 DECIDING 可以暂时没有统一裁决")
+        .isInstanceOf(IllegalArgumentException.class);
+  }
+
+  @Test
+  void finalItemVerdictReturnsDecidedWithTrueApprovedAndRejectedIndexes() throws Exception {
+    DecisionPackages packages = new DecisionPackages();
+    DecisionPackage pkg = proposeTwoItemPackage(packages, "pkt-complete");
+    SnapshotBackedSubmissionPort submissions = new SnapshotBackedSubmissionPort(packages);
+    DecisionPackageTools tools =
+        new DecisionPackageTools(packages, submissions, Set.of(APPROVER_ROLE));
+
+    ToolResult first =
+        tools
+            .decideItemTool()
+            .execute(context(Map.of("packageId", pkg.id(), "index", 0, "verdict", "approve")));
+    assertThat(first.success()).as("message=%s", first.message()).isTrue();
+
+    ToolResult second =
+        tools
+            .decideItemTool()
+            .execute(context(Map.of("packageId", pkg.id(), "index", 1, "verdict", "reject")));
+
+    assertThat(second.success()).as("message=%s", second.message()).isTrue();
+    JsonNode body = JSON.readTree(second.message());
+    assertThat(body.get("state").asText()).isEqualTo("DECIDED");
+    assertThat(indexes(body.get("approved"))).containsExactly(0);
+    assertThat(indexes(body.get("rejected"))).containsExactly(1);
+    assertThat(submissions.last().pkg().decision()).isNotNull();
+    assertThat(submissions.last().pkg().decision().approvedIndexes()).containsExactly(0);
+  }
+
+  private static DecisionPackage proposeTwoItemPackage(DecisionPackages packages, String id) {
+    return packages.propose(
+        id,
+        new ProposeRequest(
+            "dm-" + id,
+            AccessToken.SYSTEM,
+            secretItems(2),
+            System.currentTimeMillis() + 3_600_000L));
+  }
+
   private static ToolContext context(Map<String, Object> arguments) {
     return new ToolContext(
         AccessToken.SYSTEM, AgentPermissionSet.system(), Map.of(), arguments, APPROVER);
+  }
+
+  private static List<Integer> indexes(JsonNode values) {
+    List<Integer> indexes = new ArrayList<>();
+    values.forEach(value -> indexes.add(value.asInt()));
+    return indexes;
   }
 
   private static DecisionPackage packageWithState(
@@ -427,6 +527,39 @@ class DecisionPackageReadPortToolsTest {
           pkg.deadlineEpochMs(),
           state,
           decision);
+    }
+  }
+
+  private static final class SnapshotBackedSubmissionPort implements DecisionSubmissionPort {
+    private final DecisionPackages packages;
+    private DecisionSubmission last;
+
+    private SnapshotBackedSubmissionPort(DecisionPackages packages) {
+      this.packages = packages;
+    }
+
+    private DecisionSubmission last() {
+      return last;
+    }
+
+    @Override
+    public DecisionSubmission submitDecision(String packageId, Decision decision) {
+      throw new AssertionError("本用例只走条目级表态");
+    }
+
+    @Override
+    public DecisionSubmission itemDecided(
+        String packageId, int index, boolean approve, String by, String note) {
+      DecisionPackageSnapshot before = packages.snapshot(packageId).orElseThrow();
+      DecisionPackageSnapshot after =
+          packages.itemDecided(packageId, before.contentVersion(), index, approve, by, note);
+      last = new DecisionSubmission(after.pkg(), null, "分段表态只回填，尚未执行");
+      return last;
+    }
+
+    @Override
+    public DecisionSubmission commitPackage(String packageId, String by) {
+      throw new AssertionError("本用例只走条目级表态");
     }
   }
 

@@ -9,10 +9,14 @@ import java.util.Objects;
  * COMMIT_FAILED}）时，包<b>保持 {@code DECIDED}</b>——这时既不能报成落定，也不能把整次裁决报成失败 （人做的那次裁决确实生效了）。所以 {@code
  * receipt == null} 必须带一句诚实的 {@link #commitNote()}， 而不是让调用方看到一片空白自己去猜。
  *
+ * <p><b>分段表态是唯一例外</b>：{@code DECIDING} 表示"这次裁决还在逐条累积"，此时统一裁决 {@link DecisionPackage#decision()}
+ * 可以仍为 {@code null}——这是工具面一次条目级表态后必须能返回的合法回执形状。 它<b>不是</b>可执行的 {@code
+ * DECIDED}：未表态条目仍未决，只有全部条目表态完或显式执行/到点时才生成统一裁决。
+ *
  * <p><b>密钥纪律</b>：{@code commitNote} 只写"为什么没有回执"（id / 拒码 / 一行理由），<b>不得</b>抄参数明文——它是给人读的 回执面，而明文只在包内
  * {@code args} 与决策面的详情响应里。
  *
- * @param pkg 回填后的包快照（{@code state != PROPOSED}；裁决就在 {@link DecisionPackage#decision()} 里）
+ * @param pkg 回填后的包快照（{@code state != PROPOSED}；{@code DECIDING} 可暂时没有统一裁决，其他状态必须有）
  * @param receipt 提交回执（{@code null} = 这次没有落定，见 {@link #commitNote()}）
  * @param commitNote 提交侧的诚实说明（{@code receipt == null} 时不得为空白）；不含明文
  */
@@ -24,8 +28,9 @@ public record DecisionSubmission(DecisionPackage pkg, CommitReceipt receipt, Str
       throw new IllegalArgumentException(
           "回填后的包不可能是 PROPOSED（那是「还没人裁」）：id=" + pkg.id() + " state=" + pkg.state());
     }
-    if (pkg.decision() == null) {
-      throw new IllegalArgumentException("回填后的包必须带裁决（谁批的、批了哪些都要能对账）：id=" + pkg.id());
+    if (pkg.decision() == null && pkg.state() != PackageState.DECIDING) {
+      throw new IllegalArgumentException(
+          "只有 DECIDING 的分段表态可以暂时没有统一裁决（谁批的、批了哪些都要能对账）：id=" + pkg.id() + " state=" + pkg.state());
     }
     commitNote = commitNote == null ? "" : commitNote;
     if (receipt == null && commitNote.isBlank()) {
