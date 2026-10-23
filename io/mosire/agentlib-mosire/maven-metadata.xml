@@ -3,10 +3,10 @@
   <groupId>io.mosire</groupId>
   <artifactId>agentlib-mosire</artifactId>
   <versioning>
-    <release>0.2.2</release>
+    <release>0.2.3</release>
     <versions>
-      <version>0.2.2</version>
+      <version>0.2.3</version>
     </versions>
-    <lastUpdated>20261017115543</lastUpdated>
+    <lastUpdated>20261023144836</lastUpdated>
   </versioning>
 </metadata>

@@ -23,7 +23,7 @@
   <body>
     <h1>Mosire Maven 仓库</h1>
     <p class="sub">
-      只读 Maven 仓库（GitHub Pages）。当前版本：<code>0.2.2</code>。<br />
+      只读 Maven 仓库（GitHub Pages）。当前版本：<code>0.2.3</code>。<br />
       发布 <code>io.mosire:agentlib-mosire</code> / <code>workspace-mosire</code> /
       <code>docs-mosire</code> 三个库 + 父 pom <code>mosire-parent</code>；公开、消费方零认证。
     </p>
@@ -40,22 +40,22 @@
 &lt;/repositories&gt;</code></pre>
 
     <p>按需加依赖（<code>agentlib-mosire</code> 会被后两个传递带出）：</p>
-    <pre><code>&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;docs-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.2&lt;/version&gt;&lt;/dependency&gt;
-&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;workspace-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.2&lt;/version&gt;&lt;/dependency&gt;</code></pre>
+    <pre><code>&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;docs-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.3&lt;/version&gt;&lt;/dependency&gt;
+&lt;dependency&gt;&lt;groupId&gt;io.mosire&lt;/groupId&gt;&lt;artifactId&gt;workspace-mosire&lt;/artifactId&gt;&lt;version&gt;0.2.3&lt;/version&gt;&lt;/dependency&gt;</code></pre>
 
-    <h2>当前版本制品（0.2.2）</h2>
+    <h2>当前版本制品（0.2.3）</h2>
     <ul>
       <li><code>io.mosire:agentlib-mosire</code>：
-        <a href="io/mosire/agentlib-mosire/0.2.2/agentlib-mosire-0.2.2.jar">jar</a> ·
-        <a href="io/mosire/agentlib-mosire/0.2.2/agentlib-mosire-0.2.2-sources.jar">sources</a></li>
+        <a href="io/mosire/agentlib-mosire/0.2.3/agentlib-mosire-0.2.3.jar">jar</a> ·
+        <a href="io/mosire/agentlib-mosire/0.2.3/agentlib-mosire-0.2.3-sources.jar">sources</a></li>
       <li><code>io.mosire:workspace-mosire</code>：
-        <a href="io/mosire/workspace-mosire/0.2.2/workspace-mosire-0.2.2.jar">jar</a> ·
-        <a href="io/mosire/workspace-mosire/0.2.2/workspace-mosire-0.2.2-sources.jar">sources</a></li>
+        <a href="io/mosire/workspace-mosire/0.2.3/workspace-mosire-0.2.3.jar">jar</a> ·
+        <a href="io/mosire/workspace-mosire/0.2.3/workspace-mosire-0.2.3-sources.jar">sources</a></li>
       <li><code>io.mosire:docs-mosire</code>：
-        <a href="io/mosire/docs-mosire/0.2.2/docs-mosire-0.2.2.jar">jar</a> ·
-        <a href="io/mosire/docs-mosire/0.2.2/docs-mosire-0.2.2-sources.jar">sources</a></li>
+        <a href="io/mosire/docs-mosire/0.2.3/docs-mosire-0.2.3.jar">jar</a> ·
+        <a href="io/mosire/docs-mosire/0.2.3/docs-mosire-0.2.3-sources.jar">sources</a></li>
       <li><code>io.mosire:mosire-parent</code>（父 pom，子模块靠它解析）：
-        <a href="io/mosire/mosire-parent/0.2.2/mosire-parent-0.2.2.pom">pom</a></li>
+        <a href="io/mosire/mosire-parent/0.2.3/mosire-parent-0.2.3.pom">pom</a></li>
     </ul>
 
     <h2>须知</h2>
@@ -72,7 +72,7 @@
     <p>打 tag 即发布：<code>git tag -a vX.Y.Z -m "…" &amp;&amp; git push origin vX.Y.Z</code>，
       触发 <a href="https://github.com/c1589190/ProjectMosire/blob/main/.github/workflows/publish-maven.yml">publish-maven</a>
       工作流（定版本 → 只发布父 pom + 三个库 → 校验布局 → 推 <code>gh-pages</code>）。
-      页面里的 <code>0.2.2</code> 由发布版本替换；版本变更说明见对应 tag 的注释。</p>
+      页面里的 <code>0.2.3</code> 由发布版本替换；版本变更说明见对应 tag 的注释。</p>
 
     <p class="note">单文件静态页：无 JS、无外部资源依赖。</p>
   </body>
