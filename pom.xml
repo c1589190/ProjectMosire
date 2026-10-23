@@ -6,7 +6,7 @@
 
   <groupId>io.mosire</groupId>
   <artifactId>mosire-parent</artifactId>
-  <version>0.2.3-SNAPSHOT</version>
+  <version>0.2.3</version>
   <packaging>pom</packaging>
 
   <name>ProjectMosire Parent</name>
@@ -51,7 +51,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
     <!-- 可复现构建：jar/pom 内条目的时间戳固定，避免同一提交每次构建产生不同字节。 -->
-    <project.build.outputTimestamp>2026-10-17T11:46:10Z</project.build.outputTimestamp>
+    <project.build.outputTimestamp>2026-10-23T14:37:43Z</project.build.outputTimestamp>
 
     <!-- BOM 锁定表（2026-09-08 repo1.maven.org 实测；策略：季度复核，见 开发计划.md §九.4） -->
     <mcp.sdk.version>2.0.1</mcp.sdk.version>

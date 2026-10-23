@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-10-17 22:10（Asia/Shanghai）
+> **更新时间**：2026-10-23 22:45（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -8,10 +8,10 @@
 
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
-| 当前开发版本 | **0.2.3-SNAPSHOT** | 根 `pom.xml:9`；6 个模块 POM 的 `<parent>` 版本均已同步。本批尚未发布。 |
-| 已发布版本（历史） | **0.2.2** | 发布基线 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；tag `v0.2.2`；发布历史见 §4。 |
-| 最近 full gate 的源码 HEAD | **`33b97e28286c26d29f82d0a6ba9ff6102f6f6b43`** | gate manifest 记录 `worktree=dirty(tracked=12,untracked=8)`；该次全绿覆盖的是工作树内容，不是某个提交对象。 |
-| 本批实现提交 | **`0481401`**（`feat(agentlib): 决策包五工具支持宿主读取端口`） | 提交内容是 gate 时的工作树代码、测试、设计文档与契约；提交后未重跑 full。 |
+| 当前发布版本 | **0.2.3** | 2026-10-23 发布；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.3`；tag `v0.2.3`；发布证据见 §4.4。 |
+| 上一发布版本 | **0.2.2** | 发布基线 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；tag `v0.2.2`；发布历史见 §4.1–§4.3。 |
+| 最近 full gate 的源码 HEAD | **`790faa6590aaf06f0cd264a85a13161846112c40`** | 0.2.3 发布前门禁；manifest 记录 `worktree=dirty(tracked=12,untracked=5)`（工作树含本版代码与版本号）；run `20261023T143755Z-70901-26515`。 |
+| 0.2.3 发布提交 | **`fix(agentlib): DECIDING 分段表态可回填` + `release: 0.2.3`** | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。 |
 | 模块数 | **6** | 根 `pom.xml`：AgentLib、Workspace、Docs、Brain、Main、BashPlugin。 |
 | 公开 API 兼容基线 | **0.2.2 起** | 用户 2026-10-17 裁定；后续公开 API 只增不减，变更时走下游消费方验证。 |
 | 发布工作流 | **现有 `verify → deploy` 顺序与 `deploy` 继续跑测试的行为均不修改** | 用户 2026-10-17 裁定；本批未碰 `.github/workflows/**`。 |
@@ -59,6 +59,8 @@
 | 证据路径 | `.work/gate/20261017T140447Z-245064-28641/summary.txt`。 |
 
 > 更早的 `1ed2372` 全绿证据（run `20261017T130949Z-218934-4482`，1618 tests）保留为历史证据，不冒充本批读取端口改动。
+>
+> 0.2.3 发布前的全量门禁见 §4.4（run `20261023T143755Z-70901-26515`，**1625 tests**）。
 
 ### 2.4 focused 判定样本
 
@@ -93,9 +95,21 @@
 - `DecisionPackages.verdicts` 为兼容适配器：保留旧 `itemVerdicts` 的 `DECIDING` 投影规则（包括既有把累积裁决摊到未表态条目的行为）；纯累计语义由 Simos core 直接返回 `DecisionPackageSnapshot.verdicts()`。
 - 设计和证据见 `设计-决策包读取端口.md`。
 
+### 2.8 0.2.3 发布前门禁（2026-10-23）
+
+| 项目 | 事实 |
+|---|---|
+| 命令 | `./scripts/gate.sh full`（内部 `./mvnw -B -ntp verify`）。 |
+| `run_id` | **`20261023T143755Z-70901-26515`**。 |
+| `source_sha` | **`790faa6`**；gate 时工作树 `dirty(tracked=12,untracked=5)`，包含 0.2.3 版本号与 DECIDING 修正。 |
+| 结果 | `rc=0`，**`FULL VERIFY PASSED`**。 |
+| 测试 | **1625 tests / 0 failures / 0 errors / 6 skipped**（AgentLib 681、Workspace 62、Docs 81、Brain 472、Bash 104 + 6 skipped、Main 225）。 |
+| SpotBugs | 6 个模块均为 `BugInstance size is 0`。 |
+| 证据 | `.work/gate/20261023T143755Z-70901-26515/summary.txt`；`CROSSCHECK log=1625 xml=1625 status=MATCH`。 |
+
 ## 3. 工作树状态
 
-本批功能提交为 `0481401`；文档收尾（STATUS/SKILLS）随后落库。功能提交后的预期工作树只剩下开工前已有的 5 个未跟踪文件：
+0.2.3 发布提交后，工作树预期只剩开工前已有的 5 个未跟踪文件：
 
 ```text
 ?? AgentLibMosire/.factorypath
@@ -106,10 +120,10 @@
 ```
 
 - `.work/gate/**` 为 run-bound 证据，默认不入库；
-- 本批改动未提交进任何历史归档，未修改 `docs/archive/**`；
-- 本批没有修改 `DecisionPackageTransitions`、`DecisionPackageSnapshot`、`DecisionSubmissionPort`、HTTP 审批面或发布工作流；没有修改 Simos 仓库。
+- 本版未修改 `docs/archive/**`；未修改 `DecisionPackageTransitions`、`DecisionPackageSnapshot`、`DecisionSubmissionPort` 的签名，未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
+- 0.2.3 的 Pages 核验在发布工作流完成后回填到 §4.5。
 
-## 4. 0.2.2 发布历史与 Pages（保留）
+## 4. 发布历史与 Pages
 
 ### 4.1 v0.2.2 发布证据
 
@@ -139,22 +153,38 @@
 - 工作流拒绝 `-SNAPSHOT`、拒绝覆盖 gh-pages 上已存在的版本。
 - 用户已裁定**不修改“deploy 再跑测试”的行为**；STATUS 只记录事实，不提出工作流改动。
 
+### 4.4 v0.2.3 发布（2026-10-23）
+
+| 项目 | 事实 |
+|---|---|
+| 版本 | **0.2.3**（非 SNAPSHOT）；根 pom 与 6 个模块 `<parent>` 一致。 |
+| 发布范围 | 父 pom + `agentlib-mosire` / `workspace-mosire` / `docs-mosire`；Brain/Main/Bash 不发 Pages。 |
+| 发布前门禁 | run `20261023T143755Z-70901-26515`：1625 tests / 0 failures / 0 errors / 6 skipped；SpotBugs 6 模块 0；`FULL VERIFY PASSED`。 |
+| 门禁源码基线 | `790faa6`，worktree `dirty(tracked=12,untracked=5)`；提交后的代码树与该工作树一致，仅追加 STATUS 文本。 |
+| 本版变更 | ① `DecisionPackageReadPort` + 五工具端口重载（`0481401`）；② DECIDING 分段表态可回填、`decide_item` 回执只报真实表态（`设计-决策包读取端口.md` §10）。 |
+| tag | `v0.2.3`（annotated，指向 release 提交）。 |
+| Pages | 发布工作流完成后回填 §4.5。 |
+
+### 4.5 v0.2.3 Pages 核验
+
+> 发布工作流完成后回填：gh-pages 提交、三库 `0.2.3` 的 jar/pom/sources 下载与 sha1、落地页版本、独立消费方解析结果。
+
+
 ## 5. 未验证 / 未做事项
 
-- `docs-skills.yml` 已在 `33b97e2` 上实跑成功（run `39036796799`），`verify` 也在同一 SHA 上成功（run `39036796619`）；本批读取端口改动尚未 commit/push，因此**没有本批 CI 证据**。
+- 0.2.3 的 CI 与 Pages 证据在推送后回填 §4.5；推送前没有 0.2.3 的远端证据。
+- 0.2.2 已实际下载 jar/pom/sources 并核对 sha1；0.2.3 尚未从 Pages 下载核验（待发布）。
+- 已用 `javap` 对照 0.2.2 jar：`DecisionPackageTools` 旧公开成员无删除，新增 7 个端口重载；`DecisionPackages` 旧公开方法无删除（类声明新增 `implements`）。**未配置/未运行 japicmp**；0.2.3 相对 0.2.2 的公开面增量以源码/用例为准，未做字节码级兼容扫描。
+- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，需改为 `0.2.3` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
-- 本批 full gate 已在工作树 dirty 状态下通过；manifest 的 `source_sha` 是 HEAD `33b97e2`，不等于“已提交包含本批改动的 SHA”。提交后如需发布级证据，应按新 SHA 重跑。
-- 已用 `javap` 对照 0.2.2 jar：`DecisionPackageTools` 旧公开成员无删除，新增 7 个端口重载；`DecisionPackages` 旧公开方法无删除（类声明新增 `implements`）。未配置/运行 japicmp。
-- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 的 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
-- 未在浏览器实际下载 Pages 上的 jar；Pages 事实只到 git 对象/路径级核对。
-- 本批不 tag、不刷新 Pages、不发布 `0.2.3`；`0.2.3-SNAPSHOT` 只在开发/本机安装链上。提交与推送按用户当次指令执行，状态以 `git status`/远端 `main` 为准。
+- 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。
 - 迁移台账中的 pending 规则尚未裁定，见 `docs/archive/2026-10-17-agents-rule-migration.md`。
 
 ## 6. 下一步
 
-1. 把 `0.2.3-SNAPSHOT` 的 AgentLib 安装到本机 Maven 仓（或等待正式发布），供 Simos 更新 `agentlib-mosire.version` 后接入。
-2. Simos 实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
-3. 下游通过后，再决定是否把版本固定为 `0.2.3`、更新 STATUS/tag/Pages 并发布。
+1. 等发布工作流完成，按 §4.5 核验 `0.2.3` 的三库制品与落地页，并把结果回填本文。
+2. Simos 把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.3`（走 Pages），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
+3. 下一开发版本从 `0.2.4-SNAPSHOT` 起（何时升号由用户决定）；公开 API 兼容基线从 0.2.2 起，0.2.3 只增不减。
 4. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 5. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 6. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
