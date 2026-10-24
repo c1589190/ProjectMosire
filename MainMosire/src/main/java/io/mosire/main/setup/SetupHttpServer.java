@@ -35,10 +35,14 @@ import org.slf4j.LoggerFactory;
  * <ul>
  *   <li>{@code GET /api/setup/status} → {@code {"configured":bool,"model":"unconfigured|<model>"}}；
  *   <li>{@code POST /api/setup/llm} → body {@code
- *       {"name":"default","baseUrl":"…","model":"…","apiKey":"…"}} （name 缺省 {@code default}
- *       且须过路由名关；apiKey 可空 = 匿名）→ 探测 → 写盘 → 热切换 → {@code 200 {"ok":true,"name","model"}}；参数坏/探测失败
- *       {@code 400}；方法不符 {@code 405}。
+ *       {"name":"default","baseUrl":"…","model":"…","apiKey":"…","maxContext":…,"maxOutput":…}}
+ *       （name 缺省 {@code default} 且须过路由名关；apiKey 可空 = 匿名；maxContext/maxOutput 是必填正整数，写入 {@code
+ *       llm.routes.<name>.capabilities.*}）→ 探测 → 写盘 → 热切换 → {@code 200 {"ok":true,"name","model"}}；
+ *       参数坏/探测失败 {@code 400}（均不写盘）；方法不符 {@code 405}。
  * </ul>
+ *
+ * <p><b>热切换边界</b>：本端点只替换 {@link SetupLlmRouter} 里的 raw LLM client。默认上下文压缩器在进程启动时按真模型 capabilities
+ * 装配；setup 未配置态没有 compactor，热切换也不会补建。压缩要在写盘并<b>重启</b>后生效，不能把 200 误解成 “热切换后压缩已生效”。
  */
 public final class SetupHttpServer {
 
@@ -118,12 +122,22 @@ public final class SetupHttpServer {
       String baseUrl = textOr(body, "baseUrl", "");
       String model = textOr(body, "model", "");
       String apiKey = textOr(body, "apiKey", "");
+      Integer maxContext = positiveIntOrNull(body, "maxContext");
+      Integer maxOutput = positiveIntOrNull(body, "maxOutput");
       if (!LlmRouteLoader.isValidRouteName(name)) {
         send(exchange, 400, error("name 非法（字母/数字开头，仅含字母数字_-）"));
         return;
       }
       if (baseUrl.isBlank() || model.isBlank()) {
         send(exchange, 400, error("baseUrl 与 model 必填"));
+        return;
+      }
+      if (maxContext == null) {
+        send(exchange, 400, error("maxContext 必填且必须为正整数"));
+        return;
+      }
+      if (maxOutput == null) {
+        send(exchange, 400, error("maxOutput 必填且必须为正整数"));
         return;
       }
       try {
@@ -133,13 +147,18 @@ public final class SetupHttpServer {
         send(exchange, 400, error("探测失败：" + probeFailure.getMessage()));
         return;
       }
-      LlmConfigWriter.write(store, name, baseUrl, model, apiKey);
+      LlmConfigWriter.write(store, name, baseUrl, model, apiKey, maxContext, maxOutput);
       String credentialsRef = apiKey.isBlank() ? "" : "keys." + name;
       router.swap(
           new OpenAICompatibleLlmClient(
               new ModelRoute(name, baseUrl, model, credentialsRef),
               new ConfigApiKeySource(store, credentialsRef, AccessToken.SYSTEM)));
-      LOG.info("setup 完成：路由 {} 模型 {}（热切换生效，配置已落盘）", name, model);
+      LOG.info(
+          "setup 完成：路由 {} 模型 {} maxContext={} maxOutput={}（LLM 热切换生效，配置已落盘；" + "默认上下文压缩需重启后装配）",
+          name,
+          model,
+          maxContext,
+          maxOutput);
       ObjectNode ok = JSON.createObjectNode();
       ok.put("ok", true);
       ok.put("name", name);
@@ -155,6 +174,18 @@ public final class SetupHttpServer {
   private static String textOr(JsonNode body, String field, String dflt) {
     JsonNode value = body.get(field);
     return value == null || !value.isTextual() ? dflt : value.asText();
+  }
+
+  /** 必填正整数字段：JSON 整数且 1..Integer.MAX_VALUE；其他形态（含字符串数字）一律不猜。 */
+  private static Integer positiveIntOrNull(JsonNode body, String field) {
+    JsonNode value = body.get(field);
+    if (value == null
+        || !value.isIntegralNumber()
+        || !value.canConvertToInt()
+        || value.asInt() <= 0) {
+      return null;
+    }
+    return value.asInt();
   }
 
   private static ObjectNode error(String message) {

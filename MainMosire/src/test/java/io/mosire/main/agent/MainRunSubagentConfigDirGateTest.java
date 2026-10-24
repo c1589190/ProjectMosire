@@ -254,7 +254,8 @@ class MainRunSubagentConfigDirGateTest {
             + stub.baseUrl()
             + "\",\"model\":\""
             + CONFIG_MODEL
-            + "\",\"credentialsRef\":\"keys.local\"}}",
+            + "\",\"credentialsRef\":\"keys.local\",\"capabilities\":"
+            + "{\"maxContext\":131072,\"maxOutput\":8192}}}",
         StandardCharsets.UTF_8);
     return root;
   }

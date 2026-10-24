@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.compact.CompactionException;
+import io.mosire.agentlib.compact.CompactionOutcome;
+import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.context.ContextComposer;
 import io.mosire.agentlib.context.ContextWindow;
 import io.mosire.agentlib.context.LlmRoundTrip;
@@ -187,6 +190,14 @@ public final class AgentPipeline {
 
   /** 会话压缩器；{@code null} = 未接线（既有构造的取法，行为与压缩接线前逐字节一致）。 */
   private final Compactor compactor;
+
+  /**
+   * 每轮 LLM 往返前的默认上下文压缩器（AgentLib compact SPI）；{@code null} = 未接线。
+   *
+   * <p>它与旧 {@link Compactor} 是两条互斥的压缩路径：旧路径在回合边界做三档压缩，新路径在每个 LLM 往返前由 {@link AgentLoop}
+   * 调用。构造期同时给出两者会响亮拒绝，避免同一回合被两套算法各压一次。
+   */
+  private final ContextCompactor contextCompactor;
 
   /**
    * 当前生效摘要的槽：<b>必须与装配器共用同一个</b>（否则档 2 的摘要在请求里不可见）——本类只写不读（除回传给 Compactor 做并集）。
@@ -442,7 +453,7 @@ public final class AgentPipeline {
         compactor,
         compactSummary,
         toolConfig,
-        null);
+        (ApprovalCoordinator) null);
   }
 
   /**
@@ -487,7 +498,7 @@ public final class AgentPipeline {
         compactSummary,
         toolConfig,
         coordinator,
-        null);
+        (DecisionApprovalBridge) null);
   }
 
   /**
@@ -538,31 +549,325 @@ public final class AgentPipeline {
         toolConfig,
         coordinator,
         decisionBridge,
-        null);
+        (CrossProcessDecisionSubmitter) null);
   }
 
   /**
-   * 全参装配 + 审批桥 + <b>跨进程收尾缝</b>（P3b，设计 §5quinquies）：除最后一个参数外与上一条构造逐字相同。
+   * 不落库 + 工具配置 + <b>默认上下文压缩器</b>：无跨进程收尾缝的显式装配入口。
    *
-   * <p><b>{@code crossProcessSubmitter} 非 null</b> ⇒ 子体这一侧：回合开始时若缝<b>真的可用</b> （{@link
-   * CrossProcessDecisionSubmitter#available()}：父侧那个工具在 registry 里且本实例判定面放行它）就绑本轮队列， 收尾走跨进程提交；缝不可用 ⇒
-   * 一个字段都不改语义（不绑队列，{@code Ask} 走既有那一跳）。{@code null} ⇒ 与接线前逐字节一致。
+   * <p>既有「不落库 + toolConfig」构造保持原签名并委派 {@code null}；本重载只追加新压缩器。
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        DiscardingConversationStore.INSTANCE,
+        conversationIdOf(config),
+        null,
+        CompactSummarySlot.empty(),
+        toolConfig,
+        null,
+        null,
+        null,
+        contextCompactor);
+  }
+
+  /**
+   * 不落库 + 工具配置 + 跨进程收尾缝 + <b>默认上下文压缩器</b>：子 Agent 的显式装配入口。
    *
-   * <p><b>为什么与桥并存而不是二选一</b>：装配层可能同时给两者（子体进程里挂一条本进程的桥做兜底，或反过来）； 谁走哪条路由 {@link
-   * #flushPendingDecisions} 现判（缝优先），不由构造顺序暗示。
+   * <p>这是既有「自定义 assembler + crossProcessSubmitter」子 Agent 路径的 ContextCompactor 重载；既有构造保持原签名并委派
+   * {@code null}。新压缩器只从 AgentLib 的 {@link ContextCompactor} SPI 接入，不触碰旧 {@link Compactor} 三档路径。
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        DiscardingConversationStore.INSTANCE,
+        conversationIdOf(config),
+        null,
+        CompactSummarySlot.empty(),
+        toolConfig,
+        null,
+        null,
+        crossProcessSubmitter,
+        contextCompactor);
+  }
+
+  /** 全参装配 + 会话持久化 + <b>默认上下文压缩器</b>（无旧 Compactor / 无工具配置的最简注入口）。 */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        null,
+        CompactSummarySlot.empty(),
+        Map.of(),
+        null,
+        null,
+        null,
+        contextCompactor);
+  }
+
+  /** 旧 Compactor 构造 + <b>默认上下文压缩器</b>（互斥校验的显式入口）。 */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        Map.of(),
+        null,
+        null,
+        null,
+        contextCompactor);
+  }
+
+  /** 旧 Compactor 构造 + 工具配置 + <b>默认上下文压缩器</b>。 */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        null,
+        null,
+        null,
+        contextCompactor);
+  }
+
+  /** 旧 Compactor 构造 + 工具配置 + 审批编排器 + <b>默认上下文压缩器</b>。 */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        coordinator,
+        null,
+        null,
+        contextCompactor);
+  }
+
+  /**
+   * 全参装配 + 会话持久化 + 审批桥 + <b>默认上下文压缩器</b>：主 Agent 的显式装配入口。
    *
-   * <p><b>为什么 {@code decisionBridge}/{@code crossProcessSubmitter} 带 {@code EI_EXPOSE_REP2}
-   * 抑制</b>：它们是<b>注入的协作者</b> （管线在回合收尾必须调它们：收成包、投递/提交、等裁决、执行被批子集），与本类既有的 {@code events}/{@code
-   * bus}/{@code llm}/{@code guard} 完全同类——<b>故意的共享引用（依赖注入）</b>，不是"把内部状态漏出去"；字段是 {@code private
-   * final}，本类不外传、不暴露取值口。
+   * <p>参数与 16 参审批桥构造逐字一致，只在末尾追加 {@link ContextCompactor}；旧 {@link Compactor} 仍可作为前序参数给出， 但两者同时非
+   * null 时由终态构造响亮拒绝（同一管线不允许两套压缩算法）。
+   */
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      ContextCompactor contextCompactor) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        null,
+        contextCompactor);
+  }
+
+  public AgentPipeline(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AccessToken caller,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Compactor compactor,
+      CompactSummarySlot compactSummary,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this(
+        config,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        caller,
+        permissionSet,
+        store,
+        conversationId,
+        compactor,
+        compactSummary,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        crossProcessSubmitter,
+        (ContextCompactor) null);
+  }
+
+  /**
+   * 终态构造：同时接收旧 {@link Compactor} 与新 {@link ContextCompactor}，但构造期强制两者互斥。
    *
-   * <p><b>这条抑制今天来回过一次，把经过与口径写在这里，免得后人再来回</b>：它此前挂过同样一条，2026-10-17 一次「清 {@code target/classes} 后只跑
-   * SpotBugs」的检查给出 {@code BugInstance size is 0}，于是按 AGENTS §三「抑制多余也是要修的告警」删掉，
-   * 并留下「若将来真报了再按当时的事实加回来」的话；同日**上下文窗口下沉批次**（采纳 {@code ContextWindow}/{@code LlmRoundTrip}）
-   * 完成后的<b>清源重编 + 全量 {@code verify}</b> 又报出 {@code EI_EXPOSE_REP2}（{@code BugInstance size is
-   * 1}，此外无其它告警） ⇒ 按当时写下的话加回来。⇒ **口径：这条告警的可见性依赖构建状态**（增量 vs 全清、aux classpath 里 {@code
-   * DecisionApprovalBridge} 是否被一并分析），一次「没报」不足以证明抑制多余——**要动它的状态，先做一次「清源重编 + 全量 {@code verify}」**，
-   * 不要拿一次 {@code spotbugs:check} 的 0 就删。
+   * <p>互斥不是风格选择：旧路径会在回合边界先压一次，新路径又会在每个往返前压一次；两者同时启用会让同一段历史被两套算法各改一次， 成本、事件与窗口形状都失去单一解释。需要旧行为就显式给旧
+   * compactor；需要默认每轮压缩就给新 contextCompactor。
    */
   @SuppressFBWarnings("EI_EXPOSE_REP2")
   public AgentPipeline(
@@ -582,7 +887,13 @@ public final class AgentPipeline {
       Map<String, Object> toolConfig,
       ApprovalCoordinator coordinator,
       DecisionApprovalBridge decisionBridge,
-      CrossProcessDecisionSubmitter crossProcessSubmitter) {
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    if (compactor != null && contextCompactor != null) {
+      throw new IllegalArgumentException(
+          "旧 Compactor 与新 ContextCompactor 不能同时注入同一 AgentPipeline（拒绝双压）");
+    }
+    this.contextCompactor = contextCompactor;
     this.crossProcessSubmitter = crossProcessSubmitter;
     this.decisionBridge = decisionBridge;
     this.toolConfig = Map.copyOf(Objects.requireNonNull(toolConfig, "toolConfig"));
@@ -622,6 +933,22 @@ public final class AgentPipeline {
    */
   public void cancel() {
     cancelled = true;
+  }
+
+  /**
+   * 请求下一次 LLM 往返前强制压缩一次（手动入口）。
+   *
+   * <p>本方法只设置一次性 force，不直接改窗口：真正触发仍在下一轮往返前的 {@link ContextCompactor#compactIfNeeded} 内，保证 “摘要 + 下一轮
+   * user 合成一条 user”的窗口形状与自动触发完全一致。未接 {@link ContextCompactor} 时响亮失败，不静默 no-op。
+   *
+   * @throws IllegalStateException 本管线未注入 {@link ContextCompactor}
+   */
+  public void requestCompaction() {
+    if (contextCompactor == null) {
+      throw new IllegalStateException(
+          "AgentPipeline 未接 ContextCompactor，无法请求手动压缩（拒绝静默 no-op）: " + config.id());
+    }
+    contextCompactor.requestCompaction();
   }
 
   /**
@@ -795,6 +1122,7 @@ public final class AgentPipeline {
         .dispatcher(dispatcher)
         .stopPolicy(stopPolicy)
         .listener(listener)
+        .contextCompactor(contextCompactor)
         .maxToolCallsPerResponse(config.maxToolCallsPerTurn())
         .build()
         .runTurn(turnInput, tools);
@@ -941,14 +1269,85 @@ public final class AgentPipeline {
     }
 
     @Override
+    public void onCompacted(CompactionOutcome outcome, LoopState state) {
+      // 摘要调用是额外的 LLM 成本：成功压缩时先落记账，再落压缩结果。摘要正文只留在 ContextWindow raw 中，绝不进事件。
+      emitCompactCall(outcome.summarizerResponse(), outcome.summarizerLatencyMs());
+      emit(
+          EventTypes.CONVERSATION_COMPACT,
+          Map.of(
+              "tier",
+              "checkpoint",
+              "reason",
+              outcome.reason(),
+              "beforeTokens",
+              outcome.beforeTokens(),
+              "afterTokens",
+              outcome.afterTokens(),
+              "triggerTokens",
+              outcome.triggerTokens(),
+              "droppedMessages",
+              outcome.droppedMessages(),
+              "summaryTokens",
+              outcome.summaryTokens()));
+    }
+
+    @Override
     public void onLlmError(LlmException error, List<LlmMessage> roundInput, LoopState state) {
+      // 压缩器在提交前失败时窗口一个字节都没动；若摘要调用已经发生，CompactionException 会带出 response 与耗时。
+      // 记账必须先于失败 decision 与落库，保证“钱花了但事件里看不见”的窗口不存在。
+      boolean compactionFailed = error instanceof CompactionException;
+      if (compactionFailed) {
+        CompactionException compactionError = (CompactionException) error;
+        compactionError
+            .summarizerResponse()
+            .ifPresent(response -> emitCompactCall(response, compactionError.latencyMs()));
+      }
+
+      // 压缩失败是独立的结构性失败，不和普通 LLM_ERROR 混成一条含糊 decision；reason 只取异常的结构性说明，不含摘要/prompt 原文。
+      // 先把失败事实落事件，再走既有失败输入回补与落库：用户本轮说过的话不能因压缩失败而丢。
+      if (compactionFailed) {
+        emitDecision("COMPACT_FAILED", Map.of("reason", structuralReason(error)));
+      }
+
       // 失败路径的接线要求（设计 §5.2）：LlmRoundTrip 在 chat 抛出时"窗口一个字节都没动"（写回是成功后才发生的），
       // 所以本轮 user 必须由宿主自己补写回再落库——否则第 1 轮失败时"用户说过什么"就丢了（旧行为里本轮 user 在组请求时就已进列表）。
       // 第 ≥2 轮 roundInput 为空，appendAll 天然是空操作（旧行为同样不新增任何东西）。
       window.appendAll(roundInput);
-      // 此刻 assistant 消息尚未入列，历史以工具结果干净收尾（与旧行为一致）
-      emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(error.getMessage())));
+      // 此刻 assistant 消息尚未入列，历史以工具结果干净收尾（与旧行为一致）。
+      if (!compactionFailed) {
+        emitDecision("LLM_ERROR", Map.of("reason", String.valueOf(error.getMessage())));
+      }
       saveHistory();
+    }
+
+    /** 落一条摘要调用的 llm.call 记账；没有响应（未发生摘要调用）时不伪造零成本事件。 */
+    private void emitCompactCall(LlmResponse response, long latencyMs) {
+      if (response == null) {
+        return;
+      }
+      emit(
+          EventTypes.LLM_CALL,
+          Map.of(
+              "phase",
+              "compact",
+              "inputTokens",
+              response.inputTokens(),
+              "outputTokens",
+              response.outputTokens(),
+              "cacheReadTokens",
+              response.cacheReadTokens(),
+              "cacheWriteTokens",
+              response.cacheWriteTokens(),
+              "model",
+              response.model(),
+              "latencyMs",
+              Math.max(0L, latencyMs)));
+    }
+
+    /** 压缩失败的结构性原因；不回显摘要、prompt 或密钥。 */
+    private String structuralReason(LlmException error) {
+      String message = error.getMessage();
+      return message == null || message.isBlank() ? "压缩失败（无结构化原因）" : message;
     }
 
     /** onStop 的 payload 映射（设计 §4.3）：只覆盖旧实现的三种专属形状 + CANCELLED 空载荷，其余原因走通用 detail。 */

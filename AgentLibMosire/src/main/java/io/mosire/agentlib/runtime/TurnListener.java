@@ -1,5 +1,6 @@
 package io.mosire.agentlib.runtime;
 
+import io.mosire.agentlib.compact.CompactionOutcome;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmException;
 import io.mosire.agentlib.llm.LlmMessage;
@@ -19,8 +20,9 @@ import java.util.Optional;
  * / 落事件"统一放在这四个回调里，而不是放在 {@code runTurn} 返回之后再补——后者会漏掉"异常在 return 前发生"的时序，
  * 而且"结果已经返回、历史还没保存"这个窗口本身就是失忆 bug 的形状。
  *
- * <p><b>{@link #onRoundTrip} 不是终止回调</b>：每次成功往返恰好一次；它<b>可以返回</b>终止信号（见下），返回信号时骨架会先转去 {@link
- * #onStop}，所以一次回合内的 {@code onRoundTrip} 次数可以多于 {@code onStop} 次数。
+ * <p><b>{@link #onRoundTrip} / {@link #onCompacted} 不是终止回调</b>：{@code onRoundTrip} 每次成功往返恰好一次；
+ * {@code onCompacted} 每次成功提交压缩恰好一次（可能 0 次，也可能跨多轮工具循环出现多次）。{@code onRoundTrip} 可以返回终止信号（见下），
+ * 返回信号时骨架会先转去 {@link #onStop}，所以一次回合内的 {@code onRoundTrip} 次数可以多于 {@code onStop} 次数。
  *
  * <p><b>回调里允许做什么</b>：记账、发事件、写窗口（工具结果/占位）、落库、记录指标。不允许：重新发起 LLM 调用、修改骨架参数、
  * 抛异常当控制流用——回调抛出运行时异常会原样向上传播（骨架不吞宿主 bug）。
@@ -44,6 +46,17 @@ public interface TurnListener {
   default Optional<StopSignal> onRoundTrip(LlmResponse response, long latencyMs, LoopState state) {
     return Optional.empty();
   }
+
+  /**
+   * 上下文压缩器成功提交一次压缩之后、主 LLM 请求发出之前调用。
+   *
+   * <p>宿主在这里落压缩摘要调用成本（{@code outcome.summarizerResponse()}）与压缩事件；<b>不要把摘要正文写进事件或日志</b>，它已经在窗口 raw
+   * 的历史里。本回调不是终止回调，抛出运行时异常会原样向上传播。
+   *
+   * @param outcome 压缩结果（非 null；{@code compacted=true}，turnInput 为空）
+   * @param state 压缩提交后的回合进度快照（主请求尚未发出、轮数未增加）
+   */
+  default void onCompacted(CompactionOutcome outcome, LoopState state) {}
 
   /**
    * 模型没有工具调用 ⇒ 本回合正常结束。宿主通常在这里落库（{@code saveHistory} 一类的动作）。
@@ -75,14 +88,14 @@ public interface TurnListener {
   default void onStop(StopSignal signal, LoopState state) {}
 
   /**
-   * {@code LlmRoundTrip#call} 抛 {@link LlmException}：本回合以 {@link StopReason#LLM_ERROR} 收尾。
+   * 上下文压缩器或 {@code LlmRoundTrip#call} 抛 {@link LlmException}：本回合以 {@link StopReason#LLM_ERROR} 收尾。
    *
-   * <p><b>{@code roundInput} 为什么交回给宿主</b>：往返失败时窗口<b>一个字节都没动</b>（写回只在 chat 成功后发生），所以这次失败的往返
-   * "原本要写回的本轮输入"还在骨架手里。失败的输入算不算历史是<b>宿主的失败策略</b>：完整 Agent 宿主通常希望下一轮还记得用户说过什么 （于是把 {@code
-   * roundInput} append 回窗口再落库）；一次性脚本宿主可能选择丢弃。库不替宿主决定，只把原样交回。
+   * <p><b>{@code roundInput} 为什么交回给宿主</b>：压缩器按契约在提交前失败时窗口<b>一个字节都没动</b>；往返失败时窗口同样未写回（写回只在 chat
+   * 成功后发生）。所以这次失败的往返 "原本要写回的本轮输入"还在骨架手里。失败的输入算不算历史是<b>宿主的失败策略</b>：完整 Agent 宿主通常希望下一轮还记得用户说过什么 （于是把
+   * {@code roundInput} append 回窗口再落库）；一次性脚本宿主可能选择丢弃。库不替宿主决定，只把原样交回。
    *
-   * @param error 失败原因（非 null）
-   * @param roundInput 这次失败的往返原本要写回的本轮输入（非 null；首轮非空、此后各轮为空列表）
+   * @param error 失败原因（非 null；可能是 {@link io.mosire.agentlib.compact.CompactionException}）
+   * @param roundInput 这次失败的往返原本要写回的本轮输入（非 null；首轮非空、此后各轮为空列表；压缩已提交时为空）
    * @param state 失败时刻的进度快照（<b>{@code rounds} 未加一</b>——这次往返没有完成）
    */
   default void onLlmError(LlmException error, List<LlmMessage> roundInput, LoopState state) {}

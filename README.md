@@ -8,7 +8,7 @@
 
 | 模块 | 职责 | 允许依赖 / 要点 |
 |---|---|---|
-| `AgentLibMosire` | 通用 LLM 工具包：LLM 客户端/接口、AgentTool、MCP 适配、权限、事件存储、配置、进程管理；并含 **Agent 描述符**（`AgentConfig`）、**上下文窗口结构**（`ContextWindow`/`ContextComposer`/`LlmRoundTrip`）与**通用循环骨架**（`AgentLoop` + 策略 SPI） | —；不得 import `io.mosire.brain.*` / `io.mosire.main.*`。**含骨架/描述符，不含具体策略**：何时停、记账、事件形状、持久化、技能、记忆、子 Agent、重试、沙箱、权限判定仍留 Brain。 |
+| `AgentLibMosire` | 通用 LLM 工具包：LLM 客户端/接口、AgentTool、MCP 适配、权限、事件存储、配置、进程管理；并含 **Agent 描述符**（`AgentConfig`）、**上下文窗口结构**（`ContextWindow`/`ContextComposer`/`LlmRoundTrip`）、**可覆写的默认上下文压缩**（`ContextCompactor`/`DefaultContextCompactor`）与**通用循环骨架**（`AgentLoop` + 策略 SPI） | —；不得 import `io.mosire.brain.*` / `io.mosire.main.*`。何时停、记账、事件形状、持久化、技能、记忆、子 Agent、重试、沙箱、权限判定仍留 Brain；上下文压缩策略可通过 SPI 覆写。 |
 | `WorkspaceMosire` | 工作区虚拟路径、挂载、能力/权限与安全路径解析（`resolveForIo`） | `agentlib-mosire` |
 | `DocsMosire` | 文档/日志存储、编辑、查询与文档工具 | `agentlib-mosire` + `workspace-mosire` |
 | `BrainMosire` | Agent 运行时：对话、工具载入、上下文构造/压缩、子 Agent 编排、skills、记忆 | `agentlib-mosire`、`workspace-mosire`、`docs-mosire`（+ Jackson/SLF4J）；不得依赖 `MainMosire` |

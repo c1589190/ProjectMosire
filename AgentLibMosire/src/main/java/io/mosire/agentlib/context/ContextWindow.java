@@ -5,6 +5,7 @@ import io.mosire.agentlib.llm.LlmMessage;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * 上下文窗口：一个会话此刻看得见的那串消息 + 它的标识与中性读数。
@@ -20,7 +21,8 @@ import java.util.Objects;
  *   <li><b>不认识会话存储</b>：窗口不 load、不 append、不校验"落库了没有"。持久化是宿主策略，窗口只报中性事实——"自上次 {@link #markSaved()}
  *       以来尾部多了哪些消息"（见 {@link #unsavedTail()}）。真实用法里存在<b>刻意不落库</b>的消息（每轮现插的提醒），
  *       若把"落库"写进窗口的不变量，那种用法当场非法。
- *   <li><b>不认识技能 / 记忆 / 压缩</b>：这些是"往窗口里放什么"的供给方，窗口不反向依赖它们，也不知道压缩是什么。
+ *   <li><b>不认识技能 / 记忆 / 压缩策略</b>：这些是"往窗口里放什么"的供给方，窗口不反向依赖它们。窗口只认识一个中性的 compact
+ *       标记，并据此生成可见投影；摘要怎么产生、何时产生仍由宿主/压缩器决定。
  *   <li><b>不认识 Brain</b>：本包不得 import 下游模块（Brain / Main）的任何类型（模块边界，见 AGENTS.md §0.1）——反过来也正是它可复用的原因。
  * </ul>
  *
@@ -33,6 +35,22 @@ import java.util.Objects;
  */
 public final class ContextWindow {
 
+  /**
+   * compact 标记保留 role。
+   *
+   * <p>它不是 LLM 合法 role，只存在于 {@link #rawMessages()} 的 raw 历史中；{@link #messages()}
+   * 永远会把它投影掉，任何模型请求都不得看到它。
+   */
+  public static final String ROLE_COMPACT = "compact";
+
+  /** 合成 user 检查点的固定前言（由窗口统一生成，避免各调用方拼出不同格式）。 */
+  public static final String COMPACTION_CHECKPOINT_PREFIX =
+      "[自动上下文压缩检查点]\n" + "以下是较早对话的压缩摘要，作为已确立的背景继续工作，不要复述或确认本检查点。\n\n" + "<compacted-summary>\n";
+
+  /** 合成 user 检查点的固定结尾。 */
+  public static final String COMPACTION_CHECKPOINT_SUFFIX = "\n</compacted-summary>";
+
+  /** raw 历史（含 compact 标记）；对外只经快照方法暴露。 */
   private final List<LlmMessage> messages = new ArrayList<>();
 
   /** 未落库尾部的起点：不变量恒为 {@code 0 <= unsavedFrom <= messages.size()}。 */
@@ -73,18 +91,95 @@ public final class ContextWindow {
   }
 
   /**
-   * 当前内容的<b>不可变快照</b>（按序）。
+   * 当前<b>可见投影</b>的不可变快照（按序）。
+   *
+   * <p><b>两种层次</b>：raw 历史永远 append-only 保留全部消息；compact 标记（{@link #ROLE_COMPACT}）只存在于 raw 中。本方法找最后一个
+   * compact 标记，并返回它之后的可见后缀：标记之前的消息全部被屏蔽，标记本身也永不出现。
+   *
+   * <p><b>投影规则</b>：无 compact 标记时逐字节保持旧行为（返回 raw 全量）。有标记时，摘要取自标记里的文本 part；若标记后首条是 user， 把该 user 的文本
+   * part 与摘要按 {@link #COMPACTION_CHECKPOINT_PREFIX}/{@link #COMPACTION_CHECKPOINT_SUFFIX} 合成一条纯文本
+   * user，再接后缀其余消息；否则返回 {@code [user(摘要检查点)] + 后缀}。合成 user 不保留图片等非文本 part。
    *
    * <p>为什么给快照而不是活视图：调用方（装配器、宿主）常要把它交给另一次调用或跨线程读；给视图等于同时给了一个绕过"唯一改写路径"的后门。代价是每回合 O(n)
    * 拷贝——与既有实现里同量级的一次拷贝相比不值得为它引入"谁在什么时候能改"的新约定。
    */
   public List<LlmMessage> messages() {
+    return List.copyOf(visibleMessages());
+  }
+
+  /**
+   * 当前<b>可见消息条数</b>（compact 标记不计入；无标记时与 raw 条数相同）。
+   *
+   * <p>压缩标记之后只保留最后一段可见后缀，因此该值可能小于 {@link #rawSize()}。
+   */
+  public int size() {
+    return visibleMessages().size();
+  }
+
+  /**
+   * raw 历史的不可变快照（含 compact 标记，按序）。
+   *
+   * <p><b>只给持久化 / 审计 / 诊断使用；绝不能直接送给模型。</b>compact 是窗口内部标记，不是供应商合法 role； 要组 LLM 请求必须使用 {@link
+   * #messages()}（它会自动投影并屏蔽标记前的旧历史）。
+   */
+  public List<LlmMessage> rawMessages() {
     return List.copyOf(messages);
   }
 
-  /** 当前消息条数。 */
-  public int size() {
+  /** raw 消息条数（含 compact 标记）。 */
+  public int rawSize() {
     return messages.size();
+  }
+
+  /** 是否至少存在一个 compact 标记。 */
+  public boolean hasCompaction() {
+    return lastCompactIndex() >= 0;
+  }
+
+  /**
+   * 最后一个 compact 标记里的摘要正文（可见诊断用）。
+   *
+   * <p>返回值只用于诊断/事件的结构性判断；不要把它写进日志原文。标记没有文本 part 时返回空；多个文本 part 按出现顺序以换行连接。
+   */
+  public Optional<String> lastCompactionSummary() {
+    int index = lastCompactIndex();
+    if (index < 0) {
+      return Optional.empty();
+    }
+    return Optional.of(summaryText(messages.get(index)));
+  }
+
+  /**
+   * 追加一条 compact 标记；<b>不删除 raw 历史</b>。
+   *
+   * <p>标记正文只存模型摘要。它进入未落库尾部（{@link #unsavedTail()} 会包含它），因此正常落库后重启可从 raw 自动恢复投影。
+   *
+   * @param summary 模型生成的摘要正文（非 null、非空白）
+   */
+  public void compact(String summary) {
+    Objects.requireNonNull(summary, "summary");
+    if (summary.isBlank()) {
+      throw new IllegalArgumentException("compact 摘要不得为空白");
+    }
+    append(new LlmMessage(ROLE_COMPACT, List.of(new ContentPart.Text(summary))));
+  }
+
+  /**
+   * 按固定检查点格式生成压缩后的合成 user 文本。
+   *
+   * <p>压缩器提交前用它构造后校验请求，保证估算内容与真正投影出来的 user 完全一致。{@code nextUserText} 为 {@code null}
+   * 或空串时只生成到摘要结尾（没有下一轮 user 的形态）。
+   *
+   * @param summary 摘要正文
+   * @param nextUserText 下一轮 user 原文；可为 null/空
+   * @return 确定性渲染的纯文本 user 内容
+   */
+  public static String formatCompactedUser(String summary, String nextUserText) {
+    Objects.requireNonNull(summary, "summary");
+    String checkpoint = COMPACTION_CHECKPOINT_PREFIX + summary + COMPACTION_CHECKPOINT_SUFFIX;
+    return nextUserText == null || nextUserText.isEmpty()
+        ? checkpoint
+        : checkpoint + "\n\n" + nextUserText;
   }
 
   /** 追加一条消息（默认路径；落进未落库尾部）。 */
@@ -104,13 +199,14 @@ public final class ContextWindow {
   }
 
   /**
-   * 就地替换半开区间 {@code [from, to)}；{@code replacement} 为空列表 = <b>删除</b>该区间。窗口唯一的"就地改写"口。
+   * 就地替换 <b>raw 历史</b>的半开区间 {@code [from, to)}（下标是 {@link #rawSize()} 的 raw 下标，不是可见投影下标）；{@code
+   * replacement} 为空列表 = <b>删除</b>该区间。窗口唯一的"就地改写"口。
    *
    * <p><b>为什么需要它</b>：只追加表达不了三种真实需求——压缩（把中段换成占位/摘要）、悬空 {@code tool_call} 的修复（补回填或删掉发出却没回填的调用）、
    * 以及"某条不进历史"的裁剪。它们都不是"追加"，硬用 append 模拟只会得到更乱的形状。
    *
    * <p><b>参数校验：三种非法一律抛 {@link IndexOutOfBoundsException}</b>（{@code from < 0}、{@code to >
-   * size()}、{@code from > to}）。 刻意<b>不</b>做 {@code IllegalArgumentException}/{@code
+   * rawSize()}、{@code from > to}）。 刻意<b>不</b>做 {@code IllegalArgumentException}/{@code
    * IndexOutOfBoundsException} 二分（{@code List.subList} 是二分的）：调用方对"下标非法" 只需一个
    * catch，分档的收益不值得让每个调用点记两套语义。校验在任何写入<b>之前</b>完成——失败的调用不留下半截窗口。
    *
@@ -118,8 +214,8 @@ public final class ContextWindow {
    * （改的是尾部内部）、要么变大（改到了已落库的前缀），<b>只会变大、绝不缩小</b>：缩小等于窗口单方面宣布"这段我已经存过了"，而改写恰恰是"存过的那份
    * 现在不对了"的场合。怎么收口（重写、压缩、或明确 {@link #markSaved()} 声明已处置）由宿主决定。
    *
-   * @param from 区间起点（含），{@code 0 <= from <= size()}
-   * @param to 区间终点（不含），{@code from <= to <= size()}
+   * @param from raw 区间起点（含），{@code 0 <= from <= rawSize()}
+   * @param to raw 区间终点（不含），{@code from <= to <= rawSize()}
    * @param replacement 替换进去的消息（可为空列表 = 删除；非 null）
    * @throws IndexOutOfBoundsException 下标非法（上述三种之一）
    */
@@ -143,7 +239,7 @@ public final class ContextWindow {
   }
 
   /**
-   * 整体替换窗口内容（= 既有管线的 {@code replaceWorkingSet}）：清空后按序装入给定消息，并把未落库尾部<b>清空</b>。
+   * 整体替换 <b>raw 历史</b>（= 既有管线的 {@code replaceWorkingSet}）：清空后按序装入给定消息，并把未落库尾部<b>清空</b>。
    *
    * <p><b>为什么整体替换算"已处置"（而不是"整窗都算未落库"）</b>——本类唯一需要选边的语义，选这边的三个理由：
    *
@@ -160,7 +256,7 @@ public final class ContextWindow {
    * #appendAll(List)}——后者的语义就是"这些是新的"， 宿主落库循环照常取 {@link
    * #unsavedTail()}。本类不提供"整体替换但同时宣称未落库"的口：那等于让窗口替宿主猜存储状态，而它连 store 都不认识。
    *
-   * @param newMessages 新的窗口内容（非 null；整体拷贝，之后改传入的 List 不影响本窗口）
+   * @param newMessages 新的 raw 内容（非 null；整体拷贝，之后改传入的 List 不影响本窗口）
    */
   public void replaceAll(List<LlmMessage> newMessages) {
     List<LlmMessage> copy = List.copyOf(Objects.requireNonNull(newMessages, "newMessages"));
@@ -188,9 +284,10 @@ public final class ContextWindow {
   /**
    * 自上次 {@link #markSaved()} 以来<b>新增或被改动的消息尾部</b>（不可变快照）——宿主据此落库，或据此判断"哪些不落库"。
    *
-   * <p><b>它永远是窗口的一个后缀</b>（不变量：{@code [unsavedFrom, size())}）。这条不变量让宿主的落库循环写成"取尾部 → 逐条 append →
-   * {@link #markSaved()}"即可，不必自己记下标。它替代的是既有管线里那段下标推导（今天靠 {@code messages.subList(replayedSize + 1,
-   * size)} 推 "本回合新增的尾部"）：append/appendAll 之后返回这些新消息，markSaved 之后返回空。
+   * <p><b>它永远是 raw 历史的一个后缀</b>（不变量：{@code [unsavedFrom, rawSize())}）。这条不变量让宿主的落库循环写成"取尾部 → 逐条
+   * append → {@link #markSaved()}"即可，不必自己记下标。它替代的是既有管线里那段下标推导（今天靠 {@code
+   * messages.subList(replayedSize + 1, size)} 推 "本回合新增的尾部"）：append/appendAll 之后返回这些新消息，markSaved
+   * 之后返回空。
    *
    * <p><b>"未被处置"不等于"没落库"</b>：窗口不知道谁落了库，它只记"宿主还没对这段尾部表态"（见 {@link #markSaved()} 的语义）。
    */
@@ -220,13 +317,66 @@ public final class ContextWindow {
    */
   public int estimatedTokens() {
     int chars = 0;
-    for (LlmMessage message : messages) {
+    for (LlmMessage message : visibleMessages()) {
       chars += message.role().length();
       for (ContentPart part : message.content()) {
         chars += partChars(part);
       }
     }
     return chars / 4;
+  }
+
+  /** 生成可见投影；无 compact 标记时直接返回 raw 的不可变拷贝（旧行为）。 */
+  private List<LlmMessage> visibleMessages() {
+    int compactIndex = lastCompactIndex();
+    if (compactIndex < 0) {
+      return List.copyOf(messages);
+    }
+
+    String summary = summaryText(messages.get(compactIndex));
+    List<LlmMessage> suffix = messages.subList(compactIndex + 1, messages.size());
+    List<LlmMessage> visible = new ArrayList<>(suffix.size() + 1);
+    String nextUserText = "";
+    if (!suffix.isEmpty() && LlmMessage.ROLE_USER.equals(suffix.get(0).role())) {
+      nextUserText = userText(suffix.get(0));
+    }
+    visible.add(LlmMessage.user(formatCompactedUser(summary, nextUserText)));
+    if (!suffix.isEmpty() && LlmMessage.ROLE_USER.equals(suffix.get(0).role())) {
+      visible.addAll(suffix.subList(1, suffix.size()));
+    } else {
+      visible.addAll(suffix);
+    }
+    return List.copyOf(visible);
+  }
+
+  /** 最后一个 compact 标记的 raw 下标；没有时返回 -1。 */
+  private int lastCompactIndex() {
+    for (int i = messages.size() - 1; i >= 0; i--) {
+      if (ROLE_COMPACT.equals(messages.get(i).role())) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /** compact 标记里的文本正文；多个文本 part 按序以换行连接。 */
+  private static String summaryText(LlmMessage compactMarker) {
+    return compactMarker.content().stream()
+        .filter(ContentPart.Text.class::isInstance)
+        .map(ContentPart.Text.class::cast)
+        .map(ContentPart.Text::text)
+        .reduce((left, right) -> left + "\n" + right)
+        .orElse("");
+  }
+
+  /** 一条 user 消息里所有文本 part 按序以换行连接；非文本 part 丢弃。 */
+  private static String userText(LlmMessage userMessage) {
+    return userMessage.content().stream()
+        .filter(ContentPart.Text.class::isInstance)
+        .map(ContentPart.Text.class::cast)
+        .map(ContentPart.Text::text)
+        .reduce((left, right) -> left + "\n" + right)
+        .orElse("");
   }
 
   /** 分片字符数（与既有估算逐项同源，含"工具结果不计 toolCallId"这一细节）。 */

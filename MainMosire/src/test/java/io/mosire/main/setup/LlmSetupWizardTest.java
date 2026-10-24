@@ -51,7 +51,7 @@ class LlmSetupWizardTest {
     boolean configured =
         wizard.run(
             tempDir,
-            reader(lines("1", "", "", "sk-test")),
+            reader(lines("1", "", "", "131072", "8192", "sk-test")),
             secret("sk-test"),
             new java.io.PrintStream(out, true, StandardCharsets.UTF_8));
 
@@ -81,7 +81,9 @@ class LlmSetupWizardTest {
     boolean configured =
         wizard.run(
             tempDir,
-            reader(lines("1", "", "", "sk-1", "1", "", "", "sk-1")),
+            reader(
+                lines(
+                    "1", "", "", "131072", "8192", "sk-1", "1", "", "", "131072", "8192", "sk-1")),
             secret("sk-1"),
             new java.io.PrintStream(out, true, StandardCharsets.UTF_8));
 
@@ -91,6 +93,31 @@ class LlmSetupWizardTest {
         .contains("探测失败")
         .contains("连接被拒")
         .contains("配置未写入");
+  }
+
+  @Test
+  void invalidCapacitiesAreRepromptedUntilBothArePositiveIntegers() throws IOException {
+    List<String> probed = new ArrayList<>();
+    LlmSetupWizard wizard =
+        new LlmSetupWizard((baseUrl, model, apiKey) -> probed.add(baseUrl + "|" + model));
+    var out = new java.io.ByteArrayOutputStream();
+
+    boolean configured =
+        wizard.run(
+            tempDir,
+            reader(lines("1", "", "", "not-a-number", "0", "131072", "-5", "8192", "sk-test")),
+            secret("sk-test"),
+            new java.io.PrintStream(out, true, StandardCharsets.UTF_8));
+
+    assertThat(configured).isTrue();
+    assertThat(probed).hasSize(1);
+    assertThat(out.toString(StandardCharsets.UTF_8))
+        .contains("maxContext（模型最大上下文 token） 必须是正整数")
+        .contains("maxOutput（模型最大输出 token） 必须是正整数");
+    var store = new io.mosire.agentlib.config.FileConfigStore(tempDir);
+    var capabilities = io.mosire.agentlib.llm.LlmRouteLoader.capabilities(store, "default");
+    assertThat(capabilities.maxContext()).isEqualTo(131072);
+    assertThat(capabilities.maxOutput()).isEqualTo(8192);
   }
 
   @Test

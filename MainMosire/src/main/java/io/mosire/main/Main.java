@@ -1,6 +1,7 @@
 package io.mosire.main;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.config.ConfigException;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.event.Event;
@@ -11,6 +12,7 @@ import io.mosire.agentlib.llm.FakeLlmClient;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.llm.LlmRouteLoader;
+import io.mosire.agentlib.llm.ModelCapabilities;
 import io.mosire.agentlib.llm.ModelRoute;
 import io.mosire.agentlib.llm.OpenAICompatibleLlmClient;
 import io.mosire.agentlib.permission.AccessToken;
@@ -18,6 +20,7 @@ import io.mosire.agentlib.permission.AgentIdentity;
 import io.mosire.main.agent.SubagentProcessMain;
 import io.mosire.main.app.App;
 import io.mosire.main.app.BootConfig;
+import io.mosire.main.app.CompactionAssembly;
 import io.mosire.main.app.ContextReport;
 import io.mosire.main.app.FakeLlmScript;
 import io.mosire.main.setup.LlmSetupWizard;
@@ -223,7 +226,8 @@ public final class Main {
   static App startApp(BootConfig config, boolean fake, String fakeScript) {
     Path subagentConfigDir =
         (fakeScript == null && !fake && !config.demo()) ? config.dataDir() : null;
-    return App.start(config, selectLlm(config, fake, fakeScript), List.of(), subagentConfigDir);
+    LlmAssembly assembly = selectLlmAssembly(config, fake, fakeScript);
+    return App.start(config, assembly.llm(), List.of(), subagentConfigDir, assembly.compactor());
   }
 
   /**
@@ -239,14 +243,30 @@ public final class Main {
    * @return 交给 {@code App.start} 的 LLM 覆盖；{@code null} 表示不覆盖（仅 demo 路径）
    */
   static LlmClient selectLlm(BootConfig config, boolean fake, String fakeScript) {
-    return fakeScript != null
-        ? FakeLlmScript.parse(fakeScript)
-        : fake
-            ? FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY))
-            : config.demo()
-                ? null
-                : config.setup() ? SetupLlmRouter.unconfigured() : realLlm(config.dataDir());
+    return selectLlmAssembly(config, fake, fakeScript).llm();
   }
+
+  /**
+   * 生产启动的 LLM + 默认压缩器束：离线/demo/setup 未配置态只给 client（compactor 为 null），真模型态同时给出严格容量校验后的 compactor。
+   *
+   * <p>分开返回而不是把 compactor 塞进 {@link LlmClient} 装饰器：superior judge 等一次性调用必须继续拿到未包装的 raw client；
+   * compactor 只走 {@link App#start(BootConfig, LlmClient, List, Path, ContextCompactor)} 进
+   * AgentRuntime。
+   */
+  static LlmAssembly selectLlmAssembly(BootConfig config, boolean fake, String fakeScript) {
+    return fakeScript != null
+        ? new LlmAssembly(FakeLlmScript.parse(fakeScript), null)
+        : fake
+            ? new LlmAssembly(FakeLlmClient.with(LlmResponse.text(App.DEFAULT_LLM_REPLY)), null)
+            : config.demo()
+                ? new LlmAssembly(null, null)
+                : config.setup()
+                    ? new LlmAssembly(SetupLlmRouter.unconfigured(), null)
+                    : realLlmBundle(config.dataDir());
+  }
+
+  /** 启动装配用的 LLM + compactor 束；compactor 为 null 仅限离线/demo/setup 未配置路径。 */
+  record LlmAssembly(LlmClient llm, ContextCompactor compactor) {}
 
   /**
    * 生产装配：从 {@code <configRoot>/config.json} 取路由与密钥，构造真实 LLM 客户端（{@code configRoot} 即 {@code
@@ -266,11 +286,27 @@ public final class Main {
    * <p>包私有：只给 {@code run} 与同包测试用（既有测试入口 {@code App.start(...)} 不经过这里，故离线门禁不受影响）。
    */
   static LlmClient realLlm(Path configRoot) {
+    return realLlmBundle(configRoot).llm();
+  }
+
+  /**
+   * 真模型生产装配：同一 route 上同时取 {@link ModelRoute} 与 {@link ModelCapabilities}，先严格校验 {@code
+   * capabilities.maxContext}/{@code capabilities.maxOutput} 均为正，再构造 raw {@link LlmClient} 与默认
+   * compactor。
+   *
+   * <p>主 Agent 当前 {@link AgentSpec#maxOutputTokens()} 尚未接线，故按设计传 {@code 0}（表示沿用 {@code
+   * capabilities.maxOutput}）；以后若该字段成为生效上限，应把有效值传进来并与模型上限取 min。
+   */
+  static LlmAssembly realLlmBundle(Path configRoot) {
     FileConfigStore store = new FileConfigStore(configRoot);
-    ModelRoute route =
-        LlmRouteLoader.load(store, LlmRouteLoader.routeName(store, AgentIdentity.MAIN_ID));
-    return new OpenAICompatibleLlmClient(
-        route, new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM));
+    String routeName = LlmRouteLoader.routeName(store, AgentIdentity.MAIN_ID);
+    ModelRoute route = LlmRouteLoader.load(store, routeName);
+    ModelCapabilities capabilities = LlmRouteLoader.capabilities(store, routeName);
+    LlmClient llm =
+        new OpenAICompatibleLlmClient(
+            route, new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM));
+    ContextCompactor compactor = CompactionAssembly.defaultCompactor(llm, capabilities, 0);
+    return new LlmAssembly(llm, compactor);
   }
 
   /**

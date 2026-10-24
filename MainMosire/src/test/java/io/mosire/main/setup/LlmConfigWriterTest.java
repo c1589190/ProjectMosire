@@ -25,13 +25,17 @@ class LlmConfigWriterTest {
   void writtenRouteAndKeyRoundTripThroughTheLoaders() {
     FileConfigStore store = new FileConfigStore(tempDir);
 
-    LlmConfigWriter.write(store, "default", "https://example.com/v4", "glm-5.3-flash", "sk-abc");
+    LlmConfigWriter.write(
+        store, "default", "https://example.com/v4", "glm-5.3-flash", "sk-abc", 131072, 8192);
 
     ModelRoute route = LlmRouteLoader.load(store);
     assertThat(route.name()).isEqualTo("default");
     assertThat(route.baseUrl()).isEqualTo("https://example.com/v4");
     assertThat(route.model()).isEqualTo("glm-5.3-flash");
     assertThat(route.credentialsRef()).isEqualTo("keys.default");
+    var capabilities = LlmRouteLoader.capabilities(store, "default");
+    assertThat(capabilities.maxContext()).isEqualTo(131072);
+    assertThat(capabilities.maxOutput()).isEqualTo(8192);
     assertThat(new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM).apiKey())
         .isEqualTo(Optional.of("sk-abc"));
   }
@@ -39,9 +43,11 @@ class LlmConfigWriterTest {
   @Test
   void siblingRoutesSurviveANewWrite() {
     FileConfigStore store = new FileConfigStore(tempDir);
-    LlmConfigWriter.write(store, "glm", "https://glm.example/v4", "glm-5.3-flash", "sk-glm");
+    LlmConfigWriter.write(
+        store, "glm", "https://glm.example/v4", "glm-5.3-flash", "sk-glm", 131072, 8192);
 
-    LlmConfigWriter.write(store, "default", "https://ds.example", "deepseek-chat", "sk-ds");
+    LlmConfigWriter.write(
+        store, "default", "https://ds.example", "deepseek-chat", "sk-ds", 65536, 4096);
 
     assertThat(LlmRouteLoader.load(store, "glm").model()).isEqualTo("glm-5.3-flash");
     assertThat(LlmRouteLoader.load(store, "default").model()).isEqualTo("deepseek-chat");
@@ -53,7 +59,8 @@ class LlmConfigWriterTest {
   void blankApiKeyMeansAnonymousAndWritesNoKey() {
     FileConfigStore store = new FileConfigStore(tempDir);
 
-    LlmConfigWriter.write(store, "default", "http://localhost:11434/v1", "llama3", "  ");
+    LlmConfigWriter.write(
+        store, "default", "http://localhost:11434/v1", "llama3", "  ", 32768, 2048);
 
     ModelRoute route = LlmRouteLoader.load(store);
     assertThat(route.credentialsRef()).isEmpty();
@@ -65,12 +72,18 @@ class LlmConfigWriterTest {
   void rejectsBadRouteNameAndBlankRequiredFields() {
     FileConfigStore store = new FileConfigStore(tempDir);
 
-    assertThatThrownBy(() -> LlmConfigWriter.write(store, "bad name", "https://x", "m", ""))
+    assertThatThrownBy(() -> LlmConfigWriter.write(store, "bad name", "https://x", "m", "", 1, 1))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("路由名非法");
-    assertThatThrownBy(() -> LlmConfigWriter.write(store, "default", " ", "m", ""))
+    assertThatThrownBy(() -> LlmConfigWriter.write(store, "default", " ", "m", "", 1, 1))
         .isInstanceOf(IllegalArgumentException.class);
-    assertThatThrownBy(() -> LlmConfigWriter.write(store, "default", "https://x", " ", ""))
+    assertThatThrownBy(() -> LlmConfigWriter.write(store, "default", "https://x", " ", "", 1, 1))
         .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> LlmConfigWriter.write(store, "default", "https://x", "m", "", 0, 1))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("capabilities.maxContext");
+    assertThatThrownBy(() -> LlmConfigWriter.write(store, "default", "https://x", "m", "", 1, 0))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("capabilities.maxOutput");
   }
 }

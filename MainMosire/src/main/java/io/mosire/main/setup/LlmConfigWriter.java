@@ -11,7 +11,10 @@ import java.util.Objects;
 
 /**
  * 把引导得到的 provider 写进 {@code config.json}（配置引导 D2；CLI 向导与 HTTP setup 端点共用一处实现）： {@code
- * llm.routes.<name>} = {baseUrl, model, credentialsRef} + {@code keys.<name>}（apiKey 非空时）。
+ * llm.routes.<name>} = {baseUrl, model, credentialsRef, capabilities.maxContext/maxOutput} + {@code
+ * keys.<name>} （apiKey 非空时）。
+ *
+ * <p>容量两个字段是生产真模型启动的必填项：默认上下文压缩装配要求两者均为正。本类不做猜测默认值；调用方必须给出可信正整数， 否则在写盘前拒绝。
  *
  * <p><b>走 {@code ConfigStore.put} 而不是直接写文件</b>：合并语义保住文件里的其他键（approval 等）、原子写 + 读回校验免重造；授权面由 {@code
  * ConfigAuth} 的 {@code llm.*}/{@code keys.*} 仅 SYSTEM 分支把守， 本类以 {@link
@@ -38,11 +41,19 @@ public final class LlmConfigWriter {
    * @param baseUrl 完整 OpenAI 兼容地址（非空白）
    * @param model 模型名（非空白）
    * @param apiKey API 密钥；空白 = 匿名（不写 keys.*，credentialsRef 留空）
-   * @throws IllegalArgumentException 路由名/baseUrl/model 不合法
+   * @param maxContextTokens 模型最大上下文 token（必须为正整数，写入 {@code capabilities.maxContext}）
+   * @param maxOutputTokens 模型最大输出 token（必须为正整数，写入 {@code capabilities.maxOutput}）
+   * @throws IllegalArgumentException 路由名/baseUrl/model 不合法，或容量不是正整数
    * @throws io.mosire.agentlib.config.ConfigException 落盘/校验失败（原样上抛，磁盘已回滚）
    */
   public static void write(
-      FileConfigStore store, String routeName, String baseUrl, String model, String apiKey) {
+      FileConfigStore store,
+      String routeName,
+      String baseUrl,
+      String model,
+      String apiKey,
+      int maxContextTokens,
+      int maxOutputTokens) {
     Objects.requireNonNull(store, "store");
     if (!LlmRouteLoader.isValidRouteName(routeName)) {
       throw new IllegalArgumentException("路由名非法（字母/数字开头，仅含字母数字_-）: " + routeName);
@@ -51,6 +62,12 @@ public final class LlmConfigWriter {
     Objects.requireNonNull(model, "model");
     if (baseUrl.isBlank() || model.isBlank()) {
       throw new IllegalArgumentException("baseUrl/model 不得为空白");
+    }
+    if (maxContextTokens <= 0) {
+      throw new IllegalArgumentException("capabilities.maxContext 必须为正整数: " + maxContextTokens);
+    }
+    if (maxOutputTokens <= 0) {
+      throw new IllegalArgumentException("capabilities.maxOutput 必须为正整数: " + maxOutputTokens);
     }
     String credentialsRef = apiKey == null || apiKey.isBlank() ? "" : "keys." + routeName;
     ObjectNode schema = lenientObjectSchema();
@@ -66,6 +83,10 @@ public final class LlmConfigWriter {
     route.put("baseUrl", baseUrl);
     route.put("model", model);
     route.put("credentialsRef", credentialsRef);
+    route
+        .putObject("capabilities")
+        .put("maxContext", maxContextTokens)
+        .put("maxOutput", maxOutputTokens);
     store.put("llm", "routes", routes, AgentPermissionSet.system(), null, schema);
 
     if (credentialsRef.isEmpty()) {

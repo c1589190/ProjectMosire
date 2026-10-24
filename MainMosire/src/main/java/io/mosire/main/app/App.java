@@ -13,6 +13,7 @@ import io.mosire.agentlib.approval.PendingApprovalChannel;
 import io.mosire.agentlib.approval.PendingApprovals;
 import io.mosire.agentlib.approval.SuperiorJudgeDetailRegistry;
 import io.mosire.agentlib.approval.SuperiorJudgeGate;
+import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.config.ConfigStore;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.decision.DecisionCommitPort;
@@ -384,20 +385,38 @@ public final class App implements AutoCloseable {
   /**
    * 启动（额外工具注入入口——测试注入 echo 等演示工具用；{@code extraTools} 在主 Agent 工具面与 MCP 暴露快照之前注册）。
    *
-   * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装配失败=快速失败契约（端口占用/坏配置等一律 RuntimeException 原样上抛， 由
-   * CLI（Main）以非零退出与 stderr 呈现——既有 M0/M1 启动语义）；中间已回收启动期网关/进程资源与已打开的存储连接（事件/会话库）后重抛， 无更窄的异常类型。
-   *
    * @param subagentConfigDir 子 Agent 的配置根（三期 S1-A2，R-A2-4）：非 null 时经 {@link #wireSubagents} →
    *     {@link #subagentCommand} 落到子进程 argv 的 {@code --config-dir
    *     <路径>}（子体据此走真模型）。<b>只传路径</b>——密钥值仍由子进程 自己读该目录下的 {@code config.json}（D23）；null =
    *     不传（离线/测试形态，子体走模板脚本假 LLM，逐字保持原行为）
+   */
+  public static App start(
+      BootConfig config,
+      LlmClient llmOverride,
+      List<AgentTool> extraTools,
+      Path subagentConfigDir) {
+    return start(config, llmOverride, extraTools, subagentConfigDir, null);
+  }
+
+  /**
+   * 启动（生产终态入口）：除既有四参外追加默认上下文压缩器。
+   *
+   * <p>{@code contextCompactor} 只在主 Agent 的落库终态路径注入；demo 的 {@code conversations == null} 分支不装配。
+   * {@code llmOverride} 仍是未包装的 raw {@link LlmClient}——superior judge 等一次性 LLM 调用不应经过 compactor。
+   *
+   * <p><b>{@code --setup} 限制</b>：HTTP setup 的热切换只替换 {@link io.mosire.main.setup.SetupLlmRouter} 里的
+   * client。 本构造期注入的 compactor 不会随热切换重建；未配置态启动时也不会装配 compactor。要让自动压缩生效，必须在写盘后重启进程， 由新的真模型装配路径读取
+   * {@code capabilities.maxContext/maxOutput} 再装配。这里不声称热切换后压缩已生效。
+   *
+   * @param contextCompactor 默认上下文压缩器；null = 保持既有不压缩行为（离线/demo/setup 未配置/兼容调用）
    */
   @SuppressFBWarnings("THROWS_METHOD_THROWS_RUNTIMEEXCEPTION")
   public static App start(
       BootConfig config,
       LlmClient llmOverride,
       List<AgentTool> extraTools,
-      Path subagentConfigDir) {
+      Path subagentConfigDir,
+      ContextCompactor contextCompactor) {
     try {
       Files.createDirectories(config.dataDir());
     } catch (IOException e) {
@@ -1053,7 +1072,9 @@ public final class App implements AutoCloseable {
                   toolConfig,
                   approvalCoordinator,
                   // P1b：桥交给管线 = "Ask 自动进包"这条链路的最后一环（没有它，管线不绑队列，Ask 走既有审批闸）
-                  decisionApprovalBridge);
+                  decisionApprovalBridge,
+                  // 默认上下文压缩只接在主 Agent 的落库终态路径；demo 分叉（上方 conversations == null）保持不压缩。
+                  contextCompactor);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;

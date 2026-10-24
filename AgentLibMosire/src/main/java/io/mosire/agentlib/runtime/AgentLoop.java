@@ -1,6 +1,8 @@
 package io.mosire.agentlib.runtime;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.mosire.agentlib.compact.CompactionOutcome;
+import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.context.ContextComposer;
 import io.mosire.agentlib.context.ContextWindow;
 import io.mosire.agentlib.context.LlmRoundTrip;
@@ -19,18 +21,19 @@ import java.util.Optional;
  * 直到宿主策略喊停、模型自然收尾、单响应工具调用超限或 LLM 调用失败。
  *
  * <p><b>为什么循环有资格进库（而压缩/技能/记忆没有）</b>：循环的<b>结构</b>——先问停不停、组请求、发信、写回、解析工具调用、逐条分派、回到开头 ——是所有调用 LLM 的
- * Agent 都一样的骨架；而"每步做什么"（预算怎么判、事件怎么记、工具怎么执行、历史怎么落库）才是每个宿主的策略。 本类只实现结构，把三个决策点抽成 SPI：{@link
- * StopPolicy}（何时停）、{@link TurnListener}（记账/事件/终止收尾）、{@link ToolCallDispatcher}（工具怎么执行）。任何程序依赖
- * {@code agentlib-mosire} 就能复用它，不需要 Agent 运行时。
+ * Agent 都一样的骨架；而"每步做什么"（预算怎么判、事件怎么记、工具怎么执行、历史怎么落库）才是每个宿主的策略。 本类只实现结构，把主要决策点抽成 SPI：{@link
+ * StopPolicy}（何时停）、{@link TurnListener}（记账/事件/终止收尾）、{@link ToolCallDispatcher}（工具怎么执行），并提供可选的
+ * {@link ContextCompactor}（每轮往返前的上下文压缩）。任何程序依赖 {@code agentlib-mosire} 就能复用它，不需要 Agent 运行时。
  *
  * <p><b>★ 骨架<b>不做</b>的事（边界，不是遗漏）</b>：
  *
  * <ul>
- *   <li><b>不直接改窗口</b>：窗口写入只来自 {@link LlmRoundTrip}（往返成功后的本轮输入 + 答复）与宿主的 {@code dispatcher}/{@code
- *       listener}（工具结果、占位失败结果、失败输入回补）。骨架手里没有"追加一条消息"的口。
+ *   <li><b>不直接改窗口</b>：窗口写入只来自 {@link LlmRoundTrip}（往返成功后的本轮输入 + 答复）、宿主的 {@code dispatcher}/{@code
+ *       listener}（工具结果、占位失败结果、失败输入回补），以及可选的 {@link ContextCompactor}（提交压缩检查点）。骨架手里没有"追加一条消息"的口。
  *   <li><b>不发任何事件、不落任何库</b>：事件词汇与落库时机是宿主的（Brain 的 {@code llm.call}/{@code decision}/… 全部在 {@link
  *       TurnListener} 实现里）。
- *   <li><b>不做压缩 / 记忆 / 技能 / 权限 / 审批 / 沙箱 / 重试 / 降级</b>：这些是对上下文或工具面的<b>具体实现</b>， 各宿主差异最大的一部分，留在宿主。
+ *   <li><b>不实现压缩 / 记忆 / 技能 / 权限 / 审批 / 沙箱 / 重试 / 降级</b>：这些是对上下文或工具面的<b>具体实现</b>，各宿主差异最大的一部分，留在宿主；
+ *       循环只提供每轮往返前的可选 {@link ContextCompactor} 注入点。
  *   <li><b>不 catch {@link LlmException} 以外的异常</b>：编程契约违例（例如 {@link ContextComposer} 违反位置契约）直接向上抛，
  *       与改造前完全一致——循环不该把 bug 吞成"正常终止"。
  *   <li><b>不缓存请求、不解析工具结果</b>：请求永远从窗口现组（{@link LlmRoundTrip} 的契约），骨架不持有第二份请求真相；
@@ -44,12 +47,14 @@ import java.util.Optional;
  * TurnListener#onStop} / {@link TurnListener#onLlmError}）之一；{@link #runTurn} 返回后不再有任何回调。宿主据此把"落库 /
  * 落事件"放进这四个回调里 ——"结果已经返回、历史却没保存"的窗口不存在。
  *
- * <p><b>一次回合的九步（顺序是契约；宿主实现按它推导事件/落库顺序）</b>：
+ * <p><b>一次回合的执行顺序（顺序是契约；宿主实现按它推导事件/落库顺序）</b>：
  *
  * <ol>
  *   <li>问 {@link StopPolicy#check}：有信号 ⇒ {@link TurnListener#onStop} → 返回该原因；
  *   <li>本轮输入：<b>只有第 1 轮</b>带 {@code turnInput}，此后传空列表（窗口里已有它——重复带上会让模型看到两条同样的 user）；
- *   <li>{@link LlmRoundTrip#call}：组请求 + 发信 + 写回；只 catch {@link LlmException} ⇒ {@link
+ *   <li>可选压缩：调用 {@link ContextCompactor#compactIfNeeded}；压缩成功则用 outcome 的 turnInput 覆盖本轮输入并回调
+ *       {@link TurnListener#onCompacted}；
+ *   <li>{@link LlmRoundTrip#call}：组请求 + 发信 + 写回；压缩器或往返抛 {@link LlmException} 都走 {@link
  *       TurnListener#onLlmError} → 返回 {@link StopReason#LLM_ERROR}（轮数不加一）；
  *   <li>往返耗时到账、轮数加一；
  *   <li>问 {@link TurnListener#onRoundTrip}：可返回信号（如配额超限）⇒ {@link TurnListener#onStop} → 返回该原因；
@@ -75,6 +80,7 @@ public final class AgentLoop {
   private final ToolCallDispatcher dispatcher;
   private final StopPolicy stopPolicy;
   private final TurnListener listener;
+  private final ContextCompactor contextCompactor;
   private final int maxToolCallsPerResponse;
 
   private AgentLoop(
@@ -84,6 +90,7 @@ public final class AgentLoop {
       ToolCallDispatcher dispatcher,
       StopPolicy stopPolicy,
       TurnListener listener,
+      ContextCompactor contextCompactor,
       int maxToolCallsPerResponse) {
     this.window = window;
     this.composer = composer;
@@ -91,6 +98,7 @@ public final class AgentLoop {
     this.dispatcher = dispatcher;
     this.stopPolicy = stopPolicy;
     this.listener = listener;
+    this.contextCompactor = contextCompactor;
     this.maxToolCallsPerResponse = maxToolCallsPerResponse;
   }
 
@@ -102,7 +110,7 @@ public final class AgentLoop {
   /**
    * 跑一个用户回合：本轮输入 → 循环 → 终止。同步方法；一次调用只服务一个回合。
    *
-   * <p><b>顺序是契约</b>：见类注"一次回合的九步"。此处只强调两个宿主最容易依赖的点——①{@code firstRound} 只对第 1 轮传 {@code
+   * <p><b>顺序是契约</b>：见类注"一次回合的执行顺序"。此处只强调两个宿主最容易依赖的点——①{@code firstRound} 只对第 1 轮传 {@code
    * turnInput}（此后 {@link LlmRoundTrip} 每轮都会把答复写回窗口，历史自然变长，本轮输入不能再重复）；②每次成功往返后先加轮数， <b>再</b>把 {@code
    * state} 交给 {@link TurnListener#onRoundTrip}（于是宿主看到的 {@code rounds} 已含本次）。
    *
@@ -128,10 +136,22 @@ public final class AgentLoop {
       List<LlmMessage> roundInput = firstRound ? List.copyOf(turnInput) : List.of();
       firstRound = false;
 
-      // 3. 一次往返 = 组请求（从窗口现取）+ 发信 + 写回；失败时窗口一个字节都没动，故本轮输入交回宿主决定去留
-      long roundStartedNanos = System.nanoTime();
+      // 3. 可选压缩：必须在每次 LLM 往返前检查；压缩器与往返抛出的 LlmException 共用同一错误出口。
+      //    压缩器不提交时窗口不变；提交后它已把下一轮 user 写进窗口，因此 outcome.turnInput 必须为空。
       LlmResponse response;
+      long roundStartedNanos = 0L;
       try {
+        if (contextCompactor != null) {
+          CompactionOutcome outcome =
+              contextCompactor.compactIfNeeded(window, roundInput, tools, composer);
+          if (outcome.compacted()) {
+            roundInput = List.copyOf(outcome.turnInput());
+            listener.onCompacted(outcome, state(rounds, toolCalls, startedNanos));
+          }
+        }
+
+        // 4. 一次往返 = 组请求（从窗口现取）+ 发信 + 写回；失败时窗口一个字节都没动，故本轮输入交回宿主决定去留
+        roundStartedNanos = System.nanoTime();
         response = LlmRoundTrip.call(llm, window, composer, roundInput, tools);
       } catch (LlmException e) {
         LoopState errorState = state(rounds, toolCalls, startedNanos);
@@ -139,18 +159,18 @@ public final class AgentLoop {
         return new TurnResult(StopReason.LLM_ERROR, rounds, toolCalls, "");
       }
 
-      // 4. 往返成功：单轮耗时到账、轮数加一（失败的那轮不加，见上面 catch）
+      // 5. 往返成功：单轮耗时到账、轮数加一（失败的那轮不加，见上面 catch）
       long latencyMs = Math.max(0L, (System.nanoTime() - roundStartedNanos) / 1_000_000L);
       rounds++;
 
-      // 5. 成功往返后的宿主记账/判定（如 llm.call 先落、配额居中、会话事件在后）；可返回终止信号（如 QUOTA）
+      // 6. 成功往返后的宿主记账/判定（如 llm.call 先落、配额居中、会话事件在后）；可返回终止信号（如 QUOTA）
       state = state(rounds, toolCalls, startedNanos);
       Optional<StopSignal> roundSignal = listener.onRoundTrip(response, latencyMs, state);
       if (roundSignal.isPresent()) {
         return stop(roundSignal.get(), state, rounds, toolCalls);
       }
 
-      // 6. 解析工具调用（按模型给出的原序；响应里没有 ⇒ 自然收尾）
+      // 7. 解析工具调用（按模型给出的原序；响应里没有 ⇒ 自然收尾）
       List<ContentPart.ToolCall> calls =
           response.assistantMessage().content().stream()
               .filter(ContentPart.ToolCall.class::isInstance)
@@ -162,14 +182,14 @@ public final class AgentLoop {
         return new TurnResult(StopReason.FINISHED, rounds, toolCalls, text);
       }
 
-      // 7. 单响应工具调用硬顶：整批不执行（占位结果/事件/落库由宿主在回调里补）
+      // 8. 单响应工具调用硬顶：整批不执行（占位结果/事件/落库由宿主在回调里补）
       if (maxToolCallsPerResponse > 0 && calls.size() > maxToolCallsPerResponse) {
         listener.onToolCallLimit(calls, state);
         return new TurnResult(
             StopReason.TOOL_CALL_LIMIT, rounds, toolCalls, response.textPart().orElse(""));
       }
 
-      // 8. 逐条分派：每条之前再问一次策略（工具批中间的取消/超时在此生效；未派发的那条不计数）。
+      // 9. 逐条分派：每条之前再问一次策略（工具批中间的取消/超时在此生效；未派发的那条不计数）。
       //    这里问的是 checkToolCallBoundary 而不是 check——缺省两者相同，但宿主可以只在批内查取消
       //    （批内跑完整预算判定会在批中途终止并留下悬空 tool_call，见 StopPolicy 接口注）
       for (ContentPart.ToolCall call : calls) {
@@ -181,7 +201,7 @@ public final class AgentLoop {
         toolCalls++;
         dispatcher.dispatch(call, state(rounds, toolCalls, startedNanos));
       }
-      // 9. 回到第 1 步
+      // 10. 回到第 1 步
     }
   }
 
@@ -198,13 +218,14 @@ public final class AgentLoop {
   }
 
   /**
-   * {@link AgentLoop} 的装配器：必需四件（窗口 / 编排器 / 模型客户端 / 工具分派器）+ 三个可选旋钮（停止策略 / 监听器 / 单响应工具调用上限）。
+   * {@link AgentLoop} 的装配器：必需四件（窗口 / 编排器 / 模型客户端 / 工具分派器）+ 四个可选旋钮（停止策略 / 监听器 / 上下文压缩器 / 单响应工具调用上限）。
    *
-   * <p><b>为什么用 Builder 而不是 7 参构造</b>：7 参构造里四个是"必须给"、三个是"通常用缺省"，按位置传参时"把 listener 传给 stopPolicy"
+   * <p><b>为什么用 Builder 而不是长参数构造</b>：按位置传参时"把 listener 传给 stopPolicy"
    * 这种错位编译期发现不了，运行时表现为"策略从不喊停"——最坏的一类 bug。Builder 让每件依赖显式命名，缺必需依赖在 {@code build()} 处带参数名响亮失败。
    *
    * <p><b>缺省值</b>：{@code stopPolicy} 缺省 = 永不主动停（只有模型自然收尾或单响应硬顶能结束回合）；{@code listener} 缺省 = 全
-   * no-op（什么都不记、什么都不落——一次性脚本宿主够用）；{@code maxToolCallsPerResponse} 缺省 {@code 0} = 不限。
+   * no-op（什么都不记、什么都不落——一次性脚本宿主够用）；{@code contextCompactor} 缺省 null = 不压缩；{@code
+   * maxToolCallsPerResponse} 缺省 {@code 0} = 不限。
    */
   public static final class Builder {
 
@@ -214,6 +235,7 @@ public final class AgentLoop {
     private ToolCallDispatcher dispatcher;
     private StopPolicy stopPolicy;
     private TurnListener listener;
+    private ContextCompactor contextCompactor;
     private int maxToolCallsPerResponse;
 
     private Builder() {}
@@ -267,6 +289,17 @@ public final class AgentLoop {
     }
 
     /**
+     * 可选：每次 LLM 往返前的上下文压缩器。缺省 {@code null} = 不压缩，旧行为逐字节不变。
+     *
+     * <p>压缩器抛 {@link LlmException} 时本循环走 {@link TurnListener#onLlmError}；压缩成功时先回调 {@link
+     * TurnListener#onCompacted}，再用其返回的空 turnInput 发主请求。
+     */
+    public Builder contextCompactor(ContextCompactor contextCompactor) {
+      this.contextCompactor = contextCompactor;
+      return this;
+    }
+
+    /**
      * 可选：单次响应允许的工具调用条数上限；{@code 0}（缺省）= 不限。超出 ⇒ 整批不执行，转 {@link TurnListener#onToolCallLimit} 出口。
      *
      * @throws IllegalArgumentException 负数（"不限"用 0 表达；负数只可能是装配 bug，不静默当 0）
@@ -292,6 +325,7 @@ public final class AgentLoop {
           require(dispatcher, "dispatcher"),
           stopPolicy == null ? state -> Optional.empty() : stopPolicy,
           listener == null ? new TurnListener() {} : listener,
+          contextCompactor,
           maxToolCallsPerResponse);
     }
 

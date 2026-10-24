@@ -311,7 +311,7 @@ class SubagentRealModelTest {
             + CONFIG_MODEL
             + "\",\"credentialsRef\":\""
             + refName
-            + "\"}}",
+            + "\",\"capabilities\":{\"maxContext\":131072,\"maxOutput\":8192}}}",
         StandardCharsets.UTF_8);
     return root;
   }
@@ -342,7 +342,8 @@ class SubagentRealModelTest {
             + stub.baseUrl()
             + "\",\"model\":\""
             + scopedModel
-            + "\",\"credentialsRef\":\"keys.local\"}}}}",
+            + "\",\"credentialsRef\":\"keys.local\",\"capabilities\":"
+            + "{\"maxContext\":131072,\"maxOutput\":8192}}}}}",
         StandardCharsets.UTF_8);
     return root;
   }

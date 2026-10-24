@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.mosire.agentlib.agent.AgentConfig;
+import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.decision.DecisionCommitPort;
 import io.mosire.agentlib.decision.DecisionPackages;
@@ -13,6 +14,7 @@ import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.ConfigApiKeySource;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmRouteLoader;
+import io.mosire.agentlib.llm.ModelCapabilities;
 import io.mosire.agentlib.llm.ModelRoute;
 import io.mosire.agentlib.llm.OpenAICompatibleLlmClient;
 import io.mosire.agentlib.mcp.McpSourceBridge;
@@ -46,6 +48,7 @@ import io.mosire.brain.subagent.AgentTemplate;
 import io.mosire.brain.subagent.AgentTemplateStore;
 import io.mosire.docs.DocNamespaces;
 import io.mosire.main.app.BootConfig;
+import io.mosire.main.app.CompactionAssembly;
 import io.mosire.main.decision.LocalDecisionCommitPort;
 import java.io.OutputStream;
 import java.io.PrintStream;
@@ -200,10 +203,12 @@ public final class SubagentProcessMain {
       }
 
       // R-A2-1：--config-dir 缺席 ⇒ 逐字不变地走模板脚本假 LLM；在场 ⇒ 真模型（R-A2-2/R-A2-7：路由与密钥一律取自配置）
-      LlmClient llm =
+      LlmAssembly llmAssembly =
           options.configDir() == null
-              ? template.scriptedFakeLlm()
+              ? new LlmAssembly(template.scriptedFakeLlm(), null)
               : realLlm(options.configDir(), options.templateId());
+      LlmClient llm = llmAssembly.llm();
+      ContextCompactor contextCompactor = llmAssembly.compactor();
       // 技能目录预注入（每回合的目录档）：只在本进程拿到技能根时接线；扫描失败不拦启动（子体没有可用的目录档就退回
       // “不预注入”，stderr 留痕）——一个手改坏的技能不该让所有子 Agent 都拉不起来（技能**工具**走父侧链路，
       // 那时会按 SkillCatalog 的既有语义响亮报错，边界仍在）。
@@ -218,32 +223,20 @@ public final class SubagentProcessMain {
               ? decisionSubmitter(
                   registry, permissions, options.goal(), config, eventStore, eventBus)
               : null;
+      // 所有分支收敛到同一终态构造：assembler 缺省与旧便捷构造一致；crossProcessSubmitter/compactor 可为 null。
+      // 真模型路径 compactor 非 null，离线模板脚本路径恒为 null，避免给离线门禁新增任何压缩调用。
       AgentRuntime agent =
-          decisionSubmitter == null
-              ? assembler == null
-                  ? new AgentRuntime(config, llm, registry, eventStore, eventBus, permissions)
-                  : new AgentRuntime(
-                      config,
-                      llm,
-                      registry,
-                      new ToolExecutionGuard(),
-                      assembler,
-                      eventStore,
-                      eventBus,
-                      permissions)
-              : assembler == null
-                  ? new AgentRuntime(
-                      config, llm, registry, eventStore, eventBus, permissions, decisionSubmitter)
-                  : new AgentRuntime(
-                      config,
-                      llm,
-                      registry,
-                      new ToolExecutionGuard(),
-                      assembler,
-                      eventStore,
-                      eventBus,
-                      permissions,
-                      decisionSubmitter);
+          new AgentRuntime(
+              config,
+              llm,
+              registry,
+              new ToolExecutionGuard(),
+              assembler == null ? new BasicContextAssembler() : assembler,
+              eventStore,
+              eventBus,
+              permissions,
+              decisionSubmitter,
+              contextCompactor);
       runtime = agent;
       TurnResult result = agent.chat(options.goal());
       diagnostics.println(
@@ -377,17 +370,30 @@ public final class SubagentProcessMain {
    *       仍现读配置，轮换/过期感知的 SPI 契约不变。
    * </ul>
    *
+   * <p><b>默认上下文压缩</b>：本方法在同一条选中路由上读取 {@link ModelCapabilities}，并由 {@link
+   * CompactionAssembly#defaultCompactor} 严格校验 {@code capabilities.maxContext}/{@code
+   * capabilities.maxOutput} 均为正后构造 compactor。子 Agent 当前没有生效的 Agent 级输出上限，故传 {@code 0}（沿用 {@code
+   * capabilities.maxOutput}）。缺容量时引导期抛 {@code E_LLM_CONFIG_MISSING}，消息点名具体键，不猜默认值、不关闭压缩。
+   *
    * <p>异常消息不含密钥值（引用名也只经 {@link ConfigApiKeySource} 的白名单回显），可直接进子进程 stderr。
    */
-  private static LlmClient realLlm(Path configRoot, String templateId) {
+  private static LlmAssembly realLlm(Path configRoot, String templateId) {
     FileConfigStore store = new FileConfigStore(configRoot);
     // 走哪条路由（多 provider 并存）：agents.<templateId>.llm.route → llm.route → "default"（按模板配，无需新增传递面）
-    ModelRoute route = LlmRouteLoader.load(store, LlmRouteLoader.routeName(store, templateId));
+    String routeName = LlmRouteLoader.routeName(store, templateId);
+    ModelRoute route = LlmRouteLoader.load(store, routeName);
+    ModelCapabilities capabilities = LlmRouteLoader.capabilities(store, routeName);
     ConfigApiKeySource keys =
         new ConfigApiKeySource(store, route.credentialsRef(), AccessToken.SYSTEM);
+    LlmClient llm = new OpenAICompatibleLlmClient(route, keys);
+    // 容量先于密钥预检：缺 capabilities 是装配结构错误，应在最前面点名缺失键，而不是被密钥缺失遮蔽。
+    ContextCompactor compactor = CompactionAssembly.defaultCompactor(llm, capabilities, 0);
     keys.apiKey(); // 预检：结果有意丢弃（只要"取得到"这一事实；密钥值不留在本方法里）
-    return new OpenAICompatibleLlmClient(route, keys);
+    return new LlmAssembly(llm, compactor);
   }
+
+  /** 子进程真模型装配束：raw client 供审计/摘要共用，compactor 只进 AgentRuntime。离线路径由调用方给 null compactor。 */
+  private record LlmAssembly(LlmClient llm, ContextCompactor compactor) {}
 
   /**
    * 终局记录 payload（§2.1）：{@code action=finished} + 子体流水线自己的计数器（{@link TurnResult}）。

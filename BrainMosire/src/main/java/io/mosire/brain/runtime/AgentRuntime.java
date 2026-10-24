@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.agent.AgentConfig;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
+import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventStore;
@@ -419,7 +420,214 @@ public final class AgentRuntime implements AutoCloseable {
         toolConfig,
         coordinator,
         decisionBridge,
-        null);
+        (CrossProcessDecisionSubmitter) null);
+  }
+
+  /**
+   * 主 Agent 终态装配 + <b>默认上下文压缩器</b>（{@link AgentSpec}）：store + toolConfig + 审批编排器 + 决策包桥。
+   *
+   * <p>这是 App 生产终态路径的显式重载；crossProcessSubmitter 固定为 {@code null}（主 Agent 不走子体跨进程收尾缝）。
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      ContextCompactor contextCompactor) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        store,
+        conversationId,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        null,
+        contextCompactor);
+  }
+
+  /** 主 Agent 终态装配 + 默认上下文压缩器（{@link AgentConfig} 形态；内部包装为默认 {@link AgentSpec}）。 */
+  public AgentRuntime(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      ContextCompactor contextCompactor) {
+    this(
+        new AgentSpec(config),
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        store,
+        conversationId,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        contextCompactor);
+  }
+
+  /** 子 Agent 自定义 assembler + 跨进程收尾缝 + <b>默认上下文压缩器</b>（{@link AgentSpec} 形态，不落库）。 */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        null,
+        null,
+        Map.of(),
+        null,
+        null,
+        crossProcessSubmitter,
+        contextCompactor);
+  }
+
+  /** 子 Agent 自定义 assembler + 跨进程收尾缝 + 默认上下文压缩器（{@link AgentConfig} 形态）。 */
+  public AgentRuntime(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    this(
+        new AgentSpec(config),
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        crossProcessSubmitter,
+        contextCompactor);
+  }
+
+  /** 子 Agent 便捷装配 + 跨进程收尾缝 + 默认上下文压缩器（默认守卫/assembler，不落库）。 */
+  public AgentRuntime(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    this(
+        new AgentSpec(config),
+        llm,
+        registry,
+        new ToolExecutionGuard(),
+        new BasicContextAssembler(),
+        events,
+        bus,
+        permissionSet,
+        crossProcessSubmitter,
+        contextCompactor);
+  }
+
+  /** 子 Agent 自定义 assembler + toolConfig + 跨进程收尾缝 + 默认上下文压缩器（{@link AgentSpec} 形态）。 */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        null,
+        null,
+        toolConfig,
+        null,
+        null,
+        crossProcessSubmitter,
+        contextCompactor);
+  }
+
+  /** 子 Agent 自定义 assembler + toolConfig + 跨进程收尾缝 + 默认上下文压缩器（{@link AgentConfig} 形态）。 */
+  public AgentRuntime(
+      AgentConfig config,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      Map<String, Object> toolConfig,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
+    this(
+        new AgentSpec(config),
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        toolConfig,
+        crossProcessSubmitter,
+        contextCompactor);
   }
 
   /**
@@ -450,6 +658,45 @@ public final class AgentRuntime implements AutoCloseable {
       ApprovalCoordinator coordinator,
       DecisionApprovalBridge decisionBridge,
       CrossProcessDecisionSubmitter crossProcessSubmitter) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        store,
+        conversationId,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        crossProcessSubmitter,
+        null);
+  }
+
+  /**
+   * 全参装配终态 + <b>默认上下文压缩器</b>：主 Agent 与子 Agent 的统一显式入口。
+   *
+   * <p>既有 14 参终态构造保持原签名并委派 {@code null}；本重载只在末尾追加 {@link ContextCompactor}，不改变任何旧路径。
+   */
+  public AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor) {
     this.spec = Objects.requireNonNull(spec, "spec");
     AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
@@ -464,17 +711,30 @@ public final class AgentRuntime implements AutoCloseable {
             // 不落库分叉不接审批面（与 App 的 demo 分叉同口径）：{@code Ask} 在那里一律 fail-closed 拒——少一条路，不是放行。
             // ★ P3b：跨进程缝接得进来（子体进程就是这一档）——没有它，子体的敏感调用在"没接审批面"之外还多一条"没人收尾"。
             ? crossProcessSubmitter == null
-                ? new AgentPipeline(
-                    config,
-                    client,
-                    registry,
-                    guard,
-                    assembler,
-                    events,
-                    bus,
-                    permissionSet.grantedToken(),
-                    permissionSet,
-                    toolConfig)
+                ? contextCompactor == null
+                    ? new AgentPipeline(
+                        config,
+                        client,
+                        registry,
+                        guard,
+                        assembler,
+                        events,
+                        bus,
+                        permissionSet.grantedToken(),
+                        permissionSet,
+                        toolConfig)
+                    : new AgentPipeline(
+                        config,
+                        client,
+                        registry,
+                        guard,
+                        assembler,
+                        events,
+                        bus,
+                        permissionSet.grantedToken(),
+                        permissionSet,
+                        toolConfig,
+                        contextCompactor)
                 : new AgentPipeline(
                     config,
                     client,
@@ -486,7 +746,8 @@ public final class AgentRuntime implements AutoCloseable {
                     permissionSet.grantedToken(),
                     permissionSet,
                     toolConfig,
-                    crossProcessSubmitter)
+                    crossProcessSubmitter,
+                    contextCompactor)
             : new AgentPipeline(
                 config,
                 client,
@@ -504,7 +765,8 @@ public final class AgentRuntime implements AutoCloseable {
                 toolConfig,
                 coordinator,
                 decisionBridge,
-                crossProcessSubmitter);
+                crossProcessSubmitter,
+                contextCompactor);
 
     // 起步即记录生命周期（事件词汇表 agent.lifecycle）
     // model 报的是【客户端实际在用的模型】（client.model()），不是装配层标签 config.model()：后者由
@@ -560,6 +822,19 @@ public final class AgentRuntime implements AutoCloseable {
    */
   public void cancel() {
     pipeline.cancel();
+  }
+
+  /**
+   * 请求下一次 LLM 往返前强制压缩一次（手动入口，仅接线 {@link ContextCompactor} 时可用）。
+   *
+   * <p>只设置一次性 force，不直接改窗口；真正摘要与窗口提交发生在下一轮 {@code AgentLoop} 往返前，保证与自动压缩共用同一套 “摘要 + 下一轮 user 合成一条
+   * user”的严格校验。未接 compactor 时抛 {@link IllegalStateException}，不静默 no-op。
+   *
+   * @throws IllegalStateException 未接线 {@link ContextCompactor}，或 Agent 已关闭
+   */
+  public void requestCompaction() {
+    ensureOpen();
+    pipeline.requestCompaction();
   }
 
   public AgentConfig config() {

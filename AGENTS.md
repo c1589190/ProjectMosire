@@ -24,7 +24,7 @@ BashPluginMosire ──→ AgentLibMosire（PF4J provided；宿主不 import）
 
 | 模块 | artifactId | 允许内部依赖 / 要点 |
 |---|---|---|
-| `AgentLibMosire` | `agentlib-mosire` | 无 `io.mosire.*` 内部依赖；含 Agent 描述符、上下文窗口结构、通用循环骨架与策略 SPI，**不含具体策略**；不得 import Brain/Main。 |
+| `AgentLibMosire` | `agentlib-mosire` | 无 `io.mosire.*` 内部依赖；含 Agent 描述符、上下文窗口结构、**可覆写的默认上下文压缩**、通用循环骨架与策略 SPI；不得 import Brain/Main。 |
 | `WorkspaceMosire` | `workspace-mosire` | `agentlib-mosire`；安全路径解析、挂载与能力面；不得反向依赖 Brain/Main。 |
 | `DocsMosire` | `docs-mosire` | `agentlib-mosire` + `workspace-mosire`；文档/日志存储；不得反向依赖 Brain/Main。 |
 | `BrainMosire` | `brain-mosire` | `agentlib-mosire` + `workspace-mosire` + `docs-mosire`（+ Jackson/SLF4J）；不得依赖 Main。 |

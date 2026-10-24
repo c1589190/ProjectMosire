@@ -249,7 +249,8 @@ class MainRealLlmTest {
             + "\"},\"llm\":{\"baseUrl\":\"http://127.0.0.1:1/v1\",\"model\":\"flat-model\","
             + "\"credentialsRef\":\"keys.flat\",\"route\":\"second\",\"routes\":{\"second\":"
             + "{\"baseUrl\":\"http://127.0.0.1:2/v1\",\"model\":\"second-model\","
-            + "\"credentialsRef\":\"keys.second\"}}}}");
+            + "\"credentialsRef\":\"keys.second\",\"capabilities\":"
+            + "{\"maxContext\":131072,\"maxOutput\":8192}}}}}");
 
     LlmClient client = Main.realLlm(tempDir);
     assertThat(((OpenAICompatibleLlmClient) client).route().name()).isEqualTo("second");
@@ -290,6 +291,44 @@ class MainRealLlmTest {
     assertThat(failure.getMessage()).contains("glmm").contains("glm");
   }
 
+  // ---------- F4 严格容量：真模型装配不猜 maxContext/maxOutput ----------
+
+  @Test
+  void realLlmAndSelectLlmFailWhenMaxContextIsMissing() throws IOException {
+    writeConfig(
+        "{\"keys\":{\"local\":\"sk-test-placeholder\"},\"llm\":{\"baseUrl\":"
+            + "\"http://127.0.0.1:1/v1\",\"model\":\"model-one\",\"credentialsRef\":\"keys.local\","
+            + "\"capabilities\":{\"maxOutput\":8192}}}");
+
+    ConfigException real = catchThrowableOfType(ConfigException.class, () -> Main.realLlm(tempDir));
+    ConfigException selected =
+        catchThrowableOfType(
+            ConfigException.class, () -> Main.selectLlm(bootConfig(false), false, null));
+
+    assertThat(real.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(real.getMessage()).contains("capabilities.maxContext");
+    assertThat(selected.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(selected.getMessage()).contains("capabilities.maxContext");
+  }
+
+  @Test
+  void realLlmAndSelectLlmFailWhenMaxOutputIsMissing() throws IOException {
+    writeConfig(
+        "{\"keys\":{\"local\":\"sk-test-placeholder\"},\"llm\":{\"baseUrl\":"
+            + "\"http://127.0.0.1:1/v1\",\"model\":\"model-one\",\"credentialsRef\":\"keys.local\","
+            + "\"capabilities\":{\"maxContext\":131072}}}");
+
+    ConfigException real = catchThrowableOfType(ConfigException.class, () -> Main.realLlm(tempDir));
+    ConfigException selected =
+        catchThrowableOfType(
+            ConfigException.class, () -> Main.selectLlm(bootConfig(false), false, null));
+
+    assertThat(real.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(real.getMessage()).contains("capabilities.maxOutput");
+    assertThat(selected.code()).isEqualTo(LlmRouteLoader.E_LLM_CONFIG_MISSING);
+    assertThat(selected.getMessage()).contains("capabilities.maxOutput");
+  }
+
   // ---------- 工具 ----------
 
   private void writeConfig(String json) throws IOException {
@@ -312,7 +351,7 @@ class MainRealLlmTest {
         + UNREACHABLE_BASE_URL
         + "\",\"model\":\"model-one\",\"credentialsRef\":\""
         + refName
-        + "\"}}";
+        + "\",\"capabilities\":{\"maxContext\":131072,\"maxOutput\":8192}}}";
   }
 
   private BootConfig bootConfig(boolean demo) {

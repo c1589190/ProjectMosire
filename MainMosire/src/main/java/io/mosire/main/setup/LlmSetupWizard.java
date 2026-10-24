@@ -17,6 +17,9 @@ import java.util.Objects;
  * MCP stdio 流，本类不碰 {@code System.out}。
  *
  * <p>路由名恒写 {@code default}（单渠道起步；多路由属既有按名路由的配置手艺，不进向导）。
+ *
+ * <p>模型容量 {@code capabilities.maxContext}/{@code capabilities.maxOutput} 是必填正整数：严格启动的真模型路径会用它们装配默认
+ * 上下文压缩，缺失时进程启动失败。向导不提供猜测默认值，输入非法会要求重填；探测失败与写盘失败仍沿用既有处理。
  */
 public final class LlmSetupWizard {
 
@@ -103,6 +106,8 @@ public final class LlmSetupWizard {
         out.println("无效选择。");
         continue;
       }
+      int maxContextTokens = requirePositiveInt(in, out, "maxContext（模型最大上下文 token）");
+      int maxOutputTokens = requirePositiveInt(in, out, "maxOutput（模型最大输出 token）");
       String apiKey = new String(secrets.readPassword("API Key（留空 = 匿名；输入不回显）: ")).strip();
       out.println("探测中：" + model + " @ " + baseUrl + " …");
       try {
@@ -112,7 +117,8 @@ public final class LlmSetupWizard {
         out.println("配置未写入。请重选渠道重试（4 = 放弃）。");
         continue;
       }
-      LlmConfigWriter.write(store, ROUTE_NAME, baseUrl, model, apiKey);
+      LlmConfigWriter.write(
+          store, ROUTE_NAME, baseUrl, model, apiKey, maxContextTokens, maxOutputTokens);
       out.println("配置已写入（路由 " + ROUTE_NAME + "，模型 " + model + "）。继续启动。");
       return true;
     }
@@ -133,6 +139,23 @@ public final class LlmSetupWizard {
         return line;
       }
       out.println("不得为空白，请重填。");
+    }
+  }
+
+  /** 必填正整数：空白、非整数或非正都在本步重问，绝不悄悄填默认容量。 */
+  private static int requirePositiveInt(LineReader in, PrintStream out, String what)
+      throws IOException {
+    while (true) {
+      String line = in.readLine(what + ": ").strip();
+      try {
+        int value = Integer.parseInt(line);
+        if (value > 0) {
+          return value;
+        }
+      } catch (NumberFormatException ignored) {
+        // 与越界/非正共用下一条提示：字段名与"正整数"要求一起给出。
+      }
+      out.println(what + " 必须是正整数，请重填。");
     }
   }
 }

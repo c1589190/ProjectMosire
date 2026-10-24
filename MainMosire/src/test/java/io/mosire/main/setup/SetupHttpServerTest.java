@@ -14,6 +14,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -50,8 +51,10 @@ class SetupHttpServerTest {
         exchange -> {
           try {
             byte[] body =
-                ("data: {\"model\":\"stub-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n"
-                        + "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"
+                ("data:"
+                        + " {\"model\":\"stub-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n"
+                        + "data:"
+                        + " {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"
                         + "data: [DONE]\n\n")
                     .getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
@@ -103,7 +106,8 @@ class SetupHttpServerTest {
         post(
             "{\"name\":\"default\",\"baseUrl\":\"http://127.0.0.1:"
                 + stubPort
-                + "/v1\",\"model\":\"stub-model\",\"apiKey\":\"sk-test\"}");
+                + "/v1\",\"model\":\"stub-model\",\"apiKey\":\"sk-test\","
+                + "\"maxContext\":131072,\"maxOutput\":8192}");
 
     assertThat(response.statusCode()).isEqualTo(200);
     assertThat(response.body()).contains("\"ok\":true").contains("stub-model");
@@ -120,10 +124,39 @@ class SetupHttpServerTest {
     startServer();
 
     HttpResponse<String> response =
-        post("{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\",\"apiKey\":\"\"}");
+        post(
+            "{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\",\"apiKey\":\"\","
+                + "\"maxContext\":131072,\"maxOutput\":8192}");
 
     assertThat(response.statusCode()).isEqualTo(400);
     assertThat(response.body()).contains("探测失败");
+    assertThat(router.configured()).isFalse();
+    assertThat(new io.mosire.agentlib.config.FileConfigStore(tempDir).get("llm", "routes"))
+        .isEmpty();
+  }
+
+  @Test
+  void invalidCapacityFieldsAre400AndWriteNothing() throws Exception {
+    startServer();
+    List<String> invalidBodies =
+        List.of(
+            "{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\"}",
+            "{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\",\"maxContext\":131072}",
+            "{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\",\"maxContext\":0,"
+                + "\"maxOutput\":8192}",
+            "{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\",\"maxContext\":\"131072\","
+                + "\"maxOutput\":8192}",
+            "{\"baseUrl\":\"http://127.0.0.1:1\",\"model\":\"m\",\"maxContext\":2147483648,"
+                + "\"maxOutput\":8192}");
+
+    for (String body : invalidBodies) {
+      HttpResponse<String> response = post(body);
+      assertThat(response.statusCode()).as(body).isEqualTo(400);
+      assertThat(response.body())
+          .as(body)
+          .contains("正整数")
+          .satisfies(text -> assertThat(text).containsAnyOf("maxContext", "maxOutput"));
+    }
     assertThat(router.configured()).isFalse();
     assertThat(new io.mosire.agentlib.config.FileConfigStore(tempDir).get("llm", "routes"))
         .isEmpty();
