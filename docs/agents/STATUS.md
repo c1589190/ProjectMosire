@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-10-23 22:55（Asia/Shanghai）
+> **更新时间**：2026-10-24 14:20（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -8,9 +8,10 @@
 
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
-| 当前发布版本 | **0.2.3** | 2026-10-23 发布；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.3`；tag `v0.2.3`；发布证据见 §4.4。 |
+| 当前本地版本 | **0.2.4** | 2026-10-24 用户要求作为 0.2.4 提交、推送并安装到本地 Maven 仓库；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.4`；**未打 tag、未发布 Pages**。 |
+| 当前 Pages 发布版本 | **0.2.3** | 2026-10-23 发布；tag `v0.2.3`；发布证据见 §4.4–§4.5。 |
 | 上一发布版本 | **0.2.2** | 发布基线 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；tag `v0.2.2`；发布历史见 §4.1–§4.3。 |
-| 最近 full gate 的源码 HEAD | **`790faa6590aaf06f0cd264a85a13161846112c40`** | 0.2.3 发布前门禁；manifest 记录 `worktree=dirty(tracked=12,untracked=5)`（工作树含本版代码与版本号）；run `20261023T143755Z-70901-26515`。 |
+| 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`。 |
 | 0.2.3 发布提交 | **`4287752`**（`fix(agentlib): DECIDING 分段表态可回填`）+ **`4ebbf6a`**（`release: 0.2.3`） | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。tag 指向 `4ebbf6a`。 |
 | 模块数 | **6** | 根 `pom.xml`：AgentLib、Workspace、Docs、Brain、Main、BashPlugin。 |
 | 公开 API 兼容基线 | **0.2.2 起** | 用户 2026-10-17 裁定；后续公开 API 只增不减，变更时走下游消费方验证。 |
@@ -107,9 +108,23 @@
 | SpotBugs | 6 个模块均为 `BugInstance size is 0`。 |
 | 证据 | `.work/gate/20261023T143755Z-70901-26515/summary.txt`；`CROSSCHECK log=1625 xml=1625 status=MATCH`。 |
 
+### 2.9 默认上下文压缩（2026-10-24，已提交，0.2.4）
+
+- 设计与开发计划：`设计-默认上下文压缩.md`、`开发计划-默认上下文压缩.md`。
+- 功能提交：**`6cf36d5`**（`feat(agentlib): 增加默认上下文压缩与 user checkpoint`）。
+- AgentLib 新增 `ContextWindow` compact 标记/自动投影、`io.mosire.agentlib.compact` 可覆写压缩 SPI 与 `DefaultContextCompactor`，并在 `AgentLoop` 每次 LLM 往返前提供可选压缩钩子。
+- Brain 接线事件/严格失败/手动 `requestCompaction()`；Main 与子 Agent 真模型路径默认装配；setup/CLI 写入 `capabilities.maxContext/maxOutput`；缺容量严格失败。
+- 0.2.4 full gate `20261024T061503Z-91459-17843`：`rc=0`，**FULL VERIFY PASSED**；**1667 tests / 0 failures / 0 errors / 6 skipped**；6 模块 SpotBugs 0；`CROSSCHECK log=1667 xml=1667 status=MATCH`。
+- 证据：`.work/gate/20261024T061503Z-91459-17843/summary.txt`。
+- **真实 LLM 验证 PASSED（2026-10-24，`deepseek-flash`）**：
+  - AgentLib 引擎级：真实摘要调用 + 主模型续答 `COMPACT-OK`；
+  - AgentRuntime 级：第 6 轮自动触发，`beforeTokens=3177 → afterTokens=592`，`droppedMessages=10`，`conversation.compact reason=threshold`，摘要调用 `llm.call phase=compact` 落库；压缩后真实续聊 `AFTER-COMPACT-OK`；
+  - 证据：`.work/real-compact-probe/run.log`、`.work/real-compact-probe/runtime-run-4.log`、`.work/real-compact-probe/runtime-agent/events.db`；日志/事件库密钥扫描 0 命中。
+- 未验证：provider 精确 tokenizer、`~/SimulatorMosire` 下游消费方检查。
+
 ## 3. 工作树状态
 
-0.2.3 发布提交后，工作树预期只剩开工前已有的 5 个未跟踪文件：
+0.2.3 发布提交后，开工前已有的 5 个未跟踪文件：
 
 ```text
 ?? AgentLibMosire/.factorypath
@@ -119,9 +134,15 @@
 ?? configs/agents/bash-agent.json
 ```
 
+当前 0.2.4 本地版本由两个关注点提交组成：
+1. `6cf36d5`：默认上下文压缩功能与测试；
+2. 0.2.4 版本 bump + 本文状态收口（release commit，本文件所在提交）。
+
+0.2.4 只做本地 Maven 安装，**未打 tag、未发布 Pages**；当前 Pages 发布版本仍是 0.2.3。
+
 - `.work/gate/**` 为 run-bound 证据，默认不入库；
-- 本版未修改 `docs/archive/**`；未修改 `DecisionPackageTransitions`、`DecisionPackageSnapshot`、`DecisionSubmissionPort` 的签名，未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
-- 0.2.3 的 Pages 核验在发布工作流完成后回填到 §4.5。
+- 本版未修改 `docs/archive/**`；未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
+- 0.2.3 的 Pages 核验见 §4.5。
 
 ## 4. 发布历史与 Pages
 
@@ -181,20 +202,32 @@
 | 落地页 | `index.html` 显示 **0.2.3**，链接指向三库与父 pom 的 0.2.3 制品。 |
 | 元数据 | 三库 + 父 pom 的 `maven-metadata.xml`：`release=0.2.3`；仍只列当前版本（历史目录保留，metadata 不累积，见 §4.3）。 |
 
+### 4.6 v0.2.4 本地版本与 Maven 本地仓库安装（2026-10-24）
+
+| 项目 | 事实 |
+|---|---|
+| 版本 | **0.2.4**；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 一致。 |
+| 功能提交 | `6cf36d5`（默认上下文压缩 + 测试）。 |
+| release commit | 本文件所在的 0.2.4 版本 bump 提交（不另打 tag）。 |
+| full gate | run `20261024T061503Z-91459-17843`：`FULL VERIFY PASSED`；1667 tests / 0 failures / 0 errors / 6 skipped；6 模块 SpotBugs 0；`CROSSCHECK log=1667 xml=1667 status=MATCH`。 |
+| 本地安装 | `./mvnw -B -ntp -DskipTests -Dspotbugs.skip=true install`：rc=0；父 pom + 6 模块的 `0.2.4` `pom`/`jar`/`sources.jar` 均已进入 `~/.m2/repository/io/mosire/`。 |
+| 制品核验 | 7 个坐标目录均存在；`agentlib-mosire-0.2.4.jar`、`brain-mosire-0.2.4.jar`、`main-mosire-0.2.4.jar` 等均存在。 |
+| Pages / tag | **未打 tag、未发布 Pages**；当前 Pages 发布版本仍是 0.2.3。 |
+
 ## 5. 未验证 / 未做事项
 
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
-- `maven-metadata.xml` 只列当前版本（0.2.3）；钉死版本的消费不受影响，`RELEASE`/`LATEST`/版本区间只能看到最新版。
-- **未配置/未运行 japicmp**；0.2.3 相对 0.2.2 的公开面用 `javap` 对照（§4.5）与用例覆盖，未做语义级兼容测试。
-- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，需改为 `0.2.3` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
+- 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages，故 Pages 上的 `maven-metadata.xml` 仍是 0.2.3。
+- **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
+- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，可在本机改用 `0.2.4` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
 - 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。CI 又在 tag `4ebbf6a` 上跑了一轮 `verify` 并通过（run `39972052202`）。
 - 迁移台账中的 pending 规则尚未裁定，见 `docs/archive/2026-10-17-agents-rule-migration.md`。
 
 ## 6. 下一步
 
-1. Simos 把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.3`（走 Pages），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
-2. 下一开发版本从 `0.2.4-SNAPSHOT` 起（何时升号由用户决定）；公开 API 兼容基线从 0.2.2 起，0.2.3 只增不减。
+1. Simos 可先把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为本机已安装的 `0.2.4`，实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
+2. 若要把 0.2.4 发布到 Pages，需用户另行授权打 tag；公开 API 兼容基线从 0.2.2 起，0.2.4 只增不减。
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
