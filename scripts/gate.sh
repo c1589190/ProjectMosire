@@ -797,10 +797,12 @@ spawn_fake_java() {
   local bin="$SELFTEST_TMP/fakejava"
   mkdir -p "$bin" "$cwd"
   if [ ! -x "$bin/java" ]; then
-    cp "$(command -v sleep)" "$bin/java" || return 1
+    # 用 python3 拷贝成 java：既保留 comm=java（pgrep -x java 命中），
+    # 又不像 coreutils multicall 的 sleep 那样按 argv0 拒绝 "java"（CI 实测）。
+    cp "$(command -v python3)" "$bin/java" || return 1
     chmod +x "$bin/java"
   fi
-  (cd "$cwd" && exec -a "$argv0" "$bin/java" 60) &
+  (cd "$cwd" && exec -a "$argv0" "$bin/java" -c 'import time; time.sleep(60)') &
   SPAWNED_PID=$!
   SELFTEST_PIDS+=("$SPAWNED_PID")
   local i
