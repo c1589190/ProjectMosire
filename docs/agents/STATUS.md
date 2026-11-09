@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-11-09 21:25（Asia/Shanghai）
+> **更新时间**：2026-11-09 21:35（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | 当前本地版本 | **0.2.5** | 2026-11-09 用户要求作为 0.2.5 提交、推送并发布；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.5`；tag `v0.2.5`（发布工作流见 §4.7）。 |
 | 依赖基线（2026-11-09 复核） | MCP SDK **2.1.0**；Jackson **2.23.0**；json-schema-validator **2.0.8**；sqlite-jdbc **3.54.1.0**；PF4J **3.16.1**；Mockito **5.24.0** | 根 `pom.xml` properties；A2A 仍 `1.3.1.Final`；逐项理由与未跟版本见 §2.10。 |
-| 当前 Pages 发布版本 | **0.2.3**（0.2.5 发布中） | 0.2.4 未发布 Pages；0.2.5 tag 已推、发布工作流证据见 §4.7；完成后回填 Pages 事实。 |
+| 当前 Pages 发布版本 | **0.2.5** | 2026-11-09 发布；tag `v0.2.5`；工作流 run `42623814837` success；制品核验见 §4.7。 |
 | 上一发布版本 | **0.2.3** | 发布基线 tag `v0.2.3`（`4ebbf6a`）；0.2.4 只做本地 Maven 安装、未发布 Pages；历史见 §4.4–§4.6。 |
 | 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`（历史）。 |
 | 0.2.5 发布 gate | **run `20261109T131027Z-125791-19837`，`FULL VERIFY PASSED`，1709 tests** | 2026-11-09；source_sha `c7cfdb3` + 7 个 POM 版本号 dirty；6 模块 SpotBugs 0；证据见 §4.7。 |
@@ -307,16 +307,20 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | 门禁源码基线 | `c7cfdb36fa22042e84c79851fc639aa03ce82506`，worktree `dirty(tracked=7,untracked=5)`（仅 7 个 POM 版本号）。 |
 | release commit | 0.2.5 版本 bump + 本文 §4.7 收口（本文件所在提交）。 |
 | tag | **`v0.2.5`**（annotated，指向 release commit）。 |
-| 发布工作流 | tag 触发 `publish-maven`；run 与结果**待回填**（见下）。 |
-| Pages | 发布工作流成功后再核验 `gh-pages` / 制品 / 落地页；**待回填**。 |
-
-> 发布工作流证据（run id、gh-pages 提交、0.2.5 制品 URL/校验和）在本节创建时尚未产生；工作流完成后以追加方式回填，不改写既有行。
+| 发布工作流 | run **`42623814837`**（`publish-maven`，tag `v0.2.5`）**success**，耗时 6m4s；`verify` run `42623815006` success；`pages build and deployment` run `42624705905` success。 |
+| `gh-pages` 提交 | `c7a0a2d902cd4782a4f16d9a8392e727da240224`，`2026-11-09T13:21:03Z`（21:21:03 +08），消息 `deploy: ec53381b97b043a8a3d849941d90d5677a45991d`。 |
+| 0.2.5 制品 | 父 pom + 三库的 `jar` / `sources.jar` / `pom` 及 `md5` / `sha1`，共 **30** 个文件。 |
+| HTTP | 父 pom、三库 `jar`/`pom`/`sources.jar`、三库 `maven-metadata.xml`、`index.html` 共 **10 个 URL 全部 200**。 |
+| 校验和 | 下载 `agentlib-mosire-0.2.5.jar`：本地 sha1 `e480e03705496ad8ab746c5d050c183be0887c16` = 远端 `.sha1`。 |
+| 版本资源 | 同一 jar 内 `io/mosire/agentlib/version.properties` 为 `version=0.2.5`。 |
+| 元数据 / 落地页 | 三库 `maven-metadata.xml` 的 `release=0.2.5`；`index.html` 当前版本显示 **0.2.5**。 |
+| 已知红 | tag 上的 `docs-skills` run `42623816370` 失败：`gate.sh selftest` 用 `cp sleep` 伪造 `java`，在 CI coreutils multicall 下按 argv0 拒绝执行（`unknown program 'java'`）。已在 main 修 `scripts/gate.sh`（改用 python3 伪装），**不影响 0.2.5 制品与 Pages**。 |
 
 ## 5. 未验证 / 未做事项
 
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
 - 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages（历史）。
-- 0.2.5 的发布前 full gate 已过；`v0.2.5` tag 已推，**发布工作流与 Pages 事实尚未回填 §4.7**（以工作流实际结果为准）。
+- 0.2.5 已发布：tag `v0.2.5`、publish-maven success、Pages 制品/校验和/版本资源已核验（§4.7）。tag 上的 docs-skills 因 `gate.sh` 自检夹具在 CI 下不兼容而红；main 上的夹具修复随后提交并重跑。
 - **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
 - 2026-11-09 依赖复核（§2.10）只验证了本仓编译 + full gate；未跑下游 `~/SimulatorMosire` 消费方，未做 japicmp；MCP 2.2.0-M2 / 3.0 未采用。
 - A9 只做了单元/门禁验证：**未接真实 LLM 会话验证注入投递与工具面中途变化**，未验证 GUI/DSH 侧消费；`context.injected` 事件的真实落库顺序只由单测覆盖。
@@ -331,7 +335,7 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 ## 6. 下一步
 
 1. Simos 可先把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.5`（Pages 发布完成后），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
-2. 0.2.5 已按用户 2026-11-09 指令打 tag 并发布；发布工作流/Pages 证据回填 §4.7。公开 API 兼容基线从 0.2.2 起，0.2.5 只增不减。
+2. 0.2.5 已按用户 2026-11-09 指令打 tag 并发布；发布工作流/Pages 证据见 §4.7。公开 API 兼容基线从 0.2.2 起，0.2.5 只增不减。tag 上的 docs-skills 红与制品无关，修复提交在 main 上。
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
