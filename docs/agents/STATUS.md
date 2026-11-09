@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-11-09 21:00（Asia/Shanghai）
+> **更新时间**：2026-11-09 21:15（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -193,7 +193,9 @@
 - **行为变更（有意）**：旧 `startHttp(host, ...)` 在非回环上不再“只 WARN”，而是启动失败；Simos 默认 `127.0.0.1` 不受影响，配 `0.0.0.0` 需改用带 security 的重载或显式 allowInsecure。
 - 测试：`McpHttpAuthTest` 4、`AgentToMcpServerSecurityTest` 3（非回环启动失败、Bearer 401/放行、PKCS12 TLS 真握手 + 401）；`keytool` 生成临时自签证书。
 - full gate：run **`20261109T125439Z-105303-30944`**，`FULL VERIFY PASSED`；**1709 tests / 0 failures / 0 errors / 6 skipped**（AgentLib 751、Workspace 62、Docs 81、Brain 479、Bash 104 + 6 skipped、Main 232）；6 模块 SpotBugs 0；`CROSSCHECK log=1709 xml=1709 status=MATCH`；证据 `.work/gate/20261109T125439Z-105303-30944/summary.txt`。
-- 未做：未跑 `~/SimulatorMosire` 消费方（其 `config.bindAddress()` 配 0.0.0.0 时需改调用）；未做 OAuth/mTLS/token 轮换；未从配置文件接线 TLS/认证；未用真实 MCP 客户端带 Bearer 连接（测试用 JDK HttpClient）。
+- **配置归属（用户 2026-11-09 修正）**：AgentLib 不提供配置文件/环境变量解析器；TLS/认证/allowInsecure 由宿主 core 读自己的配置后构造
+  `McpHttpSecurity` 实例传入。本项目 core 尚未接 HTTP MCP（Main 仍 stdio），BMA3 用其自己的配置系统。
+- 未做：未跑 `~/SimulatorMosire` 消费方（其 `config.bindAddress()` 配 0.0.0.0 时需改调用）；未做 OAuth/mTLS/token 轮换；未用真实 MCP 客户端带 Bearer 连接（测试用 JDK HttpClient）。
 
 ## 3. 工作树状态
 

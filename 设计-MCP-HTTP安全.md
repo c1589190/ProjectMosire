@@ -80,6 +80,31 @@ public record McpHttpSecurity(
 
 ---
 
+## 一·补 配置归属（2026-11-09 用户修正）
+
+**AgentLib 不做配置文件/环境变量解析。** 不提供 `McpHttpSecurityConfig` 一类“读 JSON 再构造”的入口；`McpHttpSecurity` /
+`McpHttpTlsConfig` / `McpHttpAuth` 都是纯实例 API。
+
+- **本项目（ProjectMosire）**：由 core（`Main`/`BootConfig`/`App`/`ConfigStore` 等统一配置路径）读配置、取密钥、构造实例，再传给
+  `AgentToMcpServer.startHttp`。
+- **BMA3 等其他项目**：用它们自己的配置初始化方式；读完同样构造 `McpHttpSecurity` 实例传入即可。
+- **为什么**：文件格式、密钥来源（env / 文件 / secret manager）、热更新、优先级都是宿主策略；AgentLib 绑死一种格式会让每个消费方被迫适配，
+  也会把“读进程环境/读文件”这类副作用塞进库。
+
+宿主 core 的典型装配（示意，密钥值由 core 从自己的配置/secret 源取，绝不硬编码）：
+
+```java
+McpHttpTlsConfig tls =
+    new McpHttpTlsConfig(keystorePath, storePassword, keyPassword, "PKCS12");
+McpHttpSecurity security =
+    McpHttpSecurity.tls(tls, McpHttpAuth.bearer(BearerTokenVerifier.constantTime(token)));
+AgentToMcpServer.startHttp(
+    host, port, path, registry, serverName, serverVersion, caller, authorizer, assetResolver, security);
+```
+
+`McpHttpTlsConfig.toString()` 已脱敏；AgentLib 不打印密码/token。本项目 Main 目前只走 stdio MCP，尚未接 HTTP MCP；
+等 core 需要对外 HTTP 时，按上面的实例装配接。
+
 ## 二 实现落点
 
 - `JdkHttpStreamableServerTransportProvider` 增加 `McpHttpAuth` 字段；`handle()` 顺序改为：
