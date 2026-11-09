@@ -1,6 +1,8 @@
 package io.mosire.agentlib.mcp;
 
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsServer;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.modelcontextprotocol.server.McpServer;
@@ -22,9 +24,13 @@ import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolRegistry;
 import io.mosire.agentlib.tool.ToolResult;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -36,6 +42,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -513,6 +521,9 @@ public final class AgentToMcpServer implements AutoCloseable {
    * fail-closed， 但把它当成"网络暴露面"的隐式默认，等于让审批路径在外部面上静默失效（外部调用者只会看到"审批被拒"，而不是"你根本没装配审批"）。 要审批就显式装配带
    * coordinator 的 authorizer；不审批也要显式选一个（哪怕就是 {@code standard()}）。
    *
+   * <p><b>安全（A1）</b>：本重载等价 {@link McpHttpSecurity#none()}；非回环 caller-owned server 请在带 {@link
+   * McpHttpSecurity} 的重载里配置 Bearer，或显式 {@code allowInsecure}，否则启动失败。
+   *
    * @param server 调用方持有并已（或即将）{@code start()} 的 HTTP server；本类不接管其生命周期
    * @param path MCP 端点路径（如 {@code /mcp}）；{@code createContext} 是前缀匹配，provider 内部做精确守卫
    * @param registry 待暴露的工具注册表（持有引用，后续变更实时同步）
@@ -521,6 +532,32 @@ public final class AgentToMcpServer implements AutoCloseable {
    * @param caller 经 MCP 到达的 {@code tools/call} 所使用的执行身份（建链时绑定，客户端改不了）
    * @param authorizer 工具调用唯一入口（<b>必填</b>，见上文；审批闸等横切判定都在其中）
    * @since 0.1.0
+   */
+  public static AgentToMcpServer startHttp(
+      HttpServer server,
+      String path,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer) {
+    return startHttp(
+        server,
+        path,
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        authorizer,
+        McpHttpSecurity.none());
+  }
+
+  /**
+   * 启动（HTTP，<b>caller-owned</b> + 安全配置，A1）：TLS 由调用方负责（传入的必须是 {@link HttpsServer} 才能配 TLS）； 认证由本类挂到
+   * provider 上。非回环 + 无认证 + 非 {@code allowInsecure} ⇒ 启动失败。
+   *
+   * <p>生命周期所有权与旧 caller-owned 重载逐字相同：本方法不 {@code start()}/{@code stop()} 调用方的 server、不关它的
+   * executor；{@link #close()} 只取消订阅 + removeContext。
    */
   @SuppressFBWarnings(
       value = "THROWS_METHOD_THROWS_RUNTIMEEXCEPTION",
@@ -534,10 +571,21 @@ public final class AgentToMcpServer implements AutoCloseable {
       String serverName,
       String serverVersion,
       ToolContext caller,
-      ToolCallAuthorizer authorizer) {
+      ToolCallAuthorizer authorizer,
+      McpHttpSecurity security) {
     Objects.requireNonNull(server, "server");
     Objects.requireNonNull(path, "path");
     Objects.requireNonNull(authorizer, "authorizer");
+    Objects.requireNonNull(security, "security");
+    boolean loopback =
+        server.getAddress() != null
+            && server.getAddress().getAddress() != null
+            && server.getAddress().getAddress().isLoopbackAddress();
+    validateSecurity(loopback, security, "caller-owned");
+    if (security.hasTls() && !(server instanceof HttpsServer)) {
+      throw new IllegalArgumentException(
+          "caller-owned startHttp 配置了 TLS，但传入的不是 HttpsServer；TLS 由调用方负责创建");
+    }
     if (server.getExecutor() == null) {
       LOG.warn(
           "caller-owned HttpServer 未设置自定义 executor：默认单线程 executor 会与 parked GET 监听流互锁，"
@@ -545,7 +593,10 @@ public final class AgentToMcpServer implements AutoCloseable {
           path);
     }
     JdkHttpStreamableServerTransportProvider provider =
-        new JdkHttpStreamableServerTransportProvider(path);
+        new JdkHttpStreamableServerTransportProvider(
+            McpJsonDefaults.getMapper(),
+            path,
+            security.hasAuth() ? security.auth() : McpHttpAuth.none());
     // 顺序硬约束：先 build（SDK 在 build 时注入 sessionFactory），再 createContext。
     AgentToMcpServer self =
         startWith(registry, serverName, serverVersion, caller, provider, name -> true, authorizer);
@@ -569,14 +620,14 @@ public final class AgentToMcpServer implements AutoCloseable {
    * executor.shutdown()}。②→③ 顺序不能颠倒：先让 provider 把每个会话的 listening stream 有序收掉，再停 server；反了会把停驻线程强断在
    * {@code latch.await()} 上，SSE 客户端看到裸断连。
    *
-   * <p><b>host 非回环 = 显式 opt-in + 响亮告警</b>：默认由便捷重载绑 {@code 127.0.0.1}。显式传入非回环 host 本身<b>就是</b>
-   * opt-in（调用方必须点名），但本面<b>无鉴权、无 TLS</b>——任何能连到该地址的人都能列举并调用工具、读取并替人答复审批。故非回环时记 {@code
-   * WARN}，把风险说在启动日志里，而不是让人以为"默认就是安全的"。要对外提供服务必须先有鉴权，那是另一个包的事。
+   * <p><b>安全（A1）</b>：本重载等价 {@link McpHttpSecurity#none()}——回环允许无认证/无 TLS；<b>非回环启动失败</b>， 必须改用带
+   * {@link McpHttpSecurity} 的重载（Bearer，或显式 {@code allowInsecure}）。安全矩阵与 TLS/认证语义见 {@link
+   * McpHttpSecurity} 与 {@code 设计-MCP-HTTP安全.md}。
    *
    * <p><b>authorizer 形参必填</b>：同 {@link #startHttp(HttpServer, String, ToolRegistry, String, String,
    * ToolContext, ToolCallAuthorizer)}，不得静默退化为 {@link ToolCallAuthorizer#standard()}。
    *
-   * @param host 绑定地址（非回环须显式点名并接受无鉴权风险）
+   * @param host 绑定地址（非回环须改用带 {@link McpHttpSecurity} 的重载）
    * @param port 端口；{@code 0} = 由系统分配，实际端口用 {@link #boundPort()} 读回
    * @param path MCP 端点路径（如 {@code /mcp}）
    * @param registry 待暴露的工具注册表（持有引用，后续变更实时同步）
@@ -625,28 +676,63 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolContext caller,
       ToolCallAuthorizer authorizer,
       ToolAssetResolver assetResolver) {
+    return startHttp(
+        host,
+        port,
+        path,
+        registry,
+        serverName,
+        serverVersion,
+        caller,
+        authorizer,
+        assetResolver,
+        McpHttpSecurity.none());
+  }
+
+  /**
+   * 启动（HTTP，<b>owned</b> + 安全配置，A1）：TLS 可选、Bearer 认证可选；非回环的校验见 {@link #validateSecurity(boolean,
+   * McpHttpSecurity, String)}。
+   *
+   * <p>生命周期所有权、关闭次序与旧 owned 重载逐字相同；TLS 时自建 {@link HttpsServer} + {@link HttpsConfigurator}。
+   */
+  public static AgentToMcpServer startHttp(
+      String host,
+      int port,
+      String path,
+      ToolRegistry registry,
+      String serverName,
+      String serverVersion,
+      ToolContext caller,
+      ToolCallAuthorizer authorizer,
+      ToolAssetResolver assetResolver,
+      McpHttpSecurity security) {
     Objects.requireNonNull(host, "host");
     Objects.requireNonNull(path, "path");
     Objects.requireNonNull(authorizer, "authorizer");
     Objects.requireNonNull(assetResolver, "assetResolver");
-    if (!isLoopback(host)) {
-      LOG.warn(
-          "MCP HTTP 面绑定非回环地址 {}（无鉴权、无 TLS）：任何能连到该地址的人都能列举并调用工具。" + "仅在你已在本机/网络层另有隔离时这样做。path={}",
-          host,
-          path);
-    }
+    Objects.requireNonNull(security, "security");
+    validateSecurity(isLoopback(host), security, "owned");
     ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     HttpServer server;
     try {
-      server = HttpServer.create(new InetSocketAddress(host, port), 0);
-    } catch (IOException e) {
+      if (security.hasTls()) {
+        HttpsServer https = HttpsServer.create(new InetSocketAddress(host, port), 0);
+        https.setHttpsConfigurator(new HttpsConfigurator(sslContext(security.tls())));
+        server = https;
+      } else {
+        server = HttpServer.create(new InetSocketAddress(host, port), 0);
+      }
+    } catch (IOException | RuntimeException e) {
       executor.shutdownNow();
       throw new IllegalStateException("MCP HTTP 面启动失败 host=" + host + " port=" + port, e);
     }
     server.setExecutor(executor);
     try {
       JdkHttpStreamableServerTransportProvider provider =
-          new JdkHttpStreamableServerTransportProvider(path);
+          new JdkHttpStreamableServerTransportProvider(
+              McpJsonDefaults.getMapper(),
+              path,
+              security.hasAuth() ? security.auth() : McpHttpAuth.none());
       AgentToMcpServer self =
           startWith(
               registry,
@@ -672,7 +758,7 @@ public final class AgentToMcpServer implements AutoCloseable {
   }
 
   /**
-   * 启动（HTTP，<b>owned</b>，便捷重载）：host 缺省 {@code 127.0.0.1}（回环，无鉴权基线下的安全缺省）；其余语义见 {@link
+   * 启动（HTTP，<b>owned</b>，便捷重载）：host 缺省 {@code 127.0.0.1}（回环、无认证/无 TLS 的开发缺省）；其余语义见 {@link
    * #startHttp(String, int, String, ToolRegistry, String, String, ToolContext,
    * ToolCallAuthorizer)}。
    *
@@ -690,6 +776,46 @@ public final class AgentToMcpServer implements AutoCloseable {
       ToolCallAuthorizer authorizer) {
     return startHttp(
         "127.0.0.1", port, path, registry, serverName, serverVersion, caller, authorizer);
+  }
+
+  /**
+   * 安全矩阵校验（A1）：回环默认放行；非回环必须有 Bearer，或显式 {@code allowInsecure=true}。TLS 本身不算认证。
+   *
+   * <p>失败抛可读 {@link IllegalArgumentException}（不含 token/密码）；非回环 + Bearer 无 TLS 只 WARN。
+   */
+  private static void validateSecurity(boolean loopback, McpHttpSecurity security, String form) {
+    if (loopback) {
+      return;
+    }
+    if (security.allowInsecure()) {
+      LOG.warn("MCP HTTP 面绑定非回环且显式 allowInsecure=true（{}）：任何能连到该地址的人都能列举并调用工具。", form);
+      return;
+    }
+    if (!security.hasAuth()) {
+      throw new IllegalArgumentException(
+          "非回环 MCP HTTP 面必须配置 Bearer 认证，或显式 allowInsecure=true（" + form + "）");
+    }
+    if (!security.hasTls()) {
+      LOG.warn("非回环 MCP HTTP 面使用明文 Bearer（{}）：token 会以明文经过网络，建议 TLS 或反向代理终止 TLS。", form);
+    }
+  }
+
+  /** 从 PKCS12/JKS 构建 SSLContext；密码只用于加载，不落日志/异常消息。 */
+  private static SSLContext sslContext(McpHttpTlsConfig tls) {
+    Objects.requireNonNull(tls, "tls");
+    try (InputStream in = Files.newInputStream(tls.keystore())) {
+      KeyStore keyStore = KeyStore.getInstance(tls.keystoreType());
+      keyStore.load(in, tls.keystorePassword().toCharArray());
+      KeyManagerFactory keyManagerFactory =
+          KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+      keyManagerFactory.init(keyStore, tls.keyPassword().toCharArray());
+      SSLContext context = SSLContext.getInstance("TLS");
+      context.init(keyManagerFactory.getKeyManagers(), null, null);
+      return context;
+    } catch (IOException | GeneralSecurityException e) {
+      throw new IllegalStateException(
+          "MCP HTTPS 证书加载失败: keystore=" + tls.keystore() + ", type=" + tls.keystoreType(), e);
+    }
   }
 
   /** 绑定地址是否回环：{@code localhost} 与解析出的回环地址为真；解析不了按非回环处理（宁多告警不漏）。 */

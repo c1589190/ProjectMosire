@@ -88,6 +88,9 @@ final class JdkHttpStreamableServerTransportProvider
   private final McpJsonMapper jsonMapper;
   private final String path;
 
+  /** 认证钩子（A1）；默认 {@link McpHttpAuth#none()} = 显式无认证。 */
+  private final McpHttpAuth auth;
+
   /** SDK 在 {@code McpServer.sync(provider).build()} 时注入；注入前 initialize 会得到 500。 */
   private volatile McpStreamableServerSession.Factory sessionFactory;
 
@@ -120,15 +123,25 @@ final class JdkHttpStreamableServerTransportProvider
   private volatile boolean closing;
 
   JdkHttpStreamableServerTransportProvider(String path) {
-    this(McpJsonDefaults.getMapper(), path);
+    this(McpJsonDefaults.getMapper(), path, McpHttpAuth.none());
+  }
+
+  JdkHttpStreamableServerTransportProvider(String path, McpHttpAuth auth) {
+    this(McpJsonDefaults.getMapper(), path, auth);
   }
 
   JdkHttpStreamableServerTransportProvider(McpJsonMapper jsonMapper, String path) {
+    this(jsonMapper, path, McpHttpAuth.none());
+  }
+
+  JdkHttpStreamableServerTransportProvider(
+      McpJsonMapper jsonMapper, String path, McpHttpAuth auth) {
     if (jsonMapper == null || path == null || path.isBlank()) {
       throw new IllegalArgumentException("jsonMapper/path 不能为空");
     }
     this.jsonMapper = jsonMapper;
     this.path = path;
+    this.auth = auth == null ? McpHttpAuth.none() : auth;
   }
 
   @Override
@@ -215,6 +228,11 @@ final class JdkHttpStreamableServerTransportProvider
   void handle(HttpExchange exchange) throws IOException {
     if (!exchange.getRequestURI().getPath().equals(path)) {
       sendError(exchange, 404, "未知路径: " + exchange.getRequestURI().getPath());
+      return;
+    }
+    // 认证先于 closing：未认证请求不应探测服务状态；覆盖 POST/GET/DELETE。
+    if (!auth.authorize(exchange.getRequestMethod(), path, exchange.getRequestHeaders())) {
+      sendUnauthorized(exchange);
       return;
     }
     if (closing) {
@@ -466,6 +484,18 @@ final class JdkHttpStreamableServerTransportProvider
         jsonMapper.writeValueAsString(Map.of("error", message)).getBytes(StandardCharsets.UTF_8);
     exchange.getResponseHeaders().set("Content-Type", APPLICATION_JSON + "; charset=utf-8");
     exchange.sendResponseHeaders(status, bytes.length);
+    try (OutputStream out = exchange.getResponseBody()) {
+      out.write(bytes);
+    }
+  }
+
+  /** 401：未认证/错 token；带标准 Bearer challenge，不回显 token。 */
+  private void sendUnauthorized(HttpExchange exchange) throws IOException {
+    byte[] bytes =
+        jsonMapper.writeValueAsString(Map.of("error", "未认证")).getBytes(StandardCharsets.UTF_8);
+    exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer realm=\"mosire-mcp\"");
+    exchange.getResponseHeaders().set("Content-Type", APPLICATION_JSON + "; charset=utf-8");
+    exchange.sendResponseHeaders(401, bytes.length);
     try (OutputStream out = exchange.getResponseBody()) {
       out.write(bytes);
     }

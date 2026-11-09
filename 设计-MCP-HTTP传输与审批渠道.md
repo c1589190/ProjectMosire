@@ -126,6 +126,11 @@ owned 形态的 ②→③ 顺序不能颠倒：先 `server.close()` 让 provider
 | 请求体上限 | 有（默认与 SDK 同量级，见 §1.1 的 413） | 不做流式解析；超限直接 413。 |
 | 探活 | GET 长连周期写 `: ping` 注释行 | SSE 注释帧不产生事件，只保活；周期可配。 |
 
+> ★ **追加标注（2026-11-09，不删上文）**：本表「绑定地址 = 非回环只告警」「鉴权 / TLS = 无（本轮）」已被
+> **[设计-MCP-HTTP安全.md](设计-MCP-HTTP安全.md)** 取代。用户 2026-11-09 裁定：TLS 可以上、`0.0.0.0` 可以绑；
+> 非回环 + 无认证（或 TLS 但无认证）必须显式 `allowInsecure=true`，否则启动失败；Bearer 由 `McpHttpAuth` 提供。
+> 本节其余项（resumability / 协议版本 / SSE / 写锁 / 编码 / 体积上限 / 探活）仍有效。
+
 **行为变更记账（本变更集唯一一处）**：`AgentToMcpServer` 现显式声明工具能力 `McpSchema.ServerCapabilities.builder().tools(true).build()`，故所有 MCP 路径都对外广播 `tools.listChanged=true`。原因是 SDK 的 `ToolCapabilities.listChanged` 默认为装箱 `null`，`McpAsyncServer.addTool/removeTool` 对其拆箱会在**每次注册变更**抛 NPE，而该异常被 `ToolRegistry.notifyChanged` 吞掉，导致 `notifications/tools/list_changed` 永远不可达。除此之外，本变更集不改动任何协议行为（安全边界、路由、鉴权均同表上各项）。
 
 ---
