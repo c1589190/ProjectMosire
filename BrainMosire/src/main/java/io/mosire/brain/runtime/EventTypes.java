@@ -79,6 +79,16 @@ public final class EventTypes {
   public static final String PLUGIN_LIFECYCLE = "plugin.lifecycle";
 
   /**
+   * 一条上下文注入成功投递到一次 LLM 请求之后。payload: {@code
+   * {"id","kind","priority","summary","revision"?}}——<b>不含完整正文</b>。
+   *
+   * <p>字符串值以 AgentLib 的 {@link io.mosire.agentlib.event.ContextEventTypes#CONTEXT_INJECTED}
+   * 为准；本处只做词汇表别名， 不复制字面量。
+   */
+  public static final String CONTEXT_INJECTED =
+      io.mosire.agentlib.event.ContextEventTypes.CONTEXT_INJECTED;
+
+  /**
    * 装订期角色审计（RA4 的产物；2026-10-16 用户裁定「补上吧」⇒ 从"只有日志"改成"日志 + 一条事件"）。payload: {@code
    * {"toolCount","roleDeclaringToolCount","knownRoleCount","catalogChecked","unknownRoles",
    * "unknownCount","uncoveredCount","catalogDiffCount"}}——{@code unknownRoles} 去空白、去重、排序（角色名不是密钥；

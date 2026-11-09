@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,11 +53,19 @@ public final class ToolRegistry {
   private final Map<String, String> toolToSource = new ConcurrentHashMap<>();
   private final CopyOnWriteArrayList<Runnable> changeListeners = new CopyOnWriteArrayList<>();
 
+  /**
+   * 工具面版本：每次<b>成功的</b>增删在写锁内自增。供 {@code ToolSurface} 判断“工具面是否变了”，从而只在下一次 LLM 请求重算。
+   *
+   * <p>为什么不拿 {@link #list()} 的哈希代替：哈希要遍历全部工具；版本号 O(1)，且与 {@link #onChange} 的触发点同源（同一把写锁内）。
+   */
+  private final AtomicLong revision = new AtomicLong();
+
   /** 注册一个工具（内建路径，无来源归属）；名字重复抛 {@link IllegalArgumentException}；成功后广播变更。 */
   public AgentTool register(AgentTool tool) {
     readWriteLock.writeLock().lock();
     try {
       putChecked(null, tool);
+      revision.incrementAndGet();
     } finally {
       readWriteLock.writeLock().unlock();
     }
@@ -73,6 +82,7 @@ public final class ToolRegistry {
     readWriteLock.writeLock().lock();
     try {
       putChecked(sourceId, tool);
+      revision.incrementAndGet();
     } finally {
       readWriteLock.writeLock().unlock();
     }
@@ -98,6 +108,9 @@ public final class ToolRegistry {
         tools.put(entry.name(), entry.tool());
         toolToSource.put(entry.name(), NO_SOURCE);
       }
+      if (!pending.isEmpty()) {
+        revision.incrementAndGet();
+      }
     } finally {
       readWriteLock.writeLock().unlock();
     }
@@ -114,6 +127,7 @@ public final class ToolRegistry {
       removed = tools.remove(name);
       if (removed != null) {
         toolToSource.remove(name);
+        revision.incrementAndGet();
       }
     } finally {
       readWriteLock.writeLock().unlock();
@@ -134,6 +148,9 @@ public final class ToolRegistry {
           toolToSource.remove(name);
           count++;
         }
+      }
+      if (count > 0) {
+        revision.incrementAndGet();
       }
     } finally {
       readWriteLock.writeLock().unlock();
@@ -167,6 +184,9 @@ public final class ToolRegistry {
           count++;
         }
         toolToSource.remove(name);
+      }
+      if (count > 0) {
+        revision.incrementAndGet();
       }
     } finally {
       readWriteLock.writeLock().unlock();
@@ -264,6 +284,15 @@ public final class ToolRegistry {
     } finally {
       readWriteLock.readLock().unlock();
     }
+  }
+
+  /**
+   * 工具面版本（单调不减）：每次成功的增删 +1，失败/空操作不变。
+   *
+   * <p>消费方（如 {@code ToolSurface}）用它判断“是否需要重算当前工具面”；拿它和 {@link #list()} 对账即可，不要用工具数或哈希代替。
+   */
+  public long revision() {
+    return revision.get();
   }
 
   /** 实际写入（重复检查 + 来源归属登记），不广播——批量的广播统一在收尾处。调用方必须持有写锁。 */

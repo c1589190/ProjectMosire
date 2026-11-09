@@ -1,6 +1,7 @@
 package io.mosire.agentlib.runtime;
 
 import io.mosire.agentlib.compact.CompactionOutcome;
+import io.mosire.agentlib.context.ContextInjection;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmException;
 import io.mosire.agentlib.llm.LlmMessage;
@@ -57,6 +58,17 @@ public interface TurnListener {
    * @param state 压缩提交后的回合进度快照（主请求尚未发出、轮数未增加）
    */
   default void onCompacted(CompactionOutcome outcome, LoopState state) {}
+
+  /**
+   * 一批上下文注入<b>成功投递</b>到一次 LLM 请求之后调用（每次成功往返至多一次；没有注入不调用）。
+   *
+   * <p><b>与终止回调的关系</b>：它不是终止回调；在 {@link #onRoundTrip} 之前调用（注入属于这次请求的一部分，事件应先于 LLM
+   * 记账/判定）。投递失败/重试不会调用它。
+   *
+   * @param injections 本次实际渲染进请求的注入（非 null、非空；顺序 = 渲染顺序）
+   * @param state 本次成功往返后的进度快照（轮数已含本次）
+   */
+  default void onContextInjected(List<ContextInjection> injections, LoopState state) {}
 
   /**
    * 模型没有工具调用 ⇒ 本回合正常结束。宿主通常在这里落库（{@code saveHistory} 一类的动作）。

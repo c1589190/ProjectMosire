@@ -4,6 +4,8 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.compact.CompactionOutcome;
 import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.context.ContextComposer;
+import io.mosire.agentlib.context.ContextInjection;
+import io.mosire.agentlib.context.ContextInjectionRenderer;
 import io.mosire.agentlib.context.ContextWindow;
 import io.mosire.agentlib.context.LlmRoundTrip;
 import io.mosire.agentlib.llm.ContentPart;
@@ -12,7 +14,11 @@ import io.mosire.agentlib.llm.LlmException;
 import io.mosire.agentlib.llm.LlmMessage;
 import io.mosire.agentlib.llm.LlmResponse;
 import io.mosire.agentlib.tool.AgentTool;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -83,6 +89,12 @@ public final class AgentLoop {
   private final ContextCompactor contextCompactor;
   private final int maxToolCallsPerResponse;
 
+  /** 注入渲染器（默认 user + system-reminder；宿主可完全自定义）。 */
+  private final ContextInjectionRenderer injectionRenderer;
+
+  /** 工具面 revision 变化时的自动提醒策略（默认标准策略；none 可关闭）。 */
+  private final ToolSurfaceNoticePolicy toolSurfaceNoticePolicy;
+
   private AgentLoop(
       ContextWindow window,
       ContextComposer composer,
@@ -91,7 +103,9 @@ public final class AgentLoop {
       StopPolicy stopPolicy,
       TurnListener listener,
       ContextCompactor contextCompactor,
-      int maxToolCallsPerResponse) {
+      int maxToolCallsPerResponse,
+      ContextInjectionRenderer injectionRenderer,
+      ToolSurfaceNoticePolicy toolSurfaceNoticePolicy) {
     this.window = window;
     this.composer = composer;
     this.llm = llm;
@@ -100,6 +114,8 @@ public final class AgentLoop {
     this.listener = listener;
     this.contextCompactor = contextCompactor;
     this.maxToolCallsPerResponse = maxToolCallsPerResponse;
+    this.injectionRenderer = injectionRenderer;
+    this.toolSurfaceNoticePolicy = toolSurfaceNoticePolicy;
   }
 
   /** 建一个空的装配器；必需依赖在 {@link Builder#build()} 处校验（失败抛带参数名的 {@link NullPointerException}）。 */
@@ -119,10 +135,27 @@ public final class AgentLoop {
    * @return 终止原因 + 回合计数 + 最终文本（非 null）
    */
   public TurnResult runTurn(List<LlmMessage> turnInput, List<AgentTool> tools) {
+    return runTurn(turnInput, ToolSurface.fixed(tools));
+  }
+
+  /**
+   * 跑一个用户回合，工具面<b>逐轮重新求值</b>（见 {@link ToolSurface}）。
+   *
+   * <p>与 {@link #runTurn(List, List)} 的区别只在“工具从哪来”：本方法每轮取一次 {@link ToolSurface#tools()}，并在 revision
+   * 变化时按 {@link ToolSurfaceNoticePolicy} 生成一条上下文注入；旧方法用固定快照。
+   *
+   * <p><b>注入的投递顺序</b>：压缩之后、LLM 请求之前；渲染进本轮 {@code turnInput}（不写历史）。只有往返成功才 {@link
+   * ContextWindow#commitInjections} 并回调 {@link TurnListener#onContextInjected}；失败下一轮重试。
+   */
+  public TurnResult runTurn(List<LlmMessage> turnInput, ToolSurface surface) {
+    Objects.requireNonNull(turnInput, "turnInput");
+    Objects.requireNonNull(surface, "surface");
     int rounds = 0;
     int toolCalls = 0;
     long startedNanos = System.nanoTime();
     boolean firstRound = true;
+    long notifiedRevision = surface.revision();
+    List<AgentTool> notifiedTools = List.copyOf(surface.tools());
 
     while (true) {
       // 1. 往返开始前的终止判定（宿主决定：取消 / 轮数上限 / 时间预算……）
@@ -136,34 +169,53 @@ public final class AgentLoop {
       List<LlmMessage> roundInput = firstRound ? List.copyOf(turnInput) : List.of();
       firstRound = false;
 
-      // 3. 可选压缩：必须在每次 LLM 往返前检查；压缩器与往返抛出的 LlmException 共用同一错误出口。
+      // 3. 工具面：每轮现取；revision 变了才在下一轮请求里体现（正在执行的工具批不打断）
+      long currentRevision = surface.revision();
+      List<AgentTool> currentTools = List.copyOf(surface.tools());
+
+      // 4. 可选压缩：必须在每次 LLM 往返前检查；压缩器与往返抛出的 LlmException 共用同一错误出口。
       //    压缩器不提交时窗口不变；提交后它已把下一轮 user 写进窗口，因此 outcome.turnInput 必须为空。
       LlmResponse response;
       long roundStartedNanos = 0L;
+      List<ContextInjection> deliveries;
       try {
         if (contextCompactor != null) {
           CompactionOutcome outcome =
-              contextCompactor.compactIfNeeded(window, roundInput, tools, composer);
+              contextCompactor.compactIfNeeded(window, roundInput, currentTools, composer);
           if (outcome.compacted()) {
             roundInput = List.copyOf(outcome.turnInput());
             listener.onCompacted(outcome, state(rounds, toolCalls, startedNanos));
           }
         }
 
-        // 4. 一次往返 = 组请求（从窗口现取）+ 发信 + 写回；失败时窗口一个字节都没动，故本轮输入交回宿主决定去留
+        // 5. 注入：工具面变化 + 窗口里待投递的注入；压缩之后追加，避免被摘要吞掉。
+        deliveries =
+            collectInjections(notifiedRevision, notifiedTools, currentRevision, currentTools);
+        List<LlmMessage> requestInput = withInjections(roundInput, deliveries);
+
+        // 6. 一次往返 = 组请求（从窗口现取）+ 发信 + 写回；失败时窗口一个字节都没动，故本轮输入交回宿主决定去留
         roundStartedNanos = System.nanoTime();
-        response = LlmRoundTrip.call(llm, window, composer, roundInput, tools);
+        response = LlmRoundTrip.call(llm, window, composer, requestInput, currentTools);
       } catch (LlmException e) {
         LoopState errorState = state(rounds, toolCalls, startedNanos);
+        // 注入未投递：不回滚队列、不标记工具面已通知；下一轮重试（roundInput 用不含注入的原值）
         listener.onLlmError(e, roundInput, errorState);
         return new TurnResult(StopReason.LLM_ERROR, rounds, toolCalls, "");
       }
 
-      // 5. 往返成功：单轮耗时到账、轮数加一（失败的那轮不加，见上面 catch）
+      // 7. 往返成功：单轮耗时到账、轮数加一（失败的那轮不加，见上面 catch）
       long latencyMs = Math.max(0L, (System.nanoTime() - roundStartedNanos) / 1_000_000L);
       rounds++;
 
-      // 6. 成功往返后的宿主记账/判定（如 llm.call 先落、配额居中、会话事件在后）；可返回终止信号（如 QUOTA）
+      // 8. 注入已真正进入这次成功的请求：清队列（只清本窗口的待投递项；工具面通知不在队列里也无害）+ 回调宿主
+      if (!deliveries.isEmpty()) {
+        window.commitInjections(deliveries.stream().map(ContextInjection::id).toList());
+        listener.onContextInjected(deliveries, state(rounds, toolCalls, startedNanos));
+      }
+      notifiedRevision = currentRevision;
+      notifiedTools = currentTools;
+
+      // 9. 成功往返后的宿主记账/判定（如 llm.call 先落、配额居中、会话事件在后）；可返回终止信号（如 QUOTA）
       state = state(rounds, toolCalls, startedNanos);
       Optional<StopSignal> roundSignal = listener.onRoundTrip(response, latencyMs, state);
       if (roundSignal.isPresent()) {
@@ -205,6 +257,49 @@ public final class AgentLoop {
     }
   }
 
+  /**
+   * 收集本轮要投递的注入：工具面变化（按策略）+ 窗口待投递项；按 id 去重，按 priority/createdAt 排序。
+   *
+   * <p>工具面通知只在 revision 变化时生成；同一轮里窗口注入可能与它并存，顺序由 priority 决定。
+   */
+  private List<ContextInjection> collectInjections(
+      long previousRevision,
+      List<AgentTool> previousTools,
+      long currentRevision,
+      List<AgentTool> currentTools) {
+    Map<String, ContextInjection> byId = new LinkedHashMap<>();
+    if (currentRevision != previousRevision) {
+      toolSurfaceNoticePolicy
+          .notice(previousRevision, previousTools, currentRevision, currentTools)
+          .ifPresent(injection -> byId.put(injection.id(), injection));
+    }
+    for (ContextInjection injection : window.pendingInjections()) {
+      byId.putIfAbsent(injection.id(), injection);
+    }
+    if (byId.isEmpty()) {
+      return List.of();
+    }
+    List<ContextInjection> deliveries = new ArrayList<>(byId.values());
+    deliveries.sort(
+        Comparator.comparingInt((ContextInjection injection) -> injection.priority().ordinal())
+            .thenComparing(ContextInjection::createdAt));
+    return List.copyOf(deliveries);
+  }
+
+  /** 把注入按宿主渲染器追加到本轮输入之后（不写窗口、不改历史）。 */
+  private List<LlmMessage> withInjections(
+      List<LlmMessage> roundInput, List<ContextInjection> deliveries) {
+    if (deliveries.isEmpty()) {
+      return roundInput;
+    }
+    List<LlmMessage> messages = new ArrayList<>(roundInput.size() + deliveries.size());
+    messages.addAll(roundInput);
+    for (ContextInjection injection : deliveries) {
+      messages.add(injectionRenderer.render(injection));
+    }
+    return List.copyOf(messages);
+  }
+
   /** 终止收口：先回调宿主（落事件/落库），再返回结果——顺序是契约（结果返回前历史已处置）。 */
   private TurnResult stop(StopSignal signal, LoopState state, int rounds, int toolCalls) {
     listener.onStop(signal, state);
@@ -237,6 +332,8 @@ public final class AgentLoop {
     private TurnListener listener;
     private ContextCompactor contextCompactor;
     private int maxToolCallsPerResponse;
+    private ContextInjectionRenderer injectionRenderer;
+    private ToolSurfaceNoticePolicy toolSurfaceNoticePolicy;
 
     private Builder() {}
 
@@ -300,6 +397,24 @@ public final class AgentLoop {
     }
 
     /**
+     * 可选：上下文注入的渲染器。缺省 {@link ContextInjectionRenderer#systemReminder()}（user 角色 + system-reminder
+     * 信封）； 宿主可完全自定义 role/信封。
+     */
+    public Builder injectionRenderer(ContextInjectionRenderer injectionRenderer) {
+      this.injectionRenderer = injectionRenderer;
+      return this;
+    }
+
+    /**
+     * 可选：工具面 revision 变化时的自动提醒策略。缺省 {@link ToolSurfaceNoticePolicy#standard()}； {@link
+     * ToolSurfaceNoticePolicy#none()} 可完全关闭。
+     */
+    public Builder toolSurfaceNoticePolicy(ToolSurfaceNoticePolicy toolSurfaceNoticePolicy) {
+      this.toolSurfaceNoticePolicy = toolSurfaceNoticePolicy;
+      return this;
+    }
+
+    /**
      * 可选：单次响应允许的工具调用条数上限；{@code 0}（缺省）= 不限。超出 ⇒ 整批不执行，转 {@link TurnListener#onToolCallLimit} 出口。
      *
      * @throws IllegalArgumentException 负数（"不限"用 0 表达；负数只可能是装配 bug，不静默当 0）
@@ -326,7 +441,11 @@ public final class AgentLoop {
           stopPolicy == null ? state -> Optional.empty() : stopPolicy,
           listener == null ? new TurnListener() {} : listener,
           contextCompactor,
-          maxToolCallsPerResponse);
+          maxToolCallsPerResponse,
+          injectionRenderer == null ? ContextInjectionRenderer.systemReminder() : injectionRenderer,
+          toolSurfaceNoticePolicy == null
+              ? ToolSurfaceNoticePolicy.standard()
+              : toolSurfaceNoticePolicy);
     }
 
     /** 必需依赖校验：消息必须带参数名（"哪个没给"比"有东西没给"可查得多）。 */

@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-10-24 14:20（Asia/Shanghai）
+> **更新时间**：2026-11-09 20:30（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -9,9 +9,12 @@
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
 | 当前本地版本 | **0.2.4** | 2026-10-24 用户要求作为 0.2.4 提交、推送并安装到本地 Maven 仓库；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.4`；**未打 tag、未发布 Pages**。 |
+| 依赖基线（2026-11-09 复核） | MCP SDK **2.1.0**；Jackson **2.23.0**；json-schema-validator **2.0.8**；sqlite-jdbc **3.54.1.0**；PF4J **3.16.1**；Mockito **5.24.0** | 根 `pom.xml` properties；A2A 仍 `1.3.1.Final`；逐项理由与未跟版本见 §2.10。 |
 | 当前 Pages 发布版本 | **0.2.3** | 2026-10-23 发布；tag `v0.2.3`；发布证据见 §4.4–§4.5。 |
 | 上一发布版本 | **0.2.2** | 发布基线 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；tag `v0.2.2`；发布历史见 §4.1–§4.3。 |
 | 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`。 |
+| 最近依赖复核 gate | **run `20261109T114822Z-23830-12948`，`FULL VERIFY PASSED`，1667 tests** | 2026-11-09；source_sha `6d2a1a8`，工作树 dirty（仅根 `pom.xml` 依赖版本）；证据见 §2.10。 |
+| 最近功能 full gate（A9） | **run `20261109T122504Z-64777-18242`，`FULL VERIFY PASSED`，1681 tests** | 2026-11-09；source_sha `6d2a1a8` + A9 未提交改动；证据见 §2.11。 |
 | 0.2.3 发布提交 | **`4287752`**（`fix(agentlib): DECIDING 分段表态可回填`）+ **`4ebbf6a`**（`release: 0.2.3`） | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。tag 指向 `4ebbf6a`。 |
 | 模块数 | **6** | 根 `pom.xml`：AgentLib、Workspace、Docs、Brain、Main、BashPlugin。 |
 | 公开 API 兼容基线 | **0.2.2 起** | 用户 2026-10-17 裁定；后续公开 API 只增不减，变更时走下游消费方验证。 |
@@ -122,6 +125,38 @@
   - 证据：`.work/real-compact-probe/run.log`、`.work/real-compact-probe/runtime-run-4.log`、`.work/real-compact-probe/runtime-agent/events.db`；日志/事件库密钥扫描 0 命中。
 - 未验证：provider 精确 tokenizer、`~/SimulatorMosire` 下游消费方检查。
 
+### 2.10 依赖复核与 MCP SDK 2.1.0（2026-11-09）
+
+- 复核来源：`repo1.maven.org` 各坐标 `maven-metadata.xml`（2026-11-09 实测）。
+- 升级：MCP SDK **2.0.1 → 2.1.0**（稳定线，2026-10-16；2.2.0 仍是 milestone，不跟）；Jackson **2.22.2 → 2.23.0**；json-schema-validator **2.0.4 → 2.0.8**；sqlite-jdbc **3.53.4.0 → 3.54.1.0**；PF4J **3.15.1 → 3.16.1**；Mockito **5.23.0 → 5.24.0**。
+- 保持：A2A SDK **1.3.1.Final**（1.5.0 可用，Main 直接依赖 `a2a-java-sdk-*`，另做迁移评估）；log4j **2.26.1**（3.0 为 beta）；slf4j **2.0.19**（2.1 为 alpha）；AssertJ **3.27.7**（4.0 为 milestone）；JUnit **6.1.3**（已最新）。
+- **不跟 json-schema-validator 3.x**：3.0.9 已切到 Jackson 3（`tools.jackson.*`），与全仓 Jackson 2 树模型不兼容；2.0.8 是 2.x 最新。
+- MCP 2.1.0 的行为变化（release notes）：Streamable HTTP 不再支持 2024-11-05 协议、拒绝非 `application/json` 的 POST；本仓 provider + SDK 2.1.0 客户端测试通过，**外部旧客户端未验证**。
+- 编译：`./mvnw -B -ntp test-compile` rc=0（7 模块，4 min 40 s）。
+- full gate：run **`20261109T114822Z-23830-12948`**，`FULL VERIFY PASSED`；**1667 tests / 0 failures / 0 errors / 6 skipped**（AgentLib 709、Workspace 62、Docs 81、Brain 479、Bash 104 + 6 skipped、Main 232）；6 模块 SpotBugs `BugInstance size is 0`；`CROSSCHECK log=1667 xml=1667 status=MATCH`。
+- 证据：`.work/gate/20261109T114822Z-23830-12948/summary.txt`；source_sha `6d2a1a8`，worktree `dirty(tracked=1,untracked=5)`（tracked 仅根 `pom.xml`）。
+- 未做：下游 `~/SimulatorMosire` 消费方检查；japicmp（依赖升级不改公开类集合，仍无机器级比对）；MCP 2.2.0-M2 / 3.0 未采用。
+
+### 2.11 上下文注入与动态工具面（A9，2026-11-09）
+
+- 设计：**[设计-上下文注入与动态工具面.md](../../设计-上下文注入与动态工具面.md)**（用户裁定：system 提示词与工具面分离；不预设硬注入；注入一次性投递；role/信封完全自定义；事件只记摘要）。
+- AgentLib 新增：
+  - `io.mosire.agentlib.context.ContextInjection` / `ContextInjectionKinds` / `ContextInjectionQueue` / `ContextInjectionRenderer`；
+  - `ContextWindow` 新增 `inject` / `pendingInjections` / `commitInjections` / `clearInjections`（消息面仍调用方串行，注入队列自身线程安全）；
+  - `io.mosire.agentlib.runtime.ToolSurface`（revision + 当前工具面）与 `ToolSurfaceNoticePolicy`（standard / none / 自定义）；
+  - `AgentLoop` 新增 `runTurn(turnInput, ToolSurface)`；旧 `runTurn(turnInput, List<AgentTool>)` 保留并委托固定面；
+  - `TurnListener.onContextInjected`（default）；`ContextEventTypes.CONTEXT_INJECTED`；
+  - `ToolRegistry.revision()`（成功增删 +1，失败/空操作不变）。
+- Brain 接线：
+  - `AgentPipeline` 用 `PipelineToolSurface`（按 `registry.revision()` 缓存 `visibleTools()`）；
+  - `TurnEvents.onContextInjected` 落 `context.injected`（payload 只含 id/kind/priority/summary/revision，不含正文）；
+  - `BasicContextAssembler.systemText` **删除工具目录**，只留稳定提示“可用工具以本次请求的 tools 字段为准”；`ContextAssembler` 契约同步更新。
+- 行为变更（有意）：system 文本不再列工具名/描述；`BasicContextAssemblerTest` / `SourcesTest` / `CompactSummaryTest` 的逐字节断言与 `composition()` SYSTEM 估算同步更新。工具定义仍经 `LlmRequest.tools` 完整发送。
+- 兼容：旧 `runTurn(List)`、旧 `TurnListener` 实现、`ContextWindow` 消息语义均不变；新增面只增不减。
+- full gate：run **`20261109T122504Z-64777-18242`**，`FULL VERIFY PASSED`；**1681 tests / 0 failures / 0 errors / 6 skipped**（AgentLib 723、Workspace 62、Docs 81、Brain 479、Bash 104 + 6 skipped、Main 232）；6 模块 SpotBugs 0；`CROSSCHECK log=1681 xml=1681 status=MATCH`；证据 `.work/gate/20261109T122504Z-64777-18242/summary.txt`。
+- 新增测试：`ContextInjectionQueueTest` 7、`AgentLoopContextInjectionTest` 5、`ToolRegistryRevisionTest` 2。
+- 未做：A2 `registerAll(sourceId)` / A4 `resync()` / A5-A6 元数据与 `tool_catalog` / A1 TLS+认证 / A3 硬超时；A9 未接真实 LLM 会话与 GUI。
+
 ## 3. 工作树状态
 
 0.2.3 发布提交后，开工前已有的 5 个未跟踪文件：
@@ -140,6 +175,7 @@
 
 0.2.4 只做本地 Maven 安装，**未打 tag、未发布 Pages**；当前 Pages 发布版本仍是 0.2.3。
 
+- 2026-11-09 依赖复核（§2.10）与 A9（§2.11）尚未提交：带改动文件见 `git status`（根 `pom.xml`、AgentLib/Brain 的注入与工具面代码、设计文档、本文件）；上述 5 个未跟踪本机文件未动。
 - `.work/gate/**` 为 run-bound 证据，默认不入库；
 - 本版未修改 `docs/archive/**`；未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
 - 0.2.3 的 Pages 核验见 §4.5。
@@ -219,6 +255,8 @@
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
 - 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages，故 Pages 上的 `maven-metadata.xml` 仍是 0.2.3。
 - **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
+- 2026-11-09 依赖复核（§2.10）只验证了本仓编译 + full gate；未跑下游 `~/SimulatorMosire` 消费方，未做 japicmp；MCP 2.2.0-M2 / 3.0 未采用。
+- A9 只做了单元/门禁验证：**未接真实 LLM 会话验证注入投递与工具面中途变化**，未验证 GUI/DSH 侧消费；`context.injected` 事件的真实落库顺序只由单测覆盖。
 - 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，可在本机改用 `0.2.4` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
 - 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。CI 又在 tag `4ebbf6a` 上跑了一轮 `verify` 并通过（run `39972052202`）。
@@ -231,6 +269,7 @@
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
+6. A9 之后按用户口径继续：A2 `registerAll(sourceId)`、A4 `resync()`、A5/A6 元数据与 `tool_catalog`；A1（TLS + 显式 opt-in）与 A3（10 分钟硬超时）另开设计。
 
 ## 7. 当前文档权威关系
 

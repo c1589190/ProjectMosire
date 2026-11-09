@@ -9,6 +9,7 @@ import io.mosire.agentlib.compact.CompactionException;
 import io.mosire.agentlib.compact.CompactionOutcome;
 import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.context.ContextComposer;
+import io.mosire.agentlib.context.ContextInjection;
 import io.mosire.agentlib.context.ContextWindow;
 import io.mosire.agentlib.context.LlmRoundTrip;
 import io.mosire.agentlib.decision.DecisionPackages;
@@ -37,6 +38,7 @@ import io.mosire.agentlib.runtime.StopPolicy;
 import io.mosire.agentlib.runtime.StopReason;
 import io.mosire.agentlib.runtime.StopSignal;
 import io.mosire.agentlib.runtime.ToolCallDispatcher;
+import io.mosire.agentlib.runtime.ToolSurface;
 import io.mosire.agentlib.runtime.TurnListener;
 import io.mosire.agentlib.runtime.TurnResult;
 import io.mosire.agentlib.store.ConversationStore;
@@ -54,6 +56,7 @@ import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
 import io.mosire.brain.decision.DecisionApprovalBridge;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -1029,6 +1032,33 @@ public final class AgentPipeline {
   }
 
   /**
+   * 本管线的 {@link ToolSurface}：按 {@link ToolRegistry#revision()} 缓存 `visibleTools()` 的结果。
+   *
+   * <p>为什么缓存而不是每轮全量过滤：工具表可能很大，而 revision 只在真正增删时变；同一 revision 下可见面语义相同。工具面变化后，下一轮 {@link AgentLoop}
+   * 会重新取这里的列表，并把变化通过上下文注入告知模型。
+   */
+  private final class PipelineToolSurface implements ToolSurface {
+
+    private long cachedRevision = Long.MIN_VALUE;
+    private List<AgentTool> cachedTools = List.of();
+
+    @Override
+    public long revision() {
+      return registry.revision();
+    }
+
+    @Override
+    public List<AgentTool> tools() {
+      long current = registry.revision();
+      if (current != cachedRevision) {
+        cachedTools = visibleTools();
+        cachedRevision = current;
+      }
+      return List.copyOf(cachedTools);
+    }
+  }
+
+  /**
    * 跑一回合：用户输入 →（LLM 循环 + 工具调用）→ 终止。
    *
    * <p>约定：方法是同步的（网络/子进程调用在工具内自行发生）；回合间共享 {@link #window} （一个 Agent 实例的连续对话）。
@@ -1059,8 +1089,8 @@ public final class AgentPipeline {
 
     LlmQuota quota = config.quotaMaxTokens() > 0 ? new LlmQuota(config.quotaMaxTokens()) : null;
     Instant deadline = Instant.now().plus(config.timeBudget());
-    // 可见面 = 注册表 ∩ 判定面（唯一 oracle，A-6）：被裁掉的数量落 INFO，不静默消失
-    List<AgentTool> tools = visibleTools();
+    // 可见面 = 注册表 ∩ 判定面（唯一 oracle，A-6）：按 registry.revision() 缓存，工具面变了在下一轮重算
+    ToolSurface surface = new PipelineToolSurface();
     // 每回合一个编排器：头部只算一次、回合内复用（见 AssemblerComposer 的类注）；本轮 user 作为 turnInput 随第 1 轮往返写回
     ContextComposer composer = new AssemblerComposer(assembler, config, userMessage);
     // 本回合的输入（相对窗口新增的部分）：第 1 轮是这条 user，此后窗口里已经有了它（也含工具结果），故为空——
@@ -1068,7 +1098,7 @@ public final class AgentPipeline {
     List<LlmMessage> turnInput = List.of(LlmMessage.user(userMessage));
 
     try {
-      return runTurn(composer, turnInput, userMessage, deadline, quota, tools);
+      return runTurn(composer, turnInput, userMessage, deadline, quota, surface);
     } finally {
       // ★ 先解绑取数口，再收包——顺序不能反（2026-10-18 实测踩到）：
       //   收包那条路会**同步执行被批子集**（提交口在同一个线程上跑各条目自己的工具）。若此刻队列还绑着，
@@ -1100,7 +1130,7 @@ public final class AgentPipeline {
    * @param deadline 本回合的时间预算截止时刻（由 {@link #run(String)} 在压缩之后计算；仍用 {@link Instant#now()} 判， 不用骨架的
    *     {@code elapsedMillis}——避免把"回合外耗时"算进预算）
    * @param quota 本回合的 token 配额账本；{@code null} = 未装配配额（{@code quotaMaxTokens=0}）
-   * @param tools 本回合的可见工具面（注册表 ∩ 权限判定面，见 {@link #visibleTools()}）
+   * @param surface 本回合的可见工具面（注册表 ∩ 权限判定面，按 revision 缓存，见 {@link #visibleTools()}）
    */
   private TurnResult runTurn(
       ContextComposer composer,
@@ -1108,7 +1138,7 @@ public final class AgentPipeline {
       String userMessage,
       Instant deadline,
       LlmQuota quota,
-      List<AgentTool> tools) {
+      ToolSurface surface) {
     // 判定顺序与改造前逐字一致：cancelled → maxTurns → deadline；工具批中间只查取消（设计 §4.2）
     StopPolicy stopPolicy = new TurnStopPolicy(deadline);
     // 工具执行唯一入口一字不改：判定/审批/事件/脱敏/结果写回全在 executeToolCall 里（设计 §4.4）
@@ -1125,7 +1155,7 @@ public final class AgentPipeline {
         .contextCompactor(contextCompactor)
         .maxToolCallsPerResponse(config.maxToolCallsPerTurn())
         .build()
-        .runTurn(turnInput, tools);
+        .runTurn(turnInput, surface);
   }
 
   /**
@@ -1289,6 +1319,20 @@ public final class AgentPipeline {
               outcome.droppedMessages(),
               "summaryTokens",
               outcome.summaryTokens()));
+    }
+
+    @Override
+    public void onContextInjected(List<ContextInjection> injections, LoopState state) {
+      // 事件只记“哪一条、什么类型、摘要、revision”；完整正文不落事件（可能较长，且正文不是审计所需）。
+      for (ContextInjection injection : injections) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("id", injection.id());
+        payload.put("kind", injection.kind());
+        payload.put("priority", injection.priority().name());
+        payload.put("summary", injection.summary());
+        injection.revision().ifPresent(revision -> payload.put("revision", revision));
+        emit(EventTypes.CONTEXT_INJECTED, payload);
+      }
     }
 
     @Override

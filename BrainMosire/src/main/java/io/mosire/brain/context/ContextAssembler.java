@@ -9,8 +9,8 @@ import java.util.List;
 /**
  * 上下文组装（四来源之首）：把"一次回合的输入"变成 LLM 请求的初始消息序列。
  *
- * <p>四来源顺序固定以保 prompt-cache 前缀稳定（计划 §4.2）：system（prompt + 工具目录 + 项目 上下文）→ 会话历史。记忆检索（M3）与 skills
- * 目录（M3）按固定槽位插入。
+ * <p>四来源顺序固定以保 prompt-cache 前缀稳定（计划 §4.2）：system（prompt + 项目上下文）→ 会话历史。工具面不写进 system；它走 {@link
+ * LlmRequest#tools()}，每次请求独立（2026-11-09 用户裁定）。记忆检索（M3）与 skills 目录（M3）按固定槽位插入。
  */
 public interface ContextAssembler {
 
@@ -29,7 +29,7 @@ public interface ContextAssembler {
    * @param config Agent 配置（systemPrompt）
    * @param userMessage 本轮用户输入
    * @param history 上一回合累积的消息（不含 system 头），可为空列表（首轮）
-   * @param tools 当前可用工具（渲染成目录 + 工具定义）
+   * @param tools 当前可用工具（只生成工具定义；不再渲染 system 目录）
    */
   LlmRequest buildRequest(
       AgentConfig config, String userMessage, List<LlmMessage> history, List<AgentTool> tools);
@@ -44,7 +44,7 @@ public interface ContextAssembler {
    * @param config Agent 配置（systemPrompt）
    * @param userMessage 本轮用户输入
    * @param history 上一回合累积的消息（不含 system 头），可为空列表（首轮）
-   * @param tools 当前可用工具（计入 SYSTEM 层的工具目录）
+   * @param tools 当前可用工具（保留参数以兼容既有实现；system 层不再计入工具目录）
    */
   ContextComposition composition(
       AgentConfig config, String userMessage, List<LlmMessage> history, List<AgentTool> tools);

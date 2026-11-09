@@ -57,7 +57,7 @@ class BasicContextAssemblerTest {
     assertThat(((ContentPart.Text) last.content().get(0)).text()).isEqualTo("干活");
   }
 
-  /** system 文本逐字节锁定当前格式：prompt + 空行 + 工具目录（有描述加冒号、无描述只列名）+ 空行 + 收尾指令。 */
+  /** system 文本逐字节锁定当前格式：prompt + 稳定工具面提示（不列工具名）+ 收尾指令。 */
   @Test
   void buildRequestSystemTextIsByteIdenticalToLockedFormat() {
     BasicContextAssembler assembler = new BasicContextAssembler();
@@ -65,15 +65,11 @@ class BasicContextAssemblerTest {
     LlmRequest request = assembler.buildRequest(config(), "干活", history(), twoTools());
 
     String expected =
-        PROMPT
-            + "\n\n你有以下工具可用（一律直接调用，不要凭空想象它们不存在）：\n"
-            + "- toolA: 做 A 事\n"
-            + "- toolB\n"
-            + "\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。";
+        PROMPT + "\n\n可用工具以本次请求的 tools 字段为准；不要凭空想象不存在的工具。" + "\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。";
     assertThat(systemTextOf(request)).isEqualTo(expected);
   }
 
-  /** 无工具时目录区为占位行（当前没有任何可用工具）——同样的固定三段结构。 */
+  /** 无工具时 system 文本仍是同一份稳定格式（不含目录/占位目录）。 */
   @Test
   void buildRequestWithNoToolsKeepsPlaceholderDirectoryLine() {
     BasicContextAssembler assembler = new BasicContextAssembler();
@@ -82,10 +78,7 @@ class BasicContextAssemblerTest {
 
     assertThat(systemTextOf(request))
         .isEqualTo(
-            PROMPT
-                + "\n\n你有以下工具可用（一律直接调用，不要凭空想象它们不存在）：\n"
-                + "（当前没有任何可用工具）\n"
-                + "\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。");
+            PROMPT + "\n\n可用工具以本次请求的 tools 字段为准；不要凭空想象不存在的工具。" + "\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。");
     assertThat(request.tools()).isEmpty();
   }
 

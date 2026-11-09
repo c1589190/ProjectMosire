@@ -3,6 +3,7 @@ package io.mosire.agentlib.context;
 import io.mosire.agentlib.llm.ContentPart;
 import io.mosire.agentlib.llm.LlmMessage;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -30,8 +31,11 @@ import java.util.Optional;
  * #reset}。为什么把口收得这么窄：①请求前缀的稳定性是 prompt-cache 的前提（每回合重排或重写前缀 =
  * 每回合缓存全失效，费用与延迟一起涨），"只追加"这个词本身就在守这条；②"未落库尾部"只有在"只追加 + 少数明确的整体改写"下才可推理（见 {@link #unsavedTail()}）。
  *
- * <p><b>线程安全：不做同步、不承诺并发</b>。调用方<b>串行</b>使用——与既有管线对工作集的口径一致（同一个窗口上的回合、重置、压缩必须排在同一个串行化点上）。 {@link
+ * <p><b>线程安全：消息面不做同步、不承诺并发</b>。调用方<b>串行</b>使用——与既有管线对工作集的口径一致（同一个窗口上的回合、重置、压缩必须排在同一个串行化点上）。 {@link
  * #messages()} / {@link #unsavedTail()} 返回不可变<b>快照</b>，拿到快照的线程可以安全读它；但那只说明快照安全，不构成对窗口本身并发写入的许可。
+ *
+ * <p><b>唯一的并发例外是上下文注入</b>：{@link #inject(ContextInjection)} 可来自注册表/MCP 回调线程，队列自身线程安全（见 {@link
+ * ContextInjectionQueue}）；注入不写消息历史，因此不破坏“消息面调用方串行”的旧契约。
  */
 public final class ContextWindow {
 
@@ -52,6 +56,13 @@ public final class ContextWindow {
 
   /** raw 历史（含 compact 标记）；对外只经快照方法暴露。 */
   private final List<LlmMessage> messages = new ArrayList<>();
+
+  /**
+   * 待投递的上下文注入（线程安全；不写 {@link #messages}）。
+   *
+   * <p>为什么和消息分开：注入是“一次性提醒”，成功投递后即清；它不是历史，不参与 {@link #unsavedTail()}，也不被压缩摘要改写。
+   */
+  private final ContextInjectionQueue injections = new ContextInjectionQueue();
 
   /** 未落库尾部的起点：不变量恒为 {@code 0 <= unsavedFrom <= messages.size()}。 */
   private int unsavedFrom;
@@ -88,6 +99,35 @@ public final class ContextWindow {
   /** 窗口标识（{@link #reset(String)} 之后是新值）。 */
   public String id() {
     return id;
+  }
+
+  /**
+   * 入队一条上下文注入（线程安全）。
+   *
+   * <p>同 id 只投递一次；同 kind 且 {@code data.revision} 更大时替换旧 pending。渲染/投递/事件由 {@code AgentLoop}
+   * 与宿主负责；本方法只 保存“待处理”的事实。
+   */
+  public void inject(ContextInjection injection) {
+    injections.inject(injection);
+  }
+
+  /** 待投递注入的不可变快照（priority 高者先，同优先级按 createdAt）。 */
+  public List<ContextInjection> pendingInjections() {
+    return injections.pending();
+  }
+
+  /**
+   * 宣告这些注入已成功投递：移出队列并记入已投递集合，之后同 id 再注入会被忽略。
+   *
+   * <p>失败重试由调用方负责——不要在这里 commit 未真正发出去的注入。
+   */
+  public void commitInjections(Collection<String> ids) {
+    injections.commit(ids);
+  }
+
+  /** 清空待投递与已投递记录（新会话）。 */
+  public void clearInjections() {
+    injections.clear();
   }
 
   /**
@@ -278,6 +318,7 @@ public final class ContextWindow {
     Objects.requireNonNull(newId, "newId");
     messages.clear();
     unsavedFrom = 0;
+    injections.clear();
     this.id = newId;
   }
 

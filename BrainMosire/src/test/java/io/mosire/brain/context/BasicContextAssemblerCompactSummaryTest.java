@@ -41,10 +41,7 @@ class BasicContextAssemblerCompactSummaryTest {
    * 同源）。
    */
   private static final String SYSTEM_TEXT =
-      PROMPT
-          + "\n\n你有以下工具可用（一律直接调用，不要凭空想象它们不存在）：\n"
-          + "（当前没有任何可用工具）\n"
-          + "\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。";
+      PROMPT + "\n\n可用工具以本次请求的 tools 字段为准；不要凭空想象不存在的工具。" + "\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。";
 
   private static final String COMPACT_SUMMARY_HEADER = "此前会话的压缩摘要（较早的消息已被压缩，以下为要点）：";
 

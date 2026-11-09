@@ -151,7 +151,7 @@ public final class BasicContextAssembler implements ContextAssembler {
   public LlmRequest buildRequest(
       AgentConfig config, String userMessage, List<LlmMessage> history, List<AgentTool> tools) {
     StringBuilder system = new StringBuilder();
-    appendSegments(system, systemSegments(config, userMessage, tools));
+    appendSegments(system, systemSegments(config, userMessage));
 
     // 契约：[system] + history（逐条原样）+ [user]——history 原样回灌以保 prompt-cache 前缀稳定
     List<LlmMessage> messages = new ArrayList<>(history.size() + 2);
@@ -170,7 +170,7 @@ public final class BasicContextAssembler implements ContextAssembler {
     for (ContextLayer layer : ContextLayer.values()) {
       tokens.put(layer, 0);
     }
-    for (Segment segment : systemSegments(config, userMessage, tools)) {
+    for (Segment segment : systemSegments(config, userMessage)) {
       tokens.merge(segment.layer(), estimateTokens(segment.text()), Integer::sum);
     }
     return new ContextComposition(tokens);
@@ -204,10 +204,9 @@ public final class BasicContextAssembler implements ContextAssembler {
    * <p><b>COMPACT_SUMMARY 段是"追加在最末"的</b>（枚举声明序的末位）：压缩改变了会话本身，但它<b>不</b>改写既有的 system
    * 前缀（SYSTEM/SKILL_INDEX/LOADED_SKILLS/MEMORY 段落字节一个不动）——prompt-cache 前缀契约由此继续成立。
    */
-  private List<Segment> systemSegments(
-      AgentConfig config, String userMessage, List<AgentTool> tools) {
+  private List<Segment> systemSegments(AgentConfig config, String userMessage) {
     List<Segment> segments = new ArrayList<>(5);
-    segments.add(new Segment(ContextLayer.SYSTEM, systemText(config, tools)));
+    segments.add(new Segment(ContextLayer.SYSTEM, systemText(config)));
     if (sources.hasSkills()) {
       // 顺序有讲究：先读第二档正文（load 会记下"刚激活"），再渲染第一档目录——listing 在预算吃紧时按激活新近度淘汰，
       // 先记激活能让目录档从第一回合起就是稳态，而不是第二回合因首回合的激活而改写前缀（前缀只追加不改写）
@@ -233,21 +232,17 @@ public final class BasicContextAssembler implements ContextAssembler {
     return summary == null ? "" : COMPACT_SUMMARY_HEADER + "\n" + summary.render();
   }
 
-  /** SYSTEM 段：行为提示 + 工具目录 + 收尾指令（P2-3 起逐字节冻结，新增内容源一律另起段落，不改这里）。 */
-  private static String systemText(AgentConfig config, List<AgentTool> tools) {
+  /**
+   * SYSTEM 段：行为提示 + 稳定收尾指令。
+   *
+   * <p><b>不渲染工具目录</b>（2026-11-09 用户裁定）：system 提示词是 system 提示词，工具面是工具面。工具定义走 {@code
+   * LlmRequest.tools}，每次请求独立；把工具名/描述再抄进 system 文本会让“工具面中途变化”与缓存前缀互相打架。
+   *
+   * <p>这里只留一句稳定提示——它不随工具面变化，因此 system 头可以作为稳定前缀缓存。
+   */
+  private static String systemText(AgentConfig config) {
     StringBuilder text = new StringBuilder(config.systemPrompt());
-    text.append("\n\n你有以下工具可用（一律直接调用，不要凭空想象它们不存在）：\n");
-    if (tools.isEmpty()) {
-      text.append("（当前没有任何可用工具）\n");
-    } else {
-      for (AgentTool tool : tools) {
-        text.append("- ").append(tool.name());
-        if (!tool.description().isBlank()) {
-          text.append(": ").append(tool.description());
-        }
-        text.append('\n');
-      }
-    }
+    text.append("\n\n可用工具以本次请求的 tools 字段为准；不要凭空想象不存在的工具。");
     text.append("\n完成用户请求后，请用纯文本回复结果，不要虚构工具执行过程。");
     return text.toString();
   }
