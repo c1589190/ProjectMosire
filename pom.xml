@@ -53,22 +53,25 @@
     <!-- 可复现构建：jar/pom 内条目的时间戳固定，避免同一提交每次构建产生不同字节。 -->
     <project.build.outputTimestamp>2026-10-23T14:37:43Z</project.build.outputTimestamp>
 
-    <!-- BOM 锁定表（2026-09-08 repo1.maven.org 实测；策略：季度复核，见 开发计划.md §九.4） -->
-    <mcp.sdk.version>2.0.1</mcp.sdk.version>
+    <!-- BOM 锁定表（2026-11-09 repo1.maven.org 复核；策略：季度复核，见 开发计划.md §九.4） -->
+    <!-- MCP：2.1.0 是当前稳定线（2026-10-16）；2.2.0 仍是 milestone（modern/2026-07-28 预览），不跟。
+         3.0 发布后再按 MIGRATION 评估 modern stateless server。 -->
+    <mcp.sdk.version>2.1.0</mcp.sdk.version>
     <a2a.sdk.version>1.3.1.Final</a2a.sdk.version>
-    <jackson.version>2.22.2</jackson.version>
-    <!-- 按 mcp-json-jackson2 2.0.1 实际所需锁定：其编译目标 API 是 Jackson2 版（2.x 线）；3.0.7 为 Jackson3 线，
-         混用会运行期 NoSuchMethodError（2026-09-08 M2-A 实测）。首次引入时计划书按 3.0.7 写，偏差记录见 M2-E 文档收尾。 -->
-    <json-schema-validator.version>2.0.4</json-schema-validator.version>
-    <sqlite-jdbc.version>3.53.4.0</sqlite-jdbc.version>
+    <jackson.version>2.23.0</jackson.version>
+    <!-- 按 mcp-json-jackson2 2.1.0 实际所需锁定：其编译目标 API 是 Jackson2 版（2.x 线）；3.0.7 为 Jackson3 线，
+         混用会运行期 NoSuchMethodError（2026-09-08 M2-A 实测）。首次引入时计划书按 3.0.7 写，偏差记录见 M2-E 文档收尾。
+         ★ json-schema-validator 也必须留在 2.x：3.0.x 已切到 Jackson 3（tools.jackson.*），与全仓 Jackson 2 树模型不兼容。 -->
+    <json-schema-validator.version>2.0.8</json-schema-validator.version>
+    <sqlite-jdbc.version>3.54.1.0</sqlite-jdbc.version>
     <slf4j.version>2.0.19</slf4j.version>
     <log4j.version>2.26.1</log4j.version>
     <!-- 插件框架（二期 D13：ToolSource 扩展点 SPI；季度复核同上） -->
-    <pf4j.version>3.15.1</pf4j.version>
+    <pf4j.version>3.16.1</pf4j.version>
 
     <junit.version>6.1.3</junit.version>
     <assertj.version>3.27.7</assertj.version>
-    <mockito.version>5.23.0</mockito.version>
+    <mockito.version>5.24.0</mockito.version>
 
     <spotless.version>3.10.2</spotless.version>
     <maven-checkstyle-plugin.version>3.6.0</maven-checkstyle-plugin.version>
