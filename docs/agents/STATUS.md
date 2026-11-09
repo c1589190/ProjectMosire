@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-11-09 21:15（Asia/Shanghai）
+> **更新时间**：2026-11-09 21:25（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -8,11 +8,12 @@
 
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
-| 当前本地版本 | **0.2.4** | 2026-10-24 用户要求作为 0.2.4 提交、推送并安装到本地 Maven 仓库；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.4`；**未打 tag、未发布 Pages**。 |
+| 当前本地版本 | **0.2.5** | 2026-11-09 用户要求作为 0.2.5 提交、推送并发布；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.5`；tag `v0.2.5`（发布工作流见 §4.7）。 |
 | 依赖基线（2026-11-09 复核） | MCP SDK **2.1.0**；Jackson **2.23.0**；json-schema-validator **2.0.8**；sqlite-jdbc **3.54.1.0**；PF4J **3.16.1**；Mockito **5.24.0** | 根 `pom.xml` properties；A2A 仍 `1.3.1.Final`；逐项理由与未跟版本见 §2.10。 |
-| 当前 Pages 发布版本 | **0.2.3** | 2026-10-23 发布；tag `v0.2.3`；发布证据见 §4.4–§4.5。 |
-| 上一发布版本 | **0.2.2** | 发布基线 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；tag `v0.2.2`；发布历史见 §4.1–§4.3。 |
-| 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`。 |
+| 当前 Pages 发布版本 | **0.2.3**（0.2.5 发布中） | 0.2.4 未发布 Pages；0.2.5 tag 已推、发布工作流证据见 §4.7；完成后回填 Pages 事实。 |
+| 上一发布版本 | **0.2.3** | 发布基线 tag `v0.2.3`（`4ebbf6a`）；0.2.4 只做本地 Maven 安装、未发布 Pages；历史见 §4.4–§4.6。 |
+| 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`（历史）。 |
+| 0.2.5 发布 gate | **run `20261109T131027Z-125791-19837`，`FULL VERIFY PASSED`，1709 tests** | 2026-11-09；source_sha `c7cfdb3` + 7 个 POM 版本号 dirty；6 模块 SpotBugs 0；证据见 §4.7。 |
 | 最近依赖复核 gate | **run `20261109T114822Z-23830-12948`，`FULL VERIFY PASSED`，1667 tests** | 2026-11-09；source_sha `6d2a1a8`，工作树 dirty（仅根 `pom.xml` 依赖版本）；证据见 §2.10。 |
 | 最近功能 full gate（A9） | **run `20261109T122504Z-64777-18242`，`FULL VERIFY PASSED`，1681 tests** | 2026-11-09；source_sha `6d2a1a8` + A9 未提交改动；证据见 §2.11。 |
 | 最近功能 full gate（A2/A4/A5/A6） | **run `20261109T123803Z-81721-22467`，`FULL VERIFY PASSED`，1697 tests** | 2026-11-09；source_sha `a2d6741` + 本批未提交改动；证据见 §2.12。 |
@@ -209,13 +210,18 @@
 ?? configs/agents/bash-agent.json
 ```
 
-当前 0.2.4 本地版本由两个关注点提交组成：
-1. `6cf36d5`：默认上下文压缩功能与测试；
-2. 0.2.4 版本 bump + 本文状态收口（release commit，本文件所在提交）。
+当前 0.2.5 发布版本由 0.2.4 之后的关注点提交组成：
+1. `7874df7`：依赖复核（MCP SDK 2.1.0 等）；
+2. `a2d6741`：A9 上下文注入与动态工具面；
+3. `c252c5f`：A2/A4/A5/A6 工具面扩展与 `tool_catalog`；
+4. `ef1338b`：A3 工具执行 10 分钟硬超时；
+5. `b5807f6`：A1 MCP HTTP TLS + Bearer + 显式 opt-in；
+6. `c7cfdb3`：配置归属文档（AgentLib 只收实例）；
+7. 0.2.5 版本 bump + 本文状态收口（release commit，本文件所在提交）。
 
-0.2.4 只做本地 Maven 安装，**未打 tag、未发布 Pages**；当前 Pages 发布版本仍是 0.2.3。
+tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。0.2.4 仍只做本地 Maven 安装、未发布 Pages（历史见 §4.6）。
 
-- 2026-11-09 依赖复核（§2.10）、A9（§2.11）、A2/A4/A5/A6（§2.12）、A3（§2.13）已提交/推送；A1（§2.14）待提交；带改动文件见 `git status`；上述 5 个未跟踪本机文件未动。
+- 2026-11-09 上述 A1/A2/A3/A4/A5/A6/A9 与依赖复核均已提交/推送；当前工作树只应剩上述 5 个本机未跟踪文件。
 - `.work/gate/**` 为 run-bound 证据，默认不入库；
 - 本版未修改 `docs/archive/**`；未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
 - 0.2.3 的 Pages 核验见 §4.5。
@@ -290,25 +296,42 @@
 | 制品核验 | 7 个坐标目录均存在；`agentlib-mosire-0.2.4.jar`、`brain-mosire-0.2.4.jar`、`main-mosire-0.2.4.jar` 等均存在。 |
 | Pages / tag | **未打 tag、未发布 Pages**；当前 Pages 发布版本仍是 0.2.3。 |
 
+### 4.7 v0.2.5 发布（2026-11-09）
+
+| 项目 | 事实 |
+|---|---|
+| 版本 | **0.2.5**（非 SNAPSHOT）；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 一致。 |
+| 发布范围 | 父 pom + `agentlib-mosire` / `workspace-mosire` / `docs-mosire`；Brain/Main/Bash 不发 Pages。 |
+| 本版变更 | 依赖复核（MCP SDK 2.1.0 等）；A9 上下文注入/动态工具面；A2/A4/A5/A6 工具面扩展与 `tool_catalog`；A3 工具硬超时；A1 MCP HTTP TLS/Bearer；配置归属文档（AgentLib 只收实例）。 |
+| 发布前 full gate | run **`20261109T131027Z-125791-19837`**，`FULL VERIFY PASSED`；**1709 tests / 0 failures / 0 errors / 6 skipped**（AgentLib 751、Workspace 62、Docs 81、Brain 479、Bash 104 + 6 skipped、Main 232）；6 模块 SpotBugs 0；`CROSSCHECK log=1709 xml=1709 status=MATCH`。 |
+| 门禁源码基线 | `c7cfdb36fa22042e84c79851fc639aa03ce82506`，worktree `dirty(tracked=7,untracked=5)`（仅 7 个 POM 版本号）。 |
+| release commit | 0.2.5 版本 bump + 本文 §4.7 收口（本文件所在提交）。 |
+| tag | **`v0.2.5`**（annotated，指向 release commit）。 |
+| 发布工作流 | tag 触发 `publish-maven`；run 与结果**待回填**（见下）。 |
+| Pages | 发布工作流成功后再核验 `gh-pages` / 制品 / 落地页；**待回填**。 |
+
+> 发布工作流证据（run id、gh-pages 提交、0.2.5 制品 URL/校验和）在本节创建时尚未产生；工作流完成后以追加方式回填，不改写既有行。
+
 ## 5. 未验证 / 未做事项
 
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
-- 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages，故 Pages 上的 `maven-metadata.xml` 仍是 0.2.3。
+- 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages（历史）。
+- 0.2.5 的发布前 full gate 已过；`v0.2.5` tag 已推，**发布工作流与 Pages 事实尚未回填 §4.7**（以工作流实际结果为准）。
 - **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
 - 2026-11-09 依赖复核（§2.10）只验证了本仓编译 + full gate；未跑下游 `~/SimulatorMosire` 消费方，未做 japicmp；MCP 2.2.0-M2 / 3.0 未采用。
 - A9 只做了单元/门禁验证：**未接真实 LLM 会话验证注入投递与工具面中途变化**，未验证 GUI/DSH 侧消费；`context.injected` 事件的真实落库顺序只由单测覆盖。
 - A2/A4/A5/A6 的 `tool_catalog` 未通过真实 MCP 客户端调用（只有注册/列表与单测）；`resync()` 未在真实 HTTP MCP 会话上验证 `tools/list_changed` 的客户端侧收包。
 - A3 的 10 分钟默认值没有真实等待验证（单测用 50ms 配置）；未验证真实浏览器/网络工具被中断后的资源收尾；`tool.executionTimeoutMs` 尚未从配置文件接线。
 - A1 未跑 Simos 消费方；Simos 若把 `config.bindAddress()` 配成 `0.0.0.0` 会从“WARN 放行”变成“启动失败”，需显式传 `McpHttpSecurity` 或 `allowInsecure`。未做 OAuth/mTLS/token 轮换；TLS/认证尚未从配置文件接线。
-- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，可在本机改用 `0.2.4` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
+- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，可在本机改用 `0.2.5` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
 - 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。CI 又在 tag `4ebbf6a` 上跑了一轮 `verify` 并通过（run `39972052202`）。
 - 迁移台账中的 pending 规则尚未裁定，见 `docs/archive/2026-10-17-agents-rule-migration.md`。
 
 ## 6. 下一步
 
-1. Simos 可先把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为本机已安装的 `0.2.4`，实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
-2. 若要把 0.2.4 发布到 Pages，需用户另行授权打 tag；公开 API 兼容基线从 0.2.2 起，0.2.4 只增不减。
+1. Simos 可先把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.5`（Pages 发布完成后），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
+2. 0.2.5 已按用户 2026-11-09 指令打 tag 并发布；发布工作流/Pages 证据回填 §4.7。公开 API 兼容基线从 0.2.2 起，0.2.5 只增不减。
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
