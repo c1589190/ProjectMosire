@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-11-09 21:35（Asia/Shanghai）
+> **更新时间**：2026-11-09 21:40（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -315,12 +315,13 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | 版本资源 | 同一 jar 内 `io/mosire/agentlib/version.properties` 为 `version=0.2.5`。 |
 | 元数据 / 落地页 | 三库 `maven-metadata.xml` 的 `release=0.2.5`；`index.html` 当前版本显示 **0.2.5**。 |
 | 已知红 | tag 上的 `docs-skills` run `42623816370` 失败：`gate.sh selftest` 用 `cp sleep` 伪造 `java`，在 CI coreutils multicall 下按 argv0 拒绝执行（`unknown program 'java'`）。已在 main 修 `scripts/gate.sh`（改用 python3 伪装），**不影响 0.2.5 制品与 Pages**。 |
+| 修复后 main 复跑 | commit `c61d706`：`docs-skills` run **`42625250447` success**；`verify` run **`42625250549` success**。tag `v0.2.5` 上的 `docs-skills` 红为历史，不影响制品与 Pages。 |
 
 ## 5. 未验证 / 未做事项
 
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
 - 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages（历史）。
-- 0.2.5 已发布：tag `v0.2.5`、publish-maven success、Pages 制品/校验和/版本资源已核验（§4.7）。tag 上的 docs-skills 因 `gate.sh` 自检夹具在 CI 下不兼容而红；main 上的夹具修复随后提交并重跑。
+- 0.2.5 已发布：tag `v0.2.5`、publish-maven success、Pages 制品/校验和/版本资源已核验（§4.7）。tag 上的 docs-skills 因 `gate.sh` 自检夹具在 CI 下不兼容而红；main 修复后 `docs-skills` run `42625250447` 与 `verify` run `42625250549` 均 success。
 - **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
 - 2026-11-09 依赖复核（§2.10）只验证了本仓编译 + full gate；未跑下游 `~/SimulatorMosire` 消费方，未做 japicmp；MCP 2.2.0-M2 / 3.0 未采用。
 - A9 只做了单元/门禁验证：**未接真实 LLM 会话验证注入投递与工具面中途变化**，未验证 GUI/DSH 侧消费；`context.injected` 事件的真实落库顺序只由单测覆盖。
