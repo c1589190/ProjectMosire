@@ -52,9 +52,11 @@ import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
+import io.mosire.agentlib.tool.ToolCatalogTool;
 import io.mosire.agentlib.tool.ToolContext;
 import io.mosire.agentlib.tool.ToolExecutionGuard;
 import io.mosire.agentlib.tool.ToolRegistry;
+import io.mosire.agentlib.tool.ToolSourceInfo;
 import io.mosire.brain.context.BasicContextAssembler;
 import io.mosire.brain.context.ContextPolicy;
 import io.mosire.brain.context.ContextSources;
@@ -440,6 +442,10 @@ public final class App implements AutoCloseable {
     // ★ role.audit：装配期角色审计的留痕（同 §5.13(c)：它在装配失败抛异常<b>之前</b>经本订阅者同步落库）。
     bus.subscribe(event -> mirrorInfrastructureEvent(events, event));
     ToolRegistry tools = new ToolRegistry();
+    // A5/A6：工具与来源元数据的唯一查看入口。元数据不塞进每个 MCP tool 描述；模型/管理面按需调用。
+    tools.register(BUILTIN_TOOL_SOURCE_ID, new ToolCatalogTool(tools));
+    tools.registerSourceInfo(
+        new ToolSourceInfo(BUILTIN_TOOL_SOURCE_ID, "内置工具", Version.VERSION, "内置工具目录", Map.of()));
     // ★ P3d：子 Agent 注册表的"后绑定"取数缝——簿子在 wireSubagents 之前就要建（工具桥那份 authorizer 要它），
     //   而注册表本身在那之后才存在。查不到 ⇒ 不记账（退回逐条问人），不猜。
     AtomicReference<SubagentManager> subagentManagerLookup = new AtomicReference<>();

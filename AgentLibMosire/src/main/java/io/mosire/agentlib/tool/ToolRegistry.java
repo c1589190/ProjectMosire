@@ -60,6 +60,13 @@ public final class ToolRegistry {
    */
   private final AtomicLong revision = new AtomicLong();
 
+  /**
+   * 供给源展示元数据（sourceId → 名称/版本）。与工具表分开：工具整组下线后，管理面仍可显示“这个源上次是什么版本”。
+   *
+   * <p>本表<b>不</b>参与按源卸载；{@link #unregisterAllBySource(String)} 只删工具，不删元数据。
+   */
+  private final Map<String, ToolSourceInfo> sourceInfos = new ConcurrentHashMap<>();
+
   /** 注册一个工具（内建路径，无来源归属）；名字重复抛 {@link IllegalArgumentException}；成功后广播变更。 */
   public AgentTool register(AgentTool tool) {
     readWriteLock.writeLock().lock();
@@ -107,6 +114,41 @@ public final class ToolRegistry {
       for (PendingTool entry : pending) {
         tools.put(entry.name(), entry.tool());
         toolToSource.put(entry.name(), NO_SOURCE);
+      }
+      if (!pending.isEmpty()) {
+        revision.incrementAndGet();
+      }
+    } finally {
+      readWriteLock.writeLock().unlock();
+    }
+    if (!newTools.isEmpty()) {
+      notifyChanged();
+    }
+  }
+
+  /**
+   * 批量注册并归属到指定供给源（A2）：全有或全无，成功后广播<b>一次</b>变更。
+   *
+   * <p>语义与 {@link #registerAll(List)} 相同，只是同一批工具都记在 {@code sourceId} 下，因此可以与 {@link
+   * #unregisterAllBySource(String)} 对称地“整组上线/下线”。<b>不</b>隐式替换该源已有的工具：批内/跨批重名一律 {@link
+   * IllegalArgumentException}；先 {@code unregisterAllBySource} 再注册是调用方的 reconcile 策略。
+   *
+   * @param sourceId 供给源 id（非空白；空白会命中无源哨兵，显式拒绝）
+   * @param newTools 待注册工具；空列表是合法的空操作（不广播、不 bump revision）
+   * @throws IllegalArgumentException sourceId 空白，或批量校验失败（null 元素/空白名/重名）
+   */
+  public void registerAll(String sourceId, List<AgentTool> newTools) {
+    Objects.requireNonNull(sourceId, "sourceId");
+    if (sourceId.isBlank()) {
+      throw new IllegalArgumentException("sourceId 不能为空白");
+    }
+    Objects.requireNonNull(newTools, "newTools");
+    readWriteLock.writeLock().lock();
+    try {
+      List<PendingTool> pending = validateBatch(newTools);
+      for (PendingTool entry : pending) {
+        tools.put(entry.name(), entry.tool());
+        toolToSource.put(entry.name(), sourceId);
       }
       if (!pending.isEmpty()) {
         revision.incrementAndGet();
@@ -217,6 +259,51 @@ public final class ToolRegistry {
     } finally {
       readWriteLock.readLock().unlock();
     }
+  }
+
+  /**
+   * 登记/覆盖一个供给源的展示元数据（A6）。不改变工具表、不 bump {@link #revision()}、不广播 {@code onChange}：它不是工具面变化。
+   *
+   * @throws NullPointerException info 为 null
+   */
+  public void registerSourceInfo(ToolSourceInfo info) {
+    Objects.requireNonNull(info, "info");
+    sourceInfos.put(info.sourceId(), info);
+  }
+
+  /** 查询供给源展示元数据；未知 sourceId 返回空。 */
+  public Optional<ToolSourceInfo> sourceInfo(String sourceId) {
+    if (sourceId == null || sourceId.isBlank()) {
+      return Optional.empty();
+    }
+    return Optional.ofNullable(sourceInfos.get(sourceId));
+  }
+
+  /** 全部供给源元数据（按 sourceId 排序的不可变快照）。 */
+  public List<ToolSourceInfo> sourceInfos() {
+    List<ToolSourceInfo> snapshot = new ArrayList<>(sourceInfos.values());
+    snapshot.sort(Comparator.comparing(ToolSourceInfo::sourceId));
+    return List.copyOf(snapshot);
+  }
+
+  /** 删除一个供给源的展示元数据；不存在返回 false。工具表不受影响。 */
+  public boolean unregisterSourceInfo(String sourceId) {
+    return sourceId != null && sourceInfos.remove(sourceId) != null;
+  }
+
+  /**
+   * 查询某个工具当前归属的 sourceId；无源注册（内建路径）返回空。
+   *
+   * <p>供 {@code tool_catalog} 把“工具 → 来源”渲染出来；与 {@link #listBySource(String)} 的匹配口径一致。
+   */
+  public Optional<String> sourceOf(String toolName) {
+    if (toolName == null || toolName.isBlank()) {
+      return Optional.empty();
+    }
+    String sourceId = toolToSource.get(toolName);
+    return sourceId == null || NO_SOURCE.equals(sourceId)
+        ? Optional.empty()
+        : Optional.of(sourceId);
   }
 
   /**

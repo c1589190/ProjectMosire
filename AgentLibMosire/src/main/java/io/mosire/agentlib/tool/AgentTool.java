@@ -28,6 +28,32 @@ public interface AgentTool {
     return "";
   }
 
+  /**
+   * 人类可读的展示名（A5）；缺省空串 = 未声明。只用于管理面/查看类工具，<b>不</b>参与权限判定，也不进入 MCP {@code tools/list}
+   * 的额外字段（本仓口径：完整元数据走 {@code tool_catalog}，不主动暴露更多）。
+   */
+  default String title() {
+    return "";
+  }
+
+  /**
+   * 工具所属的功能组（A5）；缺省空串 = 未分组。组名对 AgentLib 是不透明标签，宿主自己约定命名空间。
+   *
+   * <p>它不参与权限判定；权限仍由 {@link ToolSpec} / {@link #roles()} / {@link #resources()} 决定。
+   */
+  default String group() {
+    return "";
+  }
+
+  /**
+   * 横切标签（A5，如 read-only / network / media）；缺省空集 = 未声明。
+   *
+   * <p>返回值必须非 null；标签只用于查看/筛选，不参与判定。
+   */
+  default Set<String> tags() {
+    return Set.of();
+  }
+
   /** 工具入参的 JSON Schema；缺省为无参数。 */
   default Map<String, Object> jsonSchema() {
     return Map.of("type", "object", "properties", Map.of());

@@ -20,6 +20,14 @@ import org.junit.jupiter.api.Test;
 class AgentToolTest {
 
   @Test
+  void metadataDefaultsAreEmpty() {
+    AgentTool tool = bareTool();
+    assertThat(tool.title()).isEmpty();
+    assertThat(tool.group()).isEmpty();
+    assertThat(tool.tags()).isEmpty();
+  }
+
+  @Test
   void rolesDefaultsToEmptyDeclaration() {
     assertThat(bareTool().roles()).as("缺省 = 空集 = 不表态，且非 null").isNotNull().isEmpty();
   }

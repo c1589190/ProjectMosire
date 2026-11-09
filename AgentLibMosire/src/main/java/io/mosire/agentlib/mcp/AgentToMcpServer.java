@@ -33,6 +33,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -79,6 +80,12 @@ public final class AgentToMcpServer implements AutoCloseable {
    * 出站（MCP 客户端的模型据此"看图"）。{@link ToolAssetResolver#none()} = 不认任何资产（图片引用被跳过，文本结果照旧）。
    */
   private final ToolAssetResolver assetResolver;
+
+  /**
+   * 串行化 {@link #sync()}：Registry 的 {@code onChange} 可能来自多个线程，公开的 {@link #resync()} 也可能与它并发。 用
+   * {@link ReentrantLock} 而不是 {@code synchronized}（与设计文档 §四 的虚拟线程口径一致）。
+   */
+  private final ReentrantLock syncLock = new ReentrantLock();
 
   /** 空实现兜底：在 startWith 的赋值前任何 close() 都是安全的（UwF 告警解除）。 */
   private AutoCloseable registrySubscription = () -> {};
@@ -769,8 +776,33 @@ public final class AgentToMcpServer implements AutoCloseable {
     this.assetResolver = assetResolver;
   }
 
+  /**
+   * 按当前 {@code include} 谓词与 Registry <b>重新计算</b>暴露面（A4）。
+   *
+   * <p><b>适用</b>：工具白名单/调用者权限变化但 Registry 没有增删——例如宿主换了 include 谓词背后的权限集，而工具表没动。
+   *
+   * <p><b>语义</b>：与 {@code onChange} 用的是同一个 diff（幂等）。新增/移除工具时 SDK 的 addTool/removeTool 会自动发 {@code
+   * notifications/tools/list_changed}；<b>无变化时什么都不发</b>（重复调用无副作用）。同名工具的描述/schema 变化
+   * <b>不</b>在本方法刷新——那需要移除再添加，属另一个语义；本仓的 A5/A6 元数据走 {@code tool_catalog}，不依赖这里。
+   *
+   * <p>线程安全：与 {@code onChange} 的自动同步共用一把锁；可从任意线程调用。
+   */
+  public void resync() {
+    sync();
+  }
+
   /** 增量同步：以 Registry 为准，增删 diff（幂等，供 onChange 与手动调用）；可外发且命中的才在暴露面内。 */
   private void sync() {
+    syncLock.lock();
+    try {
+      syncLocked();
+    } finally {
+      syncLock.unlock();
+    }
+  }
+
+  /** {@link #sync()} 的实际体；调用方必须持有 {@link #syncLock}。 */
+  private void syncLocked() {
     List<AgentTool> tools = registry.list();
     Set<String> desired =
         tools.stream()

@@ -1,6 +1,6 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-11-09 20:30（Asia/Shanghai）
+> **更新时间**：2026-11-09 20:45（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
@@ -15,6 +15,7 @@
 | 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`。 |
 | 最近依赖复核 gate | **run `20261109T114822Z-23830-12948`，`FULL VERIFY PASSED`，1667 tests** | 2026-11-09；source_sha `6d2a1a8`，工作树 dirty（仅根 `pom.xml` 依赖版本）；证据见 §2.10。 |
 | 最近功能 full gate（A9） | **run `20261109T122504Z-64777-18242`，`FULL VERIFY PASSED`，1681 tests** | 2026-11-09；source_sha `6d2a1a8` + A9 未提交改动；证据见 §2.11。 |
+| 最近功能 full gate（A2/A4/A5/A6） | **run `20261109T123803Z-81721-22467`，`FULL VERIFY PASSED`，1697 tests** | 2026-11-09；source_sha `a2d6741` + 本批未提交改动；证据见 §2.12。 |
 | 0.2.3 发布提交 | **`4287752`**（`fix(agentlib): DECIDING 分段表态可回填`）+ **`4ebbf6a`**（`release: 0.2.3`） | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。tag 指向 `4ebbf6a`。 |
 | 模块数 | **6** | 根 `pom.xml`：AgentLib、Workspace、Docs、Brain、Main、BashPlugin。 |
 | 公开 API 兼容基线 | **0.2.2 起** | 用户 2026-10-17 裁定；后续公开 API 只增不减，变更时走下游消费方验证。 |
@@ -157,6 +158,19 @@
 - 新增测试：`ContextInjectionQueueTest` 7、`AgentLoopContextInjectionTest` 5、`ToolRegistryRevisionTest` 2。
 - 未做：A2 `registerAll(sourceId)` / A4 `resync()` / A5-A6 元数据与 `tool_catalog` / A1 TLS+认证 / A3 硬超时；A9 未接真实 LLM 会话与 GUI。
 
+### 2.12 工具面扩展与查看（A2/A4/A5/A6，2026-11-09）
+
+- 设计：**[设计-工具面扩展与查看.md](../../设计-工具面扩展与查看.md)**。
+- A2：`ToolRegistry.registerAll(String sourceId, List<AgentTool>)`——空白 sourceId 拒绝、全量校验零部分写入、失败回滚、成功后一次 onChange/revision；与 `unregisterAllBySource` 对称，不隐式替换。
+- A4：`AgentToMcpServer.resync()` 公开；与 onChange 共用 `ReentrantLock`；只按当前 include 谓词重算暴露面，无变化不发通知，不刷新同名工具 schema。
+- A5：`AgentTool.title()/group()/tags()` default（空串/空集）；**不进 MCP `tools/list` 额外字段**，完整信息走 `tool_catalog`。
+- A6：`ToolSourceInfo` + `ToolRegistry.registerSourceInfo/sourceInfo/sourceInfos/unregisterSourceInfo/sourceOf`；来源元数据不 bump revision、不广播；按源卸载保留 last-known。
+- 新增 `ToolCatalogTool`（`tool_catalog`，只读）：summary/full、source/group/tag 过滤、limit、可见面用 `PermissionChecker.allows` 同一 oracle；失败参数返回 `INVALID_ARGUMENTS`。Main `App` 注册 `tool_catalog` 为 builtin 源并登记 `ToolSourceInfo("builtin", …)`；内置工具面 22 → 23，外部 MCP GUEST 面可见 `tool_catalog`（只列自己有权调用的工具）。
+- 兼容：旧 `registerAll(List)` / `register(sourceId, tool)` / `AgentToMcpServer` 入口、`ToolSpec`/`ToolDef` 形状均不变。
+- full gate：run **`20261109T123803Z-81721-22467`**，`FULL VERIFY PASSED`；**1697 tests / 0 failures / 0 errors / 6 skipped**（AgentLib 739、Workspace 62、Docs 81、Brain 479、Bash 104 + 6 skipped、Main 232）；6 模块 SpotBugs 0；`CROSSCHECK log=1697 xml=1697 status=MATCH`；证据 `.work/gate/20261109T123803Z-81721-22467/summary.txt`。
+- 新增测试：`ToolRegistrySourceBatchTest` 5、`ToolRegistrySourceInfoTest` 4、`ToolCatalogToolTest` 5、`AgentToMcpServerResyncTest` 1；`AppMcpLinkTest` 预期清单/计数 22→23。
+- 未做：未通过真实 MCP 客户端调用 `tool_catalog`（只验证了注册/列表）；未做 GUI/管理面；A1 TLS+认证、A3 硬超时仍未开始。
+
 ## 3. 工作树状态
 
 0.2.3 发布提交后，开工前已有的 5 个未跟踪文件：
@@ -175,7 +189,7 @@
 
 0.2.4 只做本地 Maven 安装，**未打 tag、未发布 Pages**；当前 Pages 发布版本仍是 0.2.3。
 
-- 2026-11-09 依赖复核（§2.10）与 A9（§2.11）尚未提交：带改动文件见 `git status`（根 `pom.xml`、AgentLib/Brain 的注入与工具面代码、设计文档、本文件）；上述 5 个未跟踪本机文件未动。
+- 2026-11-09 依赖复核（§2.10）、A9（§2.11）、A2/A4/A5/A6（§2.12）已提交/推送或待提交；带改动文件见 `git status`；上述 5 个未跟踪本机文件未动。
 - `.work/gate/**` 为 run-bound 证据，默认不入库；
 - 本版未修改 `docs/archive/**`；未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
 - 0.2.3 的 Pages 核验见 §4.5。
@@ -257,6 +271,7 @@
 - **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
 - 2026-11-09 依赖复核（§2.10）只验证了本仓编译 + full gate；未跑下游 `~/SimulatorMosire` 消费方，未做 japicmp；MCP 2.2.0-M2 / 3.0 未采用。
 - A9 只做了单元/门禁验证：**未接真实 LLM 会话验证注入投递与工具面中途变化**，未验证 GUI/DSH 侧消费；`context.injected` 事件的真实落库顺序只由单测覆盖。
+- A2/A4/A5/A6 的 `tool_catalog` 未通过真实 MCP 客户端调用（只有注册/列表与单测）；`resync()` 未在真实 HTTP MCP 会话上验证 `tools/list_changed` 的客户端侧收包。
 - 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，可在本机改用 `0.2.4` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
 - 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。CI 又在 tag `4ebbf6a` 上跑了一轮 `verify` 并通过（run `39972052202`）。
@@ -269,7 +284,7 @@
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
-6. A9 之后按用户口径继续：A2 `registerAll(sourceId)`、A4 `resync()`、A5/A6 元数据与 `tool_catalog`；A1（TLS + 显式 opt-in）与 A3（10 分钟硬超时）另开设计。
+6. A2/A4/A5/A6 已完成；下一步按用户口径继续 A1（TLS + 显式 opt-in）与 A3（10 分钟硬超时），二者另开设计文档。
 
 ## 7. 当前文档权威关系
 
