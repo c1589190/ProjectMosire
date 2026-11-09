@@ -1,5 +1,6 @@
 package io.mosire.agentlib.tool;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.approval.ApprovalDecision;
 import io.mosire.agentlib.approval.ApprovalRequest;
@@ -13,6 +14,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,6 +98,18 @@ public final class ToolCallAuthorizer {
 
   /** 放行标记已被用过（一次性）⇒ 具名拒；重复使用同一张放行条绝不等于第二次授权。 */
   public static final String DECISION_RELEASE_USED = "DECISION_RELEASE_USED";
+
+  /** 工具执行超过硬超时 ⇒ 稳定错误码；消息说明“超时未完成”。 */
+  public static final String TIMEOUT = "TIMEOUT";
+
+  /** 调用线程被中断 ⇒ 稳定错误码（不是工具超时）。 */
+  public static final String INTERRUPTED = "INTERRUPTED";
+
+  /** 工具执行硬超时的配置键（{@link ToolContext#config()}；毫秒）。 */
+  public static final String CONFIG_TOOL_TIMEOUT_MS = "tool.executionTimeoutMs";
+
+  /** 默认硬超时：10 分钟（用户 2026-11-09 裁定）。 */
+  public static final long DEFAULT_TOOL_TIMEOUT_MS = 600_000L;
 
   private final ToolExecutionGuard guard;
   private final ApprovalCoordinator coordinator;
@@ -256,16 +273,86 @@ public final class ToolCallAuthorizer {
       // 走到这里 = 这一条真的要去执行了 ⇒ 把那张放行条记"已用"（重复使用 ⇒ 下一次具名拒）
       ledger.consumeRelease(release.get());
     }
-    ToolResult result;
-    try {
-      result = tool.execute(effective);
-    } catch (ResourceDeniedException resourceDenied) {
-      // 工具内关键访问点的命令式断言（require）判否，在本类的边界上转成工具错误码——异常不外泄给管线/MCP
-      LOG.warn("工具内资源断言判否: tool={} 拒因={}", tool.name(), resourceDenied.getMessage());
-      return ToolResult.error(RESOURCE_DENIED, resourceDenied.getMessage());
-    }
+    ToolResult result = executeWithTimeout(tool, effective);
     registerQueuedByParent(result, tool, effective);
     return result;
+  }
+
+  /**
+   * 在虚拟线程里执行工具本体并施加硬超时（A3）。
+   *
+   * <p><b>只包 execute</b>：审批/决策等待发生在调用本方法之前，不受 10 分钟工具超时影响。超时后 {@link FutureTask#cancel(boolean)} 中断
+   * worker；工具若无视中断会继续跑完，但调用方已经拿到 {@code TIMEOUT}，晚到的结果被丢弃（WARN 留痕）。
+   *
+   * <p><b>异常口径不变</b>：工具内 {@link ResourceDeniedException} 仍转 {@code RESOURCE_DENIED}；其它
+   * RuntimeException/Error 原样上抛 （骨架不吞宿主 bug）；受检异常包装成 {@link IllegalStateException}（工具 SPI
+   * 本身不声明受检异常）。
+   */
+  @SuppressFBWarnings(
+      value = "THROWS_METHOD_THROWS_RUNTIMEEXCEPTION",
+      justification =
+          "工具 execute 抛出的运行时异常必须原样上抛（骨架不吞宿主 bug）；本方法只拆 FutureTask 的 ExecutionException，"
+              + "不改变异常语义。")
+  private static ToolResult executeWithTimeout(AgentTool tool, ToolContext context) {
+    long timeoutMillis = timeoutMillis(context);
+    FutureTask<ToolResult> task = new FutureTask<>(() -> tool.execute(context));
+    Thread.ofVirtual().name("mosire-tool-" + tool.name()).start(task);
+    try {
+      return task.get(timeoutMillis, TimeUnit.MILLISECONDS);
+    } catch (TimeoutException e) {
+      boolean interrupted = task.cancel(true);
+      LOG.warn(
+          "工具执行超过 {} ms 未完成，返回 TIMEOUT: tool={} workerInterrupted={}",
+          timeoutMillis,
+          tool.name(),
+          interrupted);
+      return ToolResult.error(TIMEOUT, "工具执行超时未完成（超过 " + timeoutMillis + " ms 已放弃等待）");
+    } catch (InterruptedException e) {
+      task.cancel(true);
+      Thread.currentThread().interrupt();
+      return ToolResult.error(INTERRUPTED, "工具执行被中断");
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      if (cause instanceof ResourceDeniedException resourceDenied) {
+        // 工具内关键访问点的命令式断言（require）判否，在本类的边界上转成工具错误码——异常不外泄给管线/MCP
+        LOG.warn("工具内资源断言判否: tool={} 拒因={}", tool.name(), resourceDenied.getMessage());
+        return ToolResult.error(RESOURCE_DENIED, resourceDenied.getMessage());
+      }
+      if (cause instanceof RuntimeException runtimeException) {
+        throw runtimeException;
+      }
+      if (cause instanceof Error error) {
+        throw error;
+      }
+      throw new IllegalStateException("工具执行抛出受检异常: " + tool.name(), cause);
+    }
+  }
+
+  /**
+   * 本次调用使用的硬超时（毫秒）：{@link ToolContext#config()} 的 {@value #CONFIG_TOOL_TIMEOUT_MS}；缺失 ⇒ 默认 10 分钟。
+   *
+   * <p>非正/不可解析 ⇒ 默认 + WARN（不静默关闭安全超时）。包级可见供单测直接测解析，不真等 10 分钟。
+   */
+  static long timeoutMillis(ToolContext context) {
+    Object value = context.config().get(CONFIG_TOOL_TIMEOUT_MS);
+    if (value == null) {
+      return DEFAULT_TOOL_TIMEOUT_MS;
+    }
+    long parsed;
+    try {
+      parsed =
+          value instanceof Number number
+              ? number.longValue()
+              : Long.parseLong(String.valueOf(value).strip());
+    } catch (NumberFormatException e) {
+      LOG.warn("工具超时配置不是数字，回落默认 {} ms: key={}", DEFAULT_TOOL_TIMEOUT_MS, CONFIG_TOOL_TIMEOUT_MS);
+      return DEFAULT_TOOL_TIMEOUT_MS;
+    }
+    if (parsed <= 0) {
+      LOG.warn("工具超时配置必须为正，回落默认 {} ms: value={}", DEFAULT_TOOL_TIMEOUT_MS, parsed);
+      return DEFAULT_TOOL_TIMEOUT_MS;
+    }
+    return parsed;
   }
 
   /**
