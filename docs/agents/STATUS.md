@@ -48,7 +48,21 @@
 | 公开 API 兼容 | `scripts/release-artifacts.py compat` 使用 japicmp 核对固定版制品。AgentLib、Workspace、Docs 对比已发行 0.2.2 公开二进制和源码签名，退出 0。 |
 | SimulatorMosire 消费方 | 独立 checkout `7561b23b` 用本次 0.2.7 库运行 `tools/gate.sh focused simos-app` 的 `test-compile surefire:test`，三套 Java 测试共 42 项，0 失败、0 错误、0 跳过。Maven 汇总与 XML 核对一致。该 checkout 的前端门禁失败项可用 Node 单独复现。证据 `/tmp/mosire-027-simos.iG8YRL99/consumer-java-0.2.7.log`。 |
 
-6 个 Bash 结构性测试因本机缺少 mount namespace 所需权限而跳过。兼容 HTTP 探针使用回环模型替身，云端供应商模型待专项验收。正式发布触发与远端制品留待用户确认后验证。
+6 个 Bash 结构性测试因本机缺少 mount namespace 所需权限而跳过。上表的兼容 HTTP 探针使用回环模型替身，真实模型验收见 §1.2。正式发布触发与远端制品留待用户确认后验证。
+
+### 1.2 0.2.7 真模型验收（2026-11-18）
+
+在 `30a00d2` 检出下，使用已验收的快照服务 JAR 和四库快照 JAR，连接用户提供的 OpenAI 兼容中转。服务端模型标识为 `deepseek-flash`。证据根目录为 `.work/live-0.2.7-20261118T100842Z-f6re/`，每次运行保留 `manifest.json` 与 `summary.json`。
+
+| 运行 | 实测结果 |
+|---|---|
+| `relay-strict-full` | 退出 0。7 个主对话回合、10 次模型调用，含 1 次子 Agent 调用。随机代号经过插入的一轮问答后可复述。`doc_read` 从独立工作区读取测试正文，工具调用与成功结果按调用 ID 对应。只读子 Agent 自己完成模型回合，真实 token 用量写入子体库。 |
+| `relay-strict-repeat` | 退出 0。全新数据目录中 4 个主对话回合、4 次模型调用。重复验证多轮记忆和重置隔离。 |
+| `sdk` | `javac` 独立编译两条 Java 入口，两个 JVM 均退出 0。仅 AgentLib 完成 3 次模型调用，验证 `SimpleAgent` 的会话记忆和 `AgentTool.of` 的真实工具往返。Brain 嵌入完成 2 次模型调用，关闭并重开运行时后复述原会话代号。SQLite 同一会话有 4 条消息和 2 条 `llm.call`。 |
+
+服务全链验证了两次重启。第一次重启后可续聊，重置生效后新会话不再带入旧代号，第二次重启后新会话指针仍生效。HTTP 终态、进程日志、主和子 SQLite 记录互证模型调用，所有已验收模型调用均有正数输入和输出 token。服务测试使用仓库附带的只读子体模板，禁用 Bash 执行面。
+
+首轮把总层数设为 1，深度守卫拒绝派生，未生成子体事件库。复验把总层数设为 2，维持至多一个在管子体。会话重置按已受理契约轮询 `GET /api/chat/session`，读取生效状态后再断言历史。验证产物中的密钥扫描通过，临时凭据副本已清理。当前覆盖常规短流程，长上下文压缩和并发负载仍待专项验证。
 
 ## 2. Phase 2：scripts 最小检查闭环与 full gate
 
