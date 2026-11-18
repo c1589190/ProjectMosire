@@ -19,6 +19,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
+      service-artifact: ${{ steps.service.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +34,7 @@ jobs:
           cache: maven
 
       - name: 校验发布版本与根 POM 一致
+        id: version
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
@@ -41,6 +46,8 @@ jobs:
             test "$INPUT_VERSION" = "$version"
           fi
           printf 'PUBLISH_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'version=%s\nrevision=%s\n' "$version" "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 scripts/release-artifacts.py release-tag
 
       - name: 读取 Pages 历史并拒绝覆盖已发布版本
         run: |
@@ -89,7 +96,6 @@ jobs:
         run: python3 scripts/release-artifacts.py sdk target/pages
 
       - name: 计算服务 ZIP 的 SHA-256
-        if: github.event_name == 'push' && github.ref_type == 'tag'
         working-directory: MainMosire/target
         run: |
           set -euo pipefail
@@ -97,14 +103,24 @@ jobs:
           sha256sum "$zip" > "$zip.sha256"
 
       - name: 保存已验收的服务制品
-        if: github.event_name == 'push' && github.ref_type == 'tag'
+        id: service
         uses: actions/upload-artifact@v4
         with:
           name: mosire-server
           if-no-files-found: error
+          overwrite: true
           path: |
             MainMosire/target/mosire-server-${{ env.PUBLISH_VERSION }}.zip
             MainMosire/target/mosire-server-${{ env.PUBLISH_VERSION }}.zip.sha256
+
+      - name: 在推送 Pages 前绑定发行标签
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            python3 scripts/release-artifacts.py release-tag --create
+          else
+            python3 scripts/release-artifacts.py release-tag --require
+          fi
 
       - name: 发布到 gh-pages
         uses: peaceiris/actions-gh-pages@v4
@@ -116,19 +132,67 @@ jobs:
 
   server-release:
     needs: publish
-    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.publish.outputs.revision }}
+
       - uses: actions/download-artifact@v4
         with:
-          name: mosire-server
+          artifact-ids: ${{ needs.publish.outputs.service-artifact }}
+          merge-multiple: true
 
-      - name: 发布服务 ZIP 与校验和
+      - name: 核对标签和服务 SHA-256
         env:
-          GH_TOKEN: ${{ github.token }}
+          PUBLISH_VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
-          zip="mosire-server-${GITHUB_REF_NAME#v}.zip"
+          python3 scripts/release-artifacts.py release-tag --require
+          zip="mosire-server-${PUBLISH_VERSION}.zip"
           sha256sum -c "$zip.sha256"
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --generate-notes "$zip" "$zip.sha256"
+
+      - name: 发布服务 ZIP 与校验和
+        uses: actions/github-script@v7
+        env:
+          PUBLISH_VERSION: ${{ needs.publish.outputs.version }}
+        with:
+          script: |
+            const { readFileSync } = require('node:fs');
+            const { createHash } = require('node:crypto');
+            const version = process.env.PUBLISH_VERSION;
+            const tag = `v${version}`;
+            const zip = `mosire-server-${version}.zip`;
+            const repo = context.repo;
+            const releases = github.rest.repos;
+            const matches = await github.paginate(
+              releases.listReleases, { ...repo, per_page: 100 },
+              response => response.data.filter(candidate => candidate.tag_name === tag)
+            );
+            if (matches.length > 1) throw new Error(`同一标签存在多个 Release ${tag}`);
+            let release = matches[0];
+            if (!release) {
+              ({ data: release } = await releases.createRelease({
+                ...repo, tag_name: tag, generate_release_notes: true, draft: true
+              }));
+            }
+            const assets = await github.paginate(releases.listReleaseAssets, {
+              ...repo, release_id: release.id
+            });
+            for (const name of [zip, `${zip}.sha256`]) {
+              const data = readFileSync(name);
+              const existing = assets.find(asset => asset.name === name);
+              const digest = `sha256:${createHash('sha256').update(data).digest('hex')}`;
+              if (existing) {
+                if (existing.digest !== digest) throw new Error(`已有同名制品与校验值不一致 ${name}`);
+              } else {
+                if (!release.draft) throw new Error(`已发布的服务缺少制品 ${name}`);
+                await releases.uploadReleaseAsset({
+                  ...repo, release_id: release.id, name, data,
+                  headers: { 'content-type': 'application/octet-stream', 'content-length': data.length }
+                });
+              }
+            }
+            if (release.draft) {
+              await releases.updateRelease({ ...repo, release_id: release.id, draft: false });
+            }

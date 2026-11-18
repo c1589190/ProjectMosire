@@ -37,9 +37,28 @@ def project_version():
 
 
 def release_version(version):
-    if version.upper().endswith("-SNAPSHOT"):
+    if version.upper().endswith("SNAPSHOT") or re.search(r"-\d{8}\.\d{6}-\d+$", version):
         raise ValueError("发布需要固定版本，当前源码版本为 " + version)
     return version
+
+
+def check_release_tag(version, create=False, require=False):
+    tag_ref = f"refs/tags/v{version}"
+    peeled_ref = tag_ref + "^{}"
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    query = ["git", "ls-remote", "--exit-code", "--tags", "origin", tag_ref, peeled_ref]
+    remote = subprocess.run(query, cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    if remote.returncode == 2 and create:
+        subprocess.run(["git", "push", "origin", f"{revision}:{tag_ref}"], cwd=ROOT, check=True)
+        remote = subprocess.run(query, cwd=ROOT, text=True, stdout=subprocess.PIPE)
+    if remote.returncode == 2:
+        if require or create:
+            raise ValueError(f"远端缺少发布标签 {tag_ref}")
+        return
+    remote.check_returncode()
+    refs = {ref: sha for sha, ref in (line.split() for line in remote.stdout.splitlines())}
+    if refs.get(peeled_ref, refs.get(tag_ref)) != revision:
+        raise ValueError(f"发布标签 {tag_ref} 与本次 checkout 不一致")
 
 
 def digest(path, algorithm):
@@ -282,6 +301,10 @@ def main():
     version_command.add_argument("--release", action="store_true")
     unused = commands.add_parser("unused-version", help="检查未发布过的固定版本")
     unused.add_argument("--history-ref")
+    tag = commands.add_parser("release-tag", help="核对正式发布的远端标签")
+    tag_mode = tag.add_mutually_exclusive_group()
+    tag_mode.add_argument("--create", action="store_true", help="手动正式发布时绑定缺失的标签")
+    tag_mode.add_argument("--require", action="store_true", help="要求对应标签已经存在")
     prepare = commands.add_parser("prepare-pages", help="核对暂存仓库，生成发布页与历史元数据")
     prepare.add_argument("repository", type=Path)
     prepare.add_argument("--history-ref")
@@ -296,6 +319,8 @@ def main():
             print(release_version(version) if args.release else version)
         elif args.command == "unused-version":
             check_unused_version(release_version(version), historical_versions(args.history_ref))
+        elif args.command == "release-tag":
+            check_release_tag(release_version(version), create=args.create, require=args.require)
         elif args.command == "prepare-pages":
             prepare_pages(args.repository.resolve(), release_version(version), historical_versions(args.history_ref))
         elif args.command == "compat":
