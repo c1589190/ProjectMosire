@@ -53,10 +53,12 @@ public final class A2aHttpServer implements AutoCloseable {
 
   private final HttpServer server;
   private final AgentCard card;
+  private final ExecutorService executor;
 
-  private A2aHttpServer(HttpServer server, AgentCard card) {
+  private A2aHttpServer(HttpServer server, AgentCard card, ExecutorService executor) {
     this.server = server;
     this.card = card;
+    this.executor = executor;
   }
 
   /**
@@ -92,12 +94,15 @@ public final class A2aHttpServer implements AutoCloseable {
     }
     ExecutorService executor = null;
     try {
-      AgentCard card = cardFactory.apply(server.getAddress().getPort());
-      A2aHttpServer self = new A2aHttpServer(server, card);
-      server.createContext("/", exchange -> self.dispatch(exchange, handler));
       executor = Executors.newVirtualThreadPerTaskExecutor();
       server.setExecutor(executor);
+      // JDK 21 的 stop 需要已启动的 dispatcher 才能释放绑定。路由在卡片就绪后开放。
       server.start();
+      AgentCard card =
+          Objects.requireNonNull(
+              cardFactory.apply(server.getAddress().getPort()), "cardFactory 返回的卡片");
+      A2aHttpServer self = new A2aHttpServer(server, card, executor);
+      server.createContext("/", exchange -> self.dispatch(exchange, handler));
       LOG.info("A2A 网关已启动: {} 端口 {}", address.getHostString(), self.port());
       return self;
     } catch (RuntimeException | Error failure) {
@@ -262,7 +267,7 @@ public final class A2aHttpServer implements AutoCloseable {
   }
 
   /**
-   * 关闭（优雅）：先停止接入新连接，再给在途 exchange（SSE 写帧循环）最多 1 秒排空时间，最后关闭全部连接。
+   * 关闭时停止接入新连接，给在途 exchange 最多 1 秒排空，再关闭连接并回收执行器。
    *
    * <p>{@code HttpServer.stop(delay)} 的契约是"关闭监听后等待当前 exchange handler 完成（或 delay 秒超时），
    * 然后关闭所有连接"——delay=0 会立即断连，在途 SSE 流（例如 R8 关停合成 FAILED 之后要推给订阅者的终态 {@code
@@ -272,6 +277,10 @@ public final class A2aHttpServer implements AutoCloseable {
    */
   @Override
   public void close() {
-    server.stop(1);
+    try {
+      server.stop(1);
+    } finally {
+      executor.shutdownNow();
+    }
   }
 }

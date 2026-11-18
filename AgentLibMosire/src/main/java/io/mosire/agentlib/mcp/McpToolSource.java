@@ -65,6 +65,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   private final String name;
   private final McpServerLinkConfig config;
   private McpSyncClient client;
+  private volatile Object notificationSource;
   private volatile List<AgentTool> cached = List.of();
   private final CopyOnWriteArrayList<Runnable> changeListeners = new CopyOnWriteArrayList<>();
   private volatile boolean disconnected;
@@ -117,8 +118,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
         ServerParameters.builder(config.command()).args(config.args()).env(config.env()).build();
     StdioClientTransport transport =
         new StdioClientTransport(parameters, McpJsonDefaults.getMapper());
-    connect(
-        transport, config.startupTimeout(), config.requestTimeout(), () -> disconnected = false);
+    connect(transport, config.startupTimeout(), config.requestTimeout());
   }
 
   /**
@@ -133,43 +133,44 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
     if (transport == null) {
       throw new IllegalArgumentException("传输不能为空");
     }
-    connect(
-        transport, DEFAULT_STARTUP_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, () -> disconnected = false);
+    connect(transport, DEFAULT_STARTUP_TIMEOUT, DEFAULT_REQUEST_TIMEOUT);
   }
 
   private void connect(
-      McpClientTransport transport,
-      Duration startupTimeout,
-      Duration requestTimeout,
-      Runnable onConnected) {
+      McpClientTransport transport, Duration startupTimeout, Duration requestTimeout) {
+    Object connection = new Object();
     McpSyncClient newClient =
         McpClient.sync(transport)
             .requestTimeout(requestTimeout)
             .initializationTimeout(startupTimeout)
-            .toolsChangeConsumer(this::onServerToolsChanged)
+            .toolsChangeConsumer(
+                tools -> {
+                  if (notificationSource == connection) {
+                    onServerToolsChanged(tools);
+                  }
+                })
             .build();
-    List<AgentTool> previousTools = cached;
+    List<AgentTool> initialTools;
     try {
       newClient.initialize();
-      this.client = newClient;
-      // 初始基线：tools/list_changed 之外的首次快照（若有订阅者立即回放）
-      cacheAndNotify(newClient.listTools().tools());
-      // 重连成功（connect 是唯一建立连接的入口）：复位断连标记
-      onConnected.run();
+      initialTools = mapAll(newClient.listTools().tools());
     } catch (RuntimeException | Error failure) {
       // 握手可能已经创建传输，此时仍由连接方负责关闭新客户端。
-      this.client = null;
       try {
         newClient.close();
       } catch (RuntimeException | Error closeFailure) {
         if (closeFailure != failure) {
           failure.addSuppressed(closeFailure);
         }
-      } finally {
-        this.cached = previousTools;
       }
       throw failure;
     }
+    // 提交客户端与目录后再通知观察者。已收到目录的观察者可能已发布对应工具。
+    this.client = newClient;
+    this.cached = initialTools;
+    this.disconnected = false;
+    this.notificationSource = connection;
+    notifyToolCatalogChanged();
   }
 
   /** {@inheritDoc}：ToolSource 唯一标识 = 源名（与 {@link #name()} 同值）。 */
@@ -201,12 +202,11 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
   }
 
   private void onServerToolsChanged(List<McpSchema.Tool> tools) {
-    cacheAndNotify(tools);
+    this.cached = mapAll(tools);
+    notifyToolCatalogChanged();
   }
 
-  private void cacheAndNotify(List<McpSchema.Tool> tools) {
-    List<AgentTool> mapped = mapAll(tools);
-    this.cached = mapped;
+  private void notifyToolCatalogChanged() {
     for (Runnable listener : changeListeners) {
       listener.run();
     }
@@ -306,7 +306,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
 
   private synchronized McpSyncClient requireConnected() {
     if (client == null) {
-      throw new IllegalStateException("MCP 工具源未连接: " + config.name());
+      throw new IllegalStateException("MCP 工具源未连接: " + name);
     }
     return client;
   }
@@ -316,6 +316,7 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
     if (client != null) {
       client.close();
       client = null;
+      notificationSource = null;
     }
   }
 }

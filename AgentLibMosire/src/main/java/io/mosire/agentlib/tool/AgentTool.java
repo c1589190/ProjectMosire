@@ -3,7 +3,9 @@ package io.mosire.agentlib.tool;
 import io.mosire.agentlib.permission.ResourceManifest;
 import io.mosire.agentlib.permission.ToolSpec;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * 工具唯一接口：一个 Agent 可执行动作的最小描述 + 执行器。
@@ -20,6 +22,54 @@ import java.util.Set;
  * </ul>
  */
 public interface AgentTool {
+
+  /**
+   * 将宿主函数包装成普通工具。调用方显式声明工具权限规格，注册后由 {@link ToolCallAuthorizer} 授权和执行。
+   *
+   * @param name 工具标识
+   * @param description 给模型的用途描述
+   * @param jsonSchema 工具参数 schema，顶层映射按快照保存
+   * @param spec 工具权限规格
+   * @param handler 接收授权后的调用上下文并返回结果
+   */
+  static AgentTool of(
+      String name,
+      String description,
+      Map<String, Object> jsonSchema,
+      ToolSpec spec,
+      Function<ToolContext, ToolResult> handler) {
+    Objects.requireNonNull(name, "name");
+    Objects.requireNonNull(description, "description");
+    Map<String, Object> schema = Map.copyOf(jsonSchema);
+    Objects.requireNonNull(spec, "spec");
+    Objects.requireNonNull(handler, "handler");
+    return new AgentTool() {
+      @Override
+      public String name() {
+        return name;
+      }
+
+      @Override
+      public String description() {
+        return description;
+      }
+
+      @Override
+      public Map<String, Object> jsonSchema() {
+        return schema;
+      }
+
+      @Override
+      public ToolSpec spec() {
+        return spec;
+      }
+
+      @Override
+      public ToolResult execute(ToolContext context) {
+        return Objects.requireNonNull(handler.apply(context), "工具函数返回结果");
+      }
+    };
+  }
 
   String name();
 

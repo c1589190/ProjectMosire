@@ -9,8 +9,8 @@ import io.mosire.agentlib.config.FileConfigStore;
 import io.mosire.agentlib.decision.DecisionCommitPort;
 import io.mosire.agentlib.decision.DecisionPackages;
 import io.mosire.agentlib.event.EventBus;
+import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
-import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.ConfigApiKeySource;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmRouteLoader;
@@ -40,7 +40,9 @@ import io.mosire.brain.decision.ReleaseMarkingCommitPort;
 import io.mosire.brain.permission.AgentRoles;
 import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.AgentRuntime;
+import io.mosire.brain.runtime.AgentSpec;
 import io.mosire.brain.runtime.EventTypes;
+import io.mosire.brain.runtime.RuntimeStorage;
 import io.mosire.brain.skills.SkillAccess;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillPermissions;
@@ -53,7 +55,6 @@ import io.mosire.main.decision.LocalDecisionCommitPort;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -133,8 +134,7 @@ public final class SubagentProcessMain {
     McpSourceBridge bridge = null;
     PipeMcpClientTransport transport = null;
     AgentRuntime runtime = null;
-    SqliteEventStore events = null;
-    EventBus bus = null;
+    RuntimeStorage storage = null;
     try {
       // 模板库是只读快照（进程级无需释放），局部使用即可（无 finally 回收——避免死存储）
       AgentTemplateStore store = new AgentTemplateStore(options.templatesDir());
@@ -145,11 +145,9 @@ public final class SubagentProcessMain {
               .orElseThrow(
                   () -> new IllegalArgumentException("子 Agent 模板不存在: " + options.templateId()));
 
-      Files.createDirectories(options.dataDir());
-      SqliteEventStore eventStore = SqliteEventStore.open(options.dataDir().resolve("events.db"));
-      events = eventStore;
-      EventBus eventBus = new EventBus();
-      bus = eventBus;
+      storage = RuntimeStorage.open(options.dataDir(), false);
+      EventStore eventStore = storage.eventStore();
+      EventBus eventBus = storage.eventBus();
 
       AgentConfig config = template.toAgentConfig(options.instanceId());
       // 技能两个面（本能力）：模板给基线，父侧 argv 传下来的是**收紧后的生效值**（父级物化过的），
@@ -176,8 +174,7 @@ public final class SubagentProcessMain {
       //   读**它自己的**配置根（父侧经 --config-dir 传下来的那一个；缺席 = 离线/测试形态 ⇒ 缺省 30 分钟不变）。
       //   ★ 这一项不是"父侧替子体配"：跨进程结算的两个窗口在父侧（App 的 decisionWindows + 网关），子体这一份只决定
       //     "它本地那个包自己的 deadline"（它拿到回执就落 decided/committed，正常路径根本走不到到点）。两边同名同义。
-      //   ★ 走 AgentPipeline 的进程级缺省而不是 toolConfig：子体这条装配路（AgentRuntime 的无 toolConfig 构造）
-      //     没有工具配置通道，而 AgentRuntime 不在本单改动面内——理由写在 AgentPipeline#defaultDecisionDeadlineMillis。
+      //   与现有子体执行口一致，子体包窗口走 AgentPipeline 的进程级缺省。
       if (options.configDir() != null) {
         DecisionWindows childWindows =
             DecisionWindows.load(new FileConfigStore(options.configDir()));
@@ -223,20 +220,19 @@ public final class SubagentProcessMain {
               ? decisionSubmitter(
                   registry, permissions, options.goal(), config, eventStore, eventBus)
               : null;
-      // 所有分支收敛到同一终态构造：assembler 缺省与旧便捷构造一致；crossProcessSubmitter/compactor 可为 null。
+      // 子体借用本进程的事件资源，只跑一次目标回合，关闭前先落终局。
       // 真模型路径 compactor 非 null，离线模板脚本路径恒为 null，避免给离线门禁新增任何压缩调用。
-      AgentRuntime agent =
-          new AgentRuntime(
-              config,
-              llm,
-              registry,
-              new ToolExecutionGuard(),
-              assembler == null ? new BasicContextAssembler() : assembler,
-              eventStore,
-              eventBus,
-              permissions,
-              decisionSubmitter,
-              contextCompactor);
+      AgentRuntime.Builder builder =
+          AgentRuntime.builder(new AgentSpec(config), llm)
+              .storage(storage)
+              .toolRegistry(registry)
+              .permissionSet(permissions)
+              .crossProcessSubmitter(decisionSubmitter)
+              .contextCompactor(contextCompactor);
+      if (assembler != null) {
+        builder.contextAssembler(assembler);
+      }
+      AgentRuntime agent = builder.build();
       runtime = agent;
       TurnResult result = agent.chat(options.goal());
       diagnostics.println(
@@ -258,7 +254,7 @@ public final class SubagentProcessMain {
         return 1;
       }
       return 0;
-    } catch (RuntimeException | java.io.IOException e) {
+    } catch (RuntimeException e) {
       diagnostics.println("子 Agent 引导/运行失败: " + e.getMessage());
       return 1;
     } finally {
@@ -274,8 +270,7 @@ public final class SubagentProcessMain {
         }
       }
       closeQuietly(runtime);
-      closeQuietly(bus);
-      closeQuietly(events);
+      closeQuietly(storage);
     }
   }
 
@@ -314,7 +309,7 @@ public final class SubagentProcessMain {
       AgentPermissionSet permissions,
       String goal,
       AgentConfig config,
-      SqliteEventStore eventStore,
+      EventStore eventStore,
       EventBus eventBus) {
     AgentIdentity identity =
         AgentIdentity.subagent(config.id(), CommandMode.LIMITED, goal == null ? "" : goal, 0);

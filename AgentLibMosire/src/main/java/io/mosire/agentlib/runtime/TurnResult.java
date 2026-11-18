@@ -2,7 +2,14 @@ package io.mosire.agentlib.runtime;
 
 import java.util.Optional;
 
-/** 一次回合（用户输入 → 终止）的结果摘要。 */
+/**
+ * 一次用户输入到回合结束的结果摘要。
+ *
+ * @param stopReason 停因
+ * @param turns 本用户回合中成功完成的模型往返次数
+ * @param toolCalls 已派发的工具调用次数，超限后为历史补写的结果不计入
+ * @param text 最终文字
+ */
 public record TurnResult(StopReason stopReason, int turns, int toolCalls, String text) {
 
   public TurnResult {

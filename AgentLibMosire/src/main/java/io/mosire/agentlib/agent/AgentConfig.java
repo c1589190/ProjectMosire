@@ -5,12 +5,13 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Agent 配置（数据不是代码——计划 D10）。
+ * 宿主提供的 Agent 配置。默认预算由 {@link #DEFAULT_MAX_TURNS}、{@link #DEFAULT_MAX_TOOL_CALLS_PER_TURN} 和 {@link
+ * #DEFAULT_TIME_BUDGET} 定义。
  *
- * <p>M1 为构造器 + 校验；M3 起由 ConfigStore 经 JSON Schema（{@code configs/schemas/}）装载， 本类的构造器保持不变、新增一个
- * fromJson。默认值即硬顶常量（计划 D10，2026-09-08 用户修订 maxTurns 20→2000）： {@code maxTurns=2000} / {@code
- * maxToolCallsPerTurn=30} / {@code timeBudget=10min}； 一个 Agent 实例可以解绑自己的配额（配额归调用方：子 Agent
- * 的配额由父级决定，M2）。
+ * @param maxTurns 一次用户回合允许完成的模型往返上限
+ * @param maxToolCallsPerTurn 一次模型响应允许包含的工具调用数上限
+ * @param timeBudget 一次用户回合的墙钟预算
+ * @param quotaMaxTokens 给宿主停因策略的 token 额度，0 表示不限
  */
 public record AgentConfig(
     String id,
@@ -24,17 +25,7 @@ public record AgentConfig(
     Duration timeBudget,
     long quotaMaxTokens) {
 
-  /**
-   * 默认轮次硬顶（计划 D10；2026-09-08 用户修订 20→2000；<b>2026-10-16 用户裁定再修订 2000→114514</b>）。
-   *
-   * <p><b>用户原话</b>：「把所有限制单个Agent执行轮数的限制改成114514！！！！」——即：<b>实际取消轮次上限</b>（这个数在任何真实 任务里都到不了）。
-   *
-   * <p>为什么这会成立：防跑飞的实际兜底本来就是 {@link #DEFAULT_TIME_BUDGET}（墙钟）——轮次硬顶只防御"每轮极快的空转循环"， 而那种循环也会很快撞上墙钟预算或
-   * token 配额。留一个大数而不是 0/负数：{@code maxTurns} 的契约是"必须为正" （见模板与 Builder 的守卫），"不限"用"大到到不了"表达，比引入一个"0 =
-   * 不限"的哨兵值少一条分支。
-   *
-   * <p>★ 时间预算与配额<b>没有被这次裁定改动</b>（10min / 30 次工具调用每轮仍在）：用户只裁了"轮数"。
-   */
+  /** 默认模型往返上限（2026-10-16 用户裁定）。日常回合由墙钟预算和 token 配额约束。 */
   public static final int DEFAULT_MAX_TURNS = 114514;
 
   public static final int DEFAULT_MAX_TOOL_CALLS_PER_TURN = 30;

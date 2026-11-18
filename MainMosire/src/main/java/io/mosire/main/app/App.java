@@ -23,7 +23,6 @@ import io.mosire.agentlib.event.EventBus;
 import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
-import io.mosire.agentlib.event.SqliteEventStore;
 import io.mosire.agentlib.llm.FakeLlmClient;
 import io.mosire.agentlib.llm.LlmClient;
 import io.mosire.agentlib.llm.LlmResponse;
@@ -48,7 +47,6 @@ import io.mosire.agentlib.plugin.PluginListener;
 import io.mosire.agentlib.plugin.PluginToolSource;
 import io.mosire.agentlib.proc.SubprocessManager;
 import io.mosire.agentlib.runtime.TurnResult;
-import io.mosire.agentlib.store.SqliteConversationStore;
 import io.mosire.agentlib.tool.AgentTool;
 import io.mosire.agentlib.tool.SandboxMask;
 import io.mosire.agentlib.tool.ToolCallAuthorizer;
@@ -73,6 +71,7 @@ import io.mosire.brain.runtime.AgentPipeline;
 import io.mosire.brain.runtime.AgentRuntime;
 import io.mosire.brain.runtime.AgentSpec;
 import io.mosire.brain.runtime.EventTypes;
+import io.mosire.brain.runtime.RuntimeStorage;
 import io.mosire.brain.skills.SkillAccess;
 import io.mosire.brain.skills.SkillCatalog;
 import io.mosire.brain.skills.SkillNamespaces;
@@ -187,10 +186,8 @@ import org.slf4j.LoggerFactory;
  * AgentPipeline.history 非线程安全的不变量，也是 AG-UI 会话 seq 区间隔离的前提——见 AgUiSessionRegistry 说明）。关停顺序：A2A
  * 任务服务（合成 FAILED + 关停共享执行器）→ A2A 网关 → AG-UI 网关 （stop(1) 给在途流排空）→ AG-UI 注册表（封创建口）→ 既有关停链。
  *
- * <p>P3-3（本类新增）：<b>会话历史落盘</b>——非 {@code --demo} 时多开一个 {@link SqliteConversationStore}（与事件库同一文件，计划
- * §六 一份 DDL），主 Agent 的多轮对话因此跨进程存活；启动会话 id 由<b>库里的会话指针</b>决定（首次启动才落到 {@link
- * #MAIN_CONVERSATION_ID}，重置写下的新 id 经指针跨重启有效）。{@code --demo} 恒不落库（零行为变化）。重置入口不在本类：{@code POST
- * /api/chat/session} → {@link
+ * <p>{@link RuntimeStorage} 管理主 Agent 的事件和会话连接。非 {@code --demo} 时，会话指针与事件同属 {@code events.db}， 主
+ * Agent 从已有指针续接，首次启动使用 {@link #MAIN_CONVERSATION_ID}。重置入口为 {@code POST /api/chat/session} → {@link
  * io.mosire.main.gateway.debug.DebugChatService#resetSession()}（切换动作排在共享 chat 执行器上，R11）。
  */
 public final class App implements AutoCloseable {
@@ -278,18 +275,7 @@ public final class App implements AutoCloseable {
   /** 非 demo 模式下 FakeLlmClient 的默认骨架回复（A2A 等调用面无脚本时也能完成一回合；真实模型 M3 接入）。 */
   public static final String DEFAULT_LLM_REPLY = "我是 Mosire 主 Agent（M1 骨架 LLM，离线占位回复）。消息已收到。";
 
-  private final EventStore events;
-
-  /**
-   * 会话历史存储（P3-3）：{@code null} = 未接线（demo 分叉——不落库，行为与落盘接入前逐字节一致）。
-   *
-   * <p>与 {@link #events} 同口径：归 App 持有、App 关停；两者是<b>同一个 db 文件</b>上的两个连接（各自自建，计划 §六 一份 DDL）。
-   * 字段类型是具体实现而非 {@link io.mosire.agentlib.store.ConversationStore}：装配层持有的是"可关停的那个打开结果"（接口本身没有
-   * close——它只描述存取语义），同 {@link SqliteEventStore} 之于 {@code EventStore}。
-   */
-  private final SqliteConversationStore conversations;
-
-  private final EventBus bus;
+  private final RuntimeStorage storage;
   private final AgentRuntime runtime;
   private final AdminHttpServer http;
   private final AgentToMcpServer mcpServer;
@@ -403,8 +389,8 @@ public final class App implements AutoCloseable {
   /**
    * 启动（生产终态入口）：除既有四参外追加默认上下文压缩器。
    *
-   * <p>{@code contextCompactor} 只在主 Agent 的落库终态路径注入；demo 的 {@code conversations == null} 分支不装配。
-   * {@code llmOverride} 仍是未包装的 raw {@link LlmClient}——superior judge 等一次性 LLM 调用不应经过 compactor。
+   * <p>{@code contextCompactor} 只在主 Agent 的会话落库路径注入。 {@code llmOverride} 仍是未包装的 raw {@link
+   * LlmClient}——superior judge 等一次性 LLM 调用不应经过 compactor。
    *
    * <p><b>{@code --setup} 限制</b>：HTTP setup 的热切换只替换 {@link io.mosire.main.setup.SetupLlmRouter} 里的
    * client。 本构造期注入的 compactor 不会随热切换重建；未配置态启动时也不会装配 compactor。要让自动压缩生效，必须在写盘后重启进程， 由新的真模型装配路径读取
@@ -419,26 +405,12 @@ public final class App implements AutoCloseable {
       List<AgentTool> extraTools,
       Path subagentConfigDir,
       ContextCompactor contextCompactor) {
-    try {
-      Files.createDirectories(config.dataDir());
-    } catch (IOException e) {
-      throw new IllegalStateException("无法创建数据目录: " + config.dataDir(), e);
-    }
     List<Runnable> startupCleanup = new ArrayList<>();
     try {
-      EventStore events = SqliteEventStore.open(config.dataDir().resolve("events.db"));
-      startupCleanup.add(events::close);
-      // P3-3 落盘：主 Agent 的会话历史落到 events.db 同一文件（SqliteConversationStore 的既定约定——计划 §六 一份 DDL）。
-      // demo 分叉恒不落库（--demo 行为零变化）：store 为 null 即走 AgentRuntime 的既有 6 参构造（不落库路径逐字节不变）
-      SqliteConversationStore conversations =
-          config.demo()
-              ? null
-              : SqliteConversationStore.open(config.dataDir().resolve("events.db"));
-      if (conversations != null) {
-        startupCleanup.add(conversations::close);
-      }
-      EventBus bus = new EventBus();
-      startupCleanup.add(bus::close);
+      RuntimeStorage storage = RuntimeStorage.open(config.dataDir(), !config.demo());
+      startupCleanup.add(storage::close);
+      EventStore events = storage.eventStore();
+      EventBus bus = storage.eventBus();
       // S4-C：审批事件的<b>落账</b>面。B1 的 ApprovalCoordinator 只把 approval.requested/decided 投到 bus
       // （B2 收口"用已有的那个总线"），而这条总线目前唯一的订阅者是 AG-UI 的<b>唤醒信号</b>
       // （AgUiHttpServer:212 只 signal；AG-UI 的数据面是从 events 回读的）⇒ 审批事件在进程里<b>没有任何可回读的面</b>
@@ -793,6 +765,11 @@ public final class App implements AutoCloseable {
       //   放在这里而不是给 AgentPipeline 加构造参数：本表正是"装配层 → 管线工具面"的既有配置通道，且子体进程
       //   那条最朴素的构造也收它（子体自己的包窗口因此同样可配）。
       toolConfig.put(AgentPipeline.CONFIG_DECISION_DEADLINE_MS, decisionWindows.deadlineMillis());
+      JsonNode configuredTimeout = configStore.get("tool", "executionTimeoutMs").orElse(null);
+      if (configuredTimeout != null) {
+        toolConfig.put(
+            ToolCallAuthorizer.CONFIG_TOOL_TIMEOUT_MS, configuredToolTimeout(configuredTimeout));
+      }
       toolConfig = Map.copyOf(toolConfig);
       // ★ P3a（设计 §5quinquies ② + §5ter 裁定 13）：派生链视角<b>接上实例注册表</b>——这是跨进程那条路的
       //   前提：子体经 MCP 桥提交的包，父侧要在<b>同一个</b>视角里核对"这个 proposerKey 在不在场"（防冒充）
@@ -1038,42 +1015,26 @@ public final class App implements AutoCloseable {
         startupCleanup.add(mcpServer::close);
       }
       // D30：工具自身配置（toolConfig）在本方法<b>前面</b>已建好（P2b 把它挪到决策块之前：提交口与管线必须拿同一份）
-      // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
-      // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
-      // （--demo 恒"零行为变化"是本仓既有约定：它只跑一条脚本回合，没有工具调用面可审批）
       // 上下文来源：技能目录档 + 预载正文（可见面已在 SkillAccess 内固定为本实例的权限集）
       BasicContextAssembler assembler =
           new BasicContextAssembler(
               ContextPolicy.defaults(),
               ContextSources.skills(skillAccess, skillSettings.preloaded()));
-      AgentRuntime runtime =
-          conversations == null
-              ? new AgentRuntime(
-                  agentSpec,
-                  llm,
-                  tools,
-                  new ToolExecutionGuard(),
-                  assembler,
-                  events,
-                  bus,
-                  permissionSet)
-              : new AgentRuntime(
-                  agentSpec,
-                  llm,
-                  tools,
-                  new ToolExecutionGuard(),
-                  assembler,
-                  events,
-                  bus,
-                  permissionSet,
-                  conversations,
-                  MAIN_CONVERSATION_ID,
-                  toolConfig,
-                  approvalCoordinator,
-                  // P1b：桥交给管线 = "Ask 自动进包"这条链路的最后一环（没有它，管线不绑队列，Ask 走既有审批闸）
-                  decisionApprovalBridge,
-                  // 默认上下文压缩只接在主 Agent 的落库终态路径；demo 分叉（上方 conversations == null）保持不压缩。
-                  contextCompactor);
+      AgentRuntime.Builder runtimeBuilder =
+          AgentRuntime.builder(agentSpec, llm)
+              .storage(storage)
+              .toolRegistry(tools)
+              .permissionSet(permissionSet)
+              .contextAssembler(assembler);
+      if (!config.demo()) {
+        runtimeBuilder
+            .initialConversationId(MAIN_CONVERSATION_ID)
+            .toolConfig(toolConfig)
+            .approvalCoordinator(approvalCoordinator)
+            .decisionBridge(decisionApprovalBridge)
+            .contextCompactor(contextCompactor);
+      }
+      AgentRuntime runtime = runtimeBuilder.build();
       startupCleanup.add(runtime::close);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
@@ -1129,9 +1090,7 @@ public final class App implements AutoCloseable {
 
       App app =
           new App(
-              events,
-              conversations,
-              bus,
+              storage,
               runtime,
               http,
               mcpServer,
@@ -1487,7 +1446,7 @@ public final class App implements AutoCloseable {
         result.turns(),
         result.toolCalls(),
         result.finalText().orElse(""),
-        app.events.count());
+        app.eventCount());
   }
 
   /** A2A Agent Card（卡片 URL = 实际监听地址；handler 侧版本协商只用 supportedInterfaces）。 */
@@ -1522,9 +1481,7 @@ public final class App implements AutoCloseable {
   }
 
   private App(
-      EventStore events,
-      SqliteConversationStore conversations,
-      EventBus bus,
+      RuntimeStorage storage,
       AgentRuntime runtime,
       AdminHttpServer http,
       AgentToMcpServer mcpServer,
@@ -1545,9 +1502,7 @@ public final class App implements AutoCloseable {
       PendingApprovalChannel approvalHttpChannel,
       DecisionPackages decisionPackages,
       MainAgent mainAgent) {
-    this.events = events;
-    this.conversations = conversations;
-    this.bus = bus;
+    this.storage = storage;
     this.runtime = runtime;
     this.http = http;
     this.mcpServer = mcpServer;
@@ -1581,12 +1536,12 @@ public final class App implements AutoCloseable {
 
   /** 事件库只读查询口（未来 AdminREST {@code /api/events} 的数据来源）；不暴露 Store 本体（SpotBugs EI_EXPOSE_REP）。 */
   public List<Event> queryEvents(EventQuery query) {
-    return events.query(query);
+    return storage.eventStore().query(query);
   }
 
   /** 事件总数（StatusSnapshot 数据来源之一）。 */
   public long eventCount() {
-    return events.count();
+    return storage.eventStore().count();
   }
 
   public AgentRuntime runtime() {
@@ -1652,7 +1607,7 @@ public final class App implements AutoCloseable {
   /**
    * 优雅关停（计划 §5.1）：A2A 任务服务先行（合成 FAILED 让在订阅的客户端收到终态——必须赶在 HTTP 服务断连之前）→ A2A 网关关闭 （停止接入）→ 网关 drain →
    * MCP 暴露闭（先摘 registry 订阅，避免桥下架工具的变更流进已闭 server）→ 各链接 bridge.close（整组下架工具）→ source.close（回收子进程）→ 子
-   * Agent 编排（逐个终止 + launcher 关闭）→ 子进程管理器兜底收割 → 运行时 → 会话存储（P3-3 开的那个）→ 事件存储 checkpoint。
+   * Agent 编排（逐个终止 + launcher 关闭）→ 子进程管理器兜底收割 → 运行时 → 排空事件总线 → SQLite 存储 checkpoint。
    *
    * <p>（顺序说明）任务要求表述为"A2A server 先行关闭"，但 {@code HttpServer.stop(0)} 会即时掐断在途 SSE 连接——若先关 server，周迟合的
    * FAILED 时序事件早已不可达订阅者（R8 验收不成立）；故先合成终态、后断连接；“A2A 先行于既有关停链” 的本意（网关先于
@@ -1729,16 +1684,22 @@ public final class App implements AutoCloseable {
           }
         });
     closeQuietly("Agent 运行时", () -> runtime.close());
-    closeQuietly(
-        "会话存储",
-        () -> {
-          if (conversations != null) {
-            conversations.close();
-          }
-        });
-    closeQuietly("事件存储", () -> events.close());
-    closeQuietly("事件总线", () -> bus.close());
+    closeQuietly("事件总线与 SQLite 存储", storage::close);
     terminated.countDown();
+  }
+
+  private static long configuredToolTimeout(JsonNode value) {
+    if (value.isIntegralNumber() && value.canConvertToLong()) {
+      return value.longValue();
+    }
+    if (value.isTextual()) {
+      try {
+        return Long.parseLong(value.textValue().strip());
+      } catch (NumberFormatException ignored) {
+        // 把非法值折成缺省标记，避免把原始配置文本带入工具上下文。
+      }
+    }
+    return 0L;
   }
 
   /**

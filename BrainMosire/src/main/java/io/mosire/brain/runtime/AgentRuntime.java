@@ -8,9 +8,11 @@ import io.mosire.agentlib.approval.ApprovalCoordinator;
 import io.mosire.agentlib.compact.ContextCompactor;
 import io.mosire.agentlib.event.Event;
 import io.mosire.agentlib.event.EventBus;
+import io.mosire.agentlib.event.EventQuery;
 import io.mosire.agentlib.event.EventStore;
 import io.mosire.agentlib.event.EventWrite;
 import io.mosire.agentlib.llm.LlmClient;
+import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
 import io.mosire.agentlib.runtime.StopReason;
 import io.mosire.agentlib.runtime.TurnResult;
@@ -22,6 +24,8 @@ import io.mosire.brain.context.CompactSummarySlot;
 import io.mosire.brain.context.ContextAssembler;
 import io.mosire.brain.decision.CrossProcessDecisionSubmitter;
 import io.mosire.brain.decision.DecisionApprovalBridge;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -37,6 +41,8 @@ import java.util.Objects;
  * <p><b>会话持久化与重置（P3-3）</b>：带 {@code (store, conversationId)} 的构造把历史推到 {@link
  * ConversationStore}（重启续聊）， 其余构造保持"不落库"路径不变；{@link #resetSession(String)} 换新会话 id +
  * 清空内存工作集（D26，旧会话在库里留档）。两者都只是对 {@link AgentPipeline} 的转发，本类不持有任何会话状态。
+ *
+ * <p>嵌入时使用 {@link #builder(AgentSpec, LlmClient)} 装配。由构建器打开的存储在运行时关闭时释放，宿主传入的资源由宿主关闭。
  */
 public final class AgentRuntime implements AutoCloseable {
 
@@ -49,6 +55,7 @@ public final class AgentRuntime implements AutoCloseable {
   private final EventStore events;
   private final EventBus bus;
   private final AgentPipeline pipeline;
+  private final RuntimeStorage ownedStorage;
 
   // ★ 决策包审批桥（P1b）**不是本类的字段**：它只在构造时透传给管线（管线才是唯一读者）。
   //   早先存成字段被 SpotBugs 判 URF_UNREAD_FIELD（真发现：存了从不读），故删字段、留这条说明防"顺手加回来"。
@@ -697,6 +704,42 @@ public final class AgentRuntime implements AutoCloseable {
       DecisionApprovalBridge decisionBridge,
       CrossProcessDecisionSubmitter crossProcessSubmitter,
       ContextCompactor contextCompactor) {
+    this(
+        spec,
+        llm,
+        registry,
+        guard,
+        assembler,
+        events,
+        bus,
+        permissionSet,
+        store,
+        conversationId,
+        toolConfig,
+        coordinator,
+        decisionBridge,
+        crossProcessSubmitter,
+        contextCompactor,
+        null);
+  }
+
+  private AgentRuntime(
+      AgentSpec spec,
+      LlmClient llm,
+      ToolRegistry registry,
+      ToolExecutionGuard guard,
+      ContextAssembler assembler,
+      EventStore events,
+      EventBus bus,
+      AgentPermissionSet permissionSet,
+      ConversationStore store,
+      String conversationId,
+      Map<String, Object> toolConfig,
+      ApprovalCoordinator coordinator,
+      DecisionApprovalBridge decisionBridge,
+      CrossProcessDecisionSubmitter crossProcessSubmitter,
+      ContextCompactor contextCompactor,
+      RuntimeStorage ownedStorage) {
     this.spec = Objects.requireNonNull(spec, "spec");
     AgentConfig config = spec.core();
     this.config = Objects.requireNonNull(config, "config");
@@ -704,6 +747,7 @@ public final class AgentRuntime implements AutoCloseable {
     this.events = Objects.requireNonNull(events, "events");
     this.bus = Objects.requireNonNull(bus, "bus");
     this.permissionSet = Objects.requireNonNull(permissionSet, "permissionSet");
+    this.ownedStorage = ownedStorage;
     // P1b/P3b：桥与跨进程缝都只转发给管线（决定"本轮队列绑不绑、谁来收尾"），本类不读它们的状态；null = 未接线
     LlmClient client = Objects.requireNonNull(llm, "llm");
     this.pipeline =
@@ -775,6 +819,144 @@ public final class AgentRuntime implements AutoCloseable {
     emit(
         EventTypes.AGENT_LIFECYCLE,
         Map.of("action", "started", "agent", config.id(), "model", client.model()));
+  }
+
+  /** 通过宿主提供的规格和模型客户端构建嵌入式运行时。 */
+  public static Builder builder(AgentSpec spec, LlmClient llm) {
+    return new Builder(spec, llm);
+  }
+
+  /** 为现有管线命名装配选项。默认工具表为空且权限为只读，模型客户端、外部注册表和审批通道由宿主持有。 */
+  public static final class Builder {
+    private final AgentSpec spec;
+    private final LlmClient llm;
+    private Path dataDirectory;
+    private RuntimeStorage storage;
+    private ToolRegistry registry;
+    private AgentPermissionSet permissions =
+        AgentPermissionSet.builder(AccessToken.GUEST).readOnly(true).build();
+    private ContextAssembler assembler = new BasicContextAssembler();
+    private Map<String, Object> toolConfig = Map.of();
+    private String initialConversationId;
+    private ApprovalCoordinator coordinator;
+    private DecisionApprovalBridge bridge;
+    private CrossProcessDecisionSubmitter submitter;
+    private ContextCompactor compactor;
+
+    private Builder(AgentSpec spec, LlmClient llm) {
+      this.spec = Objects.requireNonNull(spec, "spec");
+      this.llm = Objects.requireNonNull(llm, "llm");
+    }
+
+    /** 在此目录打开 SQLite 并从已有会话指针续接，运行时负责关闭资源。与 {@link #storage(RuntimeStorage)} 二选一。 */
+    public Builder dataDirectory(Path directory) {
+      this.dataDirectory = Objects.requireNonNull(directory, "directory");
+      return this;
+    }
+
+    /** 借用已打开的资源，宿主在运行时关闭后关闭资源。与 {@link #dataDirectory(Path)} 二选一。 */
+    @SuppressFBWarnings(value = "EI_EXPOSE_REP2", justification = "配置需借用宿主已打开的资源")
+    public Builder storage(RuntimeStorage resources) {
+      this.storage = Objects.requireNonNull(resources, "storage");
+      return this;
+    }
+
+    /** 使用宿主装配的工具注册表，或由构建器创建独立的空表。 */
+    @SuppressFBWarnings(value = "EI_EXPOSE_REP2", justification = "与宿主共用活动工具目录")
+    public Builder toolRegistry(ToolRegistry tools) {
+      this.registry = Objects.requireNonNull(tools, "registry");
+      return this;
+    }
+
+    /** 注入由宿主授予的权限，含工具、角色与资源边界。 */
+    public Builder permissionSet(AgentPermissionSet permissionSet) {
+      this.permissions = Objects.requireNonNull(permissionSet, "permissionSet");
+      return this;
+    }
+
+    /** 配置组装窗口和外部上下文的策略。 */
+    public Builder contextAssembler(ContextAssembler contextAssembler) {
+      this.assembler = Objects.requireNonNull(contextAssembler, "contextAssembler");
+      return this;
+    }
+
+    /** 传给工具调用上下文的宿主配置，顶层映射按快照保存。 */
+    public Builder toolConfig(Map<String, Object> config) {
+      this.toolConfig = Map.copyOf(config);
+      return this;
+    }
+
+    /** 指定持久会话的初始 id，已有数据库会话指针优先。缺省取 Agent id。 */
+    public Builder initialConversationId(String id) {
+      if (Objects.requireNonNull(id, "conversationId").isBlank()) {
+        throw new IllegalArgumentException("初始会话 id 不得为空白");
+      }
+      this.initialConversationId = id;
+      return this;
+    }
+
+    /** 注入持久会话使用的审批编排器。传空时审批请求按拒绝处理。 */
+    public Builder approvalCoordinator(ApprovalCoordinator approvalCoordinator) {
+      this.coordinator = approvalCoordinator;
+      return this;
+    }
+
+    /** 注入持久会话的主侧决策桥。传空时使用已有审批路径。 */
+    public Builder decisionBridge(DecisionApprovalBridge decisionBridge) {
+      this.bridge = decisionBridge;
+      return this;
+    }
+
+    /** 注入子进程的回合收尾提交口。传空表示未启用跨进程提交。 */
+    public Builder crossProcessSubmitter(CrossProcessDecisionSubmitter crossProcessSubmitter) {
+      this.submitter = crossProcessSubmitter;
+      return this;
+    }
+
+    /** 配置模型上下文压缩器，传空时保留完整窗口。 */
+    public Builder contextCompactor(ContextCompactor contextCompactor) {
+      this.compactor = contextCompactor;
+      return this;
+    }
+
+    /** 完成装配。审批、决策桥和显式初始会话 id 均须使用持久会话。装配失败会释放本次构建打开的资源。 */
+    public AgentRuntime build() {
+      boolean ownsStorage = dataDirectory != null;
+      if (ownsStorage == (storage != null)) {
+        throw new IllegalStateException("必须且只能指定 dataDirectory 或 storage");
+      }
+      if (!ownsStorage
+          && storage.conversationStore() == null
+          && (coordinator != null || bridge != null || initialConversationId != null)) {
+        throw new IllegalStateException("审批、决策桥和初始会话 id 需要持久会话");
+      }
+      String conversationId =
+          initialConversationId == null ? spec.core().id() : initialConversationId;
+      RuntimeStorage resources = ownsStorage ? RuntimeStorage.open(dataDirectory, true) : storage;
+      try {
+        return new AgentRuntime(
+            spec,
+            llm,
+            registry == null ? new ToolRegistry() : registry,
+            new ToolExecutionGuard(),
+            assembler,
+            resources.eventStore(),
+            resources.eventBus(),
+            permissions,
+            resources.conversationStore(),
+            conversationId,
+            toolConfig,
+            coordinator,
+            bridge,
+            submitter,
+            compactor,
+            ownsStorage ? resources : null);
+      } catch (RuntimeException | Error failure) {
+        try (RuntimeStorage acquired = ownsStorage ? resources : null) {
+          throw failure;
+        }
+      }
+    }
   }
 
   /**
@@ -856,16 +1038,24 @@ public final class AgentRuntime implements AutoCloseable {
     return permissionSet;
   }
 
+  /** 从本运行时使用的事件库按条件查询审计记录。 */
+  public List<Event> queryEvents(EventQuery query) {
+    ensureOpen();
+    return events.query(Objects.requireNonNull(query, "query"));
+  }
+
   /**
    * 关停：发 {@code agent.lifecycle stopped} 并封住 {@link #chat}/{@link #resetSession}。
    *
-   * <p><b>不 close 注入件</b>：{@link EventStore} 与会话存储都是装配层持有的共享资源（同生共死归调用方），本类只发事件、不替它们兜底。
+   * <p>运行时打开的存储在生命周期事件尝试写入后关闭。构造参数或 {@link Builder#storage(RuntimeStorage)} 带入的资源由宿主关闭。
    */
   @Override
   public void close() {
     if (!closed) {
       closed = true;
-      emit(EventTypes.AGENT_LIFECYCLE, Map.of("action", "stopped", "agent", config.id()));
+      try (RuntimeStorage resources = ownedStorage) {
+        emit(EventTypes.AGENT_LIFECYCLE, Map.of("action", "stopped", "agent", config.id()));
+      }
     }
   }
 
