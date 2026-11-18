@@ -9,6 +9,8 @@ on:
       - "AGENTS.md"
       - "README.md"
       - "docs/**"
+      - "pages/**"
+      - "pom.xml"
       - "scripts/**"
       - ".github/workflows/docs-skills.yml"
   pull_request:
@@ -16,6 +18,8 @@ on:
       - "AGENTS.md"
       - "README.md"
       - "docs/**"
+      - "pages/**"
+      - "pom.xml"
       - "scripts/**"
       - ".github/workflows/docs-skills.yml"
 
@@ -38,7 +42,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m py_compile scripts/*.py
-          bash -n scripts/*.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
 
       - name: 文档一致性
         run: python3 scripts/check-docs.py

@@ -3,7 +3,7 @@
 
 检查项（任务 task-10）：
 1. 根 pom.xml 的 <modules> 与 README.md / AGENTS.md 的模块清单一致；
-2. README.md / AGENTS.md / docs/agents/*.md 的相对 Markdown 链接存在；
+2. 根 README、AGENTS、文档索引及现行文档的相对 Markdown 链接存在；
 3. pages/index.html 仍保留 __MOSIRE_VERSION__ 发布占位符；
 4. docs/agents/STATUS.md 存在；
 5. .superpowers 不再被当作“权威实时状态”（允许“不是权威 / 历史留痕”这类否定句）。
@@ -273,7 +273,16 @@ def run_checks(root: Path) -> tuple[list[Finding], dict[str, int]]:
     findings.extend(pom_findings)
     findings.extend(check_module_mentions(root, modules))
     files = checked_files(root)
-    link_findings, links_checked = check_links(root, files)
+    docs_dir = root / "docs"
+    link_files = sorted(
+        set(files)
+        | {
+            path
+            for path in docs_dir.rglob("*.md")
+            if path.relative_to(docs_dir).parts[0] != "archive"
+        }
+    )
+    link_findings, links_checked = check_links(root, link_files)
     findings.extend(link_findings)
     findings.extend(check_pages(root))
     findings.extend(check_status(root))
@@ -281,7 +290,7 @@ def run_checks(root: Path) -> tuple[list[Finding], dict[str, int]]:
     findings.extend(check_current_version_drift(root, version, files))
     stats = {
         "modules": len(modules),
-        "files": sum(1 for path in files if path.is_file()),
+        "files": sum(1 for path in link_files if path.is_file()),
         "links": links_checked,
     }
     return findings, stats

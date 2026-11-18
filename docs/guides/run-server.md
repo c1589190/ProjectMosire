@@ -2,6 +2,8 @@
 
 需要 JDK 21。打开发行包内的目录，在当前目录保留 `mosire.jar` 和 `plugins/`。Bash 插件与主程序版本一致。
 
+开发期间从源码构建本地验证包。正式服务包从 [GitHub Releases](https://github.com/c1589190/ProjectMosire/releases) 选择版本并核对随附的 SHA-256。
+
 ## 离线验证
 
 ```bash
@@ -26,7 +28,7 @@ curl -fsS -H 'Content-Type: application/json' \
 java -jar mosire.jar run --no-mcp-expose --data-dir .work/mosire
 ```
 
-也可加 `--setup` 启动回环配置入口。配置后按启动信息定位网关。启用子 Agent 时通过 `--templates-dir` 选择已有的模板目录，显式审阅模板的工具白名单和资源权限。
+也可加 `--setup` 启动回环配置入口。引导写盘后重启服务，使模型能力和默认压缩器一起装配。按启动信息定位网关。启用子 Agent 时通过 `--templates-dir configs/agents` 选择随包模板，显式审阅模板的工具白名单和资源权限。
 
 ## 从源码构建
 

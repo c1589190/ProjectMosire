@@ -72,6 +72,28 @@
 
   <build>
     <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>default-compile</id>
+            <configuration>
+              <proc>full</proc>
+              <annotationProcessorPaths>
+                <path>
+                  <groupId>org.pf4j</groupId>
+                  <artifactId>pf4j</artifactId>
+                  <version>${pf4j.version}</version>
+                </path>
+              </annotationProcessorPaths>
+              <annotationProcessors>
+                <annotationProcessor>org.pf4j.processor.ExtensionAnnotationProcessor</annotationProcessor>
+              </annotationProcessors>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <!-- 插件 JAR 的形态（设计 D3）：不用 shade，只写描述符——Plugin-Id 是插件身份（PF4J 靠它装载、
            PluginToolSource 靠它落 plugin.lifecycle），Plugin-Version 与宿主同源（parent 的 version）。
            缺 Plugin-Id ⇒ PF4J 只记日志并静默跳过 ⇒ 宿主的 PluginToolSource 会把它变响亮（响亮失败，绝不静默）。 -->

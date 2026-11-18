@@ -56,7 +56,7 @@ public interface AgentTool {
 
       @Override
       public Map<String, Object> jsonSchema() {
-        return schema;
+        return Map.copyOf(schema);
       }
 
       @Override

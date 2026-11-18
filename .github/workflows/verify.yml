@@ -23,5 +23,17 @@ jobs:
           java-version: "21"
           cache: maven
 
+      - name: 核对模块边界
+        run: python3 scripts/check-module-boundaries.py
+
       - name: 完整门禁
         run: ./mvnw -B verify
+
+      - name: 核对三库公开 API 兼容
+        run: python3 scripts/release-artifacts.py compat
+
+      - name: 验收完整服务 ZIP
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/release-artifacts.py version)"
+          python3 scripts/check-server-distribution.py "MainMosire/target/mosire-server-${version}.zip"

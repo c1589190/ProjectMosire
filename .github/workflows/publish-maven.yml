@@ -1,24 +1,16 @@
 name: publish-maven
 
-# 把三个库（agentlib / workspace / docs）发布到 GitHub Pages，当作**只读 Maven 仓库**：
-#   https://c1589190.github.io/ProjectMosire/
-# 消费方只需在 pom 里加一个 <repository>，**不需要任何凭据**。
-#
-# 用法：发布提交上的根 pom 已改成固定版本（如 0.2.1），再打 tag（v0.2.1）即发布该版本；
-# 也可在 Actions 页手动 dispatch 指定版本。tag/输入必须与根 pom 的 project.version 完全一致，
-# 且固定版本不能是 -SNAPSHOT：Pages 上的文件被覆盖就没有可复现性了。
-
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "发布版本号（不含前导 v，必须与根 pom project.version 一致），例如 0.2.1"
+        description: "与根 POM 一致的固定版本，例如 0.2.7"
         required: true
 
 permissions:
-  contents: write # 推 gh-pages 分支
+  contents: write
 
 concurrency:
   group: publish-maven
@@ -37,107 +29,106 @@ jobs:
           java-version: "21"
           cache: maven
 
-      - name: 校验发布版本与根 pom 一致
+      - name: 校验发布版本与根 POM 一致
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          V="${{ github.event.inputs.version }}"
-          if [ -z "${V}" ]; then V="${GITHUB_REF_NAME#v}"; fi
-          test -n "${V}" || { echo "::error::发布版本为空"; exit 1; }
-          case "${V}" in
-            *-SNAPSHOT)
-              echo "::error::拒绝发布 SNAPSHOT 版本：${V}"
-              exit 1
-              ;;
-          esac
-
-          POM_VERSION="$(python3 - <<'PY'
-          import xml.etree.ElementTree as ET
-          root = ET.parse("pom.xml").getroot()
-          ns = {"m": "http://maven.apache.org/POM/4.0.0"}
-          node = root.find("m:version", ns)
-          if node is None or not (node.text or "").strip():
-              raise SystemExit("根 pom 缺少 project/version")
-          print(node.text.strip())
-          PY
-          )"
-          if [ "${V}" != "${POM_VERSION}" ]; then
-            echo "::error::tag/输入版本 ${V} 与根 pom project.version ${POM_VERSION} 不一致；请先提交版本升号再打 tag"
-            exit 1
-          fi
-          echo "发布版本：${V}（与根 pom 一致）"
-          echo "PUBLISH_VERSION=${V}" >> "$GITHUB_ENV"
-
-      - name: 拒绝覆盖 gh-pages 上已存在的版本
-        run: |
-          set -euo pipefail
-          V="${PUBLISH_VERSION}"
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git fetch --depth=1 origin gh-pages
-            for a in mosire-parent agentlib-mosire workspace-mosire docs-mosire; do
-              path="io/mosire/${a}/${V}"
-              if git cat-file -e "FETCH_HEAD:${path}" 2>/dev/null; then
-                echo "::error::gh-pages 已存在 ${path}，拒绝覆盖已发布版本"
-                exit 1
-              fi
-            done
-            echo "gh-pages 内没有版本 ${V}，可继续发布"
+          version="$(python3 scripts/release-artifacts.py version --release)"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
           else
-            echo "gh-pages 尚不存在，按首次发布处理"
+            test "$INPUT_VERSION" = "$version"
           fi
+          printf 'PUBLISH_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: 读取 Pages 历史并拒绝覆盖已发布版本
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin refs/heads/gh-pages >/dev/null; then
+            git fetch --depth=1 --no-tags origin refs/heads/gh-pages
+            ref="$(git rev-parse FETCH_HEAD)"
+            python3 scripts/release-artifacts.py unused-version --history-ref "$ref"
+            printf 'PAGES_HISTORY_REF=%s\n' "$ref" >> "$GITHUB_ENV"
+          else
+            rc=$?
+            test "$rc" -eq 2
+            python3 scripts/release-artifacts.py unused-version
+          fi
+
+      - name: 核对模块边界
+        run: python3 scripts/check-module-boundaries.py
 
       - name: 发布前完整门禁
-        # 先跑全仓 verify（含测试与 SpotBugs）；失败则绝不进入 deploy。
         run: ./mvnw -B verify
 
-      - name: 构建 + 部署到本地暂存目录（标准 Maven 仓库布局）
-        # 只发父 pom + 三个库：Brain/Main/Bash 不发（Pages 仓库越小越好，消费方也用不到）。
-        # SpotBugs 已由上一阶段全仓 verify 覆盖，这里只跳过重复分析以缩短发布链路；
-        # 不跳过测试：deploy 生命周期必须真实执行 Surefire。
-        run: |
-          set -euo pipefail
-          ./mvnw -B -Dspotbugs.skip=true \
-            -pl .,AgentLibMosire,WorkspaceMosire,DocsMosire \
-            deploy -DaltDeploymentRepository=pages::default::file://$PWD/target/pages
+      - name: 验收完整服务 ZIP
+        run: python3 scripts/check-server-distribution.py "MainMosire/target/mosire-server-${PUBLISH_VERSION}.zip"
 
-      - name: 带上落地页并把版本注入页面（仓库根没有 index.html 会返回 GitHub 的 404 页）
-        # pages/index.html 是仓库内的源（改它要提交）；keep_files=true 让它在后续发布中保留，这里再显式带上更稳。
-        # ★ 版本参数化（2026-10-17）：页面里凡是"当前版本"的地方都写成占位符 __MOSIRE_VERSION__，
-        #   在这里用本次发布的版本替换后再拷进暂存目录。起因：此前页面硬编码 0.1.0，
-        #   每次发布都把这张 0.1.0 的门面原样再传一遍（0.2.0 发布后门面仍写 0.1.0）。
-        #   历史版本的叙述（如"相对 0.1.0 的变更点"）保持字面量，不参与替换。
+      - name: 构建并部署到本地 Maven 暂存目录
+        # 全仓 verify 已覆盖静态分析，deploy 再执行四库的测试。
         run: |
           set -euo pipefail
-          V="${PUBLISH_VERSION}"
-          test -n "${V}"
-          # 源页面必须仍有占位符：否则这条替换会变成静默空操作，门面又会漂回硬编码版本
-          grep -q '__MOSIRE_VERSION__' pages/index.html
-          sed "s|__MOSIRE_VERSION__|${V}|g" pages/index.html > target/pages/index.html
-          if grep -q '__MOSIRE_VERSION__' target/pages/index.html; then
-            echo "落地页里仍有未替换的版本占位符，发布中止"
-            exit 1
+          test ! -e target/pages
+          ./mvnw -B -Ppublication -Dspotbugs.skip=true -pl BrainMosire -am deploy \
+            "-DaltDeploymentRepository=pages::file://$PWD/target/pages"
+
+      - name: 核对暂存制品、生成落地页与版本索引
+        run: |
+          set -euo pipefail
+          history=()
+          if [[ -n "${PAGES_HISTORY_REF:-}" ]]; then
+            history=(--history-ref "$PAGES_HISTORY_REF")
           fi
-          # 页面上必须出现三库的 jar 链接（发布方自己先证明它是本版的门面）
-          grep -q "io/mosire/agentlib-mosire/${V}/" target/pages/index.html
-          echo "落地页版本：${V}"
-          grep -o "io/mosire/[a-z-]*/${V}/[a-z0-9.-]*\.jar" target/pages/index.html | sort -u
+          python3 scripts/release-artifacts.py prepare-pages target/pages "${history[@]}"
 
-      - name: 核对暂存目录是合法仓库（父 pom 必须在，否则消费方解析不到子模块）
+      - name: 核对三库公开 API 兼容
+        run: python3 scripts/release-artifacts.py compat --repository target/pages
+
+      - name: 从独立工程运行暂存 SDK
+        run: python3 scripts/release-artifacts.py sdk target/pages
+
+      - name: 计算服务 ZIP 的 SHA-256
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        working-directory: MainMosire/target
         run: |
           set -euo pipefail
-          V="${PUBLISH_VERSION}"
-          test -f "target/pages/io/mosire/mosire-parent/${V}/mosire-parent-${V}.pom"
-          for a in agentlib-mosire workspace-mosire docs-mosire; do
-            for f in "${a}-${V}.jar" "${a}-${V}.pom" "${a}-${V}-sources.jar"; do
-              test -f "target/pages/io/mosire/${a}/${V}/${f}" || { echo "缺文件: ${a}/${V}/${f}"; exit 1; }
-            done
-          done
-          echo "暂存目录内容："
-          find target/pages -type f | sort
+          zip="mosire-server-${PUBLISH_VERSION}.zip"
+          sha256sum "$zip" > "$zip.sha256"
 
-      - name: 发布到 gh-pages（keep_files：历史版本保留）
+      - name: 保存已验收的服务制品
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosire-server
+          if-no-files-found: error
+          path: |
+            MainMosire/target/mosire-server-${{ env.PUBLISH_VERSION }}.zip
+            MainMosire/target/mosire-server-${{ env.PUBLISH_VERSION }}.zip.sha256
+
+      - name: 发布到 gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./target/pages
           publish_branch: gh-pages
           keep_files: true
+
+  server-release:
+    needs: publish
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mosire-server
+
+      - name: 发布服务 ZIP 与校验和
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          zip="mosire-server-${GITHUB_REF_NAME#v}.zip"
+          sha256sum -c "$zip.sha256"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --generate-notes "$zip" "$zip.sha256"

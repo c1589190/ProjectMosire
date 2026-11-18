@@ -46,10 +46,9 @@
 
 - **工具链**：JDK 21（`--release 21`）+ 仓库内 Maven Wrapper `./mvnw`（锁定 3.9.16）。
   **勿用系统 `mvn`**：apt 的 maven 3.8.7 不满足 SpotBugs 4.10.4.1 的 Maven ≥3.8.9 要求。
-- **门禁三件套 + 测试**：`./mvnw verify`
-  = Spotless（google-java-format）→ Checkstyle（`config/checkstyle.xml`）→
-  SpotBugs（**实际配置 `effort=More` + `threshold=Low`**；计划曾写 Max，但 Max 与庞大 aux classpath
-  组合会爆炸到 >25 分钟不终，More 保留深度数据流分析，见根 pom 注释）→ Surefire（JUnit 6）。
+- **门禁三件套与测试**由 `scripts/gate.sh full` 执行 `./mvnw -B -ntp verify`。
+  常用模块在 validate 执行 Checkstyle，在 test 执行 Surefire，在 verify 检查 Spotless 和 SpotBugs。
+  SpotBugs 配置为 `effort=More` 和 `threshold=Low`，见根 POM。
 - **最近发布证据（0.2.2，2026-10-17）**：发布 commit `c46e777472bfc48c79d9dad0663c8a1c6c54574c`；
   发布前 `./mvnw verify` 记录 AgentLib **674** / Workspace **62** / Docs **81** / Brain **472** /
   Bash **104**（6 skipped）/ Main **225** ⇒ **1618 tests, 0 failures, 0 errors, 6 skipped**；
@@ -76,11 +75,8 @@
   ★ **同源陷阱：用 `cp`/`shutil.copy2` 还原会带回旧 mtime** ⇒ Maven 增量判"没变"不重编 ⇒
   你以为在测变异体，其实跑的还是上一轮的 class（P3c 实测：M19 红在了错的断言上）。还原后必须
   `touch`/`utime` 更新时间戳，并在每轮日志里确认出现 `Compiling`。
-- ★★ **版本升号后 `package` 不带 `clean` 会在 `MainMosire/target/plugins/` 留下两版插件 jar** ⇒ PF4J 以同一 `PluginId=bash`
-  拒绝加载第二个，**主进程启动即失败**（2026-10-17 真模型台架实测：`bash-plugin-mosire-0.1.0-SNAPSHOT.jar` 与
-  `0.2.0-SNAPSHOT.jar` 并存 ⇒ `There is an already loaded plugin … with the same id (bash)`，`App.wirePlugins` 抛
-  `PluginLoadException`）。⇒ 规则：**插件目录只许一个版本**；升版本号后先清 `MainMosire/target/plugins/`（或 `clean`），
-  真进程/真模型验证前先 `ls` 一眼这个目录。
+- **插件目录每个 Plugin-Id 使用一个版本。** 0.2.7 构建自动清理 `MainMosire/target/plugins/` 中项目生成的旧版 Bash JAR，随后复制本轮制品。
+  服务 ZIP 单独选择与主 JAR 同版的插件。显式配置的外部插件目录由部署方管理。历史故障和验收见 [0.2.7 发行设计](../architecture/0.2.7-runtime-delivery.md)。
 - **勿加 `-N`**：`-N` 只构建根聚合器，对模块源码是空操作，`spotless:check` 会假绿；
   实测：模块里放明显违规文件，`./mvnw -N spotless:check` 退出 0，`./mvnw spotless:check` 正确报违规。
 - **全仓 verify 才是完整门禁**；用 `-pl <模块>` 时必须带 `-am`（否则可能用 `~/.m2` 的旧 SNAPSHOT，
