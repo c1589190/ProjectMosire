@@ -137,12 +137,40 @@ def check_unused_version(version, history):
             raise ValueError(f"gh-pages 已存在 {artifact}:{version}，拒绝覆盖已发布制品")
 
 
-def prepare_pages(repository, version, history):
+def preserve_stable_pointers(versioning, artifact, previous_versions, history_ref):
+    historical = None
+    if previous_versions:
+        path = GROUP_PATH / artifact / "maven-metadata.xml"
+        raw = subprocess.check_output(["git", "show", f"{history_ref}:{path.as_posix()}"], cwd=ROOT)
+        metadata = ET.fromstring(raw)
+        historical = metadata.find("versioning")
+        if (metadata.findtext("groupId"), metadata.findtext("artifactId")) != ("io.mosire", artifact) or historical is None:
+            raise ValueError(f"历史元数据不匹配 {path}")
+    for name in ("release", "latest"):
+        generated = versioning.find(name)
+        if generated is not None:
+            versioning.remove(generated)
+        value = historical.findtext(name) if historical is not None else None
+        if value and not value.endswith("-early"):
+            if value not in previous_versions:
+                raise ValueError(f"历史元数据的 {name} 指向缺失版本 {artifact}:{value}")
+            pointer = ET.Element(name)
+            pointer.text = value
+            versioning.insert(0, pointer)
+
+
+def prepare_pages(repository, version, history_ref):
+    history = historical_versions(history_ref)
     check_unused_version(version, history)
     staged_libraries(repository, version)
+    early = version.endswith("-early")
     template = (ROOT / "pages/index.html").read_text(encoding="utf-8")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    tokens = {"__MOSIRE_VERSION__": version, "__MOSIRE_REVISION__": revision}
+    tokens = {
+        "__MOSIRE_VERSION__": version,
+        "__MOSIRE_REVISION__": revision,
+        "__MOSIRE_RELEASE_LABEL__": "预发行版本" if early else "当前发布版本",
+    }
     for token, replacement in tokens.items():
         if token not in template:
             raise ValueError(f"发布页缺少 {token}")
@@ -162,16 +190,19 @@ def prepare_pages(repository, version, history):
         if versions is None or version not in {node.text for node in versions.findall("version")}:
             raise ValueError(f"元数据缺少暂存版本 {metadata}")
         versions.clear()
-        # 以实际历史目录恢复可选版本，保留 Maven 本次生成的 release 与 lastUpdated。
+        # 以实际历史目录恢复可选版本。普通固定版沿用本次 Maven 生成的默认版本。
         for value in sorted(history[artifact] | {version}):
             ET.SubElement(versions, "version").text = value
+        if early:
+            preserve_stable_pointers(tree.find("versioning"), artifact, history[artifact], history_ref)
         ET.indent(tree, space="  ")
         tree.write(metadata, encoding="utf-8", xml_declaration=True)
         for algorithm in ("sha1", "md5"):
             metadata.with_name(f"{metadata.name}.{algorithm}").write_text(
                 digest(metadata, algorithm), encoding="ascii"
             )
-    (repository / "index.html").write_text(template, encoding="utf-8")
+    name = f"release-{version}.html" if early else "index.html"
+    (repository / name).write_text(template, encoding="utf-8")
     print(f"PAGES STAGING READY {version} ({len(PUBLIC_LIBRARIES)} libraries)")
 
 
@@ -322,7 +353,7 @@ def main():
         elif args.command == "release-tag":
             check_release_tag(release_version(version), create=args.create, require=args.require)
         elif args.command == "prepare-pages":
-            prepare_pages(args.repository.resolve(), release_version(version), historical_versions(args.history_ref))
+            prepare_pages(args.repository.resolve(), release_version(version), args.history_ref)
         elif args.command == "compat":
             check_api(version, args.repository.resolve() if args.repository else None)
         else:

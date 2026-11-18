@@ -163,6 +163,9 @@ jobs:
             const version = process.env.PUBLISH_VERSION;
             const tag = `v${version}`;
             const zip = `mosire-server-${version}.zip`;
+            const prerelease = version.endsWith('-early');
+            const earlyFields = prerelease ? { prerelease: true, make_latest: 'false' } : {};
+            const mavenPage = `https://c1589190.github.io/ProjectMosire/release-${version}.html`;
             const repo = context.repo;
             const releases = github.rest.repos;
             const matches = await github.paginate(
@@ -171,9 +174,12 @@ jobs:
             );
             if (matches.length > 1) throw new Error(`同一标签存在多个 Release ${tag}`);
             let release = matches[0];
+            if (prerelease && release && !release.draft && !release.prerelease) {
+              throw new Error(`已有 Release 的预发行标记不匹配 ${tag}`);
+            }
             if (!release) {
               ({ data: release } = await releases.createRelease({
-                ...repo, tag_name: tag, generate_release_notes: true, draft: true
+                ...repo, ...earlyFields, tag_name: tag, generate_release_notes: true, draft: true
               }));
             }
             const assets = await github.paginate(releases.listReleaseAssets, {
@@ -194,5 +200,10 @@ jobs:
               }
             }
             if (release.draft) {
-              await releases.updateRelease({ ...repo, release_id: release.id, draft: false });
+              const update = { ...repo, ...earlyFields, release_id: release.id, draft: false };
+              const body = release.body ?? '';
+              if (prerelease && !body.includes(mavenPage)) {
+                update.body = `[Maven 预发行制品](${mavenPage})\n\n${body}`.trimEnd();
+              }
+              await releases.updateRelease(update);
             }
