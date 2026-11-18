@@ -1,14 +1,16 @@
 # ProjectMosire 当前状态
 
-> **更新时间**：2026-11-09 21:40（Asia/Shanghai）
+> **更新时间**：2026-11-18（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
 > `开发计划.md` 的历史执行状态都不再充当实时台账。
 
 ## 1. 当前源码、版本与发布基线
 
+0.2.7 开发分支为 `dev/0.2.7`，开发版本为 `0.2.7-SNAPSHOT`。第一阶段修复发行目录与启动回滚。完整运行时由 Brain 提供，正式发行待用户确认。见 [0.2.7 设计与验收](../architecture/0.2.7-runtime-delivery.md)。
+
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
-| 当前本地版本 | **0.2.5** | 2026-11-09 用户要求作为 0.2.5 提交、推送并发布；根 `pom.xml:9` 与 6 个模块 POM 的 `<parent>` 均为 `0.2.5`；tag `v0.2.5`（发布工作流见 §4.7）。 |
+| 当前开发版本 | **0.2.7-SNAPSHOT** | 根 POM 与六个模块的父版本一致。0.2.5 发版历史见 §4.7。 |
 | 依赖基线（2026-11-09 复核） | MCP SDK **2.1.0**；Jackson **2.23.0**；json-schema-validator **2.0.8**；sqlite-jdbc **3.54.1.0**；PF4J **3.16.1**；Mockito **5.24.0** | 根 `pom.xml` properties；A2A 仍 `1.3.1.Final`；逐项理由与未跟版本见 §2.10。 |
 | 当前 Pages 发布版本 | **0.2.5** | 2026-11-09 发布；tag `v0.2.5`；工作流 run `42623814837` success；制品核验见 §4.7。 |
 | 上一发布版本 | **0.2.3** | 发布基线 tag `v0.2.3`（`4ebbf6a`）；0.2.4 只做本地 Maven 安装、未发布 Pages；历史见 §4.4–§4.6。 |
@@ -313,7 +315,7 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | HTTP | 父 pom、三库 `jar`/`pom`/`sources.jar`、三库 `maven-metadata.xml`、`index.html` 共 **10 个 URL 全部 200**。 |
 | 校验和 | 下载 `agentlib-mosire-0.2.5.jar`：本地 sha1 `e480e03705496ad8ab746c5d050c183be0887c16` = 远端 `.sha1`。 |
 | 版本资源 | 同一 jar 内 `io/mosire/agentlib/version.properties` 为 `version=0.2.5`。 |
-| 元数据 / 落地页 | 三库 `maven-metadata.xml` 的 `release=0.2.5`；`index.html` 当前版本显示 **0.2.5**。 |
+| 元数据 / 落地页 | 三库 `maven-metadata.xml` 的 `release=0.2.5`；发版时 `index.html` 显示 **0.2.5**。 |
 | 已知红 | tag 上的 `docs-skills` run `42623816370` 失败：`gate.sh selftest` 用 `cp sleep` 伪造 `java`，在 CI coreutils multicall 下按 argv0 拒绝执行（`unknown program 'java'`）。已在 main 修 `scripts/gate.sh`（改用 python3 伪装），**不影响 0.2.5 制品与 Pages**。 |
 | 修复后 main 复跑 | commit `c61d706`：`docs-skills` run **`42625250447` success**；`verify` run **`42625250549` success**。tag `v0.2.5` 上的 `docs-skills` 红为历史，不影响制品与 Pages。 |
 
