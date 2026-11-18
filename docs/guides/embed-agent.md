@@ -52,7 +52,7 @@ var agentWithTool = SimpleAgent.create(config, model, tools, permissions);
 
 ## 加入工作区或文档
 
-- 需要虚拟路径、挂载和路径授权时声明 `workspace-mosire`。宿主创建 `WorkspaceRegistry`，在配置的资源范围内为 Agent 身份挂载目录。用 `WorkspaceTools.all(registry)` 获取工具并注册到同一个 `ToolRegistry`。
+- 需要虚拟路径、挂载和路径授权时声明 `workspace-mosire`。宿主在 `CapabilityCatalog` 注册所需能力，在挂载中声明能力 ID。挂载者须具备 `workspaces` 和该能力对应的资源范围，用 `WorkspaceRegistry.grant` 将已挂载范围加入 Agent 权限。用 `WorkspaceTools.all(registry)` 获取管理工具，自定义文件工具通过 `WorkspaceRegistry.resolveForIo` 解析路径。
 - 需要文档和日志时声明 `docs-mosire`。宿主在能力目录中注册 `DocsCapability`，将能力赋予相应挂载。Java 代码通过 `DocsApi` 调用，Agent 工具通过 `DocsTools.all(registry)` 注册。
 - 构造时传入的身份 id 与工作区 `WorkspaceCaller.holder()` 对齐。工作区、文档读取和文档写入的资源需要分别授权。详见 [工作区契约](../upstream/workspace-path-contract.md)和[文档契约](../upstream/docs-storage-contract.md)。
 

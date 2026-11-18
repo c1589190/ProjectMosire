@@ -6,13 +6,15 @@
 
 ## 1. 当前源码、版本与发布基线
 
-0.2.7 开发分支为 `dev/0.2.7`，开发版本为 `0.2.7-SNAPSHOT`。第一阶段修复发行目录与启动回滚。完整运行时由 Brain 提供，正式发行待用户确认。见 [0.2.7 设计与验收](../architecture/0.2.7-runtime-delivery.md)。
+0.2.7 开发分支为 `dev/0.2.7`，开发版本为 `0.2.7-SNAPSHOT`。AgentLib 提供内存会话与 Java 工具入口，Brain 提供可嵌入的持久化运行时，Main 用同一装配入口组装独立服务。正式发行待用户确认。 [0.2.7 设计与验收](../architecture/0.2.7-runtime-delivery.md)
 
 - `48f474b` 建立开发基线。文档检查通过，覆盖 6 个模块、8 份文件和 21 个相对链接。
 - `fc9cd8c` 提交启动资源回滚与同版本服务包配置。六模块 `./mvnw -B -ntp -pl MainMosire -am compile` 退出 0。独立评审复现未启动的 JDK HTTP server 残留端口和 MCP 观察者异常后的状态分裂，修正在第二阶段实施。
 - `02fc0d0` 整理接入、维护与架构入口。扩大范围检查 42 份文档的 72 个相对链接，均可解析。
 - `be45261` 增加 AgentLib 的 `SimpleAgent` 和 Brain 嵌入装配，主服务及子进程共用 Brain Builder。六模块 compile 退出 0。独立 Java 探针验证权限与工具快照、持久会话和借用资源、A2A 端口回收、MCP 工具目录观察者异常。
-- 开发分支远端全量门禁分别发现 ZIP 组装时堆不足和工具工厂 schema 的 SpotBugs 报告。第三阶段纳入修正，完整门禁和制品仍待统一验收。
+- `baee55c` 配齐四库、BOM、模块审计和服务发行验收，修复早期 CI 发现的 ZIP 组装堆不足与工具 schema 持有方式。
+- `bc10cde` 补 8 项回归测试，并处理 Brain、Main 的 SpotBugs 报告及测试输入与 Surefire 命令通道争用。独占副本中 7 个故障变异均被相应测试检出。
+- `c2caa76` 统一标签和手动发布的制品，以及服务上架单独重跑的路径。标签校验在本地 bare 仓库演练，Release 上传与重跑使用模拟 API 验证。
 
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
@@ -20,7 +22,7 @@
 | 依赖基线（2026-11-09 复核） | MCP SDK **2.1.0**；Jackson **2.23.0**；json-schema-validator **2.0.8**；sqlite-jdbc **3.54.1.0**；PF4J **3.16.1**；Mockito **5.24.0** | 根 `pom.xml` properties；A2A 仍 `1.3.1.Final`；逐项理由与未跟版本见 §2.10。 |
 | 当前 Pages 发布版本 | **0.2.5** | 2026-11-09 发布；tag `v0.2.5`；工作流 run `42623814837` success；制品核验见 §4.7。 |
 | 上一发布版本 | **0.2.3** | 发布基线 tag `v0.2.3`（`4ebbf6a`）；0.2.4 只做本地 Maven 安装、未发布 Pages；历史见 §4.4–§4.6。 |
-| 最近 full gate 的源码 HEAD | **`6cf36d540140b151afaa4efa8c1f2804b98b75a6`** | 2026-10-24 默认上下文压缩功能提交；gate 时工作树 dirty（仅 0.2.4 版本号 bump 与 STATUS 待提交）；run `20261024T061503Z-91459-17843`（历史）。 |
+| 最近全量门禁 | **`c2caa764f94d5477ddfbf1588aed8c16364586fb`** | run `20261118T071914Z-43879-9966`。1717 项，0 失败、0 错误、6 跳过。见 §1.1。 |
 | 0.2.5 发布 gate | **run `20261109T131027Z-125791-19837`，`FULL VERIFY PASSED`，1709 tests** | 2026-11-09；source_sha `c7cfdb3` + 7 个 POM 版本号 dirty；6 模块 SpotBugs 0；证据见 §4.7。 |
 | 最近依赖复核 gate | **run `20261109T114822Z-23830-12948`，`FULL VERIFY PASSED`，1667 tests** | 2026-11-09；source_sha `6d2a1a8`，工作树 dirty（仅根 `pom.xml` 依赖版本）；证据见 §2.10。 |
 | 最近功能 full gate（A9） | **run `20261109T122504Z-64777-18242`，`FULL VERIFY PASSED`，1681 tests** | 2026-11-09；source_sha `6d2a1a8` + A9 未提交改动；证据见 §2.11。 |
@@ -30,7 +32,23 @@
 | 0.2.3 发布提交 | **`4287752`**（`fix(agentlib): DECIDING 分段表态可回填`）+ **`4ebbf6a`**（`release: 0.2.3`） | 两个提交；代码与版本号均被上述 full gate 覆盖，提交后仅追加 STATUS 文本。tag 指向 `4ebbf6a`。 |
 | 模块数 | **6** | 根 `pom.xml`：AgentLib、Workspace、Docs、Brain、Main、BashPlugin。 |
 | 公开 API 兼容基线 | **0.2.2 起** | 用户 2026-10-17 裁定；后续公开 API 只增不减，变更时走下游消费方验证。 |
-| 发布工作流 | **现有 `verify → deploy` 顺序与 `deploy` 继续跑测试的行为均不修改** | 用户 2026-10-17 裁定；本批未碰 `.github/workflows/**`。 |
+| 发布工作流 | **全仓 `verify` 后执行四库 `deploy`，`deploy` 继续跑测试** | `deploy` 先写本地暂存目录。验收制品后把 Maven 仓库发到 Pages，把服务 ZIP 和 SHA-256 发到对应 GitHub Release。 |
+
+### 1.1 0.2.7 开发版验收（2026-11-18）
+
+| 检查 | 结果 |
+|---|---|
+| 本地全量门禁 | `scripts/gate.sh full` 退出 0，`FULL VERIFY PASSED`。Maven 和 Surefire XML 汇总均为 1717 项，0 失败、0 错误、6 跳过。6 模块 SpotBugs 为 0。跟踪文件一致，原有 5 项未跟踪文件在场。证据 `.work/gate/20261118T071914Z-43879-9966/summary.txt` 和同目录 `manifest.txt`。 |
+| 回归测试 | `FOCUSED TEST PASSED (NOT a full gate)`，18 项均通过。证据 `.work/gate/20261118T070633Z-35731-27078/summary.txt` 和同目录 `manifest.txt`。7 个变异都使对应断言失败，副本随后复原。记录 `/tmp/mosire-027-negative.phkkt_wy/checks-xbel5yq6/summary.txt`。 |
+| 远端开发分支 | `c2caa76` 的完整门禁、模块依赖检查、三库 API 对照及 ZIP 启动通过。 [verify](https://github.com/c1589190/ProjectMosire/actions/runs/44257774216) · [docs-skills](https://github.com/c1589190/ProjectMosire/actions/runs/44257774249) |
+| 独立服务 | 快照 ZIP 和本地固定版 ZIP 各自解包启动，HTTP 健康、对话、SQLite 和同版本 Bash 装载通过。增量构建去掉旧版 Bash 制品，夹具中的其他插件保留。固定版又通过回环 OpenAI 兼容 HTTP 的两次 SSE 模型调用、`tool_catalog` 工具往返及 SQLite 事件核验。 |
+| 固定版全量门禁 | 在隔离目录复刻 `c2caa76`，仅把 7 个 POM 改为 `0.2.7`，逐文件核对。`scripts/gate.sh full` 退出 0，1717 项，0 失败、0 错误、6 跳过，6 模块 SpotBugs 为 0。证据 `/tmp/mosire-027-release-preview.I9w8IEi1/source/.work/gate/20261118T071914Z-43765-21404/summary.txt` 和同目录 `manifest.txt`。 |
+| Maven 发行暂存 | `./mvnw -B -ntp -Ppublication -Dspotbugs.skip=true -pl BrainMosire -am deploy` 使用隔离缓存和 `file:` 目标，退出 0。四库共 1379 项测试，0 失败、0 错误、0 跳过。四库 JAR、sources、Javadoc、父 POM 和校验和通过核验，父 POM 与原三库的历史版本索引已合并。暂存目录 `/tmp/mosire-027-release-preview.I9w8IEi1/pages`。 |
+| 外部 SDK | `scripts/release-artifacts.py sdk` 用新缓存从暂存仓库解析制品。AgentLib 单库工具往返、Brain 经 BOM 装配并重开会话均通过。另用隔离工程验证 Workspace 单库挂载和 Docs 文件读写。四种组合均核对实际 classpath 与暂存 JAR 字节。证据 `/tmp/mosire-027-release-preview.I9w8IEi1/sdk.log` 与 `optional-module-probes/checks.log`。 |
+| 公开 API 兼容 | `scripts/release-artifacts.py compat` 使用 japicmp 核对固定版制品。AgentLib、Workspace、Docs 对比已发行 0.2.2 公开二进制和源码签名，退出 0。 |
+| SimulatorMosire 消费方 | 独立 checkout `7561b23b` 用本次 0.2.7 库运行 `tools/gate.sh focused simos-app` 的 `test-compile surefire:test`，三套 Java 测试共 42 项，0 失败、0 错误、0 跳过。Maven 汇总与 XML 核对一致。该 checkout 的前端门禁失败项可用 Node 单独复现。证据 `/tmp/mosire-027-simos.iG8YRL99/consumer-java-0.2.7.log`。 |
+
+6 个 Bash 结构性测试因本机缺少 mount namespace 所需权限而跳过。兼容 HTTP 探针使用回环模型替身，云端供应商模型待专项验收。正式发布触发与远端制品留待用户确认后验证。
 
 ## 2. Phase 2：scripts 最小检查闭环与 full gate
 
@@ -59,7 +77,7 @@
 
 > 本次 STATUS 修正后，又在当前工作树运行 `python3 scripts/check-docs.py` 与 `python3 scripts/skills-lint.py`：均 PASS（非 Maven 检查）。
 
-### 2.3 最近一次 full gate
+### 2.3 2026-10-17 的全量门禁记录
 
 | 项目 | 事实 |
 |---|---|
@@ -208,7 +226,7 @@
 
 ## 3. 工作树状态
 
-0.2.3 发布提交后，开工前已有的 5 个未跟踪文件：
+0.2.7 开工前已有的 5 个未跟踪文件仍在工作树中：
 
 ```text
 ?? AgentLibMosire/.factorypath
@@ -218,7 +236,7 @@
 ?? configs/agents/bash-agent.json
 ```
 
-当前 0.2.5 发布版本由 0.2.4 之后的关注点提交组成：
+0.2.5 的发布基线由 0.2.4 之后的关注点提交组成：
 1. `7874df7`：依赖复核（MCP SDK 2.1.0 等）；
 2. `a2d6741`：A9 上下文注入与动态工具面；
 3. `c252c5f`：A2/A4/A5/A6 工具面扩展与 `tool_catalog`；
@@ -229,9 +247,8 @@
 
 tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。0.2.4 仍只做本地 Maven 安装、未发布 Pages（历史见 §4.6）。
 
-- 2026-11-09 上述 A1/A2/A3/A4/A5/A6/A9 与依赖复核均已提交/推送；当前工作树只应剩上述 5 个本机未跟踪文件。
-- `.work/gate/**` 为 run-bound 证据，默认不入库；
-- 本版未修改 `docs/archive/**`；未修改 HTTP 审批面或发布工作流；没有修改 Simos 仓库。
+- 2026-11-09 上述 A1/A2/A3/A4/A5/A6/A9 与依赖复核均已提交并推送。
+- `.work/gate/**` 保留本机验证证据。
 - 0.2.3 的 Pages 核验见 §4.5。
 
 ## 4. 发布历史与 Pages
@@ -247,7 +264,7 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | SpotBugs | 6 个模块均为 `BugInstance size is 0`；见同一日志。 |
 | 发布范围 | Pages 只发布父 pom + `agentlib-mosire` / `workspace-mosire` / `docs-mosire`；Brain/Main/Bash 不发 Pages。 |
 
-### 4.2 Pages（GitHub Pages 只读 Maven 仓库）
+### 4.2 Pages（2026-10-17 核对记录）
 
 | 项目 | 事实 |
 |---|---|
@@ -258,11 +275,11 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | 落地页（0.2.2 历史快照） | `index.html` 当时显示 **0.2.2**，链接指向上述三库与父 pom。 |
 | 核对方式 | `git ls-remote origin refs/heads/gh-pages` 后 `git fetch --depth=1 origin gh-pages`，再用 `git ls-tree` / `git show FETCH_HEAD:index.html` 核对；**未在浏览器里逐个下载 jar**。 |
 
-### 4.3 发布工作流的已知边界
+### 4.3 0.2.7 的发布流程
 
-- `.github/workflows/publish-maven.yml` 在 tag `v*` 或手动 dispatch 时运行；先 `./mvnw -B verify`，再 `deploy` 到 Pages 暂存目录。
-- 工作流拒绝 `-SNAPSHOT`、拒绝覆盖 gh-pages 上已存在的版本。
-- 用户已裁定**不修改“deploy 再跑测试”的行为**；STATUS 只记录事实，不提出工作流改动。
+- `.github/workflows/publish-maven.yml` 由版本标签或手动触发，先全仓 `verify`，再运行四库测试并 `deploy` 到本地暂存目录。
+- 工作流校验固定版本和对应源码，拒绝覆盖 Pages 已有版本。制品与外部接入验收完成后推送 Pages，再以上述版本的 ZIP 和 SHA-256 创建服务 Release。
+- 当前为本地演练完成状态。正式发行待用户确认，验证记录见 §1.1。
 
 ### 4.4 v0.2.3 发布（2026-10-23）
 
@@ -330,21 +347,21 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
 - 0.2.4 只安装到本机 `~/.m2`；未打 tag、未发布 Pages（历史）。
 - 0.2.5 已发布：tag `v0.2.5`、publish-maven success、Pages 制品/校验和/版本资源已核验（§4.7）。tag 上的 docs-skills 因 `gate.sh` 自检夹具在 CI 下不兼容而红；main 修复后 `docs-skills` run `42625250447` 与 `verify` run `42625250549` 均 success。
-- **未配置/未运行 japicmp**；0.2.3/0.2.4 的公开面变化未做机器级兼容比对，只由编译、测试与下游源码使用约束覆盖。
+- 0.2.3/0.2.4 发版时的公开面变化只由编译、测试和下游源码使用约束覆盖。0.2.7 开始使用 japicmp 核对 0.2.2 基线，见 §1.1。
 - 2026-11-09 依赖复核（§2.10）只验证了本仓编译 + full gate；未跑下游 `~/SimulatorMosire` 消费方，未做 japicmp；MCP 2.2.0-M2 / 3.0 未采用。
 - A9 只做了单元/门禁验证：**未接真实 LLM 会话验证注入投递与工具面中途变化**，未验证 GUI/DSH 侧消费；`context.injected` 事件的真实落库顺序只由单测覆盖。
 - A2/A4/A5/A6 的 `tool_catalog` 未通过真实 MCP 客户端调用（只有注册/列表与单测）；`resync()` 未在真实 HTTP MCP 会话上验证 `tools/list_changed` 的客户端侧收包。
-- A3 的 10 分钟默认值没有真实等待验证（单测用 50ms 配置）；未验证真实浏览器/网络工具被中断后的资源收尾；`tool.executionTimeoutMs` 尚未从配置文件接线。
+- A3 的 10 分钟默认值没有真实等待验证（单测用 50ms 配置），浏览器和网络工具被中断后的资源收尾待验收。0.2.7 的主 Agent 模型工具超时已接入配置文件。 [配置参考](../reference/configuration.md)
 - A1 未跑 Simos 消费方；Simos 若把 `config.bindAddress()` 配成 `0.0.0.0` 会从“WARN 放行”变成“启动失败”，需显式传 `McpHttpSecurity` 或 `allowInsecure`。未做 OAuth/mTLS/token 轮换；TLS/认证尚未从配置文件接线。
-- 未重新跑下游 `~/SimulatorMosire` 消费方测试；Simos 仍钉 `0.2.3-SNAPSHOT`，可在本机改用 `0.2.5` 后验证，且其 `CoreDecisionPackageReadPort` / `CoreDecisionSubmissionPort` 尚未实现。
+- 0.2.7 在隔离的 SimulatorMosire checkout 运行了 42 项 Java 接入测试，见 §1.1。下游的业务接线与版本采用由下游仓维护。
 - **宿主 Skill 的发现/显式触发/隐式触发均未验证**；`.agents/skills/` 不存在，active 工程 Skill 仍为 0。
 - 0.2.3 的 full gate 在 `790faa6` + dirty 工作树上通过；manifest 的 `source_sha` 不等于 release 提交 SHA，提交只搬运同一棵树（STATUS 文本除外）。CI 又在 tag `4ebbf6a` 上跑了一轮 `verify` 并通过（run `39972052202`）。
 - 迁移台账中的 pending 规则尚未裁定，见 `docs/archive/2026-10-17-agents-rule-migration.md`。
 
 ## 6. 下一步
 
-1. Simos 可先把 `agentlib-mosire.version` 从 `0.2.3-SNAPSHOT` 改为 `0.2.5`（Pages 发布完成后），实现 `CoreDecisionPackageReadPort`（`find` 读历史、`verdicts` 直接返回 `DecisionPackageSnapshot.verdicts()`、`pending/all` 按 tick 投影）与 `CoreDecisionSubmissionPort`，跑重启/持久化验收。
-2. 0.2.5 已按用户 2026-11-09 指令打 tag 并发布；发布工作流/Pages 证据见 §4.7。公开 API 兼容基线从 0.2.2 起，0.2.5 只增不减。tag 上的 docs-skills 红与制品无关，修复提交在 main 上。
+1. 0.2.7 待用户确认可用。确认后切固定版本，执行正式发布并回读 Pages 四库与服务 ZIP 的实际制品和校验和。
+2. 0.2.5 发布证据见 §4.7。公开 API 兼容基线从 0.2.2 起，本轮对照结果见 §1.1。
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
 5. 处理规则迁移台账中的 pending 条目；涉及 AGENTS/门禁/发布工作流的变化先走设计或用户裁定。
