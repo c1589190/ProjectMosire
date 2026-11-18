@@ -6,7 +6,7 @@
 
 ## 1. 当前源码、版本与发布基线
 
-0.2.7 开发分支为 `dev/0.2.7`，开发版本为 `0.2.7-SNAPSHOT`。AgentLib 提供内存会话与 Java 工具入口，Brain 提供可嵌入的持久化运行时，Main 用同一装配入口组装独立服务。正式发行待用户确认。 [0.2.7 设计与验收](../architecture/0.2.7-runtime-delivery.md)
+0.2.7 开发分支为 `dev/0.2.7`，开发版本为 `0.2.7-SNAPSHOT`。AgentLib 提供内存会话与 Java 工具入口，Brain 提供可嵌入的持久化运行时，Main 用同一装配入口组装独立服务。预发行 `0.2.7-early` 已上架，稳定版 `0.2.7` 待用户确认。 [0.2.7 设计与验收](../architecture/0.2.7-runtime-delivery.md)
 
 - `48f474b` 建立开发基线。文档检查通过，覆盖 6 个模块、8 份文件和 21 个相对链接。
 - `fc9cd8c` 提交启动资源回滚与同版本服务包配置。六模块 `./mvnw -B -ntp -pl MainMosire -am compile` 退出 0。独立评审复现未启动的 JDK HTTP server 残留端口和 MCP 观察者异常后的状态分裂，修正在第二阶段实施。
@@ -18,12 +18,12 @@
 
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
-| 当前开发版本 | **0.2.7-SNAPSHOT** | 根 POM 与六个模块的父版本一致。0.2.5 发版历史见 §4.7。 |
-| 预发行候选 | **0.2.7-early** | 用户指定按固定坐标发行。全仓门禁、公网 Maven 和服务 ZIP 验收完成后入账。 |
+| 当前开发版本 | **0.2.7-SNAPSHOT** | `dev/0.2.7` 的根 POM 与六个模块的父版本一致。 |
+| 当前预发行 | **0.2.7-early** | 标签 `v0.2.7-early` 指向 `0f494df`。公网制品与链接见 §4.8。 |
 | 依赖基线（2026-11-09 复核） | MCP SDK **2.1.0**；Jackson **2.23.0**；json-schema-validator **2.0.8**；sqlite-jdbc **3.54.1.0**；PF4J **3.16.1**；Mockito **5.24.0** | 根 `pom.xml` properties；A2A 仍 `1.3.1.Final`；逐项理由与未跟版本见 §2.10。 |
-| 当前 Pages 发布版本 | **0.2.5** | 2026-11-09 发布；tag `v0.2.5`；工作流 run `42623814837` success；制品核验见 §4.7。 |
+| 当前 Pages 稳定版本 | **0.2.5** | 2026-11-09 发布，标签 `v0.2.5`，发行工作流 `42623814837`。0.2.7-early 公网回读确认了该稳定默认值。 |
 | 上一发布版本 | **0.2.3** | 发布基线 tag `v0.2.3`（`4ebbf6a`）；0.2.4 只做本地 Maven 安装、未发布 Pages；历史见 §4.4–§4.6。 |
-| 最近全量门禁 | **`c2caa764f94d5477ddfbf1588aed8c16364586fb`** | run `20261118T071914Z-43879-9966`。1717 项，0 失败、0 错误、6 跳过。见 §1.1。 |
+| 最近全量门禁 | **`0f494df5c5dc800dffa37ddaabdbdbb31f1fe47e`** | run `20261118T142900Z-14923-26084`。1717 项，0 失败、0 错误、6 跳过。见 §4.8。 |
 | 0.2.5 发布 gate | **run `20261109T131027Z-125791-19837`，`FULL VERIFY PASSED`，1709 tests** | 2026-11-09；source_sha `c7cfdb3` + 7 个 POM 版本号 dirty；6 模块 SpotBugs 0；证据见 §4.7。 |
 | 最近依赖复核 gate | **run `20261109T114822Z-23830-12948`，`FULL VERIFY PASSED`，1667 tests** | 2026-11-09；source_sha `6d2a1a8`，工作树 dirty（仅根 `pom.xml` 依赖版本）；证据见 §2.10。 |
 | 最近功能 full gate（A9） | **run `20261109T122504Z-64777-18242`，`FULL VERIFY PASSED`，1681 tests** | 2026-11-09；source_sha `6d2a1a8` + A9 未提交改动；证据见 §2.11。 |
@@ -49,7 +49,7 @@
 | 公开 API 兼容 | `scripts/release-artifacts.py compat` 使用 japicmp 核对固定版制品。AgentLib、Workspace、Docs 对比已发行 0.2.2 公开二进制和源码签名，退出 0。 |
 | SimulatorMosire 消费方 | 独立 checkout `7561b23b` 用本次 0.2.7 库运行 `tools/gate.sh focused simos-app` 的 `test-compile surefire:test`，三套 Java 测试共 42 项，0 失败、0 错误、0 跳过。Maven 汇总与 XML 核对一致。该 checkout 的前端门禁失败项可用 Node 单独复现。证据 `/tmp/mosire-027-simos.iG8YRL99/consumer-java-0.2.7.log`。 |
 
-6 个 Bash 结构性测试因本机缺少 mount namespace 所需权限而跳过。上表的兼容 HTTP 探针使用回环模型替身，真实模型验收见 §1.2。正式发布触发与远端制品留待用户确认后验证。
+6 个 Bash 结构性测试因本机缺少 mount namespace 所需权限而跳过。上表的兼容 HTTP 探针使用回环模型替身，真实模型验收见 §1.2，预发行公网读回记录见 §4.8。
 
 ### 1.2 0.2.7 真模型验收（2026-11-18）
 
@@ -357,6 +357,22 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | 已知红 | tag 上的 `docs-skills` run `42623816370` 失败：`gate.sh selftest` 用 `cp sleep` 伪造 `java`，在 CI coreutils multicall 下按 argv0 拒绝执行（`unknown program 'java'`）。已在 main 修 `scripts/gate.sh`（改用 python3 伪装），**不影响 0.2.5 制品与 Pages**。 |
 | 修复后 main 复跑 | commit `c61d706`：`docs-skills` run **`42625250447` success**；`verify` run **`42625250549` success**。tag `v0.2.5` 上的 `docs-skills` 红为历史，不影响制品与 Pages。 |
 
+### 4.8 v0.2.7-early 预发行（2026-11-18）
+
+| 项目 | 实测结果 |
+|---|---|
+| 发布源码 | `main` 的固定版本提交 `0f494df5c5dc800dffa37ddaabdbdbb31f1fe47e`，与附注标签 `v0.2.7-early` 一并推送。 |
+| 本地门禁 | `scripts/gate.sh full` 退出 0，日志与 XML 一致为 1717 项、0 失败、0 错误、6 项 Bash 沙箱跳过。六模块 SpotBugs 为 0。证据 `.work/releases/0.2.7-early/local-full/summary.txt`、`manifest.txt`。 |
+| Maven 暂存 | 全仓门禁后向 `file:` 目标执行 `deploy`，四库 1379 项、0 失败、0 错误。japicmp 验证三库对照 0.2.2 的公开 API 兼容。 |
+| 远端工作流 | 标签运行 `44326044067` 的 `publish`、`server-release` 均成功，服务于 2026-11-18 22:42:47 +08:00 标为预发行。 [发布工作流](https://github.com/c1589190/ProjectMosire/actions/runs/44326044067) · [GitHub Release](https://github.com/c1589190/ProjectMosire/releases/tag/v0.2.7-early) |
+| Pages 公网读回 | 部署提交 `78ccac23953a28043d6aaa459f892ac459ccba73`。68 个下载文件与提交内容一致，预发行页和 0.2.5 稳定首页均可用。历史四个坐标的 `release` 仍为 0.2.5，Brain 首次上架无稳定默认值。 [Maven 预发行页](https://c1589190.github.io/ProjectMosire/release-0.2.7-early.html) |
+| Maven 消费方 | `public-readback-proxy.py sdk` 退出 0。空 Maven 缓存从公开 Pages 解析 0.2.7-early，核对实际类路径中的库与已下载制品字节一致。AgentLib 单库工具往返、Brain 加 BOM 重开会话均通过。本机直连下载出现连接重置，实测使用本机 HTTP 代理和 Central 优先解析第三方依赖。证据 `public-maven-sdk-proxy.log`。 |
+| 服务公网读回 | 下载的 ZIP 与 Release SHA-256 匹配，解包启动通过 HTTP 健康、对话、SQLite 和同版本 Bash 插件装载。摘要 `4c0c39c69615ddd1f835a96a75149636eef039e3f79e81adc2ce2803b2dfa566`。 |
+
+公网回执保留在 `.work/releases/0.2.7-early/`，包括 `publish-run.json`、`maven-http.json`、`service-http.json`。
+
+本机演练 ZIP 与 CI ZIP 中的 LICENSE、NOTICE 行尾不同，主 JAR 和插件 JAR 内其余文件内容一致。上架依据为本轮 GitHub CI 验收并上传的 ZIP。
+
 ## 5. 未验证 / 未做事项
 
 - 0.2.3 的 CI 与 Pages 证据已回填 §4.5（发布工作流、gh-pages、下载校验、独立消费方解析均为实测）。
@@ -375,7 +391,7 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 
 ## 6. 下一步
 
-1. 0.2.7 待用户确认可用。确认后切固定版本，执行正式发布并回读 Pages 四库与服务 ZIP 的实际制品和校验和。
+1. `0.2.7-early` 的发布记录见 §4.8。稳定版 `0.2.7` 待用户确认后按固定版本流程发行。
 2. 0.2.5 发布证据见 §4.7。公开 API 兼容基线从 0.2.2 起，本轮对照结果见 §1.1。
 3. `mosire-verify` 已完成 pilot 并判定不激活；不再创建 active Skill。后续只有出现真实 RED 时，才重新提议候选。
 4. 评估 handoff 时先看 `STATUS.md` + 模板 + `check-docs.py` 是否足够；不够再考虑候选，不按数量配额创建。
