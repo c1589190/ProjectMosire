@@ -14,6 +14,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Consumer;
@@ -83,17 +84,40 @@ public final class A2aHttpServer implements AutoCloseable {
     Objects.requireNonNull(address, "address");
     Objects.requireNonNull(cardFactory, "cardFactory");
     Objects.requireNonNull(handler, "handler");
+    HttpServer server;
     try {
-      HttpServer server = HttpServer.create(address, 0);
+      server = HttpServer.create(address, 0);
+    } catch (IOException e) {
+      throw new IllegalStateException("启动 A2A HTTP server 失败: " + address, e);
+    }
+    ExecutorService executor = null;
+    try {
       AgentCard card = cardFactory.apply(server.getAddress().getPort());
       A2aHttpServer self = new A2aHttpServer(server, card);
       server.createContext("/", exchange -> self.dispatch(exchange, handler));
-      server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+      executor = Executors.newVirtualThreadPerTaskExecutor();
+      server.setExecutor(executor);
       server.start();
       LOG.info("A2A 网关已启动: {} 端口 {}", address.getHostString(), self.port());
       return self;
-    } catch (IOException e) {
-      throw new IllegalStateException("启动 A2A HTTP server 失败: " + address, e);
+    } catch (RuntimeException | Error failure) {
+      try {
+        server.stop(0);
+      } catch (RuntimeException | Error closeFailure) {
+        if (closeFailure != failure) {
+          failure.addSuppressed(closeFailure);
+        }
+      }
+      if (executor != null) {
+        try {
+          executor.shutdownNow();
+        } catch (RuntimeException | Error closeFailure) {
+          if (closeFailure != failure) {
+            failure.addSuppressed(closeFailure);
+          }
+        }
+      }
+      throw failure;
     }
   }
 

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.2.0 https://maven.apache.org/xsd/assembly-2.2.0.xsd">
+  <id>server</id>
+  <formats>
+    <format>zip</format>
+  </formats>
+  <includeBaseDirectory>true</includeBaseDirectory>
+  <baseDirectory>mosire-server-${project.version}</baseDirectory>
+  <files>
+    <file>
+      <source>${project.build.directory}/mosire.jar</source>
+      <outputDirectory>/</outputDirectory>
+    </file>
+    <file>
+      <source>${project.build.directory}/plugins/bash-plugin-mosire-${project.version}.jar</source>
+      <outputDirectory>plugins</outputDirectory>
+    </file>
+    <file>
+      <source>${project.basedir}/../configs/agents/general-assistant.json</source>
+      <outputDirectory>configs/agents</outputDirectory>
+    </file>
+    <file>
+      <source>${project.basedir}/../docs/guides/run-server.md</source>
+      <outputDirectory>/</outputDirectory>
+      <destName>README.md</destName>
+    </file>
+    <file>
+      <source>${project.basedir}/../LICENSE</source>
+      <outputDirectory>/</outputDirectory>
+    </file>
+    <file>
+      <source>${project.basedir}/../NOTICE</source>
+      <outputDirectory>/</outputDirectory>
+    </file>
+  </files>
+</assembly>

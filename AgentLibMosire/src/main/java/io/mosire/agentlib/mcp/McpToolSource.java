@@ -148,12 +148,28 @@ public final class McpToolSource implements ToolSource, AutoCloseable {
             .initializationTimeout(startupTimeout)
             .toolsChangeConsumer(this::onServerToolsChanged)
             .build();
-    newClient.initialize();
-    this.client = newClient;
-    // 初始基线：tools/list_changed 之外的首次快照（若有订阅者立即回放）
-    cacheAndNotify(newClient.listTools().tools());
-    // 重连成功（connect 是唯一建立连接的入口）：复位断连标记
-    onConnected.run();
+    List<AgentTool> previousTools = cached;
+    try {
+      newClient.initialize();
+      this.client = newClient;
+      // 初始基线：tools/list_changed 之外的首次快照（若有订阅者立即回放）
+      cacheAndNotify(newClient.listTools().tools());
+      // 重连成功（connect 是唯一建立连接的入口）：复位断连标记
+      onConnected.run();
+    } catch (RuntimeException | Error failure) {
+      // 握手可能已经创建传输，此时仍由连接方负责关闭新客户端。
+      this.client = null;
+      try {
+        newClient.close();
+      } catch (RuntimeException | Error closeFailure) {
+        if (closeFailure != failure) {
+          failure.addSuppressed(closeFailure);
+        }
+      } finally {
+        this.cached = previousTools;
+      }
+      throw failure;
+    }
   }
 
   /** {@inheritDoc}：ToolSource 唯一标识 = 源名（与 {@link #name()} 同值）。 */

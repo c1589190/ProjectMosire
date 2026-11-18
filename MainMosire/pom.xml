@@ -124,6 +124,11 @@
             </goals>
             <configuration>
               <finalName>mosire</finalName>
+              <artifactSet>
+                <excludes>
+                  <exclude>io.mosire:bash-plugin-mosire</exclude>
+                </excludes>
+              </artifactSet>
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
@@ -144,9 +149,32 @@
           </execution>
         </executions>
       </plugin>
-      <!-- 默认打包的另一半（工作束四 D7）：把 bash 插件 JAR 拷到 target/plugins/ ⇒ 从仓库根
-           java -jar MainMosire/target/mosire.jar 时 <jar 目录>/plugins 正好命中 D4.3 的缺省解析。
-           prepare-package + 声明在 shade 之后：插件 JAR 由 reactor 先行产出（provided 依赖保证构建顺序）。 -->
+      <!-- 宿主默认从 target/plugins 加载插件。同一 Plugin-Id 只允许一个版本。 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.2.0</version>
+        <executions>
+          <execution>
+            <id>prune-old-bash-plugins</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <target>
+                <delete>
+                  <fileset dir="${project.build.directory}/plugins"
+                           includes="bash-plugin-mosire-*.jar"
+                           excludes="bash-plugin-mosire-${project.version}.jar"
+                           erroronmissingdir="false"
+                           followsymlinks="false"/>
+                </delete>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
@@ -159,8 +187,36 @@
               <goal>copy-dependencies</goal>
             </goals>
             <configuration>
+              <includeGroupIds>io.mosire</includeGroupIds>
               <includeArtifactIds>bash-plugin-mosire</includeArtifactIds>
+              <excludeTransitive>true</excludeTransitive>
+              <overWriteReleases>true</overWriteReleases>
+              <overWriteSnapshots>true</overWriteSnapshots>
               <outputDirectory>${project.build.directory}/plugins</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- package 阶段按声明顺序先 shade，再组装本次服务制品。 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-assembly-plugin</artifactId>
+        <version>3.7.1</version>
+        <executions>
+          <execution>
+            <id>server-distribution</id>
+            <phase>package</phase>
+            <goals>
+              <goal>single</goal>
+            </goals>
+            <configuration>
+              <descriptors>
+                <descriptor>src/assembly/server.xml</descriptor>
+              </descriptors>
+              <finalName>mosire-server-${project.version}</finalName>
+              <appendAssemblyId>false</appendAssemblyId>
+              <attach>false</attach>
+              <outputTimestamp>${project.build.outputTimestamp}</outputTimestamp>
             </configuration>
           </execution>
         </executions>

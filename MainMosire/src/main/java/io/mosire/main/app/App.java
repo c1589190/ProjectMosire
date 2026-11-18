@@ -424,91 +424,68 @@ public final class App implements AutoCloseable {
     } catch (IOException e) {
       throw new IllegalStateException("无法创建数据目录: " + config.dataDir(), e);
     }
-    EventStore events = SqliteEventStore.open(config.dataDir().resolve("events.db"));
-    // P3-3 落盘：主 Agent 的会话历史落到 events.db 同一文件（SqliteConversationStore 的既定约定——计划 §六 一份 DDL）。
-    // demo 分叉恒不落库（--demo 行为零变化）：store 为 null 即走 AgentRuntime 的既有 6 参构造（不落库路径逐字节不变）
-    SqliteConversationStore conversations =
-        config.demo() ? null : SqliteConversationStore.open(config.dataDir().resolve("events.db"));
-    EventBus bus = new EventBus();
-    // S4-C：审批事件的<b>落账</b>面。B1 的 ApprovalCoordinator 只把 approval.requested/decided 投到 bus
-    // （B2 收口"用已有的那个总线"），而这条总线目前唯一的订阅者是 AG-UI 的<b>唤醒信号</b>
-    // （AgUiHttpServer:212 只 signal；AG-UI 的数据面是从 events 回读的）⇒ 审批事件在进程里<b>没有任何可回读的面</b>
-    // （实测数据目录 events.db：distinct type 只有
-    // agent.lifecycle/llm.call/conversation.turn/tool.call/tool.result，
-    // 无 approval.*）。V3 判据要求 "approval.decided{scope=once} 落账" ⇒ 在这里把审批事件镜像进事件库。
-    // 只认<b>前缀白名单</b>（管线自己的 emit 已落库，不会双写）；落库失败只告警，不改判定（同 B1 的审计口径）。
-    // ★ RB3（设计 §5.13(c)）：白名单必须含 decision.package.*——决策包的四个事件由桥投到 bus，
-    //   而这里过去只收 approval.* ⇒ 事件会<b>静默消失</b>（不报错、没有用例会红），这是 RB3 的真缺陷之一。
-    // ★ role.audit：装配期角色审计的留痕（同 §5.13(c)：它在装配失败抛异常<b>之前</b>经本订阅者同步落库）。
-    bus.subscribe(event -> mirrorInfrastructureEvent(events, event));
-    ToolRegistry tools = new ToolRegistry();
-    // A5/A6：工具与来源元数据的唯一查看入口。元数据不塞进每个 MCP tool 描述；模型/管理面按需调用。
-    tools.register(BUILTIN_TOOL_SOURCE_ID, new ToolCatalogTool(tools));
-    tools.registerSourceInfo(
-        new ToolSourceInfo(BUILTIN_TOOL_SOURCE_ID, "内置工具", Version.VERSION, "内置工具目录", Map.of()));
-    // ★ P3d：子 Agent 注册表的"后绑定"取数缝——簿子在 wireSubagents 之前就要建（工具桥那份 authorizer 要它），
-    //   而注册表本身在那之后才存在。查不到 ⇒ 不记账（退回逐条问人），不猜。
-    AtomicReference<SubagentManager> subagentManagerLookup = new AtomicReference<>();
-    // ★ P3d（设计 §5sexies③）：父侧的「该子体本轮队列」簿子——按子体实例 id 记这一轮被 defer 的 Ask 调用，
-    //   收尾结算完即清；另记"被批条目的一次性放行"（重复使用即拒）。它<b>不是</b>第二条决策路径：
-    //   不进 pending()、不落父侧历史、不发 decision.package.* 事件（正式记录只在子体自己的库与包表里）。
-    //   ★ 两个注入件都是"父侧本来就有的真相"：工具目录（判子体有没有提交口）+ 子体权限集（判它的判定面放不放行）。
-    //     ★ 这一问是**必需**的：模板 allowedTools 里没有 submit_decision_package 的子体提交不了，父侧若照记不误，
-    //       那条调用就会既没执行、也没人去裁（子体拿 DECISION_QUEUED 回去、本地队列却是空的）——最贵的假绿。
-    ParentSubagentDecisionLedger subagentDecisionLedger =
-        new ParentSubagentDecisionLedger(
-            tools,
-            instanceId -> {
-              SubagentManager manager = subagentManagerLookup.get();
-              return manager == null
-                  ? Optional.empty()
-                  : manager.get(instanceId).map(SubagentInstance::permissions);
-            });
-    // 回收订阅：agent.lifecycle 的终局动作（finished/failed/killed）⇒ 那台子体的簿子与未用放行一起清
-    // （设计 §5sexies③②）。解析不出动作的（非终局 / 形状变了）不动簿子——"拿不准就不清"与"清早了"相比，
-    // 前者最多多留一会儿内存（还有 TTL 与 LRU 兜底），后者会把一条正在等的待裁决调用清掉。
-    bus.subscribe(
-        event -> {
-          if (EventTypes.AGENT_LIFECYCLE.equals(event.type()) && isTerminalLifecycle(event)) {
-            subagentDecisionLedger.recycle(event.agent());
-          }
-        });
-    McpLinks links;
+    List<Runnable> startupCleanup = new ArrayList<>();
     try {
-      // 主 try 之前会抛非致命异常的两处调用（工具注册同名/空元素、链接装配）都在本兜底内：抛错时控制流直接逃出
-      // start()，主 catch 够不着——就地回收前面已打开的两条连接（回收口径同主 catch，且用 quiet 关闭保证原异常原样上抛
-      // ——失败原因不被"关闭也失败"顶掉）。
-      tools.registerAll(extraTools == null ? List.of() : extraTools);
-      // W2 步骤 1：MCP 链接装配（在暴露快照与主 Agent 使用之前连入 registry——计划 §5.1 "MCP links → 创建主 AgentRuntime"）
-      links = wireMcpLinks(config.mcpLinks(), tools);
-    } catch (RuntimeException e) {
-      closeQuietly(
-          "会话存储",
-          () -> {
-            if (conversations != null) {
-              conversations.close();
+      EventStore events = SqliteEventStore.open(config.dataDir().resolve("events.db"));
+      startupCleanup.add(events::close);
+      // P3-3 落盘：主 Agent 的会话历史落到 events.db 同一文件（SqliteConversationStore 的既定约定——计划 §六 一份 DDL）。
+      // demo 分叉恒不落库（--demo 行为零变化）：store 为 null 即走 AgentRuntime 的既有 6 参构造（不落库路径逐字节不变）
+      SqliteConversationStore conversations =
+          config.demo()
+              ? null
+              : SqliteConversationStore.open(config.dataDir().resolve("events.db"));
+      if (conversations != null) {
+        startupCleanup.add(conversations::close);
+      }
+      EventBus bus = new EventBus();
+      startupCleanup.add(bus::close);
+      // S4-C：审批事件的<b>落账</b>面。B1 的 ApprovalCoordinator 只把 approval.requested/decided 投到 bus
+      // （B2 收口"用已有的那个总线"），而这条总线目前唯一的订阅者是 AG-UI 的<b>唤醒信号</b>
+      // （AgUiHttpServer:212 只 signal；AG-UI 的数据面是从 events 回读的）⇒ 审批事件在进程里<b>没有任何可回读的面</b>
+      // （实测数据目录 events.db：distinct type 只有
+      // agent.lifecycle/llm.call/conversation.turn/tool.call/tool.result，
+      // 无 approval.*）。V3 判据要求 "approval.decided{scope=once} 落账" ⇒ 在这里把审批事件镜像进事件库。
+      // 只认<b>前缀白名单</b>（管线自己的 emit 已落库，不会双写）；落库失败只告警，不改判定（同 B1 的审计口径）。
+      // ★ RB3（设计 §5.13(c)）：白名单必须含 decision.package.*——决策包的四个事件由桥投到 bus，
+      //   而这里过去只收 approval.* ⇒ 事件会<b>静默消失</b>（不报错、没有用例会红），这是 RB3 的真缺陷之一。
+      // ★ role.audit：装配期角色审计的留痕（同 §5.13(c)：它在装配失败抛异常<b>之前</b>经本订阅者同步落库）。
+      bus.subscribe(event -> mirrorInfrastructureEvent(events, event));
+      ToolRegistry tools = new ToolRegistry();
+      // A5/A6：工具与来源元数据的唯一查看入口。元数据不塞进每个 MCP tool 描述；模型/管理面按需调用。
+      tools.register(BUILTIN_TOOL_SOURCE_ID, new ToolCatalogTool(tools));
+      tools.registerSourceInfo(
+          new ToolSourceInfo(BUILTIN_TOOL_SOURCE_ID, "内置工具", Version.VERSION, "内置工具目录", Map.of()));
+      // ★ P3d：子 Agent 注册表的"后绑定"取数缝——簿子在 wireSubagents 之前就要建（工具桥那份 authorizer 要它），
+      //   而注册表本身在那之后才存在。查不到 ⇒ 不记账（退回逐条问人），不猜。
+      AtomicReference<SubagentManager> subagentManagerLookup = new AtomicReference<>();
+      // ★ P3d（设计 §5sexies③）：父侧的「该子体本轮队列」簿子——按子体实例 id 记这一轮被 defer 的 Ask 调用，
+      //   收尾结算完即清；另记"被批条目的一次性放行"（重复使用即拒）。它<b>不是</b>第二条决策路径：
+      //   不进 pending()、不落父侧历史、不发 decision.package.* 事件（正式记录只在子体自己的库与包表里）。
+      //   ★ 两个注入件都是"父侧本来就有的真相"：工具目录（判子体有没有提交口）+ 子体权限集（判它的判定面放不放行）。
+      //     ★ 这一问是**必需**的：模板 allowedTools 里没有 submit_decision_package 的子体提交不了，父侧若照记不误，
+      //       那条调用就会既没执行、也没人去裁（子体拿 DECISION_QUEUED 回去、本地队列却是空的）——最贵的假绿。
+      ParentSubagentDecisionLedger subagentDecisionLedger =
+          new ParentSubagentDecisionLedger(
+              tools,
+              instanceId -> {
+                SubagentManager manager = subagentManagerLookup.get();
+                return manager == null
+                    ? Optional.empty()
+                    : manager.get(instanceId).map(SubagentInstance::permissions);
+              });
+      // 回收订阅：agent.lifecycle 的终局动作（finished/failed/killed）⇒ 那台子体的簿子与未用放行一起清
+      // （设计 §5sexies③②）。解析不出动作的（非终局 / 形状变了）不动簿子——"拿不准就不清"与"清早了"相比，
+      // 前者最多多留一会儿内存（还有 TTL 与 LRU 兜底），后者会把一条正在等的待裁决调用清掉。
+      bus.subscribe(
+          event -> {
+            if (EventTypes.AGENT_LIFECYCLE.equals(event.type()) && isTerminalLifecycle(event)) {
+              subagentDecisionLedger.recycle(event.agent());
             }
           });
-      closeQuietly("事件存储", events::close);
-      throw e;
-    }
-    AgentToMcpServer mcpServer = null;
-    A2aHttpServer a2aServer = null;
-    A2aTaskService a2aTaskService = null;
-    AgUiHttpServer aguiServer = null;
-    AgUiSessionRegistry aguiRegistry = null;
-    DebugChatService debugChatService = null;
-    DebugChatHttpServer debugChatServer = null;
-    // S4-B2：审批面资源声明在 try 之外（同其余网关口径）——装配中途失败时 catch 里要回收已起的那部分
-    ApprovalHttpEndpoint approvalServer = null;
-    TtyApprovalChannel approvalTtyChannel = null;
-    PendingApprovalChannel approvalHttpChannel = null;
-    ExecutorService chatExecutor = null;
-    SubagentManager subagentManager = null;
-    SubprocessManager subagentProcesses = null;
-    PluginToolSource pluginTools = null;
-    SetupHttpServer setupServer = null;
-    try {
+
+      tools.registerAll(extraTools == null ? List.of() : extraTools);
+      McpLinks links = wireMcpLinks(config.mcpLinks(), tools, startupCleanup);
+
       AgentConfig agentConfig =
           AgentConfig.builder("main")
               .systemPrompt(DEFAULT_SYSTEM_PROMPT)
@@ -525,7 +502,10 @@ public final class App implements AutoCloseable {
       // 子体拿不到它——出厂模板 allowedTools 不含 bash（S5 的裁决面）。工具未标 noExport ⇒ 会进 MCP 外发面
       // （有意的：子体的白名单挡着，启动日志会报出实际外发面）。bash 的 tools.bash.* 配置由插件在 init 里
       // 装载期校验（坏值 ⇒ 装载失败 ⇒ 启动响亮失败），宿主不再读它（D5：宿主不认识 bash 的配置 schema）。
-      pluginTools = wirePlugins(configStore, tools, events);
+      PluginToolSource pluginTools = wirePlugins(configStore, tools, events);
+      if (pluginTools != null) {
+        startupCleanup.add(pluginTools::close);
+      }
       ApprovalConfig approvalConfig = ApprovalConfigLoader.load(configStore);
       // ★ 裁定 15 ④（2026-10-17 用户指令「这玩意他妈不是可配置项吗？」）：决策链路的两个等待窗做成配置项——
       //   decision.package.deadlineMs（等人答复，同时是包 deadline；缺省 30 分钟）/ decision.commit.waitMs
@@ -541,14 +521,18 @@ public final class App implements AutoCloseable {
           DecisionPackages.DEFAULT_DEADLINE_MILLIS,
           CrossProcessDecisionGateway.DEFAULT_COMMIT_WAIT_MILLIS);
       PendingApprovals pendingApprovals = new PendingApprovals();
-      approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
-      approvalHttpChannel = new PendingApprovalChannel(pendingApprovals);
+      TtyApprovalChannel approvalTtyChannel = new TtyApprovalChannel(pendingApprovals);
+      startupCleanup.add(approvalTtyChannel::close);
+      PendingApprovalChannel approvalHttpChannel = new PendingApprovalChannel(pendingApprovals);
+      startupCleanup.add(approvalHttpChannel::close);
       // S6：LLM 的装配点<b>上移</b>到审批装配之前——上级判定闸（SuperiorJudgeGate）要用同一个客户端跑一次性判定。
       // 供应商客户端由 Main.selectLlm 经 llmOverride 注入（生产 = 真模型；App.start 直调无覆盖 = 离线骨架）。
       LlmClient llm = scriptedLlm(config, llmOverride);
       // 配置引导面（设计 D4）：仅 --setup 且注入的是未配置态路由器时装配（防 --setup --fake 组合谎报可引导）
+      SetupHttpServer setupServer = null;
       if (config.setup() && llmOverride instanceof SetupLlmRouter router) {
         setupServer = SetupHttpServer.start(config.setupPort(), config.dataDir(), router);
+        startupCleanup.add(setupServer::close);
         LOG.info(
             "配置引导面已装配：http://127.0.0.1:{}（GET /api/setup/status，POST /api/setup/llm）",
             setupServer.port());
@@ -758,10 +742,12 @@ public final class App implements AutoCloseable {
               approvalCoordinator,
               ToolCallAuthorizer::defaultDigest,
               subagentDecisionLedger);
+      ApprovalHttpEndpoint approvalServer = null;
       if (approvalConfig.http()) {
         approvalServer =
             ApprovalHttpEndpoint.start(
                 approvalConfig.httpPort(), pendingApprovals, approvalCoordinator);
+        startupCleanup.add(approvalServer::close);
         // S6 档位端点挂在<b>同一台</b> server、同一端口上（AgentLib 通用件只做审批；档位逻辑留 Main 薄包装，
         // 不另起第二台 server——设计 §五 A3 裁决）。
         CommandModeHttpHandler.register(approvalServer, commandMode);
@@ -933,6 +919,8 @@ public final class App implements AutoCloseable {
       // ★ RA4（设计 §4.6）：模板库在这里<b>只装载一次</b>——既供 SubagentManager 用，也供紧随其后的装订期角色审计取
       //   declaredRoles。上移只让审计看得见同一份快照；装载时机与失败语义（坏模板 / 缺目录 ⇒ 启动响亮失败）逐字不变。
       AgentTemplateStore templateStore = null;
+      SubagentManager subagentManager = null;
+      SubprocessManager subagentProcesses = null;
       if (config.templatesDir() != null) {
         templateStore = new AgentTemplateStore(config.templatesDir());
         templateStore.load();
@@ -958,9 +946,11 @@ public final class App implements AutoCloseable {
                 // M2 要判"user 是不是调用者的后代"，而这份血缘真值住在 Brain（实例记录）；
                 // 装配层把它接进注册表的取数缝（注册表不得依赖 Brain，设计 §3）
                 lineageIndex::put);
-        subagentManager = rig.manager();
-        subagentManagerLookup.set(subagentManager);
         subagentProcesses = rig.processes();
+        startupCleanup.add(subagentProcesses::close);
+        subagentManager = rig.manager();
+        startupCleanup.add(subagentManager::close);
+        subagentManagerLookup.set(subagentManager);
       }
       // ★ RA4（设计 §4.6「装订期：派生 + 审计」，不变量 A-4 / A-5）：注册表在这一点已是"对外服务前的完整面貌"
       //   （插件 / 技能 / docs / 工作区 / 决策包提议工具 / 编排工具都已注册），把角色维扫一遍：
@@ -1021,7 +1011,7 @@ public final class App implements AutoCloseable {
               // 第 8 维（角色，设计 §4.5）：外部 MCP 面**显式表态为 ⊥**（一个角色都不是）⇒ 角色门工具对该面全拒。
               // ★ 注意这不是该面"看不到工具"的死因：真实死因是**令牌级别**（角色维只是恰好也不相交）。
               .withRoles(RoleSet.none());
-      mcpServer =
+      AgentToMcpServer mcpServer =
           config.mcpExpose()
               ? AgentToMcpServer.start(
                   tools,
@@ -1044,6 +1034,9 @@ public final class App implements AutoCloseable {
                           .orElse(false),
                   approvalAuthorizer)
               : null;
+      if (mcpServer != null) {
+        startupCleanup.add(mcpServer::close);
+      }
       // D30：工具自身配置（toolConfig）在本方法<b>前面</b>已建好（P2b 把它挪到决策块之前：提交口与管线必须拿同一份）
       // P3-3：落库分叉只此一处——conversations == null（demo）走不落库的既有构造，非 demo 走 (store, conversationId)
       // S4-B2：审批编排器只接在<b>生产分叉</b>（落库那条，= run 的终态装配路径）；demo 分叉保持无审批面
@@ -1081,6 +1074,7 @@ public final class App implements AutoCloseable {
                   decisionApprovalBridge,
                   // 默认上下文压缩只接在主 Agent 的落库终态路径；demo 分叉（上方 conversations == null）保持不压缩。
                   contextCompactor);
+      startupCleanup.add(runtime::close);
       // W5：AdminREST 数据面——agents=编排器快照、tools=registry 名单、events=Store 只读查询（经 App::queryEvents
       // 相同的入参形态）
       SubagentManager subagentSource = subagentManager;
@@ -1093,34 +1087,45 @@ public final class App implements AutoCloseable {
               () -> subagentSource == null ? List.of() : subagentSource.list(),
               () -> tools.list().stream().map(AgentTool::name).toList(),
               events::query);
+      startupCleanup.add(http::close);
 
       // W2 步骤 3：A2A 接入——状态存储=EventStore（Task 快照）+ runner 桥 → 主 Agent chat；
       // 任务执行串行化（Rul B：不引入并发任务——单线程执行器 + Pipeline history 实例级共享（非线程安全），串行即不变量）；
       // W4：主 Agent 回合执行器与 A2A 共享同一实例（AG-UI 会话隔离的前提——见 AgUiSessionRegistry）
-      chatExecutor = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("chat-").factory());
-      a2aTaskService =
+      ExecutorService chatExecutor =
+          Executors.newSingleThreadExecutor(Thread.ofVirtual().name("chat-").factory());
+      startupCleanup.add(chatExecutor::shutdownNow);
+      A2aTaskService a2aTaskService =
           new A2aTaskService(
               new EventStoreA2aTaskStore(events), new A2aAgentRunner(runtime), chatExecutor);
-      a2aServer =
+      startupCleanup.add(a2aTaskService::close);
+      A2aHttpServer a2aServer =
           A2aHttpServer.start(
               new InetSocketAddress(config.a2aHost(), config.a2aPort()),
               port -> a2aCard(a2aBaseUrl(config.a2aHost(), port)),
               // handler 卡仅用于版本协商（URL 无关——真实绑定后的卡片经 cardFactory 构建）
               new A2aJsonRpcHandler(
                   a2aCard(a2aBaseUrl(config.a2aHost(), config.a2aPort())), a2aTaskService));
+      startupCleanup.add(a2aServer::close);
 
       // W4：AG-UI 接入——会话注册表（运行桥）+ SSE 网关（POST /sessions + GET /sessions/{id}/events）
-      aguiRegistry = new AgUiSessionRegistry(runtime, events, bus, chatExecutor);
-      aguiServer =
+      AgUiSessionRegistry aguiRegistry =
+          new AgUiSessionRegistry(runtime, events, bus, chatExecutor);
+      startupCleanup.add(aguiRegistry::close);
+      AgUiHttpServer aguiServer =
           AgUiHttpServer.start(
               new InetSocketAddress(config.aguiHost(), config.aguiPort()),
               aguiRegistry,
               events,
               bus);
+      startupCleanup.add(aguiServer::close);
 
       // P2-1 Task 3：调试对话——与 A2A/AG-UI 共用同一 chat 执行器（串行化不变量），HTTP 面恒绑 127.0.0.1
-      debugChatService = new DebugChatService(runtime, chatExecutor);
-      debugChatServer = DebugChatHttpServer.start(config.debugPort(), debugChatService);
+      DebugChatService debugChatService = new DebugChatService(runtime, chatExecutor);
+      startupCleanup.add(debugChatService::close);
+      DebugChatHttpServer debugChatServer =
+          DebugChatHttpServer.start(config.debugPort(), debugChatService);
+      startupCleanup.add(debugChatServer::close);
 
       App app =
           new App(
@@ -1154,60 +1159,9 @@ public final class App implements AutoCloseable {
       }
       Runtime.getRuntime().addShutdownHook(new Thread(app::close, "mosire-shutdown"));
       return app;
-    } catch (RuntimeException e) {
-      // 装配中途失败（如端口占用）：回收已起的网关/MCP 子进程/子 Agent 编排，避免启动失败后残留僵尸进程
-      if (approvalServer != null) {
-        approvalServer.close();
-      }
-      if (approvalTtyChannel != null) {
-        approvalTtyChannel.close();
-      }
-      if (approvalHttpChannel != null) {
-        approvalHttpChannel.close();
-      }
-      if (aguiServer != null) {
-        aguiServer.close();
-      }
-      if (aguiRegistry != null) {
-        aguiRegistry.close();
-      }
-      if (a2aServer != null) {
-        a2aServer.close();
-      }
-      if (a2aTaskService != null) {
-        a2aTaskService.close();
-      }
-      if (debugChatServer != null) {
-        debugChatServer.close();
-      }
-      if (debugChatService != null) {
-        debugChatService.close();
-      }
-      if (conversations != null) {
-        conversations.close();
-      }
-      if (chatExecutor != null) {
-        chatExecutor.shutdownNow();
-      }
-      if (mcpServer != null) {
-        mcpServer.close();
-      }
-      if (subagentManager != null) {
-        subagentManager.close();
-      }
-      if (subagentProcesses != null) {
-        subagentProcesses.close();
-      }
-      if (pluginTools != null) {
-        pluginTools.close();
-      }
-      if (setupServer != null) {
-        setupServer.close();
-      }
-      closeLinks(links);
-      // 事件存储最后关（与 App.close 的口径一致：其余组件仍可能向它写事件时不得先关它）
-      events.close();
-      throw e;
+    } catch (RuntimeException | Error failure) {
+      rollbackStartup(startupCleanup, failure);
+      throw failure;
     }
   }
 
@@ -1241,40 +1195,48 @@ public final class App implements AutoCloseable {
       WorkspaceRegistry workspaceRegistry,
       BiConsumer<String, String> lineageRegistrar) {
     SubprocessManager processes = new SubprocessManager();
-    SubProcessExecutor executor =
-        new SubProcessExecutor(
-            processes,
-            subagentCommand(config, subagentConfigDir, skillsRoot, skillsListingBudget),
-            tools,
-            PARENT_SERVER_NAME,
-            Version.VERSION,
-            authorizer,
-            skillsRoot,
-            // R3b：子体链路的遮蔽面改由注册表产出（技能根 + 工作区树，判定按该子体自己的面逐条求与）
-            workspaceRegistry);
-    // S6：父级档位取数缝传的是<b>持有者</b>（现读）——HTTP 断点把主 Agent 降到 LIMITED 后，接着派子 Agent 也拿不到 FULL
-    SubagentManager manager =
-        new SubagentManager(
-            templateStore,
-            executor,
-            events,
-            bus,
-            parentConfig,
-            parentPermissions,
-            0,
-            commandMode::get,
-            limits,
-            config.dataDir().resolve("subagents"),
-            // R3b：spawn 侧为每个子体挂一块自己的工作区（holder=父 / user=子 / 落点=父工作区下的真子目录）
-            workspaceRegistry,
-            // 血缘登记缝：工作区模块不得依赖 Brain，而"拟建子体"的血缘只有 spawn 侧算得出来
-            lineageRegistrar);
-    BuiltinToolSource builtin =
-        new BuiltinToolSource(BUILTIN_TOOL_SOURCE_ID, SubagentOrchestrationTools.of(manager));
-    for (AgentTool tool : builtin.listTools()) {
-      tools.register(builtin.id(), tool);
+    List<Runnable> startupCleanup = new ArrayList<>();
+    startupCleanup.add(processes::close);
+    try {
+      SubProcessExecutor executor =
+          new SubProcessExecutor(
+              processes,
+              subagentCommand(config, subagentConfigDir, skillsRoot, skillsListingBudget),
+              tools,
+              PARENT_SERVER_NAME,
+              Version.VERSION,
+              authorizer,
+              skillsRoot,
+              // R3b：子体链路的遮蔽面改由注册表产出（技能根 + 工作区树，判定按该子体自己的面逐条求与）
+              workspaceRegistry);
+      // S6：父级档位取数缝传的是<b>持有者</b>（现读）——HTTP 断点把主 Agent 降到 LIMITED 后，接着派子 Agent 也拿不到 FULL
+      SubagentManager manager =
+          new SubagentManager(
+              templateStore,
+              executor,
+              events,
+              bus,
+              parentConfig,
+              parentPermissions,
+              0,
+              commandMode::get,
+              limits,
+              config.dataDir().resolve("subagents"),
+              // R3b：spawn 侧为每个子体挂一块自己的工作区（holder=父 / user=子 / 落点=父工作区下的真子目录）
+              workspaceRegistry,
+              // 血缘登记缝：工作区模块不得依赖 Brain，而"拟建子体"的血缘只有 spawn 侧算得出来
+              lineageRegistrar);
+      startupCleanup.add(manager::close);
+      BuiltinToolSource builtin =
+          new BuiltinToolSource(BUILTIN_TOOL_SOURCE_ID, SubagentOrchestrationTools.of(manager));
+      for (AgentTool tool : builtin.listTools()) {
+        tools.register(builtin.id(), tool);
+      }
+      return new SubagentRig(manager, processes);
+    } catch (RuntimeException | Error failure) {
+      rollbackStartup(startupCleanup, failure);
+      throw failure;
     }
-    return new SubagentRig(manager, processes);
   }
 
   /**
@@ -1347,11 +1309,9 @@ public final class App implements AutoCloseable {
     }
   }
 
-  /**
-   * MCP 链接装配：每链接 {@code connect} → {@code bind}；任一链接失败则先回收已建立的链接再抛出（声明的能力必须
-   * 在启动时齐备，不做逐链接静默跳过——重连策略不在本期范围）。
-   */
-  private static McpLinks wireMcpLinks(Path linksFile, ToolRegistry registry) {
+  /** MCP 链接装配：源和桥分别登记回收动作。某条链接装配失败时，{@link #start} 回滚本次取得的全部资源。 */
+  private static McpLinks wireMcpLinks(
+      Path linksFile, ToolRegistry registry, List<Runnable> startupCleanup) {
     if (linksFile == null) {
       return McpLinks.empty();
     }
@@ -1361,12 +1321,14 @@ public final class App implements AutoCloseable {
     try {
       for (McpServerLinkConfig link : configs) {
         McpToolSource source = new McpToolSource(link);
+        startupCleanup.add(source::close);
         source.connect();
         sources.add(source);
-        bridges.add(McpSourceBridge.bind(source, registry));
+        McpSourceBridge bridge = McpSourceBridge.bind(source, registry);
+        startupCleanup.add(bridge::close);
+        bridges.add(bridge);
       }
     } catch (RuntimeException e) {
-      closeLinks(new McpLinks(List.copyOf(sources), List.copyOf(bridges)));
       throw new IllegalStateException("MCP 链接装配失败（" + linksFile + "）: " + e.getMessage(), e);
     }
     return new McpLinks(List.copyOf(sources), List.copyOf(bridges));
@@ -1379,7 +1341,7 @@ public final class App implements AutoCloseable {
    * <p>返回 {@code null} = 未装配（开关关闭 / 缺省目录不存在——"没装插件"是正常部署态，记一行日志即可）；<b>显式 {@code plugins.dir}
    * 指向缺失目录不在此列</b>：那是硬要求落空 ⇒ 经 {@link PluginToolSource} 构造器响亮失败（语义见 {@link #resolvePluginsDir}）。任一
    * JAR 装载失败经 {@link PluginToolSource.PluginLoadException} 原样上抛 = 启动响亮失败（D4.5），
-   * 半装配的本源在冒泡前就地回收（回收自身失败只告警，不顶掉原失败）。
+   * 半装配的本源在冒泡前就地回收，关闭异常附加在原失败上。
    *
    * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装载失败原样冒泡（绝不静默跳过，D4.5）正是本方法的契约——由 {@code start}
    * 的既有装配失败路径统一回收资源后呈现（同 {@code start} 的 fail-fast 语义，无更窄类型）。
@@ -1417,13 +1379,8 @@ public final class App implements AutoCloseable {
           toolNames.size(),
           String.join(", ", toolNames));
       return plugins;
-    } catch (RuntimeException failure) {
-      try {
-        plugins.close();
-      } catch (RuntimeException cleanupFailure) {
-        // 回收失败不得顶掉原失败：PluginLoadException 点名坏 JAR 的诊断信息是 D4.5"响亮失败"的本体
-        LOG.warn("插件面回收失败（原失败照常上抛）", cleanupFailure);
-      }
+    } catch (RuntimeException | Error failure) {
+      rollbackStartup(List.of(plugins::close), failure);
       throw failure;
     }
   }
@@ -2081,7 +2038,20 @@ public final class App implements AutoCloseable {
     }
   }
 
-  /** 链接回收（共享给关停与装配失败路径）：先 bridge（整组下架工具），再 source（回收子进程）；逐项异常不中断整组回收。 */
+  /** 启动失败时按资源取得的逆序回收，保留最初的异常及每项关闭失败。 */
+  private static void rollbackStartup(List<Runnable> startupCleanup, Throwable failure) {
+    for (Runnable close : startupCleanup.reversed()) {
+      try {
+        close.run();
+      } catch (RuntimeException | Error closeFailure) {
+        if (closeFailure != failure) {
+          failure.addSuppressed(closeFailure);
+        }
+      }
+    }
+  }
+
+  /** 正常关停时先整组下架桥接工具，再关闭各源的子进程。 */
   private static void closeLinks(McpLinks links) {
     for (McpSourceBridge bridge : links.bridges()) {
       try {
