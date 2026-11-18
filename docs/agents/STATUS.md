@@ -2,11 +2,14 @@
 
 > **更新时间**：2026-11-18（Asia/Shanghai）
 > **本文是实时状态入口。** `AGENTS.md` 只放常驻纪律并指向这里；`README.md` 的里程碑表、
-> `开发计划.md` 的历史执行状态都不再充当实时台账。
+> 0.2.7 以前的执行记录保留在 [架构索引](../architecture/README.md)和[历史交付资料](../archive/pre-0.2.7/README.md)。
 
 ## 1. 当前源码、版本与发布基线
 
 0.2.7 开发分支为 `dev/0.2.7`，开发版本为 `0.2.7-SNAPSHOT`。第一阶段修复发行目录与启动回滚。完整运行时由 Brain 提供，正式发行待用户确认。见 [0.2.7 设计与验收](../architecture/0.2.7-runtime-delivery.md)。
+
+- `48f474b` 建立开发基线。文档检查通过，覆盖 6 个模块、8 份文件和 21 个相对链接。
+- `fc9cd8c` 提交启动资源回滚与同版本服务包配置。六模块 `./mvnw -B -ntp -pl MainMosire -am compile` 退出 0。独立评审复现未启动的 JDK HTTP server 残留端口和 MCP 观察者异常后的状态分裂，修正在第二阶段实施。
 
 | 项目 | 当前事实 | 证据/口径 |
 |---|---|---|
@@ -145,7 +148,7 @@
 
 ### 2.11 上下文注入与动态工具面（A9，2026-11-09）
 
-- 设计：**[设计-上下文注入与动态工具面.md](../../设计-上下文注入与动态工具面.md)**（用户裁定：system 提示词与工具面分离；不预设硬注入；注入一次性投递；role/信封完全自定义；事件只记摘要）。
+- 设计：**[设计-上下文注入与动态工具面.md](../architecture/设计-上下文注入与动态工具面.md)**（用户裁定：system 提示词与工具面分离；不预设硬注入；注入一次性投递；role/信封完全自定义；事件只记摘要）。
 - AgentLib 新增：
   - `io.mosire.agentlib.context.ContextInjection` / `ContextInjectionKinds` / `ContextInjectionQueue` / `ContextInjectionRenderer`；
   - `ContextWindow` 新增 `inject` / `pendingInjections` / `commitInjections` / `clearInjections`（消息面仍调用方串行，注入队列自身线程安全）；
@@ -165,7 +168,7 @@
 
 ### 2.12 工具面扩展与查看（A2/A4/A5/A6，2026-11-09）
 
-- 设计：**[设计-工具面扩展与查看.md](../../设计-工具面扩展与查看.md)**。
+- 设计：**[设计-工具面扩展与查看.md](../architecture/设计-工具面扩展与查看.md)**。
 - A2：`ToolRegistry.registerAll(String sourceId, List<AgentTool>)`——空白 sourceId 拒绝、全量校验零部分写入、失败回滚、成功后一次 onChange/revision；与 `unregisterAllBySource` 对称，不隐式替换。
 - A4：`AgentToMcpServer.resync()` 公开；与 onChange 共用 `ReentrantLock`；只按当前 include 谓词重算暴露面，无变化不发通知，不刷新同名工具 schema。
 - A5：`AgentTool.title()/group()/tags()` default（空串/空集）；**不进 MCP `tools/list` 额外字段**，完整信息走 `tool_catalog`。
@@ -178,7 +181,7 @@
 
 ### 2.13 工具执行硬超时（A3，2026-11-09）
 
-- 设计：**[设计-工具硬超时.md](../../设计-工具硬超时.md)**（用户裁定：整个可配置硬超时，默认 10 分钟；超时在工具结果里提醒 Agent 超时未完成）。
+- 设计：**[设计-工具硬超时.md](../architecture/设计-工具硬超时.md)**（用户裁定：整个可配置硬超时，默认 10 分钟；超时在工具结果里提醒 Agent 超时未完成）。
 - `ToolCallAuthorizer` 在 `tool.execute` 外包 `FutureTask` + 虚拟线程：默认 **600000 ms**，配置键 `tool.executionTimeoutMs`（`ToolContext.config()`；非正/不可解析回落默认 + WARN）。
 - 超时返回 `TIMEOUT`，消息「工具执行超时未完成（超过 N ms 已放弃等待）」；`interrupt()` worker、丢弃晚到结果并 WARN；**不杀进程**。
 - 只包工具本体，不包审批/决策等待；工具内 `ResourceDeniedException` 仍转 `RESOURCE_DENIED`，其它 RuntimeException/Error 原样上抛。
@@ -188,7 +191,7 @@
 
 ### 2.14 MCP HTTP TLS + 显式 opt-in（A1，2026-11-09）
 
-- 设计：**[设计-MCP-HTTP安全.md](../../设计-MCP-HTTP安全.md)**；旧 `设计-MCP-HTTP传输与审批渠道.md` §四已追加“被取代”标注（不删原文）。
+- 设计：**[设计-MCP-HTTP安全.md](../architecture/设计-MCP-HTTP安全.md)**；旧 `设计-MCP-HTTP传输与审批渠道.md` §四已追加“被取代”标注（不删原文）。
 - 新增：`McpHttpAuth`（method/path/headers 的传输无关钩子）、`BearerTokenVerifier.constantTime`、`McpHttpTlsConfig`（PKCS12/JKS，`toString` 脱敏）、`McpHttpSecurity`（tls/auth/allowInsecure + 工厂）。
 - `JdkHttpStreamableServerTransportProvider`：路径精确 → **认证（401 + `WWW-Authenticate: Bearer`）** → closing → 方法分派；覆盖 POST（含 initialize）/GET/DELETE。
 - `AgentToMcpServer.startHttp`：新增带 `McpHttpSecurity` 的 owned / caller-owned 重载；旧重载委托 `McpHttpSecurity.none()`。owned 在 TLS 时自建 `HttpsServer` + `HttpsConfigurator`；caller-owned TLS 要求传入 `HttpsServer`。
@@ -356,7 +359,7 @@ tag `v0.2.5` 指向 release commit；发布工作流与 Pages 事实见 §4.7。
 | `docs/agents/ENVIRONMENT.md` | 本机环境、EOL、工具差异与临时数据约束。 |
 | `docs/agents/skills-eval/2026-10-17-mosire-verify.md` | `mosire-verify` pilot 的 baseline/skill 对照与“不激活”结论；不是 active Skill。 |
 | `设计-决策包读取端口.md` | 本批读口设计、用户原话、验收判据与免责边界。 |
-| `开发计划.md` | 范围/顺序与验收判据；不重复实时记账。 |
-| 根 `设计-*.md` + `docs/upstream/**` | 机制与上游契约的权威设计。 |
+| [开发计划](../architecture/开发计划.md) | 范围、顺序与验收判据。 |
+| [架构索引](../architecture/README.md) + `docs/upstream/**` | 机制与上游公开契约。 |
 | `docs/archive/**` | 历史归档；不得当实时状态。 |
 | `.superpowers/**` | 历史/本机工具路径；**不是权威实时状态**，本仓不依赖它记账。 |

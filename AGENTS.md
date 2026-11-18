@@ -33,8 +33,8 @@ BashPluginMosire ──→ AgentLibMosire（PF4J provided；宿主不 import）
 
 - **groupId**：`io.mosire`。
 - **Main 对 bash-plugin 的 provided 依赖**只服务构建顺序/插件拷贝，不是编译依赖；shade 必须排除它。
-- 依赖边界由 **Maven enforcer + 源码 import 审计**两层检查；只用 `^import` 精确匹配，不用裸 grep 判断。
-- AgentLib 两次边界改写（AgentConfig/ContextWindow/AgentLoop）的完整理由见 `设计-上下文窗口下沉.md`、`设计-通用循环骨架.md`。
+- 依赖边界按 Maven POM 和生产源码 import 两层检查；使用 `^import` 精确匹配。
+- AgentLib 边界改写（AgentConfig/ContextWindow/AgentLoop）见 [上下文窗口下沉](docs/architecture/设计-上下文窗口下沉.md)和[通用循环骨架](docs/architecture/设计-通用循环骨架.md)。
 
 ### 0.2 红线（任何模块、任何批次）
 
@@ -53,7 +53,7 @@ BashPluginMosire ──→ AgentLibMosire（PF4J provided；宿主不 import）
 - 两套 Skill **不共享目录、加载器、权限面或生命周期**；不得软链、挂载、互相扫描或复制。
 - 工程 Skill 使用**宿主提供的技能发现机制**；宿主没有时按目录元数据选择。**不硬编码 `skill_search`**，也不用 Brain 的 `skill_*` 工具找工程 Skill。
 - 当前 active 工程 Skill = **0**；`mosire-verify` 已完成 pilot 评估，结论为不激活（`docs/agents/skills-eval/2026-10-17-mosire-verify.md`）。
-- 运行时 Skill 的命名空间、三档 fail-closed、逐层只减不增、已知缺口以 `设计-Skill运行时能力.md` 为准；不要因文档压缩忘记这些缺口。
+- 运行时 Skill 的命名空间、三档 fail-closed、逐层只减不增和已知缺口见 [Skill 运行时能力](docs/architecture/设计-Skill运行时能力.md)。
 
 ### 0.4 文档地图
 
@@ -65,8 +65,9 @@ BashPluginMosire ──→ AgentLibMosire（PF4J provided；宿主不 import）
 | `docs/agents/VERIFICATION.md` | 并发、`scripts/gate.sh`、Surefire/SpotBugs、run-bound 证据、变异自证、时钟约束。 |
 | `docs/agents/ENVIRONMENT.md` | JDK/Maven、内存、`~/.m2`、LF/CRLF、grep/find、真模型脚本、临时目录。 |
 | `docs/upstream/*.md` | 三个上游库的公开契约（决策包 / Workspace 路径 / Docs 存储），契约正文不要复制到 AGENTS。 |
-| 根 `设计-*.md` | 身份/子 Agent/权限/决策包/上下文窗口/通用循环等现行设计。 |
-| `docs/archive/**`、`开发计划.md` | 历史与范围/顺序；不冒充实时状态。 |
+| [`docs/architecture/`](docs/architecture/README.md) | 身份、子 Agent、权限、决策包、上下文、通用循环、发行与范围计划。 |
+| [`docs/README.md`](docs/README.md) | 用户指南、API 和配置参考、公开契约与历史交付入口。 |
+| `docs/archive/**` | 历史交付记录及旧执行台账。 |
 | `.omo/**`、`.work/**`、`target/**` | 本机工具/证据/构建产物，默认不入库；跨会话结论回写仓内文档。 |
 
 > `.superpowers/**` 若在本仓不存在，按历史留痕读，**不是权威实时状态**。
@@ -127,10 +128,10 @@ BashPluginMosire ──→ AgentLibMosire（PF4J provided；宿主不 import）
 2. 冲突时以**最新已落盘文档**为准；更早的 plan/status 自动降为历史；旧文档不回头改，用追加“已被 X 取代”标注。
 3. **机制性描述回代码核**：计划里说“唯一写口/某字段=某 revision”等，使用前先确认代码；发现不符先报告。
 4. 允许调查提出设计修改，但必须给依赖/调用图、影响面、迁移/回退、与红线关系，由控制方交用户裁定。
-5. 新设计放 `设计-*.md` 或 `docs/`；不要只写在聊天、代码注释或子 Agent 任务书里。
+5. 新机制设计放 `docs/architecture/` 并登记索引；不要只写在聊天、代码注释或子 Agent 任务书里。
 6. 协议消息/数据优先 `record` + `sealed interface` + 穷尽 switch；公开 API 用中文 Javadoc，解释“为什么”。
 7. 实时版本/测试/Pages 一律看 `docs/agents/STATUS.md`；AGENTS 不抄当前数字。
-8. 冻结决策表在 `开发计划.md §1`；变更决策按第 5 条先落文档。
+8. 冻结决策表见 [开发计划](docs/architecture/开发计划.md)；变更决策按第 5 条先落文档。
 
 ---
 
