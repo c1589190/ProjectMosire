@@ -1,7 +1,10 @@
 package io.mosire.agentlib.mcp;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.modelcontextprotocol.json.TypeRef;
+import io.modelcontextprotocol.spec.McpClientTransport;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.mosire.agentlib.permission.AccessToken;
 import io.mosire.agentlib.permission.AgentPermissionSet;
@@ -18,9 +21,12 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Mono;
 
 class McpToolSourceTest {
 
@@ -242,6 +248,66 @@ class McpToolSourceTest {
       first.close();
       second.close();
       assertThat(source.listTools()).extracting(AgentTool::name).contains("echo");
+    } finally {
+      Files.writeString(quitMarker, "q");
+      waitForExit(pidFile);
+    }
+  }
+
+  @Test
+  void failedInitializationClosesItsTransportBeforePublishingTools() {
+    AtomicBoolean closed = new AtomicBoolean();
+    IllegalStateException failure = new IllegalStateException("握手夹具失败");
+    McpClientTransport transport =
+        new McpClientTransport() {
+          @Override
+          public Mono<Void> connect(
+              Function<Mono<McpSchema.JSONRPCMessage>, Mono<McpSchema.JSONRPCMessage>> handler) {
+            return Mono.empty();
+          }
+
+          @Override
+          public Mono<Void> sendMessage(McpSchema.JSONRPCMessage message) {
+            return Mono.error(failure);
+          }
+
+          @Override
+          public Mono<Void> closeGracefully() {
+            return Mono.fromRunnable(() -> closed.set(true));
+          }
+
+          @Override
+          public <T> T unmarshalFrom(Object data, TypeRef<T> target) {
+            throw new AssertionError("失败的传输无响应可解析");
+          }
+        };
+    try (McpToolSource source = new McpToolSource("failed")) {
+      assertThatThrownBy(() -> source.connect(transport)).hasCauseReference(failure);
+      assertThat(closed.get()).isTrue();
+      assertThat(source.listTools()).isEmpty();
+    }
+  }
+
+  @Test
+  void observerFailureKeepsThePublishedToolsUsable(@TempDir Path tempDir) throws Exception {
+    Path pidFile = tempDir.resolve("observed-echo.pid");
+    Path quitMarker = tempDir.resolve("observed-echo-quit");
+    ToolRegistry registry = new ToolRegistry();
+    IllegalStateException rejection = new IllegalStateException("观察者夹具失败");
+    try (McpToolSource source = new McpToolSource(echoServerConfig(pidFile, quitMarker));
+        McpSourceBridge bridge = McpSourceBridge.bind(source, registry);
+        AutoCloseable laterObserver =
+            source.onChange(
+                () -> {
+                  throw rejection;
+                })) {
+      assertThatThrownBy(source::connect).isSameAs(rejection);
+      List<String> names = source.listTools().stream().map(AgentTool::name).toList();
+      assertThat(names).contains("echo");
+      assertThat(bridge.synchronizedNames()).containsExactlyInAnyOrderElementsOf(names);
+      ToolResult result = registry.find("echo").orElseThrow().execute(contextWith("仍可调用"));
+      assertThat(result.success()).isTrue();
+      assertThat(result.message()).isEqualTo("echo:仍可调用");
     } finally {
       Files.writeString(quitMarker, "q");
       waitForExit(pidFile);

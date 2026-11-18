@@ -855,14 +855,12 @@ public final class AgentRuntime implements AutoCloseable {
     }
 
     /** 借用已打开的资源，宿主在运行时关闭后关闭资源。与 {@link #dataDirectory(Path)} 二选一。 */
-    @SuppressFBWarnings(value = "EI_EXPOSE_REP2", justification = "配置需借用宿主已打开的资源")
     public Builder storage(RuntimeStorage resources) {
       this.storage = Objects.requireNonNull(resources, "storage");
       return this;
     }
 
     /** 使用宿主装配的工具注册表，或由构建器创建独立的空表。 */
-    @SuppressFBWarnings(value = "EI_EXPOSE_REP2", justification = "与宿主共用活动工具目录")
     public Builder toolRegistry(ToolRegistry tools) {
       this.registry = Objects.requireNonNull(tools, "registry");
       return this;
@@ -896,12 +894,16 @@ public final class AgentRuntime implements AutoCloseable {
     }
 
     /** 注入持久会话使用的审批编排器。传空时审批请求按拒绝处理。 */
+    @SuppressFBWarnings(
+        value = "EI_EXPOSE_REP2",
+        justification = "运行时借用宿主实际使用的审批编排器，复制会切断共享的待审批记录和通道")
     public Builder approvalCoordinator(ApprovalCoordinator approvalCoordinator) {
       this.coordinator = approvalCoordinator;
       return this;
     }
 
     /** 注入持久会话的主侧决策桥。传空时使用已有审批路径。 */
+    @SuppressFBWarnings(value = "EI_EXPOSE_REP2", justification = "运行时借用宿主的决策桥，共用决策账本与提交路径")
     public Builder decisionBridge(DecisionApprovalBridge decisionBridge) {
       this.bridge = decisionBridge;
       return this;

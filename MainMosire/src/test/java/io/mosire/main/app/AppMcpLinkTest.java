@@ -236,7 +236,7 @@ class AppMcpLinkTest {
     Path quitMarker = tempDir.resolve("echo-quit");
     Path linksFile = writeLinksJson(pidFile, quitMarker);
     try (java.net.ServerSocket occupied = new java.net.ServerSocket(0)) {
-      // 端口被占：链接已建立后装配失败 → 已起的 MCP 子进程也必须被回收（不留僵尸）
+      // 端口被占：装配失败后必须回收已连入的 MCP 子进程。工装的进程输入留给 Surefire。
       BootConfig config =
           new BootConfig(
               occupied.getLocalPort(),
@@ -244,7 +244,7 @@ class AppMcpLinkTest {
               false,
               "",
               linksFile,
-              true,
+              false,
               "127.0.0.1",
               0);
       assertThatThrownBy(() -> App.start(config)).isInstanceOf(IllegalStateException.class);

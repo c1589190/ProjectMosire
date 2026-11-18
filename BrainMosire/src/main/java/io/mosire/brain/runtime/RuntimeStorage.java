@@ -64,12 +64,10 @@ public final class RuntimeStorage implements AutoCloseable {
   }
 
   /** 提供给宿主的共享总线，订阅者可在关闭时完成队列中的工作。 */
-  @SuppressFBWarnings(value = "EI_EXPOSE_REP", justification = "宿主需要在这个总线上订阅运行时事件")
   public EventBus eventBus() {
     return bus;
   }
 
-  @SuppressFBWarnings(value = "EI_EXPOSE_REP", justification = "同包的运行时借用同一个会话存储")
   ConversationStore conversationStore() {
     requireOpen();
     return conversations;

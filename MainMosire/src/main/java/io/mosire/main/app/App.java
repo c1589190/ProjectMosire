@@ -398,7 +398,6 @@ public final class App implements AutoCloseable {
    *
    * @param contextCompactor 默认上下文压缩器；null = 保持既有不压缩行为（离线/demo/setup 未配置/兼容调用）
    */
-  @SuppressFBWarnings("THROWS_METHOD_THROWS_RUNTIMEEXCEPTION")
   public static App start(
       BootConfig config,
       LlmClient llmOverride,
@@ -1301,11 +1300,7 @@ public final class App implements AutoCloseable {
    * 指向缺失目录不在此列</b>：那是硬要求落空 ⇒ 经 {@link PluginToolSource} 构造器响亮失败（语义见 {@link #resolvePluginsDir}）。任一
    * JAR 装载失败经 {@link PluginToolSource.PluginLoadException} 原样上抛 = 启动响亮失败（D4.5），
    * 半装配的本源在冒泡前就地回收，关闭异常附加在原失败上。
-   *
-   * <p>THROWS_METHOD_THROWS_RUNTIMEEXCEPTION 抑制：装载失败原样冒泡（绝不静默跳过，D4.5）正是本方法的契约——由 {@code start}
-   * 的既有装配失败路径统一回收资源后呈现（同 {@code start} 的 fail-fast 语义，无更窄类型）。
    */
-  @SuppressFBWarnings("THROWS_METHOD_THROWS_RUNTIMEEXCEPTION")
   private static PluginToolSource wirePlugins(
       ConfigStore configStore, ToolRegistry tools, EventStore events) {
     PluginDirResolution resolution = resolvePluginsDir(configStore, codeLocation());
