@@ -16,6 +16,8 @@
 
 在消费项目 POM 中配置 [Pages 仓库](https://c1589190.github.io/ProjectMosire/)，从该页选定已发行版本。
 
+试用预发行时将 `mosire.version` 固定为 `0.2.7-early`。该版本的四库、BOM 和服务下载入口见 [0.2.7-early 制品页](https://c1589190.github.io/ProjectMosire/release-0.2.7-early.html)。
+
 ```xml
 <repositories>
   <repository>
