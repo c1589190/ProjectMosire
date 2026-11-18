@@ -1,12 +1,18 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='utf-8'?>
 <metadata>
   <groupId>io.mosire</groupId>
   <artifactId>agentlib-mosire</artifactId>
   <versioning>
     <release>0.2.5</release>
     <versions>
+      <version>0.1.0</version>
+      <version>0.2.0</version>
+      <version>0.2.1</version>
+      <version>0.2.2</version>
+      <version>0.2.3</version>
       <version>0.2.5</version>
+      <version>0.2.7-early</version>
     </versions>
-    <lastUpdated>20261109132022</lastUpdated>
+    <lastUpdated>20261118144031</lastUpdated>
   </versioning>
 </metadata>

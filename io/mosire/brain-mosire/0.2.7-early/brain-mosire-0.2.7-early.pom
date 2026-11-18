@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.mosire</groupId>
+    <artifactId>mosire-parent</artifactId>
+    <version>0.2.7-early</version>
+  </parent>
+
+  <artifactId>brain-mosire</artifactId>
+  <name>BrainMosire</name>
+  <description>Agent 运行时：tool-calling 循环、上下文构造与压缩、子 Agent 编排、skills、记忆（同一实现服务主 Agent 与子 Agent，差异=配置）</description>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>agentlib-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!--
+      工作区标准（R3b 裁定 2026-10-13）：spawn 侧要"为一个子体挂一块自己的工作区并落格 docs 能力"——
+      这是父侧运行期状态的一次登记（holder=父/user=子），必须在 Brain 的派生链上完成，不能挪到 Main 的装配期
+      （那时还不知道实例 id）。依赖方向无环：workspace-mosire → agentlib-mosire（workspace 不依赖 Brain）。
+    -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>workspace-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!--
+      Docs 面（同上裁定）：{@code docs}/{@code docs-edit} 两个命名空间常量住在 docs-mosire（DocNamespaces），
+      物化与 argv 传递都必须引用<b>那一份</b>——在 Brain 里另抄一份字符串就是设计 §2.1 点名的"第二处拼写点"。
+      依赖方向无环：docs-mosire → workspace-mosire → agentlib-mosire。
+    -->
+    <dependency>
+      <groupId>io.mosire</groupId>
+      <artifactId>docs-mosire</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- 事件 payload/工具参数 JSON 序列化（版本由根 pom jackson-bom 管理） -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <!-- SpotBugs 抑制注解：registry()/config() 等“有意暴露实时对象”的访问器标记（编译期仅为注解） -->
+    <dependency>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-annotations</artifactId>
+      <version>4.10.4</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

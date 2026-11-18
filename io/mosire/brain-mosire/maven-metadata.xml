@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='utf-8'?>
+<metadata>
+  <groupId>io.mosire</groupId>
+  <artifactId>brain-mosire</artifactId>
+  <versioning>
+    <versions>
+      <version>0.2.7-early</version>
+    </versions>
+    <lastUpdated>20261118144031</lastUpdated>
+  </versioning>
+</metadata>

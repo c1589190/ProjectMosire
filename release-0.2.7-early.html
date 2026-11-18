@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Mosire 公共 Maven 仓库，提供 AgentLib、Workspace、Docs、Brain 和版本清单" />
+    <title>Mosire Maven 仓库（io.mosire）</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 15px/1.75 -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+             max-width: 46rem; margin: 3rem auto; padding: 0 1.2rem; }
+      h1 { font-size: 1.45rem; margin-bottom: .2rem; }
+      h2 { font-size: 1.05rem; margin-top: 2rem; border-bottom: 1px solid rgba(127,127,127,.3); padding-bottom: .3rem; }
+      .sub { opacity: .75; margin-top: .3rem; }
+      pre { background: rgba(127,127,127,.13); padding: .8rem 1rem; border-radius: 6px; overflow-x: auto; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+      ul { padding-left: 1.2rem; }
+      li { margin: .25rem 0; }
+      a { color: inherit; }
+    </style>
+  </head>
+  <body>
+    <h1>Mosire Maven 仓库</h1>
+    <p class="sub">
+      预发行版本为 <code>0.2.7-early</code>。库需要 JDK 21，可直接从此公共仓库下载。
+    </p>
+
+    <h2>接入</h2>
+    <p>将此仓库添加到项目的 <code>pom.xml</code>。</p>
+    <pre><code>&lt;repositories&gt;
+  &lt;repository&gt;
+    &lt;id&gt;mosire-pages&lt;/id&gt;
+    &lt;url&gt;https://c1589190.github.io/ProjectMosire/&lt;/url&gt;
+    &lt;releases&gt;&lt;enabled&gt;true&lt;/enabled&gt;&lt;/releases&gt;
+    &lt;snapshots&gt;&lt;enabled&gt;false&lt;/enabled&gt;&lt;/snapshots&gt;
+  &lt;/repository&gt;
+&lt;/repositories&gt;</code></pre>
+
+    <p>简单 Agent 和工具封装只需在 <code>&lt;dependencies&gt;</code> 中声明 AgentLib。</p>
+    <pre><code>&lt;dependency&gt;
+  &lt;groupId&gt;io.mosire&lt;/groupId&gt;
+  &lt;artifactId&gt;agentlib-mosire&lt;/artifactId&gt;
+  &lt;version&gt;0.2.7-early&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+    <p>需要会话持久化和完整运行时的项目可声明 Brain。Brain 会传递引入 AgentLib、Workspace 和 Docs。
+      也可以按需单独声明 Workspace 或 Docs。导入 BOM 后，以下四库的依赖声明可省略版本。</p>
+    <pre><code>&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;io.mosire&lt;/groupId&gt;
+      &lt;artifactId&gt;mosire-parent&lt;/artifactId&gt;
+      &lt;version&gt;0.2.7-early&lt;/version&gt;
+      &lt;type&gt;pom&lt;/type&gt;
+      &lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;</code></pre>
+
+    <h2>当前版本制品（0.2.7-early）</h2>
+    <ul>
+      <li><code>io.mosire:agentlib-mosire</code>
+        <a href="io/mosire/agentlib-mosire/0.2.7-early/agentlib-mosire-0.2.7-early.pom">POM</a> ·
+        <a href="io/mosire/agentlib-mosire/0.2.7-early/agentlib-mosire-0.2.7-early.jar">JAR</a> ·
+        <a href="io/mosire/agentlib-mosire/0.2.7-early/agentlib-mosire-0.2.7-early-sources.jar">源码</a> ·
+        <a href="io/mosire/agentlib-mosire/0.2.7-early/agentlib-mosire-0.2.7-early-javadoc.jar">Javadoc</a></li>
+      <li><code>io.mosire:workspace-mosire</code>
+        <a href="io/mosire/workspace-mosire/0.2.7-early/workspace-mosire-0.2.7-early.pom">POM</a> ·
+        <a href="io/mosire/workspace-mosire/0.2.7-early/workspace-mosire-0.2.7-early.jar">JAR</a> ·
+        <a href="io/mosire/workspace-mosire/0.2.7-early/workspace-mosire-0.2.7-early-sources.jar">源码</a> ·
+        <a href="io/mosire/workspace-mosire/0.2.7-early/workspace-mosire-0.2.7-early-javadoc.jar">Javadoc</a></li>
+      <li><code>io.mosire:docs-mosire</code>
+        <a href="io/mosire/docs-mosire/0.2.7-early/docs-mosire-0.2.7-early.pom">POM</a> ·
+        <a href="io/mosire/docs-mosire/0.2.7-early/docs-mosire-0.2.7-early.jar">JAR</a> ·
+        <a href="io/mosire/docs-mosire/0.2.7-early/docs-mosire-0.2.7-early-sources.jar">源码</a> ·
+        <a href="io/mosire/docs-mosire/0.2.7-early/docs-mosire-0.2.7-early-javadoc.jar">Javadoc</a></li>
+      <li><code>io.mosire:brain-mosire</code>
+        <a href="io/mosire/brain-mosire/0.2.7-early/brain-mosire-0.2.7-early.pom">POM</a> ·
+        <a href="io/mosire/brain-mosire/0.2.7-early/brain-mosire-0.2.7-early.jar">JAR</a> ·
+        <a href="io/mosire/brain-mosire/0.2.7-early/brain-mosire-0.2.7-early-sources.jar">源码</a> ·
+        <a href="io/mosire/brain-mosire/0.2.7-early/brain-mosire-0.2.7-early-javadoc.jar">Javadoc</a></li>
+      <li><code>io.mosire:mosire-parent</code>
+        <a href="io/mosire/mosire-parent/0.2.7-early/mosire-parent-0.2.7-early.pom">父 POM / BOM</a></li>
+    </ul>
+    <p>可以继续使用旧版固定坐标。历史版本可查各制品的 Maven 索引。</p>
+    <ul>
+      <li><a href="io/mosire/agentlib-mosire/maven-metadata.xml">AgentLib 历史</a></li>
+      <li><a href="io/mosire/workspace-mosire/maven-metadata.xml">Workspace 历史</a></li>
+      <li><a href="io/mosire/docs-mosire/maven-metadata.xml">Docs 历史</a></li>
+      <li><a href="io/mosire/brain-mosire/maven-metadata.xml">Brain 历史</a></li>
+      <li><a href="io/mosire/mosire-parent/maven-metadata.xml">父 POM 历史</a></li>
+    </ul>
+
+    <h2>使用文档</h2>
+    <ul>
+      <li><a href="https://github.com/c1589190/ProjectMosire/blob/0f494df5c5dc800dffa37ddaabdbdbb31f1fe47e/docs/guides/embed-agent.md">嵌入 Java Agent</a></li>
+      <li><a href="https://github.com/c1589190/ProjectMosire/blob/0f494df5c5dc800dffa37ddaabdbdbb31f1fe47e/docs/reference/artifacts.md">制品与模块参考</a></li>
+      <li><a href="https://github.com/c1589190/ProjectMosire/blob/0f494df5c5dc800dffa37ddaabdbdbb31f1fe47e/docs/guides/run-server.md">独立服务指南</a></li>
+      <li><a href="https://github.com/c1589190/ProjectMosire/releases">下载服务 ZIP 和 SHA-256</a></li>
+    </ul>
+  </body>
+</html>
